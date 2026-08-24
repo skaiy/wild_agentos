@@ -248,10 +248,39 @@ impl Default for TaskContext {
     }
 }
 
+/// Structured task outcome verdict — decoupled from the human-readable status string.
+/// The `finish` action historically flattened a verdict into `status: "success"`,
+/// losing blocked/failed intent; this enum preserves it so consumers (e.g. SA
+/// verify-first logic) can react honestly instead of re-parsing summary text.
+///
+/// Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskVerdict {
+    Success,
+    PartialSuccess,
+    Failed,
+    Timeout,
+    Blocked,
+}
+
+impl TaskVerdict {
+    /// Maps back to the legacy status string so existing consumers keep working.
+    pub fn to_status_str(self) -> &'static str {
+        match self {
+            TaskVerdict::Success => "success",
+            TaskVerdict::PartialSuccess => "partial_success",
+            TaskVerdict::Failed => "failed",
+            TaskVerdict::Timeout => "timeout",
+            TaskVerdict::Blocked => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskResult {
     pub task_iri: String,
     pub status: String,
+    pub verdict: Option<TaskVerdict>,
     pub summary: String,
     pub output: Option<Value>,
     pub jsonld_output: Option<Value>,

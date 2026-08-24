@@ -13,8 +13,8 @@ pub mod unified_graph;
 
 pub use consistency_engine::{ConsistencyEngine, WriteStrategy};
 pub use embedding_service::{
-    create_embedding_service_from_config, EmbeddingService, FallbackEmbeddingService,
-    OneApiEmbeddingService,
+    create_embedding_service_from_config, embedding_health_snapshot, record_embedding_health,
+    EmbeddingService, FallbackEmbeddingService, OneApiEmbeddingService,
 };
 pub use hyperspace_store::{HybridSearchFilter, HyperspaceStore, ScoredEntry};
 pub use l0_store::{L0Store, MesiState};

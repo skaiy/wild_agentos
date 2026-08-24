@@ -469,6 +469,18 @@ impl AgentOSService {
                 "l1_max_messages": self.settings.memory.l1.max_messages,
                 "l2_max_node_size": self.settings.memory.l2.max_node_size,
             },
+            "workspace": {
+                "watch_enabled": self.settings.workspace.watch_enabled,
+                "poll_interval_ms": self.settings.workspace.poll_interval_ms,
+                "debounce_ms": self.settings.workspace.debounce_ms,
+                "max_debounce_wait_ms": self.settings.workspace.max_debounce_wait_ms,
+                "content_store_max_bytes": self.settings.workspace.content_store_max_bytes,
+                "content_cache_capacity": self.settings.workspace.content_cache_capacity,
+            },
+            "sandbox": crate::tools::builtin::sandbox::sandbox_runtime_snapshot(),
+            "verify_first": crate::core::sa::verify_first_runtime_snapshot(),
+            "memory_scheduler": crate::memory::scheduler::MemoryScheduler::runtime_snapshot(),
+            "embedding_health": crate::memory::embedding_health_snapshot(),
             "agents": {
                 "max_iterations": self.settings.agents.max_iterations,
                 "max_parallel_agents": self.settings.agents.max_parallel_agents,

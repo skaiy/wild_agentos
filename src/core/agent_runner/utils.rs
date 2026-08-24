@@ -1226,6 +1226,7 @@ impl super::AgentRunner {
             Ok(TaskResult {
                 task_iri: ctx.task_iri,
                 status: "success".to_string(),
+                verdict: None,
                 summary: final_summary,
                 output: Some(output_value),
                 jsonld_output,

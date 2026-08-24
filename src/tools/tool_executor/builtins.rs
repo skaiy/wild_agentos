@@ -15,6 +15,10 @@ use crate::knowledge_graph::rdf_mapper::RdfMapper;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{BridgeRelationType, EdgeDef, NodeDef, RdfQuad, RdfValue};
 use crate::memory::{HybridSearchFilter, HyperspaceStore};
+use crate::tools::builtin::sandbox::{
+    build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
+    SandboxConfig, SandboxStatus,
+};
 use crate::utils::text::safe_truncate;
 
 use super::{GlobSearchInput, GrepSearchInput, ToolSearchInput, WebFetchInput, WebSearchInput};
@@ -156,6 +160,7 @@ pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
 
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_build_or_vendored_dir(entry.path()))
         .filter_map(|e| e.ok())
     {
         if !entry.file_type().is_file() {
@@ -315,6 +320,26 @@ fn match_glob(path: &str, pattern: &str) -> bool {
         return glob_matcher.matches(file_name);
     }
     file_name.contains(pattern.trim_start_matches('*'))
+}
+
+/// Directories excluded from recursive file scans so a repository-scale
+/// search does not traverse build artifacts and vendored dependencies.
+///
+/// Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+fn is_build_or_vendored_dir(path: &std::path::Path) -> bool {
+    const EXCLUDED: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "vendor",
+        ".venv",
+        "__pycache__",
+        ".next",
+    ];
+    let name = path.file_name().and_then(|n| n.to_str());
+    matches!(name, Some(name) if EXCLUDED.contains(&name))
 }
 
 pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
@@ -664,6 +689,18 @@ struct BashInput {
     #[allow(dead_code)]
     description: Option<String>,
     timeout: Option<u64>,
+    #[serde(rename = "run_in_background")]
+    run_in_background: Option<bool>,
+    #[serde(rename = "dangerouslyDisableSandbox")]
+    dangerously_disable_sandbox: Option<bool>,
+    #[serde(rename = "namespaceRestrictions")]
+    namespace_restrictions: Option<bool>,
+    #[serde(rename = "isolateNetwork")]
+    isolate_network: Option<bool>,
+    #[serde(rename = "filesystemMode")]
+    filesystem_mode: Option<FilesystemIsolationMode>,
+    #[serde(rename = "allowedMounts")]
+    allowed_mounts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -829,27 +866,46 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         return execute_powershell(ps_input).await;
     }
 
-    // Unix: execute via sh -c
+    // Unix: execute via sh -c (or unshare sandbox launcher when active)
     #[cfg(not(windows))]
     {
         let params: BashInput =
             serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-        use std::process::Command;
         use std::sync::{Arc, Mutex};
         use std::thread;
         let timeout_ms = params.timeout.unwrap_or(60_000);
+        let cwd = std::env::current_dir().map_err(|e| format!("Current dir error: {}", e))?;
+        let sandbox_status = sandbox_status_for_input(&params, &cwd);
+        let sandbox_status_json = serde_json::to_value(&sandbox_status)
+            .map_err(|e| format!("Sandbox status serialize error: {}", e))?;
+
+        // Background execution: spawn detached and return immediately.
+        if params.run_in_background.unwrap_or(false) {
+            let mut cmd = prepare_bash_spawn(&params.command, &cwd, &sandbox_status)?;
+            let spawned = cmd
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("Spawn error: {}", e))?;
+            return Ok(json!({
+                "command": params.command,
+                "background_task_id": spawned.id().to_string(),
+                "sandbox_status": sandbox_status_json,
+            }));
+        }
+
+        // Self-protection: the DA often cleans up spawned processes with
+        // `pkill -f <name>`; because the agent's own command line embeds the
+        // task prompt (which may contain the same <name>), a full-command-line
+        // match kills the agent itself. Wrap the command so pkill/killall
+        // resolve targets via pgrep and exclude the agent PID + wrapper shell.
+        let guarded_command = self_protect_bash_command(&params.command);
 
         let spawn_child = |cmd: &str| -> Result<std::process::Child, String> {
-            let mut c = Command::new("sh");
-            c.arg("-c")
-                .arg(cmd)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            #[cfg(unix)]
-            {
-                c.process_group(0);
-            }
-            c.spawn().map_err(|e| format!("Spawn error: {}", e))
+            prepare_bash_spawn(cmd, &cwd, &sandbox_status)?
+                .spawn()
+                .map_err(|e| format!("Spawn error: {}", e))
         };
 
         let spawn_readers =
@@ -875,7 +931,7 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                 (out_buf, err_buf)
             };
 
-        let mut child = spawn_child(&params.command)?;
+        let mut child = spawn_child(&guarded_command)?;
         let (mut stdout_buf, mut stderr_buf) = spawn_readers(&mut child);
 
         let mut start = std::time::Instant::now();
@@ -886,19 +942,25 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                 Ok(Some(status)) => {
                     // brief pause for reader threads to finish
                     thread::sleep(std::time::Duration::from_millis(50));
-                    let stdout = stdout_buf
+                    let stdout_raw = stdout_buf
                         .lock()
                         .expect("stdout_buf Mutex poisoned")
                         .clone();
-                    let stderr = stderr_buf
+                    let stderr_raw = stderr_buf
                         .lock()
                         .expect("stderr_buf Mutex poisoned")
                         .clone();
+                    let (stdout, truncated) = truncate_output(&stdout_raw);
+                    let (stderr, _) = truncate_output(&stderr_raw);
+                    let original_size = stdout_raw.len() + stderr_raw.len();
                     let code = status.code().unwrap_or(-1);
                     break json!({
                         "command": params.command, "exit_code": code,
                         "stdout": stdout, "stderr": stderr,
                         "duration_ms": start.elapsed().as_millis() as u64,
+                        "truncated": truncated,
+                        "original_size": original_size,
+                        "sandbox_status": sandbox_status_json,
                     });
                 }
                 Ok(None) => {
@@ -910,7 +972,7 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                             );
                             let _ = child.kill();
                             kill_process_group(&child);
-                            child = spawn_child(&params.command)?;
+                            child = spawn_child(&guarded_command)?;
                             let (o, e) = spawn_readers(&mut child);
                             stdout_buf = o;
                             stderr_buf = e;
@@ -942,6 +1004,155 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         };
         Ok(result)
     }
+}
+
+/// Resolve the effective sandbox status from the per-command overrides.
+/// Sandboxing is opt-in: without an explicit `dangerouslyDisableSandbox`
+/// value the sandbox stays disabled, preserving existing behaviour (and
+/// keeping pkill/pgrep able to manage host processes across the namespace
+/// boundary, which a default-enabled PID namespace would break).
+///
+/// Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+fn sandbox_status_for_input(input: &BashInput, cwd: &std::path::Path) -> SandboxStatus {
+    let enabled = input
+        .dangerously_disable_sandbox
+        .map(|disabled| !disabled)
+        .unwrap_or(false);
+    let request = SandboxConfig::default().resolve_request(
+        Some(enabled),
+        input.namespace_restrictions,
+        input.isolate_network,
+        input.filesystem_mode,
+        input.allowed_mounts.clone(),
+    );
+    resolve_sandbox_status_for_request(&request, cwd)
+}
+
+/// Prepare a bash spawn: unshare launcher when the sandbox is active,
+/// otherwise a plain `sh -lc` (with sandbox HOME/TMPDIR when filesystem
+/// isolation is requested).
+fn prepare_bash_spawn(
+    command: &str,
+    cwd: &std::path::Path,
+    sandbox_status: &SandboxStatus,
+) -> Result<std::process::Command, String> {
+    use std::process::Command;
+    if sandbox_status.filesystem_active {
+        let _ = crate::tools::builtin::sandbox::ensure_sandbox_dirs(cwd);
+    }
+    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+        let mut c = Command::new(launcher.program);
+        c.args(launcher.args);
+        c.current_dir(cwd);
+        c.envs(launcher.env);
+        c.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            c.process_group(0);
+        }
+        return Ok(c);
+    }
+    let mut c = Command::new("sh");
+    c.arg("-lc").arg(command).current_dir(cwd);
+    if sandbox_status.filesystem_active {
+        c.env("HOME", cwd.join(".sandbox-home"));
+        c.env("TMPDIR", cwd.join(".sandbox-tmp"));
+    }
+    c.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        c.process_group(0);
+    }
+    Ok(c)
+}
+
+const MAX_OUTPUT_BYTES: usize = 16_384;
+
+/// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
+pub(super) fn truncate_output(s: &str) -> (String, bool) {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return (s.to_string(), false);
+    }
+    let mut end = MAX_OUTPUT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str("\n\n[output truncated — exceeded 16384 bytes]");
+    (truncated, true)
+}
+
+/// Guards a bash command against self-kill. The DA frequently cleans up
+/// spawned processes with `pkill -f <name>` / `killall <name>`; the agent's
+/// own process command line embeds the task prompt, which can contain the
+/// same `<name>` (e.g. a file the DA created and then pkill -f's). A plain
+/// full-command-line match then kills the agent OS process itself.
+///
+/// When the command mentions pkill/killall, we prepend shell function
+/// overrides that resolve targets via `pgrep` and exclude both the agent's
+/// own PID and the wrapper shell's PID before signaling.
+///
+/// Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+#[cfg(unix)]
+fn self_protect_bash_command(command: &str) -> String {
+    if !command.contains("pkill") && !command.contains("killall") {
+        return command.to_string();
+    }
+    let self_pid = std::process::id();
+    // pkill/killall drop-in: keep flags (signal, -f) but route matching
+    // through pgrep so we can filter out our own PID. `command pgrep`
+    // bypasses any function alias; `$$` is the wrapper shell PID.
+    format!(
+        r#"_agent_self_pid={self_pid}
+pkill() {{
+  local sig="TERM" f="" pat="" p killed=0
+  for a in "$@"; do
+    case "$a" in
+      -[0-9]*|-SIG*) sig="${{a#-}}"; ;;
+      -f) f="-f"; ;;
+      -*) ;;
+      *) pat="$a"; ;;
+    esac
+  done
+  [ -z "${{pat:-}}" ] && return 1
+  # Signal PIDs one-by-one. `pgrep -f` also matches the already-exited
+  # command-substitution subshell whose argv contains this pattern; a
+  # single `kill` of that mixed list returns 1 even when the real target
+  # was signaled. Succeed if at least one live PID is killed.
+  for p in $(command pgrep $f -- "$pat" 2>/dev/null); do
+    [ "$p" = "$_agent_self_pid" ] && continue
+    [ "$p" = "$$" ] && continue
+    command kill "-$sig" "$p" 2>/dev/null && killed=1
+  done
+  [ "$killed" = 1 ]
+}}
+killall() {{
+  local sig="TERM" pat="" p killed=0
+  for a in "$@"; do
+    case "$a" in
+      -[0-9]*|-SIG*) sig="${{a#-}}"; ;;
+      -*) ;;
+      *) pat="$a"; ;;
+    esac
+  done
+  [ -z "${{pat:-}}" ] && return 1
+  for p in $(command pgrep -- "$pat" 2>/dev/null); do
+    [ "$p" = "$_agent_self_pid" ] && continue
+    [ "$p" = "$$" ] && continue
+    command kill "-$sig" "$p" 2>/dev/null && killed=1
+  done
+  [ "$killed" = 1 ]
+}}
+{command}
+"#
+    )
+}
+
+#[cfg(not(unix))]
+fn self_protect_bash_command(command: &str) -> String {
+    command.to_string()
 }
 
 #[cfg(unix)]
@@ -1926,6 +2137,35 @@ pub(super) async fn execute_knowledge_extract_code(
                 "deleted_quads": deleted_quads,
                 "graph": graph,
             })),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_build_or_vendored_dir() {
+        let cases = [
+            ("target", true),
+            ("node_modules", true),
+            (".git", true),
+            ("dist", true),
+            ("build", true),
+            ("vendor", true),
+            (".venv", true),
+            ("__pycache__", true),
+            (".next", true),
+            ("src", false),
+            ("crates", false),
+            ("docs", false),
+            ("target_arch", false),
+            ("mybuild", false),
+        ];
+        for (name, expected) in cases {
+            let path = std::path::Path::new(name);
+            assert_eq!(is_build_or_vendored_dir(path), expected, "case: {name}");
         }
     }
 }

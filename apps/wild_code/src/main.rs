@@ -205,7 +205,10 @@ fn main() -> anyhow::Result<()> {
 fn run_single(config: wild_code_cli::config::CliConfig, prompt: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    let mut engine = wild_code_cli::engine::CodeCliEngine::new(config)?;
+    let mut engine = {
+        let _rt_guard = rt.enter();
+        wild_code_cli::engine::CodeCliEngine::new(config)?
+    };
     println!("Code CLI - Agent OS");
     println!(
         "Model: {} | Workspace: {}",
@@ -243,7 +246,10 @@ fn run_single(config: wild_code_cli::config::CliConfig, prompt: &str) -> anyhow:
 
 fn list_checkpoints(config: &wild_code_cli::config::CliConfig) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let engine = wild_code_cli::engine::CodeCliEngine::new(config.clone())?;
+    let engine = {
+        let _rt_guard = rt.enter();
+        wild_code_cli::engine::CodeCliEngine::new(config.clone())?
+    };
 
     let checkpoints = rt.block_on(engine.list_checkpoints())?;
     if checkpoints.is_empty() {

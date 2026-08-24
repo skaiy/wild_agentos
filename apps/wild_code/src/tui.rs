@@ -625,7 +625,13 @@ impl App {
         let max_l1_mb = config.max_l1_mb;
         let max_l2_mb = config.max_l2_mb;
         let max_l3_mb = config.max_l3_mb;
-        let engine = super::engine::CodeCliEngine::new(config)?;
+        let rt = tokio::runtime::Runtime::new()?;
+        // Construct the engine inside the runtime context so subsystems
+        // that capture a tokio Handle at init (e.g. WatchEngine) work.
+        let engine = {
+            let _rt_guard = rt.enter();
+            super::engine::CodeCliEngine::new(config)?
+        };
         let l0 = engine.l0();
         let l2_bb = engine.l2_bb();
         let proj = engine.proj();
@@ -649,7 +655,6 @@ impl App {
         let causal_engine = engine.causal_engine();
         let timeline = engine.timeline();
 
-        let rt = tokio::runtime::Runtime::new()?;
         let mut app = Self {
             engine: Arc::new(tokio::sync::Mutex::new(engine)),
             event_bus,

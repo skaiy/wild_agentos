@@ -258,6 +258,40 @@ pub struct ExecutionPlan {
     pub fallback_steps: Vec<PlanStep>,
 }
 
+/// Decide whether a verify-first AA verdict requires full execution.
+///
+/// The agent_runner's `finish` action hardcodes `status: "success"` regardless
+/// of what the verify-AA actually concluded, so the final status is meaningless
+/// for verify-first plans. The structured `verdict` takes priority: blocked,
+/// failed, and timeout verdicts always require execution; success and partial
+/// success fall through to a summary double-check. Summary text matching is the
+/// fallback for results without a structured verdict. Conservative by design:
+/// only an explicit completion confirmation avoids re-execution; any
+/// missing/ambiguous/negative verdict means full PDCA is needed.
+///
+/// Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+pub fn verify_aa_needs_execution(result: &crate::core::agent_runner::TaskResult) -> bool {
+    use crate::core::agent_runner::TaskVerdict;
+    if let Some(verdict) = result.verdict {
+        match verdict {
+            TaskVerdict::Blocked | TaskVerdict::Failed | TaskVerdict::Timeout => return true,
+            TaskVerdict::Success | TaskVerdict::PartialSuccess => {}
+        }
+    }
+    let s = result.summary.to_lowercase();
+    const COMPLETION_MARKERS: [&str; 8] = [
+        "verified-pass",
+        "verified pass",
+        "task already done",
+        "already done",
+        "already satisfies",
+        "already complete",
+        "no execution needed",
+        "no need to execute",
+    ];
+    !COMPLETION_MARKERS.iter().any(|m| s.contains(m))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CyclePhase {
     Idle,

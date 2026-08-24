@@ -96,6 +96,27 @@ impl SupervisorAgent {
             prev_agent_summary.clone()
         };
 
+        // Activate the MemoryScheduler context path: when the blackboard
+        // yields no role-filtered context, recall via the scheduler instead of
+        // silently falling back to prev_agent_summary.
+        //
+        // Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+        let prev_summary = if prev_summary.is_none() {
+            if let Some(ref sched) = self.scheduler {
+                match sched
+                    .context_request_with_decay(role, &context.task_iri, 0.5)
+                    .await
+                {
+                    Ok(recalled) if !recalled.trim().is_empty() => Some(recalled),
+                    _ => prev_summary,
+                }
+            } else {
+                prev_summary
+            }
+        } else {
+            prev_summary
+        };
+
         let context = if let Some(ref summary) = prev_summary {
             context.with_prev_summary(summary)
         } else {
@@ -127,6 +148,7 @@ impl SupervisorAgent {
                     return Ok(TaskResult {
                         task_iri: iri,
                         status: "timeout".to_string(),
+                        verdict: Some(crate::core::agent_runner::TaskVerdict::Timeout),
                         summary: format!(
                             "Agent {:?} timed out after {} seconds",
                             role, timeout_secs
@@ -224,6 +246,7 @@ impl SupervisorAgent {
                         Err(_) => Ok(TaskResult {
                             task_iri: iri,
                             status: "timeout".to_string(),
+                            verdict: Some(crate::core::agent_runner::TaskVerdict::Timeout),
                             summary: format!(
                                 "Parallel agent {:?} timed out after {}s",
                                 role, timeout_secs
@@ -539,6 +562,7 @@ impl SupervisorAgent {
                     let ha_result = TaskResult {
                         task_iri: task_iri.to_string(),
                         status: status.to_string(),
+                        verdict: None,
                         summary: summary.clone(),
                         output: None,
                         jsonld_output: None,
@@ -692,6 +716,7 @@ impl SupervisorAgent {
                         return Ok(TaskResult {
                             task_iri: task_iri.to_string(),
                             status: "partial_failure".to_string(),
+                            verdict: None,
                             summary: format!("Some parallel {:?} agents failed", step.role),
                             output: None,
                             jsonld_output: None,
@@ -860,6 +885,7 @@ impl SupervisorAgent {
                             return Ok(TaskResult {
                                 task_iri: task_iri.to_string(),
                                 status: "failed".to_string(),
+                                verdict: None,
                                 summary: format!("Wave node dispatch failed: {}", e),
                                 output: None,
                                 jsonld_output: None,
@@ -952,6 +978,7 @@ impl SupervisorAgent {
         Ok(last_result.unwrap_or(TaskResult {
             task_iri: task_iri.to_string(),
             status: "completed".to_string(),
+            verdict: None,
             summary: "No agents executed".to_string(),
             output: None,
             jsonld_output: None,
@@ -1007,6 +1034,7 @@ impl SupervisorAgent {
             return Ok(Some(TaskResult {
                 task_iri: task_iri.to_string(),
                 status: "failed".to_string(),
+                verdict: None,
                 summary: format!(
                     "Agent {:?} failed at step {}{}",
                     step.role, step.step_id, error_detail

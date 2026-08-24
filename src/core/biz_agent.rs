@@ -131,6 +131,7 @@ impl BizAgent {
             Err(e) => TaskResult {
                 task_iri: String::new(),
                 status: "failed".to_string(),
+                verdict: None,
                 summary: e.to_string(),
                 output: None,
                 jsonld_output: None,
@@ -219,6 +220,7 @@ impl BizAgent {
                         self.sub_results.push(TaskResult {
                             task_iri: String::new(),
                             status: "failed".to_string(),
+                            verdict: None,
                             summary: format!("Sub-agent execution failed: {}", e),
                             output: None,
                             jsonld_output: None,
@@ -537,6 +539,7 @@ Output only the JSON, no other content."#,
                 TaskResult {
                     task_iri: fallback.task_iri.clone(),
                     status,
+                    verdict: None,
                     summary,
                     output: Some(json!({"aggregated": true})),
                     jsonld_output: None,
@@ -586,6 +589,7 @@ Output only the JSON, no other content."#,
             } else {
                 "partial".to_string()
             },
+            verdict: None,
             summary,
             output: None,
             jsonld_output: None,

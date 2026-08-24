@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,6 +12,17 @@ const DEFAULT_VEC_SIZE: usize = 128;
 pub trait EmbeddingService: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String>;
     fn dimension(&self) -> usize;
+
+    /// Stable provider identifier for health/status panels ("ollama" | "oneapi" | "fallback").
+    fn provider(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// Lightweight connectivity probe. `Err` means the remote embedding backend is unreachable
+    /// and semantic search will silently degrade to the local fallback.
+    async fn health_check(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct OneApiEmbeddingService {
@@ -86,6 +98,32 @@ impl EmbeddingService for OneApiEmbeddingService {
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    fn provider(&self) -> &'static str {
+        "oneapi"
+    }
+
+    async fn health_check(&self) -> Result<(), String> {
+        let url = format!(
+            "{}/v1/models",
+            crate::config::settings::normalize_api_base(&self.api_url)
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| format!("OneAPI health check failed: {}", e))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "OneAPI health check returned status {}",
+                resp.status()
+            ))
+        }
+    }
 }
 
 pub struct FallbackEmbeddingService {
@@ -133,6 +171,10 @@ impl EmbeddingService for FallbackEmbeddingService {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn provider(&self) -> &'static str {
+        "fallback"
     }
 }
 
@@ -203,6 +245,28 @@ impl EmbeddingService for OllamaEmbeddingService {
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    async fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/api/tags", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Ollama health check failed: {}", e))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Ollama health check returned status {}",
+                resp.status()
+            ))
+        }
+    }
 }
 
 pub fn create_embedding_service_from_config(
@@ -269,6 +333,26 @@ pub fn create_embedding_service_from_config(
     }
 }
 
+static EMBEDDING_DEGRADED: AtomicBool = AtomicBool::new(false);
+static EMBEDDING_CHECKED: AtomicBool = AtomicBool::new(false);
+static EMBEDDING_PROVIDER: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Record a health-probe result for Admin / TUI status panels (no secrets).
+pub fn record_embedding_health(provider: &'static str, ok: bool) {
+    let _ = EMBEDDING_PROVIDER.set(provider);
+    EMBEDDING_CHECKED.store(true, Ordering::Relaxed);
+    EMBEDDING_DEGRADED.store(!ok, Ordering::Relaxed);
+}
+
+/// Cheap Admin snapshot of embedding health.
+pub fn embedding_health_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "provider": EMBEDDING_PROVIDER.get().copied().unwrap_or("unknown"),
+        "checked": EMBEDDING_CHECKED.load(Ordering::Relaxed),
+        "degraded": EMBEDDING_DEGRADED.load(Ordering::Relaxed),
+    })
+}
+
 fn fnv_hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
@@ -310,5 +394,12 @@ mod tests {
     fn test_fnv() {
         assert_eq!(fnv_hash("a"), fnv_hash("a"));
         assert_ne!(fnv_hash("a"), fnv_hash("b"));
+    }
+
+    #[tokio::test]
+    async fn fallback_health_check_ok() {
+        let svc = FallbackEmbeddingService::new();
+        assert_eq!(svc.provider(), "fallback");
+        assert!(svc.health_check().await.is_ok());
     }
 }

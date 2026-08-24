@@ -25,6 +25,6 @@ jobs:
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'https://github.com/skaiy/wild_agentos/blob/main/CLA.md'
           branch: 'main'
-          allowlist: skaiy,dependabot[bot],bot*
+          allowlist: skaiy,dependabot[bot],bot*,cursoragent
           custom-notsigned-prcomment: 'Thank you for your contribution to Wild AgentOS! Because this project is dual-licensed (AGPLv3 + commercial), we need you to read and sign our $pathToCLADocument before we can merge.'
           custom-allsigned-prcomment: 'All contributors have signed the CLA. Thank you!'
