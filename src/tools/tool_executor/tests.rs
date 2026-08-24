@@ -313,7 +313,8 @@ mod tests {
             // Spawn a real background sleep; pkill -f on a unique marker
             // must still terminate it (protection only filters the agent).
             let marker = format!("real_target_marker_{}", std::process::id());
-            let mut child = Command::new("sh")
+            // `exec -a` is a bashism (dash/`sh` on Debian/Ubuntu rejects it).
+            let mut child = Command::new("bash")
                 .arg("-c")
                 .arg(format!("exec -a {} sleep 60", marker))
                 .spawn()
