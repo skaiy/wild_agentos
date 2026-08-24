@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify::RecursiveMode;
@@ -110,7 +110,9 @@ impl WatchConfig {
 /// Events are debounced and forwarded to the EventBus as `WorkspaceFile*` events.
 /// Falls back to polling when native watching is unavailable.
 pub struct WatchEngine {
-    debouncer: Option<Debouncer<notify::RecommendedWatcher>>,
+    /// Shared slot so the event callback can install watches on newly created
+    /// directories. The callback holds a Weak ref to avoid a cycle.
+    debouncer: Option<Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher>>>>>,
     polling_handle: Option<tokio::task::AbortHandle>,
     /// Configuration.
     #[allow(dead_code)]
@@ -194,10 +196,11 @@ impl WatchEngine {
         config: &WatchConfig,
         event_bus: Arc<EventBus>,
         inventory: Option<Arc<RwLock<FileInventory>>>,
-    ) -> Result<Debouncer<notify::RecommendedWatcher>, String> {
+    ) -> Result<Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher>>>>, String> {
         let debounce = Duration::from_millis(config.debounce_ms);
         let root_owned = root.to_string();
         let exclude = config.exclude_patterns.clone();
+        let watch_exclude = config.exclude_patterns.clone();
         let rt_handle = tokio::runtime::Handle::try_current().ok();
 
         // Per-path cooldown prevents feedback loops: when the app's own output
@@ -206,9 +209,19 @@ impl WatchEngine {
         let last_emit =
             std::sync::Mutex::new(std::collections::HashMap::<String, std::time::Instant>::new());
 
+        // Shared handle so the event callback can install watches on newly
+        // created directories (NonRecursive watches do not auto-follow).
+        // The callback holds a Weak ref: the strong ref lives in WatchEngine,
+        // so dropping the engine drops the Debouncer (which sends Shutdown).
+        //
+        // Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+        let shared_debouncer: Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher>>>> =
+            Arc::new(Mutex::new(None));
+        let shared_for_callback = Arc::downgrade(&shared_debouncer);
+
         let mut debouncer = new_debouncer(debounce, move |result: DebounceEventResult| {
             let now = std::time::Instant::now();
-            let approved: Vec<notify_debouncer_mini::DebouncedEvent> = match &result {
+            let mut approved: Vec<notify_debouncer_mini::DebouncedEvent> = match &result {
                 Ok(events) => {
                     let mut last = last_emit.lock().unwrap();
                     let mut out = Vec::new();
@@ -231,7 +244,56 @@ impl WatchEngine {
                 Err(_) => Vec::new(),
             };
 
-            // update inventory directly from the watcher thread (no tokio::spawn needed)
+            // A directory creation event means future writes inside it would
+            // be invisible (NonRecursive watches do not follow new children).
+            // Install a watch on the new directory and emit catch-up events
+            // for files already present.
+            let mut catch_up: Vec<notify_debouncer_mini::DebouncedEvent> = Vec::new();
+            if let Some(shared) = shared_for_callback.upgrade() {
+                if let Some(ref mut debouncer) = *shared.lock().unwrap() {
+                    for event in &approved {
+                        let path = &event.path;
+                        if path.is_dir()
+                            && !Self::is_path_excluded(&path.to_string_lossy(), &exclude)
+                        {
+                            let _ = debouncer
+                                .watcher()
+                                .watch(path, RecursiveMode::NonRecursive);
+                            for dir in walkdir::WalkDir::new(path)
+                                .min_depth(1)
+                                .max_depth(1)
+                                .into_iter()
+                                .filter_map(|e| e.ok())
+                                .filter(|e| e.file_type().is_dir())
+                            {
+                                let _ = debouncer
+                                    .watcher()
+                                    .watch(dir.path(), RecursiveMode::NonRecursive);
+                            }
+                            for entry in walkdir::WalkDir::new(path)
+                                .into_iter()
+                                .filter_entry(|e| {
+                                    e.depth() == 0
+                                        || !Self::is_path_excluded(
+                                            &e.path().to_string_lossy(),
+                                            &exclude,
+                                        )
+                                })
+                                .filter_map(|e| e.ok())
+                            {
+                                if entry.file_type().is_file() {
+                                    catch_up.push(notify_debouncer_mini::DebouncedEvent {
+                                        path: entry.path().to_path_buf(),
+                                        kind: notify_debouncer_mini::DebouncedEventKind::Any,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            approved.extend(catch_up);
+
             if let Some(ref inv) = inventory {
                 for event in &approved {
                     if let Some(path) = event.path.to_str() {
@@ -285,12 +347,38 @@ impl WatchEngine {
         })
         .map_err(|e| format!("Failed to create debouncer: {}", e))?;
 
-        debouncer
-            .watcher()
-            .watch(Path::new(&root_owned), RecursiveMode::Recursive)
+        // Watch each directory individually (NonRecursive) instead of one
+        // Recursive watch on the root: notify's recursive watch enumerates the
+        // whole tree at startup (no filter support), which blocks start() for
+        // minutes on repositories with large build directories (e.g. target/).
+        let watcher = debouncer.watcher();
+        for entry in walkdir::WalkDir::new(&root_owned)
+            .min_depth(1)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 1
+                    || !Self::is_path_excluded(&entry.path().to_string_lossy(), &watch_exclude)
+            })
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            watcher
+                .watch(entry.path(), RecursiveMode::NonRecursive)
+                .map_err(|e| {
+                    format!(
+                        "Failed to watch directory {}: {}",
+                        entry.path().display(),
+                        e
+                    )
+                })?;
+        }
+        watcher
+            .watch(Path::new(&root_owned), RecursiveMode::NonRecursive)
             .map_err(|e| format!("Failed to watch directory: {}", e))?;
-
-        Ok(debouncer)
+        *shared_debouncer.lock().unwrap() = Some(debouncer);
+        Ok(shared_debouncer)
     }
 
     fn is_path_excluded(path: &str, exclude_patterns: &[String]) -> bool {

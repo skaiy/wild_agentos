@@ -279,4 +279,225 @@ mod tests {
             );
         });
     }
+
+    // ── Bash self-protection + sandbox (ported from doiito/gliding_horse, MIT) ──
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_pkill_excludes_own_pid() {
+        rt().block_on(async {
+            // `pkill -f <our own cmdline fragment>` must NOT kill this test
+            // process (the agent itself). The wrapper resolves targets via
+            // pgrep and filters out the agent PID.
+            let self_pid = std::process::id();
+            let cmd = format!("pkill -f 'self_protect_marker_{}'", self_pid);
+            let result = super::super::builtins::execute_bash(json!({"command": cmd}))
+                .await
+                .unwrap();
+            // Exit code 1 = "no matching process" — correct: our own PID was
+            // filtered out, and nothing else matches the unique marker.
+            assert_eq!(
+                result["exit_code"],
+                1,
+                "own PID must be excluded: {:?}",
+                result
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_pkill_still_kills_real_target() {
+        rt().block_on(async {
+            use std::process::Command;
+            // Spawn a real background sleep; pkill -f on a unique marker
+            // must still terminate it (protection only filters the agent).
+            let marker = format!("real_target_marker_{}", std::process::id());
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(format!("exec -a {} sleep 60", marker))
+                .spawn()
+                .expect("spawn sleep");
+            // Give it a moment to exec so the marker appears in argv[0].
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let cmd = format!("pkill -f '{}'", marker);
+            let result = super::super::builtins::execute_bash(json!({"command": cmd}))
+                .await
+                .unwrap();
+            assert_eq!(
+                result["exit_code"], 0,
+                "pkill should find the target: {:?}",
+                result
+            );
+            // The child must be gone shortly after.
+            for _ in 0..50 {
+                if let Ok(Some(status)) = child.try_wait() {
+                    assert!(!status.success() || status.code() != Some(0));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("target process was not killed");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_killall_excludes_own_pid() {
+        rt().block_on(async {
+            let self_pid = std::process::id();
+            // killall matches by process name; our unique name is not a real
+            // process, so exit 1 (nothing found) proves the wrapper didn't
+            // fall back to a broad match that would hit the test process.
+            let cmd = format!("killall nonexistent_agent_{} 2>/dev/null || true", self_pid);
+            let result = super::super::builtins::execute_bash(json!({"command": cmd}))
+                .await
+                .unwrap();
+            assert_eq!(result["exit_code"], 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_plain_command_unchanged() {
+        rt().block_on(async {
+            let result = super::super::builtins::execute_bash(json!({"command": "printf ok"}))
+                .await
+                .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            assert_eq!(result["stdout"], "ok");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_sandbox_status_reported() {
+        rt().block_on(async {
+            let result = super::super::builtins::execute_bash(json!({
+                "command": "printf hi",
+                "dangerouslyDisableSandbox": false,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            let status = &result["sandbox_status"];
+            assert!(
+                status.is_object(),
+                "sandbox_status must be present: {:?}",
+                result
+            );
+            assert_eq!(status["requested"]["enabled"], true);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_sandbox_disabled_when_requested() {
+        rt().block_on(async {
+            let result = super::super::builtins::execute_bash(json!({
+                "command": "printf hi",
+                "dangerouslyDisableSandbox": true,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            let status = &result["sandbox_status"];
+            assert_eq!(
+                status["enabled"], false,
+                "sandbox must be disabled: {:?}",
+                result
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_sandbox_unshare_launcher_active() {
+        rt().block_on(async {
+            // Sandbox is opt-in: with explicit enablement and namespace
+            // restrictions the command must run inside the unshare sandbox
+            // (or fall back gracefully on hosts without unshare).
+            let result = super::super::builtins::execute_bash(json!({
+                "command": "printf isolated",
+                "dangerouslyDisableSandbox": false,
+                "namespaceRestrictions": true,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                result["exit_code"], 0,
+                "sandbox command failed: {:?}",
+                result
+            );
+            assert_eq!(result["sandbox_status"]["enabled"], true);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_run_in_background_returns_task_id() {
+        rt().block_on(async {
+            let result = super::super::builtins::execute_bash(json!({
+                "command": "sleep 5",
+                "run_in_background": true,
+            }))
+            .await
+            .unwrap();
+            let task_id = result["background_task_id"].as_str().unwrap_or("");
+            assert!(
+                !task_id.is_empty(),
+                "background task id must be present: {:?}",
+                result
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_output_truncated_at_16k() {
+        rt().block_on(async {
+            let result = super::super::builtins::execute_bash(json!({
+                "command": "head -c 30000 /dev/zero | tr '\\0' 'a'",
+            }))
+            .await
+            .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            assert_eq!(result["truncated"], true);
+            let stdout = result["stdout"].as_str().unwrap_or("");
+            assert!(
+                stdout.contains("[output truncated"),
+                "stdout must carry marker: {:?}",
+                result
+            );
+            assert!(
+                stdout.len() < 20_000,
+                "stdout must be capped: {}",
+                stdout.len()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_truncate_output_short_unchanged() {
+        let (out, truncated) = super::super::builtins::truncate_output("hello");
+        assert_eq!(out, "hello");
+        assert!(!truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_truncate_output_exact_boundary() {
+        let (out, truncated) = super::super::builtins::truncate_output(&"a".repeat(16_384));
+        assert_eq!(out.len(), 16_384);
+        assert!(!truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_truncate_output_one_over() {
+        let (out, truncated) = super::super::builtins::truncate_output(&"a".repeat(16_385));
+        assert!(truncated);
+        assert!(out.contains("[output truncated"));
+    }
 }

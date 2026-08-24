@@ -934,7 +934,17 @@ async fn health_handler() -> impl IntoResponse {
     })
 }
 
+fn live_runtime_hardening_fields() -> Value {
+    json!({
+        "sandbox": crate::tools::builtin::sandbox::sandbox_runtime_snapshot(),
+        "verify_first": crate::core::sa::verify_first_runtime_snapshot(),
+        "memory_scheduler": crate::memory::scheduler::MemoryScheduler::runtime_snapshot(),
+        "embedding_health": crate::memory::embedding_health_snapshot(),
+    })
+}
+
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let hardening = live_runtime_hardening_fields();
     Json(json!({
         "l2_nodes": state.core.blackboard.node_count(),
         "l2_bytes": state.core.blackboard.total_bytes(),
@@ -942,6 +952,12 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "subscribers": state.core.events.subscriber_count(),
         "skills": state.core.skills.skill_count(),
         "checkpoints": state.core.checkpoints.checkpoint_count(),
+        "sandbox_enabled": hardening["sandbox"]["enabled"],
+        "unshare_supported": hardening["sandbox"]["unshare_supported"],
+        "unshare_enabled": hardening["sandbox"]["unshare_enabled"],
+        "memory_scheduler": hardening["memory_scheduler"],
+        "verify_first": hardening["verify_first"],
+        "embedding_health": hardening["embedding_health"],
     }))
 }
 
@@ -1021,13 +1037,42 @@ async fn unified_stats_handler(State(state): State<Arc<AppState>>) -> impl IntoR
                 "active_subscribers": state.core.events.subscriber_count()
             },
             "checkpoints": state.core.checkpoints.checkpoint_count(),
-            "skills_registered": state.core.skills.skill_count()
+            "skills_registered": state.core.skills.skill_count(),
+            "sandbox": crate::tools::builtin::sandbox::sandbox_runtime_snapshot(),
+            "verify_first": crate::core::sa::verify_first_runtime_snapshot(),
+            "memory_scheduler": crate::memory::scheduler::MemoryScheduler::runtime_snapshot(),
+            "embedding_health": crate::memory::embedding_health_snapshot()
         }
     }))
 }
 
 async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let info = state.config_info.read().await.clone();
+    let mut info = state.config_info.read().await.clone();
+    if let Some(obj) = info.as_object_mut() {
+        let live = live_runtime_hardening_fields();
+        if let Some(map) = live.as_object() {
+            for (k, v) in map {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        // Workspace watch flags live in the startup snapshot when built by
+        // AgentOSService; if a test/minimal snapshot omitted them, still expose
+        // defaults so Admin always has a stable schema.
+        if !obj.contains_key("workspace") {
+            let ws = crate::config::settings::WorkspaceSettings::default();
+            obj.insert(
+                "workspace".to_string(),
+                json!({
+                    "watch_enabled": ws.watch_enabled,
+                    "poll_interval_ms": ws.poll_interval_ms,
+                    "debounce_ms": ws.debounce_ms,
+                    "max_debounce_wait_ms": ws.max_debounce_wait_ms,
+                    "content_store_max_bytes": ws.content_store_max_bytes,
+                    "content_cache_capacity": ws.content_cache_capacity,
+                }),
+            );
+        }
+    }
     Json(info)
 }
 
@@ -8248,6 +8293,12 @@ mod tests {
                     .unwrap()
                     .contains_key("api_key")
         );
+        assert!(config_res["sandbox"]["enabled"].is_boolean());
+        assert!(config_res["sandbox"]["unshare_supported"].is_boolean());
+        assert!(config_res["workspace"]["watch_enabled"].is_boolean());
+        assert!(config_res["verify_first"]["enabled"].as_bool().unwrap());
+        assert!(config_res["memory_scheduler"]["wired"].is_boolean());
+        assert!(config_res["embedding_health"]["provider"].is_string());
 
         // 清理
         let _ = std::fs::remove_dir_all(tmp);

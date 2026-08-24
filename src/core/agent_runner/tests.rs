@@ -225,6 +225,7 @@ fn test_task_result_jsonld_output() {
     let result = TaskResult {
         task_iri: "iri://task/test".to_string(),
         status: "success".to_string(),
+        verdict: None,
         summary: "task_completed".to_string(),
         output: Some(json!("output_content")),
         jsonld_output: Some(json!({
@@ -320,6 +321,7 @@ fn test_task_result_partial_success_status() {
     let result = TaskResult {
         task_iri: "iri://task/test".to_string(),
         status: "partial_success".to_string(),
+        verdict: None,
         summary: "task_partially_completed".to_string(),
         output: None,
         jsonld_output: None,

@@ -57,7 +57,7 @@
 时才需要进程级隔离。当前阶段自定义动作 `executable=false`（invoke 返回 422），不触发此需求。
 
 ### 已有可复用基础（无需从零造）
-- `src/tools/builtin/bash.rs`：已具备 `FilesystemIsolationMode`、`isolateNetwork`、
+- `src/tools/tool_executor/builtins.rs` (`execute_bash`) plus `src/tools/builtin/sandbox.rs`：已具备 `FilesystemIsolationMode`、`isolateNetwork`、
   `namespaceRestrictions`、`dangerouslyDisableSandbox` 等 namespace/网络隔离能力。
 - `src/core/syscall_gate.rs`：`WhitelistManager` / `SyscallGate` 提供能力白名单 + 签名校验骨架。
 

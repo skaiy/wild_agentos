@@ -113,4 +113,116 @@ mod tests {
         sa.cleanup_expired_cycles(3600);
         assert!(sa.active_cycles.is_empty());
     }
+
+    #[test]
+    fn test_verify_aa_needs_execution_parses_verdict() {
+        use crate::core::agent_runner::{TaskResult, TaskVerdict};
+
+        fn result_with(summary: &str, verdict: Option<TaskVerdict>) -> TaskResult {
+            TaskResult {
+                task_iri: "iri://task/verify".to_string(),
+                status: "success".to_string(),
+                verdict,
+                summary: summary.to_string(),
+                output: None,
+                jsonld_output: None,
+                artifacts: vec![],
+                errors: vec![],
+                turn_count: 1,
+                tool_call_count: 0,
+                five_w2h_updates: None,
+                tracked_actions: Vec::new(),
+                archive_iri: None,
+            }
+        }
+
+        // Verify-first AA concluded full execution is needed (the regression:
+        // the agent_runner's finish action hardcodes status "success", so this
+        // verdict must be recovered from the summary to trigger fallback_steps).
+        assert!(
+            verify_aa_needs_execution(&result_with(
+                "Final verdict: needs full execution. Existing workspace has no calculator.py — deliverable is absent.",
+                None
+            )),
+            "explicit needs-execution verdict must require execution"
+        );
+        assert!(
+            verify_aa_needs_execution(&result_with(
+                "The existing code does NOT satisfy the task requirements. Missing: calculator.py, test_calculator.py.",
+                None
+            )),
+            "missing deliverables must require execution"
+        );
+        assert!(
+            verify_aa_needs_execution(&result_with("", None)),
+            "empty verdict must conservatively require execution"
+        );
+        assert!(
+            !verify_aa_needs_execution(&result_with(
+                "Final verdict: task already done. Existing calculator.py passes all test cases.",
+                None
+            )),
+            "task-already-done verdict must not require execution"
+        );
+        assert!(
+            !verify_aa_needs_execution(&result_with(
+                "VERIFIED-PASS: existing code satisfies the task requirements.",
+                None
+            )),
+            "VERIFIED-PASS must not require execution"
+        );
+    }
+
+    #[test]
+    fn test_verify_aa_needs_execution_structured_verdict_priority() {
+        use crate::core::agent_runner::{TaskResult, TaskVerdict};
+
+        fn result_with(summary: &str, verdict: Option<TaskVerdict>) -> TaskResult {
+            TaskResult {
+                task_iri: "iri://task/verify".to_string(),
+                status: "success".to_string(),
+                verdict,
+                summary: summary.to_string(),
+                output: None,
+                jsonld_output: None,
+                artifacts: vec![],
+                errors: vec![],
+                turn_count: 1,
+                tool_call_count: 0,
+                five_w2h_updates: None,
+                tracked_actions: Vec::new(),
+                archive_iri: None,
+            }
+        }
+
+        assert!(
+            verify_aa_needs_execution(&result_with("", Some(TaskVerdict::Blocked))),
+            "Blocked verdict must require execution"
+        );
+        assert!(
+            verify_aa_needs_execution(&result_with(
+                "task already done",
+                Some(TaskVerdict::Failed)
+            )),
+            "Failed verdict must override a completion-looking summary"
+        );
+        assert!(
+            verify_aa_needs_execution(&result_with("", Some(TaskVerdict::Timeout))),
+            "Timeout verdict must require execution"
+        );
+        assert!(
+            !verify_aa_needs_execution(&result_with(
+                "VERIFIED-PASS: task already complete",
+                Some(TaskVerdict::Success)
+            )),
+            "Success verdict + completion summary must not require execution"
+        );
+        assert!(
+            verify_aa_needs_execution(&result_with(
+                "deliverable is absent",
+                Some(TaskVerdict::Success)
+            )),
+            "Success verdict + ambiguous summary must conservatively require execution"
+        );
+    }
 }

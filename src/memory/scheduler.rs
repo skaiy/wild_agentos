@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::debug;
@@ -22,7 +23,14 @@ pub struct MemoryScheduler {
     sessions: parking_lot::RwLock<HashMap<String, L1Session>>,
     /// Optional HyperspaceStore for time-decayed vector search
     hyperspace: Option<Arc<HyperspaceStore>>,
+    recall_requests: AtomicU64,
+    recall_hits: AtomicU64,
 }
+
+static SCHEDULER_WIRED: AtomicBool = AtomicBool::new(false);
+static HYPERSPACE_ATTACHED: AtomicBool = AtomicBool::new(false);
+static RECALL_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static RECALL_HITS: AtomicU64 = AtomicU64::new(0);
 
 impl MemoryScheduler {
     pub fn new(
@@ -50,7 +58,7 @@ impl MemoryScheduler {
         memory_bus: Arc<MemoryBus>,
         hyperspace: Option<Arc<HyperspaceStore>>,
     ) -> Self {
-        Self {
+        let this = Self {
             l0_store,
             blackboard,
             projection,
@@ -58,7 +66,22 @@ impl MemoryScheduler {
             memory_bus,
             sessions: parking_lot::RwLock::new(HashMap::new()),
             hyperspace,
-        }
+            recall_requests: AtomicU64::new(0),
+            recall_hits: AtomicU64::new(0),
+        };
+        SCHEDULER_WIRED.store(true, Ordering::Relaxed);
+        HYPERSPACE_ATTACHED.store(this.hyperspace.is_some(), Ordering::Relaxed);
+        this
+    }
+
+    /// Cheap Admin snapshot of scheduler wiring and recall counters.
+    pub fn runtime_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "wired": SCHEDULER_WIRED.load(Ordering::Relaxed),
+            "hyperspace_attached": HYPERSPACE_ATTACHED.load(Ordering::Relaxed),
+            "recall_requests": RECALL_REQUESTS.load(Ordering::Relaxed),
+            "recall_hits": RECALL_HITS.load(Ordering::Relaxed),
+        })
     }
 
     pub async fn on_context_request(
@@ -137,22 +160,32 @@ impl MemoryScheduler {
         task_iri: &str,
         decay_lambda: f64,
     ) -> Result<String, CoreError> {
+        self.recall_requests.fetch_add(1, Ordering::Relaxed);
+        RECALL_REQUESTS.fetch_add(1, Ordering::Relaxed);
         if let Some(ref hs) = self.hyperspace {
             let filter = crate::memory::hyperspace_store::HybridSearchFilter::new();
             let results = hs
                 .search_with_time_decay(task_iri, &filter, decay_lambda, 10)
                 .await?;
             if !results.is_empty() {
+                self.recall_hits.fetch_add(1, Ordering::Relaxed);
+                RECALL_HITS.fetch_add(1, Ordering::Relaxed);
                 let contents: Vec<String> = results.iter().map(|r| r.text.clone()).collect();
                 return Ok(contents.join("\n"));
             }
         }
-        self.on_context_request(agent_role, task_iri).await
+        let fallback = self.on_context_request(agent_role, task_iri).await?;
+        if !fallback.trim().is_empty() {
+            self.recall_hits.fetch_add(1, Ordering::Relaxed);
+            RECALL_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(fallback)
     }
 
     /// Attach a HyperspaceStore at runtime (for delayed injection).
     pub fn with_hyperspace_store(&mut self, hs: Arc<HyperspaceStore>) {
         self.hyperspace = Some(hs);
+        HYPERSPACE_ATTACHED.store(true, Ordering::Relaxed);
     }
 
     pub fn on_session_close(&self, session_id: &str) -> Result<(), CoreError> {

@@ -152,6 +152,39 @@ pub fn detect_container_environment_from(
     }
 }
 
+/// Create the sandbox HOME/TMPDIR directories under `cwd`.
+///
+/// Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+#[must_use]
+pub fn ensure_sandbox_dirs(cwd: &Path) -> (PathBuf, PathBuf) {
+    let home = cwd.join(".sandbox-home");
+    let tmp = cwd.join(".sandbox-tmp");
+    let _ = fs::create_dir_all(&home);
+    let _ = fs::create_dir_all(&tmp);
+    (home, tmp)
+}
+
+/// Whether Linux `unshare --user` is available and actually works.
+#[must_use]
+pub fn unshare_available() -> bool {
+    cfg!(target_os = "linux") && unshare_user_namespace_works()
+}
+
+/// Cheap snapshot of sandbox/unshare capability (no secrets).
+#[must_use]
+pub fn sandbox_runtime_snapshot() -> serde_json::Value {
+    let unshare = unshare_available();
+    // Bash sandbox is opt-in (default disabled) so pkill/pgrep can still
+    // manage host processes. `enabled` reports that default; `unshare_enabled`
+    // is true only when a command actually requested isolation *and* unshare works.
+    serde_json::json!({
+        "enabled": false,
+        "unshare_supported": unshare,
+        "unshare_enabled": false,
+        "opt_in": true,
+    })
+}
+
 #[must_use]
 pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStatus {
     let request = config.resolve_request(None, None, None, None, None);
@@ -358,6 +391,17 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn sandbox_runtime_snapshot_has_no_secrets() {
+        let snap = super::sandbox_runtime_snapshot();
+        assert!(snap["enabled"].is_boolean());
+        assert!(snap["unshare_supported"].is_boolean());
+        assert!(snap["unshare_enabled"].is_boolean());
+        assert_eq!(snap["opt_in"], true);
+        let obj = snap.as_object().unwrap();
+        assert!(!obj.keys().any(|k| k.contains("key") || k.contains("token")));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tempfile::TempDir;
@@ -15,10 +15,13 @@ use wild_agent_os_core::gateway::UnifiedGateway;
 use wild_agent_os_core::graph_backend::{GraphBackend, PetgraphBackend, SkillGraphSnapshotBackend};
 use wild_agent_os_core::graph_features::features::FeatureExtractor;
 use wild_agent_os_core::knowledge_graph::store::KnowledgeGraphStore;
+use wild_agent_os_core::memory::consistency_engine::ConsistencyEngine;
 use wild_agent_os_core::memory::embedding_service::{
-    create_embedding_service_from_config, FallbackEmbeddingService,
+    create_embedding_service_from_config, record_embedding_health, FallbackEmbeddingService,
 };
 use wild_agent_os_core::memory::hyperspace_store::HyperspaceStore;
+use wild_agent_os_core::memory::memory_bus::MemoryBus;
+use wild_agent_os_core::memory::scheduler::MemoryScheduler;
 use wild_agent_os_core::memory::l0_store::L0Store;
 use wild_agent_os_core::memory::l1_session::EvictionConfig;
 use wild_agent_os_core::memory::l2_blackboard::Blackboard;
@@ -72,6 +75,10 @@ pub struct CodeCliEngine {
     causal_engine: Arc<CausalEngine>,
     /// Timeline store (temporal event recording)
     timeline: Arc<TimelineStore>,
+    embedding: Arc<dyn wild_agent_os_core::memory::embedding_service::EmbeddingService>,
+    embedding_health_checked: AtomicBool,
+    embedding_degraded: AtomicBool,
+    scheduler: Arc<MemoryScheduler>,
 }
 
 impl CodeCliEngine {
@@ -128,7 +135,7 @@ impl CodeCliEngine {
             .unwrap_or_else(|| dir.path().join("hyperspace").to_string_lossy().to_string());
         let _ = std::fs::create_dir_all(&hyperspace_path);
         let vector_store = Arc::new(
-            HyperspaceStore::open(std::path::Path::new(&hyperspace_path), embed)
+            HyperspaceStore::open(std::path::Path::new(&hyperspace_path), embed.clone())
                 .map_err(|e| anyhow::anyhow!("HyperspaceStore 初始化失败: {}", e))?,
         );
 
@@ -137,7 +144,7 @@ impl CodeCliEngine {
         let proj = Arc::new(ProjectionEngine::with_vector_store(
             l2.clone(),
             agent_settings.max_projection_size,
-            Some(vector_store),
+            Some(vector_store.clone()),
         ));
         let core_config = CoreConfig {
             max_node_size: settings.memory.l2.max_node_size,
@@ -251,6 +258,29 @@ impl CodeCliEngine {
 
         let event_bus = Arc::new(EventBus::new(100));
 
+        // ── MemoryScheduler with HyperspaceStore: activates context_request_with_decay ──
+        // Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
+        let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
+        let consistency_engine = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            l0.clone(),
+            l2.clone(),
+            proj.clone(),
+        ));
+        let scheduler = Arc::new(MemoryScheduler::with_hyperspace(
+            l0.clone(),
+            l2.clone(),
+            proj.clone(),
+            consistency_engine,
+            memory_bus,
+            Some(vector_store.clone()),
+        ));
+        match mm.try_lock() {
+            Ok(mut mm_lock) => mm_lock.set_scheduler(scheduler.clone()),
+            Err(_) => warn!("MemoryManager busy during init, scheduler attach deferred"),
+        }
+        runner = runner.with_scheduler(scheduler.clone());
+
         // TimelineStore EventBus subscription deferred — requires a Tokio runtime.
         // Subscribe via start_async_components() in process_task().
 
@@ -355,7 +385,7 @@ impl CodeCliEngine {
             config.max_iterations,
             config.max_pdca_cycles,
         )
-        .with_memory(Some(l2), None, None)
+        .with_memory(Some(l2), None, Some(scheduler.clone()))
         .with_execution_timeout(agent_settings.sa_execution_timeout_secs);
 
         let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) =
@@ -417,6 +447,10 @@ impl CodeCliEngine {
             feature_extractor,
             causal_engine,
             timeline,
+            embedding: embed,
+            embedding_health_checked: AtomicBool::new(false),
+            embedding_degraded: AtomicBool::new(false),
+            scheduler,
         })
     }
 
@@ -480,6 +514,7 @@ impl CodeCliEngine {
     }
 
     pub async fn process_task(&mut self, user_input: &str) -> anyhow::Result<(String, TaskResult)> {
+        self.probe_embedding_health().await;
         // 首次进入 async 上下文时完成 WorkspaceMonitor 的异步初始化
         if let Some(ref wm) = self.workspace_monitor {
             wm.start_async_components();
@@ -652,6 +687,31 @@ impl CodeCliEngine {
     ///
     /// All reads are lock-free or use independent locks (not the engine lock),
     /// so this can be called from the UI thread without blocking.
+    async fn probe_embedding_health(&self) {
+        if self.embedding_health_checked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let provider = self.embedding.provider();
+        match self.embedding.health_check().await {
+            Ok(()) => {
+                record_embedding_health(provider, true);
+            }
+            Err(error) => {
+                self.embedding_degraded.store(true, Ordering::Release);
+                record_embedding_health(provider, false);
+                warn!(provider, %error, "Embedding health check failed; semantic search may degrade");
+            }
+        }
+    }
+
+    pub fn embedding_degraded(&self) -> bool {
+        self.embedding_degraded.load(Ordering::Acquire)
+    }
+
+    pub fn scheduler(&self) -> Arc<MemoryScheduler> {
+        self.scheduler.clone()
+    }
+
     pub fn memory_stats(&self) -> (u64, u64, u64) {
         let l2 = self.l2_bb.node_count();
         let l3 = self.proj.cache_stats().total_views as u64;
