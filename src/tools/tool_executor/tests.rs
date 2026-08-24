@@ -313,13 +313,12 @@ mod tests {
             // Spawn a real background sleep; pkill -f on a unique marker
             // must still terminate it (protection only filters the agent).
             let marker = format!("real_target_marker_{}", std::process::id());
-            // `exec -a` is a bashism (dash/`sh` on Debian/Ubuntu rejects it).
+            // Keep the marker in the live process argv (portable; no `exec -a`).
             let mut child = Command::new("bash")
                 .arg("-c")
-                .arg(format!("exec -a {} sleep 60", marker))
+                .arg(format!("while :; do sleep 1; done # {}", marker))
                 .spawn()
                 .expect("spawn sleep");
-            // Give it a moment to exec so the marker appears in argv[0].
             std::thread::sleep(std::time::Duration::from_millis(200));
             let cmd = format!("pkill -f '{}'", marker);
             let result = super::super::builtins::execute_bash(json!({"command": cmd}))
@@ -338,6 +337,7 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            let _ = child.kill();
             panic!("target process was not killed");
         });
     }

@@ -1107,7 +1107,7 @@ fn self_protect_bash_command(command: &str) -> String {
     format!(
         r#"_agent_self_pid={self_pid}
 pkill() {{
-  local sig="TERM" f=""
+  local sig="TERM" f="" pat="" p killed=0
   for a in "$@"; do
     case "$a" in
       -[0-9]*|-SIG*) sig="${{a#-}}"; ;;
@@ -1117,13 +1117,19 @@ pkill() {{
     esac
   done
   [ -z "${{pat:-}}" ] && return 1
-  local pids
-  pids="$(command pgrep $f -- "$pat" 2>/dev/null | grep -vw "$_agent_self_pid" | grep -vw "$$" || true)"
-  [ -z "$pids" ] && return 1
-  command kill "-$sig" $pids 2>/dev/null
+  # Signal PIDs one-by-one. `pgrep -f` also matches the already-exited
+  # command-substitution subshell whose argv contains this pattern; a
+  # single `kill` of that mixed list returns 1 even when the real target
+  # was signaled. Succeed if at least one live PID is killed.
+  for p in $(command pgrep $f -- "$pat" 2>/dev/null); do
+    [ "$p" = "$_agent_self_pid" ] && continue
+    [ "$p" = "$$" ] && continue
+    command kill "-$sig" "$p" 2>/dev/null && killed=1
+  done
+  [ "$killed" = 1 ]
 }}
 killall() {{
-  local sig="TERM"
+  local sig="TERM" pat="" p killed=0
   for a in "$@"; do
     case "$a" in
       -[0-9]*|-SIG*) sig="${{a#-}}"; ;;
@@ -1132,10 +1138,12 @@ killall() {{
     esac
   done
   [ -z "${{pat:-}}" ] && return 1
-  local pids
-  pids="$(command pgrep -- "$pat" 2>/dev/null | grep -vw "$_agent_self_pid" | grep -vw "$$" || true)"
-  [ -z "$pids" ] && return 1
-  command kill "-$sig" $pids 2>/dev/null
+  for p in $(command pgrep -- "$pat" 2>/dev/null); do
+    [ "$p" = "$_agent_self_pid" ] && continue
+    [ "$p" = "$$" ] && continue
+    command kill "-$sig" "$p" 2>/dev/null && killed=1
+  done
+  [ "$killed" = 1 ]
 }}
 {command}
 "#
