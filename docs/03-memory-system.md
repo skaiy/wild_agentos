@@ -38,6 +38,18 @@ graph TB
     L2 --> UGS
 ```
 
+### 当前存储栈
+
+与代码一致（`src/memory/l0_store.rs`、`crates/hyperspace-engine`、`src/memory/unified_graph.rs`）：
+
+| 角色 | 实现 | 接口 | 代码 |
+|------|------|------|------|
+| L0 永久 KV | redb | IRI / 标签 / 命名图索引 | `src/memory/l0_store.rs`（数据文件 `l0.redb`） |
+| 向量层 | hyperspace-engine（嵌入式 HNSW） | ANN / 混合检索 | `crates/hyperspace-engine`、`src/memory/hyperspace_store.rs` |
+| 图存储 | Oxigraph | SPARQL 1.1 | `src/memory/unified_graph.rs`、L2 Blackboard |
+
+向量检索由工作区 crate `hyperspace-engine` 提供，无需外部向量数据库。图查询使用 SPARQL 1.1。
+
 ## 3.2 各层详细设计
 
 ### 3.2.1 L0 Store — 永久图记忆
@@ -46,7 +58,7 @@ graph TB
 **实现状态**: ✅ 完整  
 **存储引擎**: redb (Rust 原生嵌入式键值库，带标签二级索引和命名图索引)
 
-L0 是系统的永久存储层，存储完整的 JSON-LD 图数据，支持实体对齐和 MESI 一致性状态。
+L0 是系统的永久 KV 层，将完整 JSON-LD 图数据写入 `l0.redb`，支持实体对齐和 MESI 一致性状态。向量检索不走 L0，而由 `hyperspace-engine` 提供；图查询走 Oxigraph SPARQL 1.1。
 
 **核心结构体**:
 
@@ -65,6 +77,7 @@ pub struct L0Entry {
     pub named_graph: Option<String>,
     pub jsonld_context: Option<String>,    // JSON-LD @context
     pub jsonld_types: Vec<String>,         // 多类型列表
+    pub hyperspace_point_id: Option<u32>,  // 对应 HyperspaceEngine 向量点
 }
 ```
 
@@ -474,10 +487,10 @@ stateDiagram-v2
 
 ### 3.4.3 HyperspaceEngine — 超空间向量引擎
 
-**文件**: `src/memory/hyperspace_store.rs`, `src/memory/embedding_service.rs`  
+**文件**: `src/memory/hyperspace_store.rs`, `src/memory/embedding_service.rs`, `crates/hyperspace-engine`  
 **实现状态**: ✅ 完整
 
-HyperspaceEngine 是自包含的向量嵌入引擎，零外部向量数据库依赖。核心特性：
+HyperspaceEngine 是工作区 crate `hyperspace-engine` 中的嵌入式向量引擎，由 `HyperspaceStore` 封装，零外部向量数据库依赖。核心特性：
 
 - **HNSW 近似最近邻搜索**：基于 Hierarchical Navigable Small World 图索引，10K 向量 ~1ms 延迟
 - **运行时可切换度量**：Poincaré、Cosine、Euclidean、Lorentz，无需重启

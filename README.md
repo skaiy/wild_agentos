@@ -49,7 +49,7 @@ An **AI agent operating system** built in Rust that orchestrates multiple agents
 |-------|-----------|------|
 | **Core Coordination** (Rust) | `PDCA cycle` · `5W2H ontology` · `EventBus` | Agent orchestration & lifecycle |
 | **Skill Graph** | `RDF` · `6 link types` · `18 modules` | Dynamic cognitive network |
-| **Memory System** | `L0 Sled` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI coherence` | Hierarchical memory with prefetch |
+| **Memory System** | `L0 redb` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI coherence` | Hierarchical memory with prefetch |
 | **Knowledge Graph** | `Oxigraph RDF` · `SPARQL 1.1` · `Code AST` · `Named Graphs` | Cross-subsystem unified store |
 | **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean` · `Hybrid search` | Embedded vector embeddings |
 | **Wild Code TUI** | `ratatui` · `crossterm` · `MCP` · `checkpoint/resume` | Terminal AI coding assistant |
@@ -72,7 +72,7 @@ Dynamic in-memory cognitive network with **6 semantic link types** (Prerequisite
 Dynamically selects from 7 complexity levels (L0 instant → L5 recursive → L6 emergency) via 5W2H metadata. One engine handles everything from instant queries to multi-week projects — no rigid workflows. **PA/DA/CA agent roles** with template-driven prompt construction.
 
 ### 4. CPU Cache-Inspired Memory — 4 Layers + MESI Coherence
-First-ever application of CPU cache coherence protocol to multi-agent memory. **L0** Sled disk storage → **L1** session context → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL projection cache. Intelligent prefetch engine reduces perceived latency by 90%. Solves context explosion and shared memory inconsistency across concurrent agents.
+First-ever application of CPU cache coherence protocol to multi-agent memory. **L0** redb disk KV + HyperspaceEngine vectors → **L1** session context → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL projection cache. Intelligent prefetch engine reduces perceived latency by 90%. Solves context explosion and shared memory inconsistency across concurrent agents.
 
 ### 5. JSON-LD Universal Data Bus — W3C-Standard Interoperability
 `@context` duck-typing eliminates field name conflicts between skills. `@id` enables zero-cost cross-agent entity merging. `@graph` named graphs allow conflict-free parallel writes across subsystems. Turns interoperability hell into plug-and-play.
@@ -225,7 +225,7 @@ cargo build -p wild-code-cli --release
 |-----------|---------|-----------|
 | L2 Node Write (Oxigraph) | ~2ms | 500 ops/sec |
 | L3 SPARQL Projection | ~15ms | 66 ops/sec |
-| L0 Sled KV Read | ~1ms | 1000 ops/sec |
+| L0 redb KV Read | ~1ms | 1000 ops/sec |
 | Hyperspace HNSW Search (10K vectors) | ~1ms | 1000 qps |
 | Poincaré Embedding (4D) | ~50µs | — |
 | Agent ReAct Turn | 1-5s | 0.2-1 turns/sec |
@@ -235,6 +235,7 @@ cargo build -p wild-code-cli --release
 
 ## 📚 Documentation
 
+- **Memory System** → [`docs/03-memory-system.md`](docs/03-memory-system.md) (L0 redb · HyperspaceEngine · Oxigraph SPARQL)
 - **Design Detail** → [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) · [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)

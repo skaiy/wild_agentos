@@ -49,7 +49,7 @@
 |------|------|------|
 | **核心编排** (Rust) | `PDCA 循环` · `5W2H 本体` · `事件总线` | 智能体编排与生命周期管理 |
 | **技能图谱** | `RDF` · `6 种链接类型` · `18 模块` | 动态认知网络 |
-| **记忆系统** | `L0 Sled` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI 一致性` | 带预取的分层记忆 |
+| **记忆系统** | `L0 redb` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI 一致性` | 带预取的分层记忆 |
 | **知识图谱** | `Oxigraph RDF` · `SPARQL 1.1` · `代码 AST` · `命名图` | 跨子系统统一存储 |
 | **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean` · `混合搜索` | 嵌入式向量嵌入引擎 |
 | **Wild Code TUI** | `ratatui` · `crossterm` · `MCP` · `断点恢复` | 终端 AI 编程助手 |
@@ -75,7 +75,7 @@
 `SkillDiscoveryEngine` 包装 `HyperspaceStore` 实现基于向量的语义技能搜索。`suggest_links()` 从 Jaccard 标签重叠优雅降级到余弦相似度搜索。内置 BFS 路径发现（`find_skill_chain()`）、组合树构建（`get_skill_tree()`）和冲突检测。
 
 ### 5. CPU 缓存记忆 — 4 层结构 + MESI 一致性
-业界首创将 CPU 缓存一致性协议应用于多智能体记忆系统。**L0** Sled 磁盘存储 → **L1** 会话上下文 → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL 投影缓存。智能预取引擎降低 90% 感知延迟。解决上下文爆炸与并发智能体间的共享内存不一致问题。
+业界首创将 CPU 缓存一致性协议应用于多智能体记忆系统。**L0** redb 磁盘 KV + HyperspaceEngine 向量 → **L1** 会话上下文 → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL 投影缓存。智能预取引擎降低 90% 感知延迟。解决上下文爆炸与并发智能体间的共享内存不一致问题。
 
 ### 6. JSON-LD 通用数据总线 — W3C 标准互操作
 `@context` 鸭子类型消除技能间的字段名冲突。`@id` 实现零成本跨智能体实体合并。`@graph` 命名图支持跨子系统无锁并行写入。将互操作难题变为即插即用。
@@ -225,7 +225,7 @@ cargo build -p wild-code-cli --release
 |------|------|--------|
 | L2 节点写入 (Oxigraph) | ~2ms | 500 ops/sec |
 | L3 SPARQL 投影 | ~15ms | 66 ops/sec |
-| L0 Sled KV 读取 | ~1ms | 1000 ops/sec |
+| L0 redb KV 读取 | ~1ms | 1000 ops/sec |
 | Hyperspace HNSW 搜索（万级向量） | ~1ms | 1000 qps |
 | Poincaré 嵌入（4 维） | ~50µs | — |
 | Agent ReAct 单轮 | 1-5s | 0.2-1 turns/sec |
@@ -235,6 +235,7 @@ cargo build -p wild-code-cli --release
 
 ## 📚 文档
 
+- **记忆系统** → [`docs/03-memory-system.md`](docs/03-memory-system.md)（L0 redb · HyperspaceEngine · Oxigraph SPARQL）
 - **设计细节** → [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) · [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) (English)
 - **核心设计理念** → [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) · [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) (English)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)

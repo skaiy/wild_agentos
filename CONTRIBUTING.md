@@ -30,9 +30,9 @@ Security vulnerabilities must not be reported through public issues or pull requ
 ### Prerequisites
 
 - **Rust** 1.78 or later (install via [rustup](https://rustup.rs))
-- **Oxigraph** (compiled automatically as a Rust dependency)
-- **Qdrant** (optional, for vector search; can use a Docker container)
-- **Sled** (bundled with Oxigraph, no extra installation needed)
+- **Oxigraph** (compiled automatically as a Rust dependency; RDF graph store queried with SPARQL 1.1)
+- **redb** (compiled automatically; L0 persistent key-value store in `src/memory/l0_store.rs`)
+- **hyperspace-engine** (workspace crate; embedded HNSW vector index — no external vector database)
 - **Docker** (optional, for sandboxed tool execution)
 
 ### Quick Start
@@ -45,10 +45,7 @@ cd Wild_AgentOS
 # Copy example environment file
 cp .env.example .env
 
-# (Optional) Start Qdrant for vector features
-docker run -p 6333:6333 qdrant/qdrant
-
-# Build the project
+# Build the project (Oxigraph, redb, and hyperspace-engine compile as Rust deps)
 cargo build --release
 
 # Run the test suite
@@ -130,7 +127,7 @@ We rely heavily on automated tests:
 
 - **Unit tests**: Run with `cargo test`. Place tests inside the module they test (e.g., `#[cfg(test)] mod tests { ... }`)
 - **Integration tests**: Located in `tests/`. These test full workflows (e.g., a complete PDCA cycle).
-- **Memory tests**: Due to Oxigraph’s in-memory store, tests can run in parallel without conflict. Use `Arc<Mutex<Store>>` for shared state.
+- **Memory tests**: L0 uses redb (file-backed; tests typically use a temp directory). The graph layer is Oxigraph (SPARQL 1.1); in-memory stores can run in parallel without conflict. Use `Arc<Mutex<Store>>` for shared Oxigraph state. Vector search uses the in-repo `hyperspace-engine` crate.
 - **LLM mocking**: For tests that involve LLM calls, we provide mock implementations in `src/testing/mock_llm.rs`. Use these to avoid network calls.
 
 Before submitting, ensure:
@@ -178,7 +175,8 @@ You only need to do this once. If the check does not update, comment `recheck` t
 
 ## Documentation
 
-- **README.md**: Project overview, quickstart, and architecture summary.
+- **README.md** / **README.zh.md**: Project overview, quickstart, and architecture summary.
+- **docs/03-memory-system.md**: Memory stack — L0 redb, HyperspaceEngine vectors, Oxigraph SPARQL graph store.
 - **docs/**: Detailed guides for each subsystem (memory, skills, tools, etc.).
 - **Code comments**: Explain the “why”, not the “what” (the code already shows what).
 
