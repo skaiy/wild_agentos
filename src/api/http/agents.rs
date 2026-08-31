@@ -1,6 +1,6 @@
 //! 用户态 Agent CRUD 与持久化/图谱迁移。
 //!
-//! 路由仍由 `mod.rs` 的 `build_router` 组装；聊天/RAG 留在 `mod.rs`。
+//! 路由仍由 `mod.rs` 的 `build_router` 组装；聊天/RAG 见 `chat.rs`。
 
 use std::sync::Arc;
 
