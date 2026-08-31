@@ -209,19 +209,77 @@ async fn test_mcp_client_register_to_skill_registry() {
 }
 
 #[tokio::test]
-async fn test_mcp_client_connection_fallback() {
-    // Connect to an unreachable address — should get fallback tools
+async fn test_mcp_client_connection_failure_is_visible() {
+    // 不可达地址：连接必须失败（不再伪装 connected_fallback / 假工具）。
     let mut client = McpClient::new();
     client.register_server("offline", "http://127.0.0.1:1/mcp");
 
     let result = client.connect("offline").await;
-    assert!(result.is_ok());
-    let tools = result.unwrap();
-    // Fallback tools: list_resources, read_resource
-    assert_eq!(tools.len(), 2);
+    assert!(result.is_err(), "unreachable MCP HTTP must surface connect error");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        !err.to_lowercase().contains("simulated"),
+        "error must not be masked as simulated: {err}"
+    );
 
     let state = client.get_server("offline").unwrap();
-    assert_eq!(state.status, "connected_fallback");
+    assert!(
+        state.status.starts_with("error"),
+        "status should be error:*, got {}",
+        state.status
+    );
+    assert!(state.tools.is_empty());
+    assert!(state.error.is_some());
+}
+
+#[tokio::test]
+async fn test_mcp_http_call_tool_failure_is_visible() {
+    // tools/list 正常，tools/call 返回 500：调用必须 Err，且不含 simulated。
+    async fn list_ok_call_fail(Json(body): Json<Value>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let id = body.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        match method {
+            "tools/list" => Json(json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "tools": [{
+                        "name": "browser_navigate",
+                        "description": "Navigate",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }]
+                },
+                "id": id
+            }))
+            .into_response(),
+            _ => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "upstream boom",
+            )
+                .into_response(),
+        }
+    }
+
+    let addr = start_mock_server(Router::new().route("/mcp", post(list_ok_call_fail))).await;
+    let url = format!("http://{}/mcp", addr);
+
+    let mut client = McpClient::new();
+    client.register_server("chrome", &url);
+    client.connect("chrome").await.unwrap();
+
+    let result = client
+        .call_tool(
+            "chrome",
+            "browser_navigate",
+            &json!({"url": "https://example.com"}),
+        )
+        .await;
+    assert!(result.is_err(), "HTTP transport failure must be Err");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        !err.to_lowercase().contains("simulated"),
+        "must not return simulated payload: {err}"
+    );
 }
 
 #[tokio::test]

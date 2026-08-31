@@ -268,6 +268,7 @@ impl McpClient {
                     message: format!("MCP server not registered: {}", name),
                 })?;
             state.status = "connecting".to_string();
+            state.error = None;
             state.url.clone()
         };
 
@@ -278,12 +279,10 @@ impl McpClient {
             id: self.next_request_id(),
         };
 
-        let tools = match self.send_rpc_http(&url, &request).await {
-            Ok(response) => self.handle_connect_response(name, response).await,
-            Err(e) => self.handle_connect_fallback(name, e).await,
-        };
-
-        Ok(tools)
+        match self.send_rpc_http(&url, &request).await {
+            Ok(response) => self.handle_connect_response(name, response),
+            Err(e) => Err(self.mark_connect_error(name, e)),
+        }
     }
 
     async fn connect_stdio(&mut self, name: &str) -> Result<Vec<McpTool>, CoreError> {
@@ -299,6 +298,7 @@ impl McpClient {
         // Update status
         if let Some(state) = self.servers.get_mut(name) {
             state.status = "connecting".to_string();
+            state.error = None;
         }
 
         // Spawn the subprocess
@@ -312,26 +312,30 @@ impl McpClient {
                 };
 
                 match process.send_request(&request).await {
-                    Ok(response) => {
-                        let tools = self
-                            .parse_tools_from_response(name, &response)
-                            .unwrap_or_default();
-                        self.processes.insert(name.to_string(), process);
+                    Ok(response) => match self.parse_tools_from_response(name, &response) {
+                        Ok(tools) => {
+                            self.processes.insert(name.to_string(), process);
 
-                        if let Some(state) = self.servers.get_mut(name) {
-                            state.tools = tools.clone();
-                            state.status = "connected".to_string();
+                            if let Some(state) = self.servers.get_mut(name) {
+                                state.tools = tools.clone();
+                                state.status = "connected".to_string();
+                                state.error = None;
+                            }
+                            info!(server = %name, tool_count = tools.len(), "MCP Stdio server connected successfully");
+                            Ok(tools)
                         }
-                        info!(server = %name, tool_count = tools.len(), "MCP Stdio server connected successfully");
-                        Ok(tools)
-                    }
+                        Err(e) => {
+                            let _ = process.child.kill().await;
+                            Err(self.mark_connect_error(name, e))
+                        }
+                    },
                     Err(e) => {
                         let _ = process.child.kill().await;
-                        Ok(self.handle_connect_fallback(name, e).await)
+                        Err(self.mark_connect_error(name, e))
                     }
                 }
             }
-            Err(e) => Ok(self.handle_connect_fallback(name, e).await),
+            Err(e) => Err(self.mark_connect_error(name, e)),
         }
     }
 
@@ -359,46 +363,34 @@ impl McpClient {
         }
     }
 
-    async fn handle_connect_response(
+    fn handle_connect_response(
         &mut self,
         name: &str,
         response: JsonRpcResponse,
-    ) -> Vec<McpTool> {
-        let tools = self
-            .parse_tools_from_response(name, &response)
-            .unwrap_or_default();
-        if let Some(state) = self.servers.get_mut(name) {
-            state.tools = tools.clone();
-            state.status = "connected".to_string();
+    ) -> Result<Vec<McpTool>, CoreError> {
+        match self.parse_tools_from_response(name, &response) {
+            Ok(tools) => {
+                if let Some(state) = self.servers.get_mut(name) {
+                    state.tools = tools.clone();
+                    state.status = "connected".to_string();
+                    state.error = None;
+                }
+                info!(server = %name, tool_count = tools.len(), "MCP server connected successfully");
+                Ok(tools)
+            }
+            Err(e) => Err(self.mark_connect_error(name, e)),
         }
-        info!(server = %name, tool_count = tools.len(), "MCP server connected successfully");
-        tools
     }
 
-    async fn handle_connect_fallback(&mut self, name: &str, error: CoreError) -> Vec<McpTool> {
-        let tools = vec![
-            McpTool {
-                name: "list_resources".to_string(),
-                description: Some("List available resources".to_string()),
-                input_schema: None,
-            },
-            McpTool {
-                name: "read_resource".to_string(),
-                description: Some("Read resource by URI".to_string()),
-                input_schema: Some(json!({
-                    "type": "object",
-                    "properties": { "uri": {"type": "string"} },
-                    "required": ["uri"]
-                })),
-            },
-        ];
+    /// Record a failed connect: status becomes `error:...`, tools cleared, error stored.
+    fn mark_connect_error(&mut self, name: &str, error: CoreError) -> CoreError {
         if let Some(state) = self.servers.get_mut(name) {
-            state.tools = tools.clone();
-            state.status = "connected_fallback".to_string();
+            state.tools.clear();
+            state.status = format!("error:{}", error);
             state.error = Some(error.to_string());
         }
-        warn!(server = %name, error = %error, "MCP server connection failed, using fallback tools");
-        tools
+        warn!(server = %name, error = %error, "MCP server connection failed");
+        error
     }
 
     // ── Tool execution ────────────────────────────────────────────
@@ -464,13 +456,9 @@ impl McpClient {
         url: &str,
         request: &JsonRpcRequest,
     ) -> Result<Value, CoreError> {
-        match self.send_rpc_http(url, request).await {
-            Ok(response) => Self::handle_call_response(response),
-            Err(_) => Ok(json!({
-                "status": "simulated",
-                "note": "MCP HTTP transport unavailable, returning simulated result",
-            })),
-        }
+        // 失败必须对调用方可见：不再吞错返回 status=simulated。
+        let response = self.send_rpc_http(url, request).await?;
+        Self::handle_call_response(response)
     }
 
     async fn call_tool_stdio(
@@ -486,19 +474,13 @@ impl McpClient {
             })?;
 
         if !process.is_alive() {
-            return Ok(json!({
-                "status": "simulated",
-                "note": "MCP Stdio process exited, returning simulated result",
-            }));
+            return Err(CoreError::Internal {
+                message: format!("MCP Stdio process exited: {}", server),
+            });
         }
 
-        match process.send_request(request).await {
-            Ok(response) => Self::handle_call_response(response),
-            Err(_) => Ok(json!({
-                "status": "simulated",
-                "note": "MCP Stdio communication failed, returning simulated result",
-            })),
-        }
+        let response = process.send_request(request).await?;
+        Self::handle_call_response(response)
     }
 
     fn handle_call_response(response: JsonRpcResponse) -> Result<Value, CoreError> {
@@ -529,6 +511,18 @@ impl McpClient {
             .map_err(|e| CoreError::Internal {
                 message: format!("MCP HTTP request failed: {}", e),
             })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(CoreError::Internal {
+                message: format!(
+                    "MCP HTTP request failed: status {} body={}",
+                    status,
+                    body.chars().take(200).collect::<String>()
+                ),
+            });
+        }
 
         let rpc_response: JsonRpcResponse =
             response.json().await.map_err(|e| CoreError::Internal {
