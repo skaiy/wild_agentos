@@ -1,6 +1,6 @@
 //! 本体元模型 CRUD 与动力层 Action invoke。
 //!
-//! 路由仍由 `mod.rs` 的 `build_router` 组装；知识包/KB 留在 `mod.rs`。
+//! 路由仍由 `mod.rs` 的 `build_router` 组装；知识包/KB 见 `kb.rs`。
 
 use std::sync::Arc;
 
