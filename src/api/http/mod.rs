@@ -44,6 +44,17 @@ pub mod api_gov;
 use api_gov::{ApiClient, ApiKey, ApiUsageState};
 pub mod api_clients;
 pub mod prompts;
+pub mod agents;
+pub mod tasks;
+
+use agents::{
+    create_agent_handler, delete_agent_handler, list_agents_handler, load_user_agents,
+    migrate_legacy_agent_graphs, save_user_agents, update_agent_handler,
+};
+use tasks::{
+    create_task_handler, get_execution_details_handler, get_realtime_status_handler,
+    get_task_handler, list_task_trends_handler, stream_task_handler,
+};
 
 use api_clients::{
     create_api_client_handler, delete_api_client_handler, issue_api_key_handler,
@@ -125,137 +136,6 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 用户态 Agent 的持久化文件路径。
-fn agents_store_path() -> std::path::PathBuf {
-    data_dir().join("agents.json")
-}
-
-/// 启动时从磁盘加载用户态 Agent；文件不存在或解析失败时返回空列表。
-fn load_user_agents() -> Vec<Value> {
-    match std::fs::read_to_string(agents_store_path()) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// 将用户态 Agent 持久化到磁盘（pretty JSON）。
-fn save_user_agents(agents: &[Value]) -> std::io::Result<()> {
-    let path = agents_store_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(agents).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(&path, content)
-}
-
-/// 从旧 knowledge_graph 值中解析知识库 uuid（形如 .../kb/{uuid}）。
-fn extract_kb_uuid_from_graph(graph: &str) -> Option<String> {
-    let idx = graph.rfind("/kb/")?;
-    let candidate = graph[idx + 4..].split('/').next().unwrap_or_default();
-    if candidate.len() == 36 && candidate.matches('-').count() == 4 {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
-}
-
-/// 一次性幂等迁移：将存量 agent.knowledge_graph（旧「绑定知识图谱」单值）迁入知识包体系。
-/// 策略（对每个 knowledge_graph 非空的 agent）：
-///
-///   1) 能解析出 KB uuid 且已有知识包的 graph_kb_ids 覆盖它 → 确保该包挂载到 agent，清空旧字段；
-///   2) 否则能解析出 KB uuid → 新建知识包 {graph_kb_ids:[uuid]}，挂载并清空；
-///   3) 否则（原始命名图）→ 新建知识包 {named_graph: 原值}，挂载并清空。
-///
-/// 返回 (agents_changed, packs_changed)；清空后再次运行不再产生变更（幂等）。
-fn migrate_legacy_agent_graphs(agents: &mut [Value], packs: &mut Vec<Value>) -> (bool, bool) {
-    let mut agents_changed = false;
-    let mut packs_changed = false;
-    for agent in agents.iter_mut() {
-        let kg = agent
-            .get("knowledge_graph")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if kg.is_empty() {
-            continue;
-        }
-        let agent_name = agent
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("agent")
-            .to_string();
-        let mut pack_ids: Vec<String> = agent
-            .get("knowledge_pack_ids")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let kb_uuid = extract_kb_uuid_from_graph(&kg);
-        let covering_pack_id = kb_uuid.as_ref().and_then(|uuid| {
-            packs
-                .iter()
-                .find(|p| {
-                    p.get("graph_kb_ids")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.iter().any(|x| x.as_str() == Some(uuid.as_str())))
-                        .unwrap_or(false)
-                })
-                .and_then(|p| p.get("id").and_then(|v| v.as_str()).map(String::from))
-        });
-
-        let target_pack_id = match covering_pack_id {
-            Some(pid) => pid,
-            None => {
-                let new_id = uuid::Uuid::new_v4().hyphenated().to_string();
-                let mut pack = json!({
-                    "id": new_id.clone(),
-                    "name": format!("{}（图谱迁移）", agent_name),
-                    "description": "由旧「绑定知识图谱」自动迁移生成",
-                    "version": "1.0.0",
-                    "icon": "Package",
-                    "color": "amber",
-                    "named_graph": "",
-                    "vector_namespace": "",
-                    "ontology_domain": "",
-                    "stats": { "object_types": 0, "link_types": 0, "action_types": 0, "functions": 0 },
-                    "category_ids": [],
-                    "graph_kb_ids": [],
-                    "vector_kb_ids": [],
-                    "builtin": false,
-                    "created_at": chrono::Utc::now().to_rfc3339(),
-                });
-                match &kb_uuid {
-                    Some(uuid) => pack["graph_kb_ids"] = json!([uuid]),
-                    None => pack["named_graph"] = json!(kg),
-                }
-                packs.push(pack);
-                packs_changed = true;
-                new_id
-            }
-        };
-
-        if !pack_ids.contains(&target_pack_id) {
-            pack_ids.push(target_pack_id.clone());
-        }
-        if let Some(obj) = agent.as_object_mut() {
-            obj.insert("knowledge_pack_ids".into(), json!(pack_ids));
-            obj.insert("knowledge_graph".into(), json!(""));
-            obj.remove("knowledge_graph_description");
-            obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
-        }
-        agents_changed = true;
-        tracing::info!(
-            "migrated legacy knowledge_graph for agent '{}' -> pack {}",
-            agent_name,
-            target_pack_id
-        );
-    }
-    (agents_changed, packs_changed)
-}
 
 /// MCP 服务器注册表的持久化文件路径。
 fn mcp_servers_store_path() -> std::path::PathBuf {
@@ -578,14 +458,6 @@ pub struct HealthResponse {
     pub version: String,
 }
 
-#[derive(Deserialize)]
-pub struct TaskRequest {
-    pub user_input: String,
-    /// 用户态标识，用于会话隔离（可选，缺省为匿名）。
-    pub user_id: Option<String>,
-    /// 会话标识，用于多轮上下文隔离（可选）。
-    pub session_id: Option<String>,
-}
 
 #[derive(Deserialize)]
 pub struct NodeWriteRequest {
@@ -601,18 +473,6 @@ pub struct ProjectionRequest {
     pub params: Option<HashMap<String, String>>,
 }
 
-#[derive(Deserialize)]
-pub struct StreamTaskRequest {
-    pub prompt: String,
-    pub task_iri: Option<String>,
-    pub include_thought: Option<bool>,
-    pub include_tool_calls: Option<bool>,
-}
-
-#[derive(Deserialize)]
-pub struct RealtimeStatusRequest {
-    pub task_iri: String,
-}
 
 #[derive(Deserialize)]
 pub struct KgImportRequest {
@@ -634,11 +494,6 @@ pub struct KgQueryRequest {
     pub named_graph: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct StreamEventResponse {
-    pub event_type: String,
-    pub data: Value,
-}
 
 /// 按 embedding 配置打开向量库（HyperspaceStore），包进可原子热替换的 `SharedVectorStore`。
 /// 初始化失败则内层为 None（向量检索禁用，不影响图检索）。
@@ -1414,124 +1269,6 @@ async fn spawn_reindex_all_vector_kbs(state: Arc<AppState>) -> usize {
     count
 }
 
-/// GET /api/v1/agents — 返回批处理 Agent（静态）与用户态 Agent（持久化）合并列表
-async fn list_agents_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut agents: Vec<Value> = state
-        .agents_info
-        .get("agents")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let batch_count = agents.len();
-    let user_agents = state.user_agents.read().await.clone();
-    let user_count = user_agents.len();
-    agents.extend(user_agents);
-    Json(json!({
-        "count": agents.len(),
-        "batch_count": batch_count,
-        "user_count": user_count,
-        "agents": agents,
-    }))
-}
-
-#[derive(Deserialize)]
-pub struct AgentCreateRequest {
-    pub name: String,
-    pub description: Option<String>,
-    pub business_domain: Option<String>,
-    #[serde(default)]
-    pub skills: Vec<String>,
-    /// 关联的知识包 id 列表（Agent → N 知识包）。
-    #[serde(default)]
-    pub knowledge_pack_ids: Vec<String>,
-    pub enabled: Option<bool>,
-    pub icon: Option<String>,
-    pub color: Option<String>,
-}
-
-/// POST /api/v1/agents — 创建用户态 Agent 并持久化
-async fn create_agent_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AgentCreateRequest>,
-) -> impl IntoResponse {
-    let agent = json!({
-        "id": uuid::Uuid::new_v4().hyphenated().to_string(),
-        "name": req.name,
-        "description": req.description.unwrap_or_default(),
-        "business_domain": req.business_domain.unwrap_or_default(),
-        "skills": req.skills,
-        "knowledge_pack_ids": req.knowledge_pack_ids,
-        "enabled": req.enabled.unwrap_or(true),
-        "icon": req.icon.unwrap_or_else(|| "Bot".to_string()),
-        "color": req.color.unwrap_or_else(|| "bg-blue-500".to_string()),
-        "source": "user",
-        "created_at": chrono::Utc::now().to_rfc3339(),
-    });
-    let id = agent["id"].as_str().unwrap_or("").to_string();
-    let mut guard = state.user_agents.write().await;
-    guard.push(agent.clone());
-    let _ = save_user_agents(&guard);
-    (
-        StatusCode::CREATED,
-        Json(json!({ "id": id, "status": "created", "agent": agent })),
-    )
-}
-
-/// PUT /api/v1/agents/:id — 更新用户态 Agent 并持久化
-async fn update_agent_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(patch): Json<Value>,
-) -> impl IntoResponse {
-    let mut guard = state.user_agents.write().await;
-    let found = guard
-        .iter_mut()
-        .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id.as_str()));
-    match found {
-        Some(agent) => {
-            if let (Some(obj), Some(patch_obj)) = (agent.as_object_mut(), patch.as_object()) {
-                for (k, v) in patch_obj {
-                    if k == "id" || k == "source" || k == "created_at" {
-                        continue;
-                    }
-                    obj.insert(k.clone(), v.clone());
-                }
-                obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
-            }
-            let updated = agent.clone();
-            let _ = save_user_agents(&guard);
-            (
-                StatusCode::OK,
-                Json(json!({ "status": "updated", "agent": updated })),
-            )
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "agent not found", "id": id })),
-        ),
-    }
-}
-
-/// DELETE /api/v1/agents/:id — 删除用户态 Agent 并持久化
-async fn delete_agent_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    let mut guard = state.user_agents.write().await;
-    let before = guard.len();
-    guard.retain(|a| a.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
-    if guard.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "agent not found", "id": id })),
-        );
-    }
-    let _ = save_user_agents(&guard);
-    (
-        StatusCode::OK,
-        Json(json!({ "status": "deleted", "id": id })),
-    )
-}
 
 #[derive(Deserialize)]
 pub struct AgentChatRequest {
@@ -2688,251 +2425,6 @@ async fn guard_stats_handler() -> impl IntoResponse {
     }))
 }
 
-async fn create_task_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<TaskRequest>,
-) -> impl IntoResponse {
-    match state
-        .core
-        .init_task(
-            &req.user_input,
-            None,
-            None,
-            req.user_id.as_deref(),
-            req.session_id.as_deref(),
-        )
-        .await
-    {
-        Ok(task_iri) => (
-            StatusCode::CREATED,
-            Json(json!({"task_iri": task_iri, "status": "created"})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ),
-    }
-}
-
-async fn get_task_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(task_iri): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    match state.core.read_node(&task_iri).await {
-        Ok(Some(node)) => Json(json!({
-            "task_iri": task_iri,
-            "found": true,
-            "node": node,
-        })),
-        Ok(None) => Json(json!({
-            "task_iri": task_iri,
-            "found": false,
-        })),
-        Err(e) => Json(json!({
-            "task_iri": task_iri,
-            "error": e.to_string(),
-        })),
-    }
-}
-
-async fn stream_task_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<StreamTaskRequest>,
-) -> impl IntoResponse {
-    let task_iri = req
-        .task_iri
-        .unwrap_or_else(|| format!("iri://stream/{}", uuid::Uuid::new_v4().hyphenated()));
-
-    let event_bus = state.core.events.clone();
-    let task_iri_clone = task_iri.clone();
-    // 订阅必须早于触发执行，避免执行器早期推送的事件在订阅前丢失。
-    let mut rx = event_bus.subscribe();
-
-    // 触发实际执行：经注入的 TaskExecutor 在后台驱动 SA PDCA 管线，
-    // 执行事件会发布到同一条共享事件总线，由下方 SSE 循环转发给前端。
-    match state.task_executor.clone() {
-        Some(executor) => {
-            let spec = TaskExecSpec {
-                prompt: req.prompt.clone(),
-                task_iri: task_iri.clone(),
-                include_thought: req.include_thought.unwrap_or(true),
-                include_tool_calls: req.include_tool_calls.unwrap_or(true),
-            };
-            tokio::spawn(async move {
-                executor.execute(spec).await;
-            });
-        }
-        None => {
-            // 未注入执行器（仅测试态）：即时推送失败事件，避免前端卡在「启动中」。
-            let bus = event_bus.clone();
-            let ti = task_iri.clone();
-            tokio::spawn(async move {
-                bus.emit(
-                    &ti,
-                    "TASK_FAILED",
-                    "http",
-                    &json!({"status": "failed", "summary": "task executor not configured"})
-                        .to_string(),
-                )
-                .await;
-            });
-        }
-    }
-
-    let stream = async_stream::stream! {
-        yield Ok::<axum::response::sse::Event, std::convert::Infallible>(Event::default().event("task_started").data(json!({
-            "task_iri": task_iri_clone,
-            "status": "started"
-        }).to_string()));
-
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if event.task_iri != task_iri_clone {
-                        continue;
-                    }
-
-                    if let Some(sse_event) = convert_event_to_sse(&event) {
-                        yield Ok(sse_event);
-                    }
-
-                    if event.event_type == "TASK_COMPLETED" || event.event_type == "TASK_FAILED" {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    continue;
-                }
-            }
-        }
-    };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-async fn get_realtime_status_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(task_iri): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // Read the task node from L2 blackboard; return 404 when not found.
-    match state.core.blackboard.read_node(&task_iri) {
-        Ok(Some(node)) => {
-            // Parse json_ld to extract runtime status fields if present.
-            let parsed: Value = serde_json::from_str(&node.json_ld).unwrap_or(Value::Null);
-            let status = parsed
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("queued");
-            let phase = parsed
-                .get("current_phase")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let completed_steps = parsed
-                .pointer("/progress/completed_steps")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let total_steps = parsed
-                .pointer("/progress/total_steps")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let percentage = parsed
-                .pointer("/progress/percentage")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_else(|| {
-                    completed_steps
-                        .saturating_mul(100)
-                        .checked_div(total_steps)
-                        .unwrap_or(0)
-                });
-            (
-                axum::http::StatusCode::OK,
-                Json(json!({
-                    "task_iri": task_iri,
-                    "status": status,
-                    "current_phase": phase,
-                    "node_type": node.node_type,
-                    "tags": node.tags,
-                    "created_at": node.created_at,
-                    "dirty": node.dirty,
-                    "current_agent": {
-                        "id": parsed.pointer("/current_agent/id").and_then(|v| v.as_str()).unwrap_or(""),
-                        "role": parsed.pointer("/current_agent/role").and_then(|v| v.as_str()).unwrap_or(""),
-                        "status": parsed.pointer("/current_agent/status").and_then(|v| v.as_str()).unwrap_or(status),
-                        "turn": parsed.pointer("/current_agent/turn").and_then(|v| v.as_u64()).unwrap_or(0),
-                    },
-                    "progress": {
-                        "completed_steps": completed_steps,
-                        "total_steps": total_steps,
-                        "percentage": percentage.min(100),
-                    },
-                })),
-            ).into_response()
-        }
-        _ => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(json!({ "error": "task not found", "task_iri": task_iri })),
-        )
-            .into_response(),
-    }
-}
-
-async fn get_execution_details_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(task_iri): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // Read the task node from L2 blackboard; return 404 when not found.
-    match state.core.blackboard.read_node(&task_iri) {
-        Ok(Some(node)) => {
-            let parsed: Value = serde_json::from_str(&node.json_ld).unwrap_or(Value::Null);
-            let status = parsed
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("queued");
-            let phase = parsed
-                .get("current_phase")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let turn = parsed.get("turn").and_then(|v| v.as_i64()).unwrap_or(0);
-            // Collect child nodes for this task.
-            let child_nodes = state.core.blackboard.get_task_nodes(&task_iri);
-            (
-                axum::http::StatusCode::OK,
-                Json(json!({
-                    "task_iri": task_iri,
-                    "status": status,
-                    "current_phase": phase,
-                    "node_type": node.node_type,
-                    "tags": node.tags,
-                    "created_at": node.created_at,
-                    "child_nodes": child_nodes,
-                    "plan": parsed.get("plan").cloned().unwrap_or_else(|| json!({
-                        "plan_id": "",
-                        "description": "",
-                        "steps": [],
-                    })),
-                    "steps": [],
-                    "agent_sessions": [],
-                    "stats": {
-                        "total_turns": turn,
-                        "total_tool_calls": 0,
-                        "total_tokens": 0,
-                    },
-                })),
-            )
-                .into_response()
-        }
-        _ => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(json!({ "error": "task not found", "task_iri": task_iri })),
-        )
-            .into_response(),
-    }
-}
 
 async fn write_node_handler(
     State(state): State<Arc<AppState>>,
@@ -3814,72 +3306,6 @@ async fn stream_batch_events_handler(State(state): State<Arc<AppState>>) -> impl
 // 方案A 平台运维态：L2 黑板浏览器（只读）+ 批处理 Agent 运维台
 // ============================================================
 
-#[derive(Debug, Deserialize)]
-struct TaskTrendsQuery {
-    days: Option<i64>,
-}
-
-/// GET /api/v1/tasks/trends?days=N — 任务执行时序趋势（真实持久化数据）。
-/// 扫描 L0Store 中 `iri://checkpoint/` 前缀的持久化检查点（跨进程/PVC 存活），按天聚合：
-/// 活跃任务数（去重 task_iri）/ 检查点数（执行步）/ 完成阶段数（finish_/step_complete_）。
-/// 预置最近 N 天的空桶以保证图表时间轴连续（默认 7 天，范围 1..=90）。
-async fn list_task_trends_handler(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<TaskTrendsQuery>,
-) -> impl IntoResponse {
-    let days = q.days.unwrap_or(7).clamp(1, 90);
-    let today = chrono::Utc::now().date_naive();
-    let start = today - chrono::Duration::days(days - 1);
-
-    // 每桶：(去重任务集合, 检查点计数, 完成阶段计数)
-    let mut buckets: std::collections::BTreeMap<
-        chrono::NaiveDate,
-        (std::collections::HashSet<String>, u64, u64),
-    > = std::collections::BTreeMap::new();
-    for i in 0..days {
-        buckets.insert(
-            start + chrono::Duration::days(i),
-            (std::collections::HashSet::new(), 0, 0),
-        );
-    }
-
-    if let Ok(entries) = state
-        .core
-        .l0_store
-        .scan_iri_prefix("iri://checkpoint/", 5000)
-    {
-        for e in entries {
-            let cp: crate::core::checkpoint::CheckpointData = match serde_json::from_str(&e.content)
-            {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let d = cp.created_at.date_naive();
-            if let Some(bucket) = buckets.get_mut(&d) {
-                bucket.0.insert(cp.task_iri.clone());
-                bucket.1 += 1;
-                let phase = crate::core::checkpoint::parse_checkpoint_phase(&cp.name);
-                if phase.starts_with("finish_") || phase.starts_with("step_complete_") {
-                    bucket.2 += 1;
-                }
-            }
-        }
-    }
-
-    let trends: Vec<Value> = buckets
-        .into_iter()
-        .map(|(date, (tasks, checkpoints, completed))| {
-            json!({
-                "date": date.format("%Y-%m-%d").to_string(),
-                "tasks": tasks.len(),
-                "checkpoints": checkpoints,
-                "completed": completed,
-            })
-        })
-        .collect();
-
-    Json(json!({ "days": days, "trends": trends }))
-}
 
 /// GET /api/v1/blackboard/tasks — 列出黑板上所有任务（平台/任务态，跨租户）。
 async fn list_blackboard_tasks_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -7455,251 +6881,6 @@ async fn import_graph_knowledge_base_handler(
     }
 }
 
-/// 从序列化后的 ExecutionEvent payload 中取出内层某一 kind 的字段对象。
-fn exec_event_inner(payload: &str, kind: &str) -> Option<Value> {
-    let v: Value = serde_json::from_str(payload).ok()?;
-    v.get("event")?.get(kind).cloned()
-}
-
-fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> {
-    use crate::core::event_bus::EventType;
-
-    // 富执行事件（由 AgentRunner 内联发布到总线，payload 为序列化后的 ExecutionEvent）：
-    // 解析内层字段，映射为任务控制台可直接消费的干净 SSE 事件（思考/工具调用/逐字输出）。
-    match event.event_type.as_str() {
-        "THOUGHT" => {
-            let inner = exec_event_inner(&event.payload, "Thought")?;
-            return Some(
-                Event::default().event("thought").data(
-                    json!({
-                        "agent_id": inner.get("agent_id"),
-                        "thought": inner.get("thought"),
-                        "action": inner.get("action"),
-                        "emphasis": inner.get("emphasis"),
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        "TOOL_CALL" => {
-            let inner = exec_event_inner(&event.payload, "ToolCall")?;
-            let args_raw = inner
-                .get("arguments_json")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let arguments = serde_json::from_str::<Value>(args_raw)
-                .unwrap_or_else(|_| Value::String(args_raw.to_string()));
-            return Some(
-                Event::default().event("tool_call").data(
-                    json!({
-                        "call_id": inner.get("call_id"),
-                        "tool_name": inner.get("tool_name"),
-                        "arguments": arguments,
-                        "agent_id": inner.get("agent_id"),
-                        "sequence": inner.get("sequence"),
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        "TOOL_RESULT" => {
-            let inner = exec_event_inner(&event.payload, "ToolResult")?;
-            return Some(
-                Event::default().event("tool_result").data(
-                    json!({
-                        "call_id": inner.get("call_id"),
-                        "tool_name": inner.get("tool_name"),
-                        "result": inner.get("result"),
-                        "success": inner.get("success"),
-                        "agent_id": inner.get("agent_id"),
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        "LLM_CONTENT" => {
-            let inner = exec_event_inner(&event.payload, "LlmContent")?;
-            return Some(
-                Event::default().event("llm_content").data(
-                    json!({
-                        "agent_id": inner.get("agent_id"),
-                        "role": inner.get("role"),
-                        "delta": inner.get("content_delta"),
-                        "is_reasoning": inner.get("is_reasoning"),
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        "PHASE_CHANGE" => {
-            let inner = exec_event_inner(&event.payload, "PhaseChange")?;
-            return Some(
-                Event::default().event("phase_change").data(
-                    json!({
-                        "from_phase": inner.get("from_phase"),
-                        "to_phase": inner.get("to_phase"),
-                        "agent_role": inner.get("agent_role"),
-                        "reason": inner.get("reason"),
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        "AGENT_STATUS" => {
-            let inner = exec_event_inner(&event.payload, "AgentStatus")?;
-            return Some(
-                Event::default().event("agent_status").data(
-                    json!({
-                        "agent_id": inner.get("agent_id"),
-                        "role": inner.get("role"),
-                        "status": inner.get("status"),
-                        "turn": inner.get("turn"),
-                        "iteration": inner.get("iteration"),
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        "EXECUTION_ERROR" => {
-            let inner = exec_event_inner(&event.payload, "Error")?;
-            return Some(
-                Event::default().event("error").data(
-                    json!({
-                        "error_type": inner.get("error_type"),
-                        "message": inner.get("message"),
-                        "agent_id": inner.get("agent_id"),
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        // SA 逐阶段派发事件（Debug 角色名，如 "Plan_STARTED"）→ 相位指示。
-        "Plan_STARTED" | "Do_STARTED" | "Check_STARTED" | "Act_STARTED" => {
-            let (to_phase, role) = match event.event_type.as_str() {
-                "Plan_STARTED" => ("plan", "PA"),
-                "Do_STARTED" => ("do", "DA"),
-                "Check_STARTED" => ("check", "CA"),
-                _ => ("act", "AA"),
-            };
-            return Some(
-                Event::default().event("phase_change").data(
-                    json!({
-                        "to_phase": to_phase,
-                        "agent_role": role,
-                    })
-                    .to_string(),
-                ),
-            );
-        }
-        _ => {}
-    }
-
-    let event_type = EventType::from_str(&event.event_type);
-    let (event_name, data) = match event_type {
-        EventType::PlanStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "idle",
-                "to_phase": "plan",
-                "agent_role": "PA"
-            }),
-        ),
-        EventType::PlanCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "plan",
-                "to_phase": "do",
-                "agent_role": "PA"
-            }),
-        ),
-        EventType::DoStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "plan",
-                "to_phase": "do",
-                "agent_role": "DA"
-            }),
-        ),
-        EventType::DoCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "do",
-                "to_phase": "check",
-                "agent_role": "DA"
-            }),
-        ),
-        EventType::CheckStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "do",
-                "to_phase": "check",
-                "agent_role": "CA"
-            }),
-        ),
-        EventType::CheckCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "check",
-                "to_phase": "act",
-                "agent_role": "CA"
-            }),
-        ),
-        EventType::ActStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "check",
-                "to_phase": "act",
-                "agent_role": "AA"
-            }),
-        ),
-        EventType::ActCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "act",
-                "to_phase": "completed",
-                "agent_role": "AA"
-            }),
-        ),
-        EventType::AgentStarted => (
-            "agent_status",
-            json!({
-                "agent_id": event.source_agent_iri,
-                "status": "running"
-            }),
-        ),
-        EventType::AgentCompleted => (
-            "agent_status",
-            json!({
-                "agent_id": event.source_agent_iri,
-                "status": "completed"
-            }),
-        ),
-        EventType::AgentError => (
-            "error",
-            json!({
-                "agent_id": event.source_agent_iri,
-                "message": event.payload
-            }),
-        ),
-        EventType::TaskCompleted => (
-            "completion",
-            json!({
-                "status": "success",
-                "summary": event.payload
-            }),
-        ),
-        EventType::TaskFailed => (
-            "completion",
-            json!({
-                "status": "failed",
-                "summary": event.payload
-            }),
-        ),
-        _ => return None,
-    };
-
-    Some(Event::default().event(event_name).data(data.to_string()))
-}
 
 #[cfg(test)]
 mod tests {
@@ -9309,7 +8490,7 @@ mod kb_ingest_tests {
             "id": "ev-repair-fault-kb",
             "graph_kb_ids": [kb_uuid],
         })];
-        let (a, p) = migrate_legacy_agent_graphs(&mut agents, &mut packs);
+        let (a, p) = crate::api::http::agents::migrate_legacy_agent_graphs(&mut agents, &mut packs);
         assert!(a, "agent 应被迁移");
         assert!(!p, "已覆盖：不应新建知识包");
         assert_eq!(packs.len(), 1, "包数量不变");
@@ -9319,7 +8500,7 @@ mod kb_ingest_tests {
             json!(["ev-repair-fault-kb"])
         );
         // 幂等：二次运行无变更。
-        let (a2, p2) = migrate_legacy_agent_graphs(&mut agents, &mut packs);
+        let (a2, p2) = crate::api::http::agents::migrate_legacy_agent_graphs(&mut agents, &mut packs);
         assert!(!a2 && !p2, "幂等：清空后不再变更");
     }
 
@@ -9334,7 +8515,7 @@ mod kb_ingest_tests {
             "knowledge_pack_ids": [],
         })];
         let mut packs: Vec<Value> = vec![];
-        let (a, p) = migrate_legacy_agent_graphs(&mut agents, &mut packs);
+        let (a, p) = crate::api::http::agents::migrate_legacy_agent_graphs(&mut agents, &mut packs);
         assert!(a && p, "应迁移并新建包");
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0]["graph_kb_ids"], json!([kb_uuid]));
