@@ -27,7 +27,6 @@ use crate::memory::hyperspace_store::{HybridSearchFilter, HyperspaceStore};
 use crate::memory::l2_blackboard::QueryFilter;
 use crate::tools::prompt_registry::PromptRegistry;
 use crate::tools::skill_registry::SkillMeta;
-use crate::tools::tool_guard::{GuardAuditEntry, GUARD_AUDIT_LOG};
 
 /// Shared handle to the platform Batch Agent manager (Option<..> allows tests to omit it,
 /// inner Option matches the gRPC server's take-on-shutdown lifecycle).
@@ -46,6 +45,9 @@ pub mod api_clients;
 pub mod prompts;
 pub mod agents;
 pub mod tasks;
+pub mod runtime;
+pub mod mcp;
+pub mod guard;
 
 use agents::{
     create_agent_handler, delete_agent_handler, list_agents_handler, load_user_agents,
@@ -55,6 +57,13 @@ use tasks::{
     create_task_handler, get_execution_details_handler, get_realtime_status_handler,
     get_task_handler, list_task_trends_handler, stream_task_handler,
 };
+use runtime::{
+    health_handler, live_runtime_hardening_fields, metrics_handler, unified_stats_handler,
+};
+use mcp::{
+    list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler,
+};
+use guard::{guard_audit_handler, guard_stats_handler};
 
 use api_clients::{
     create_api_client_handler, delete_api_client_handler, issue_api_key_handler,
@@ -137,28 +146,6 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 
-/// MCP 服务器注册表的持久化文件路径。
-fn mcp_servers_store_path() -> std::path::PathBuf {
-    data_dir().join("mcp_servers.json")
-}
-
-/// 启动时从磁盘加载已注册的 MCP 服务器；文件不存在或解析失败时返回空列表。
-fn load_mcp_servers() -> Vec<Value> {
-    match std::fs::read_to_string(mcp_servers_store_path()) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// 将 MCP 服务器注册表持久化到磁盘（pretty JSON）。
-fn save_mcp_servers(servers: &[Value]) -> std::io::Result<()> {
-    let path = mcp_servers_store_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(servers).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(&path, content)
-}
 
 /// 用户态注册技能的持久化文件路径（仅 POST 注册的技能，不含启动播种的默认技能）。
 fn skills_store_path() -> std::path::PathBuf {
@@ -452,11 +439,6 @@ fn json_deep_merge(dst: &mut Value, src: &Value) {
     }
 }
 
-#[derive(Serialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub version: String,
-}
 
 
 #[derive(Deserialize)]
@@ -794,124 +776,6 @@ pub fn build_router(
         .with_state(state)
 }
 
-async fn health_handler() -> impl IntoResponse {
-    Json(HealthResponse {
-        status: "healthy".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    })
-}
-
-fn live_runtime_hardening_fields() -> Value {
-    json!({
-        "sandbox": crate::tools::builtin::sandbox::sandbox_runtime_snapshot(),
-        "verify_first": crate::core::sa::verify_first_runtime_snapshot(),
-        "memory_scheduler": crate::memory::scheduler::MemoryScheduler::runtime_snapshot(),
-        "embedding_health": crate::memory::embedding_health_snapshot(),
-    })
-}
-
-async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let hardening = live_runtime_hardening_fields();
-    Json(json!({
-        "l2_nodes": state.core.blackboard.node_count(),
-        "l2_bytes": state.core.blackboard.total_bytes(),
-        "events": state.core.events.event_count(),
-        "subscribers": state.core.events.subscriber_count(),
-        "skills": state.core.skills.skill_count(),
-        "checkpoints": state.core.checkpoints.checkpoint_count(),
-        "sandbox_enabled": hardening["sandbox"]["enabled"],
-        "unshare_supported": hardening["sandbox"]["unshare_supported"],
-        "unshare_enabled": hardening["sandbox"]["unshare_enabled"],
-        "memory_scheduler": hardening["memory_scheduler"],
-        "verify_first": hardening["verify_first"],
-        "embedding_health": hardening["embedding_health"],
-    }))
-}
-
-/// GET /api/v1/memory/unified-stats — 记忆与知识运维中心的薄聚合只读端点。
-/// 一次性返回系统记忆四层(L0-L3) + 业务知识(知识库/知识包/本体) + 运行时的真实规模，
-/// 供记忆中心/知识中心顶部 Dashboard 消费。L1/L3 当前无枚举接口，返回 null 并附说明。
-async fn unified_stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // ── L0 长期记忆 ──
-    let l0_entries = match state.core.l0_store.count() {
-        Ok(c) => json!(c),
-        Err(e) => {
-            tracing::warn!("unified-stats: L0 count failed: {}", e);
-            json!(null)
-        }
-    };
-
-    // ── L2 黑板 ──
-    let l2_nodes = state.core.blackboard.node_count();
-    let l2_bytes = state.core.blackboard.total_bytes();
-    let l2_tasks = state.core.blackboard.list_task_summaries().len() as u64;
-
-    // ── 业务知识：知识库（按类型分桶）+ 知识包 ──
-    let (kb_total, kb_vector, kb_graph) = {
-        let bases = state.knowledge_bases.read().await;
-        let vector = bases
-            .iter()
-            .filter(|b| b.get("kb_type").and_then(|v| v.as_str()) == Some("vector"))
-            .count() as u64;
-        let graph = bases
-            .iter()
-            .filter(|b| b.get("kb_type").and_then(|v| v.as_str()) == Some("graph"))
-            .count() as u64;
-        (bases.len() as u64, vector, graph)
-    };
-    let kb_packs = state.knowledge_packs.read().await.len() as u64;
-
-    // ── 本体层 ──
-    let ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
-
-    Json(json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "memory_tiers": {
-            "l0_longterm": {
-                "entries": l0_entries,
-                "description": "Persistent long-term store (redb)"
-            },
-            "l1_session": {
-                "sessions": null,
-                "description": "In-memory session storage (not enumerable)"
-            },
-            "l2_blackboard": {
-                "nodes": l2_nodes,
-                "bytes": l2_bytes,
-                "tasks": l2_tasks,
-                "description": "Shared cross-agent blackboard (Oxigraph)"
-            },
-            "l3_projection": {
-                "projections": null,
-                "description": "Derived projection cache (stats not exposed)"
-            }
-        },
-        "knowledge_bases": {
-            "total": kb_total,
-            "by_type": { "vector": kb_vector, "graph": kb_graph }
-        },
-        "knowledge_packs": kb_packs,
-        "ontology": {
-            "domain": ont.domain,
-            "object_types": ont.object_types.len() as u64,
-            "link_types": ont.link_types.len() as u64,
-            "action_types": ont.action_types.len() as u64,
-            "functions": ont.functions.len() as u64
-        },
-        "runtime": {
-            "events": {
-                "total_emitted": state.core.events.event_count(),
-                "active_subscribers": state.core.events.subscriber_count()
-            },
-            "checkpoints": state.core.checkpoints.checkpoint_count(),
-            "skills_registered": state.core.skills.skill_count(),
-            "sandbox": crate::tools::builtin::sandbox::sandbox_runtime_snapshot(),
-            "verify_first": crate::core::sa::verify_first_runtime_snapshot(),
-            "memory_scheduler": crate::memory::scheduler::MemoryScheduler::runtime_snapshot(),
-            "embedding_health": crate::memory::embedding_health_snapshot()
-        }
-    }))
-}
 
 async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut info = state.config_info.read().await.clone();
@@ -1827,11 +1691,6 @@ async fn run_agent_rag(
     }
 }
 
-/// GET /api/v1/mcp/servers — 返回已注册的 MCP 服务器
-async fn list_mcp_servers_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let servers = state.mcp_servers.read().await.clone();
-    Json(json!({ "count": servers.len(), "servers": servers }))
-}
 
 // ─── 对外发布：Public API（入站密钥鉴权 + scope + 限流/配额 + 审计）──────────────
 
@@ -2365,65 +2224,7 @@ async fn openai_chat_completions_handler(
     }
 }
 
-#[derive(Deserialize)]
-pub struct McpServerRegisterRequest {
-    pub name: String,
-    pub description: Option<String>,
-    pub endpoint: String,
-    pub protocol: Option<String>,
-}
 
-/// POST /api/v1/mcp/servers — 注册新的 MCP 服务器
-async fn register_mcp_server_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<McpServerRegisterRequest>,
-) -> impl IntoResponse {
-    let server = json!({
-        "id": uuid::Uuid::new_v4().hyphenated().to_string(),
-        "name": req.name,
-        "description": req.description.unwrap_or_default(),
-        "endpoint": req.endpoint,
-        "protocol": req.protocol.unwrap_or_else(|| "sse".to_string()),
-        "status": "active",
-    });
-    let id = server["id"].as_str().unwrap_or("").to_string();
-    let mut guard = state.mcp_servers.write().await;
-    guard.push(server);
-    let _ = save_mcp_servers(&guard);
-    (
-        StatusCode::CREATED,
-        Json(json!({ "id": id, "status": "registered" })),
-    )
-}
-
-async fn guard_audit_handler() -> impl IntoResponse {
-    let log = GUARD_AUDIT_LOG.read();
-    let entries: Vec<GuardAuditEntry> = log.clone();
-    Json(json!({
-        "total": entries.len(),
-        "entries": entries,
-    }))
-}
-
-async fn guard_stats_handler() -> impl IntoResponse {
-    let log = GUARD_AUDIT_LOG.read();
-    let total = log.len();
-    if total == 0 {
-        return Json(json!({
-            "total_checks": 0,
-            "passed_checks": 0,
-            "failed_checks": 0,
-            "pass_rate": 1.0,
-        }));
-    }
-    let passed = log.iter().filter(|e| e.validation_passed).count();
-    Json(json!({
-        "total_checks": total,
-        "passed_checks": passed,
-        "failed_checks": total - passed,
-        "pass_rate": passed as f64 / total as f64,
-    }))
-}
 
 
 async fn write_node_handler(
