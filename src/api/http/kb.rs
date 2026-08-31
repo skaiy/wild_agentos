@@ -1,7 +1,7 @@
 //! 知识包 / 知识库分类 / 向量与图谱知识库 CRUD、摄取、检索与重建。
 //!
-//! 路由仍由 `mod.rs` 的 `build_router` 组装；RAG 扩包、kg_import/query、图片与
-//! 模型/embedding 热切换处理器留在 `mod.rs`。
+//! 路由仍由 `mod.rs` 的 `build_router` 组装；RAG/Public/OpenAI 见 `chat.rs`；
+//! kg_import/query、图片与模型/embedding 热切换处理器留在 `mod.rs`。
 
 use std::sync::Arc;
 
