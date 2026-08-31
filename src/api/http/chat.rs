@@ -1,6 +1,6 @@
 //! Agent 聊天 / RAG、对外 Public 门禁与 OpenAI 兼容层。
 //!
-//! 路由仍由 `mod.rs` 的 `build_router` 组装；config / kg_import / 图片与模型热切换留在 `mod.rs`。
+//! 路由仍由 `mod.rs` 的 `build_router` 组装。
 
 use std::convert::Infallible;
 use std::sync::Arc;
