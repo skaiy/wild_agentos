@@ -1,4 +1,5 @@
 pub mod consistency_engine;
+pub mod context_recall;
 pub mod embedding_service;
 pub mod hyperspace_store;
 pub mod l0_store;
@@ -12,6 +13,7 @@ pub mod scheduler;
 pub mod unified_graph;
 
 pub use consistency_engine::{ConsistencyEngine, WriteStrategy};
+pub use context_recall::{SemanticQuery, SemanticQueryError, TaskIri};
 pub use embedding_service::{
     create_embedding_service_from_config, embedding_health_snapshot, record_embedding_health,
     EmbeddingService, FallbackEmbeddingService, OneApiEmbeddingService,
