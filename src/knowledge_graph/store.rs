@@ -104,7 +104,7 @@ impl KnowledgeGraphStore {
         let graph = claims
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {}", e))?;
-        self.query_sparql(sparql, Some(&graph))
+        self.query_sparql_in_graph(sparql, Some(&graph))
     }
 
     pub fn delete_quads_for_source(&self, source_file: &str, graph: &str) -> Result<usize, String> {
@@ -165,8 +165,17 @@ impl KnowledgeGraphStore {
         Ok(count)
     }
 
-    #[allow(deprecated)]
+    /// Reads without a verified graph scope are rejected.
+    #[deprecated(note = "graph reads require query_sparql_for_claims with verified claims")]
     pub fn query_sparql(
+        &self,
+        _sparql: &str,
+        _named_graph: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        Err("verified isolation claims are required for graph reads".to_string())
+    }
+
+    fn query_sparql_in_graph(
         &self,
         sparql: &str,
         named_graph: Option<&str>,
@@ -280,31 +289,10 @@ impl KnowledgeGraphStore {
 
     pub fn search_entities(
         &self,
-        keyword: &str,
-        entity_type: Option<&str>,
+        _keyword: &str,
+        _entity_type: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let escaped = Self::escape_sparql_string(keyword);
-
-        let type_filter = match entity_type {
-            Some(t) => format!(
-                "?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{}> .",
-                t
-            ),
-            None => String::new(),
-        };
-
-        let sparql = format!(
-            "SELECT DISTINCT ?s ?label WHERE {{ \
-               GRAPH ?g {{ \
-                 ?s <http://www.w3.org/2000/01/rdf-schema#label> ?label . \
-                 {} \
-                 FILTER(CONTAINS(LCASE(STR(?label)), LCASE(\"{}\"))) \
-               }} \
-             }}",
-            type_filter, escaped
-        );
-
-        self.query_sparql(&sparql, None)
+        Err("verified isolation claims are required for graph reads".to_string())
     }
 
     /// Searches entities in the graph minted from verified claims only.
@@ -336,85 +324,10 @@ impl KnowledgeGraphStore {
 
     pub fn get_neighbors(
         &self,
-        entity_id: &str,
-        depth: usize,
+        _entity_id: &str,
+        _depth: usize,
     ) -> Result<serde_json::Value, String> {
-        if depth == 0 || depth > 3 {
-            return Ok(serde_json::json!({
-                "entity": entity_id,
-                "neighbors": [],
-                "depth": depth
-            }));
-        }
-
-        let mut all_neighbors = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        visited.insert(entity_id.to_string());
-        let mut current_level = vec![entity_id.to_string()];
-
-        for level in 0..depth {
-            let mut next_level = Vec::new();
-
-            for node_id in &current_level {
-                let node = format!("<{}>", node_id);
-
-                let out_sparql =
-                    format!("SELECT ?p ?o WHERE {{ GRAPH ?g {{ {} ?p ?o . }} }}", node);
-                let out_results = self.query_sparql(&out_sparql, None)?;
-
-                for row in &out_results {
-                    if let (Some(pred), Some(obj)) = (
-                        row.get("?p").and_then(|v| v.as_str()),
-                        row.get("?o").and_then(|v| v.as_str()),
-                    ) {
-                        let obj_clean = obj.trim_start_matches('<').trim_end_matches('>');
-                        all_neighbors.push(serde_json::json!({
-                            "source": node_id,
-                            "predicate": pred,
-                            "target": obj_clean,
-                            "direction": "outgoing",
-                            "level": level + 1
-                        }));
-                        if !visited.contains(obj_clean) && level + 1 < depth {
-                            next_level.push(obj_clean.to_string());
-                        }
-                        visited.insert(obj_clean.to_string());
-                    }
-                }
-
-                let in_sparql = format!("SELECT ?s ?p WHERE {{ GRAPH ?g {{ ?s ?p {} . }} }}", node);
-                let in_results = self.query_sparql(&in_sparql, None)?;
-
-                for row in &in_results {
-                    if let (Some(subj), Some(pred)) = (
-                        row.get("?s").and_then(|v| v.as_str()),
-                        row.get("?p").and_then(|v| v.as_str()),
-                    ) {
-                        let subj_clean = subj.trim_start_matches('<').trim_end_matches('>');
-                        all_neighbors.push(serde_json::json!({
-                            "source": subj_clean,
-                            "predicate": pred,
-                            "target": node_id,
-                            "direction": "incoming",
-                            "level": level + 1
-                        }));
-                        if !visited.contains(subj_clean) && level + 1 < depth {
-                            next_level.push(subj_clean.to_string());
-                        }
-                        visited.insert(subj_clean.to_string());
-                    }
-                }
-            }
-
-            current_level = next_level;
-        }
-
-        Ok(serde_json::json!({
-            "entity": entity_id,
-            "neighbors": all_neighbors,
-            "depth": depth,
-            "total_found": all_neighbors.len()
-        }))
+        Err("verified isolation claims are required for graph reads".to_string())
     }
 
     /// Traverses neighbours in the graph minted from verified claims only.
@@ -819,7 +732,9 @@ mod tests {
     #[test]
     fn test_get_neighbors_zero_depth() {
         let store = KnowledgeGraphStore::new().unwrap();
-        let result = store.get_neighbors("http://example.org/alice", 0).unwrap();
+        let result = store
+            .get_neighbors_for_claims(&claims(), "http://example.org/alice", 0)
+            .unwrap();
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
         assert!(
             neighbors.is_empty(),
@@ -978,11 +893,20 @@ mod tests {
         );
 
         let legacy_results = store
-            .query_sparql(
-                "SELECT ?s WHERE { ?s <http://example.org/name> \"legacy\" }",
-                Some("graph:world"),
+            .store
+            .query(
+                "SELECT ?s WHERE {
+                    GRAPH <graph:world> { ?s <http://example.org/name> \"legacy\" }
+                }",
             )
             .unwrap();
-        assert_eq!(legacy_results.len(), 1, "legacy graph:world remains intact");
+        let QueryResults::Solutions(legacy_results) = legacy_results else {
+            panic!("expected legacy graph query to return solutions");
+        };
+        assert_eq!(
+            legacy_results.count(),
+            1,
+            "legacy graph:world remains intact"
+        );
     }
 }
