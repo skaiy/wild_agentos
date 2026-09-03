@@ -2238,7 +2238,11 @@ mod kb_isolation_http_tests {
         let unauthenticated = Request::builder()
             .method("POST")
             .uri("/kb/graph-kb/import")
-            .body(Body::empty())
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=claims-required",
+            )
+            .body(Body::from("--claims-required--\r\n"))
             .unwrap();
         assert_eq!(
             response_json(&app, unauthenticated).await.0,
