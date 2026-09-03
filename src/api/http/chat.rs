@@ -244,6 +244,14 @@ async fn resolve_agent_model(state: &Arc<AppState>, agent: &Value, keys: &[&str]
         .unwrap_or_else(|| state.gateway.default_model())
 }
 
+/// Claims-scoped chat may use only an agent explicitly owned by the same
+/// tenant/project. Missing scope is denied rather than treated as a shared
+/// agent, so a legacy record cannot accidentally expose its prompt or model.
+fn agent_matches_claims(agent: &Value, claims: &IsolationClaims) -> bool {
+    agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+        && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+}
+
 /// 单轮聊天上下文组装。提供 claims 时执行 claims-scoped RAG；未提供时不访问
 /// tenant 图或向量库，供 API-key 的公开聊天面使用。
 /// 返回可复用的 RagContext，供内部 chat、对外 public chat、SSE 流式与 OpenAI 兼容层共用。
@@ -286,6 +294,17 @@ async fn build_chat_context(
             ))
         }
     };
+    if let Some(claims) = claims {
+        if !agent_matches_claims(&agent, claims) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": "agent is not accessible in the verified tenant/project scope",
+                    "id": id,
+                }),
+            ));
+        }
+    }
     let agent_name = agent
         .get("name")
         .and_then(|v| v.as_str())
@@ -1102,10 +1121,17 @@ mod tests {
             config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
             agents_info: json!({ "count": 0, "agents": [] }),
             mcp_servers: Arc::new(tokio::sync::RwLock::new(vec![])),
-            user_agents: Arc::new(tokio::sync::RwLock::new(vec![json!({
-                "id": "agent-1", "name": "Test agent",
-                "knowledge_pack_ids": ["attacker-pack"]
-            })])),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![
+                json!({
+                    "id": "agent-a", "name": "Tenant A agent",
+                    "tenant_id": "tenant-a", "project_id": "project-1",
+                    "knowledge_pack_ids": ["attacker-pack"]
+                }),
+                json!({
+                    "id": "agent-b", "name": "Tenant B agent",
+                    "tenant_id": "tenant-b", "project_id": "project-1"
+                }),
+            ])),
             prompts: Arc::new(PromptRegistry::new()),
             kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
             knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
@@ -1145,17 +1171,42 @@ mod tests {
         insert_fault(&state.kg_store, &tenant_a, "P0A80");
         insert_fault(&state.kg_store, &tenant_b, "P0A81");
 
-        let a = build_chat_context(&state, "agent-1", "P0A80", &[], Some(&tenant_a))
+        let a = build_chat_context(&state, "agent-a", "P0A80", &[], Some(&tenant_a))
             .await
             .unwrap();
         assert_eq!(a.retrieved, 1);
         assert_eq!(a.sources[0]["code"], "P0A80");
 
-        // The same request cannot enumerate tenant A when claims mint tenant B's graph.
-        let b = build_chat_context(&state, "agent-1", "P0A80", &[], Some(&tenant_b))
+        // Tenant B's permitted agent cannot enumerate tenant A's graph.
+        let b = build_chat_context(&state, "agent-b", "P0A80", &[], Some(&tenant_b))
             .await
             .unwrap();
         assert_eq!(b.retrieved, 0);
+    }
+
+    #[tokio::test]
+    async fn claims_scoped_chat_rejects_an_agent_owned_by_another_tenant() {
+        let state = make_state();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
+
+        let err = build_chat_context(&state, "agent-a", "P0A80", &[], Some(&tenant_b))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn public_api_key_chat_context_performs_no_tenant_rag() {
+        let state = make_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        insert_fault(&state.kg_store, &tenant_a, "P0A80");
+
+        // `None` is passed exclusively by API-key public endpoints.
+        let public = build_chat_context(&state, "agent-a", "P0A80", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(public.retrieved, 0);
+        assert_eq!(public.vector_retrieved, 0);
     }
 
     #[tokio::test]
@@ -1168,7 +1219,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/agents/agent-1/chat")
+                    .uri("/api/v1/agents/agent-a/chat")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         r#"{"message":"P0A80","named_graph":"graph://tenant-b/project-1","vector_namespace":"vector://tenant-b/project-1"}"#,

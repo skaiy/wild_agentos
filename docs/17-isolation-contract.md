@@ -110,8 +110,11 @@ are not returned by claims-scoped search.
 The internal agent chat RAG endpoint requires JWT-verified `IsolationClaims`.
 Its graph and vector retrieval targets are minted from those claims; client
 `named_graph` and `vector_namespace` fields and agent knowledge-pack target
-configuration are ignored. Retrieval errors are returned rather than being
-silently converted into an empty result. Public API-key chat does not carry
+configuration are ignored. The requested agent record must explicitly have the
+same tenant and project as the verified claims; missing or mismatched agent
+scope is rejected, so legacy unscoped agents are not shared implicitly.
+Retrieval errors are returned rather than being silently converted into an
+empty result. Public API-key chat does not carry
 tenant/project claims and therefore performs no tenant RAG at all—it never
 falls back to a tenant graph or vector namespace.
 
