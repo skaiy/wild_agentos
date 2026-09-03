@@ -1864,10 +1864,7 @@ fn node_visible_in_prompt(node: &Node, scope: PromptReadScope<'_>) -> bool {
     }
 
     author == scope.agent_id
-        || value
-            .get("prompt_visibility")
-            .and_then(|v| v.as_str())
-            == Some("shared")
+        || value.get("prompt_visibility").and_then(|v| v.as_str()) == Some("shared")
 }
 
 fn extract_task_iri(node_iri: &str) -> Option<String> {

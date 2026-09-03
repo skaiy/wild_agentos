@@ -35,7 +35,9 @@ impl SupervisorAgent {
         // Query context from L2 blackboard (replaces prev_summary)
         // Use query_nodes_filtered for role/cycle-aware context (AA uses prev_summary)
         let sharing_permitted = context.share_prompt_context && context.isolation_claims.is_some();
-        let prev_agent_summary = sharing_permitted.then(|| context.prev_agent_summary.clone()).flatten();
+        let prev_agent_summary = sharing_permitted
+            .then(|| context.prev_agent_summary.clone())
+            .flatten();
         let prev_summary = if role == AgentRole::Act {
             prev_agent_summary.clone()
         } else if let (Some(blackboard), Some(claims)) =
