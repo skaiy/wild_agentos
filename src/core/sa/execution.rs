@@ -818,6 +818,9 @@ impl SupervisorAgent {
                     .with_original_task(user_input)
                     .with_step_info(&step.expected_output, &step.success_criteria)
                     .with_cycle_id(&cycle_id);
+                if let Some(claims) = self.isolation_claims.clone() {
+                    context = context.with_isolation_claims(claims);
+                }
                 context = context.with_five_w2h(five_w2h_iri, five_w2h.clone());
 
                 // Resume mode: history messages on first executed step
