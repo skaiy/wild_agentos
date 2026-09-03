@@ -428,7 +428,7 @@ pub(crate) async fn list_knowledge_bases_handler(
         .filter(|kb| kb_belongs_to_claims(kb, claims))
         .cloned()
         .collect();
-    Json(json!({ "count": bases.len(), "bases": bases }))
+    (StatusCode::OK, Json(json!({ "count": bases.len(), "bases": bases })))
 }
 
 /// POST /api/v1/kb/bases — 创建知识库（向量/图），图类型在 oxigraph 落盘命名图元数据
