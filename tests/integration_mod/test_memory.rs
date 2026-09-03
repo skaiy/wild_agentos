@@ -12,7 +12,7 @@ use wild_agent_os_core::CoreConfig;
 #[test]
 fn test_memory_pipeline() {
     let dir = tempdir().unwrap();
-    let l0 = Arc::new(L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap());
+    let l0 = super::writable_l0(dir.path());
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
 
@@ -54,7 +54,7 @@ fn test_memory_pipeline() {
 #[test]
 fn test_memory_manager() {
     let dir = tempdir().unwrap();
-    let l0 = Arc::new(L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap());
+    let l0 = super::writable_l0(dir.path());
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let mut mm = MemoryManager::new(l0.clone(), l2.clone(), proj.clone(), CoreConfig::default());
@@ -183,7 +183,7 @@ fn test_full_pipeline_with_vector_store() {
         let claims =
             IsolationClaims::from_verified("test-tenant", "memory-project", "test-agent").unwrap();
         // Build full stack with vector store
-        let l0 = Arc::new(L0Store::new(_dir.path().to_string_lossy().as_ref()).unwrap());
+        let l0 = super::writable_l0(_dir.path());
         let l2 = Arc::new(Blackboard::new().unwrap());
         let store = Arc::new(HyperspaceStore::open(vdir.path(), embed).unwrap());
 

@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+mod support;
+
 use wild_agent_os_core::config::settings::AgentSettings;
 use wild_agent_os_core::core::agent_instance::{AgentInstance, AgentRole};
 use wild_agent_os_core::core::agent_runner::{AgentRunner, TaskContext};
@@ -43,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let gw = Arc::new(UnifiedGateway::new(&gateway_settings)?);
 
-    let l0 = Arc::new(L0Store::new(&format!("{}/l0", OUTPUT))?);
+    let l0 = support::writable_l0(format!("{}/l0", OUTPUT));
     let l2 = Arc::new(Blackboard::new()?);
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(

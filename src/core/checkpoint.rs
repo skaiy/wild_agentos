@@ -656,11 +656,11 @@ mod tests {
     #[test]
     fn pdca_envelope_writes_and_reads_verified_claims_snapshot() {
         let dir = tempfile::TempDir::new().unwrap();
-        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
-        let manager = CheckpointManager::with_persistence(l0);
         let claims =
             crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
                 .unwrap();
+        let l0 = Arc::new(L0Store::open_for_claims(dir.path(), &claims).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
         let tools = vec!["file_read".to_string(), "search".to_string()];
 
         let written = manager
@@ -681,7 +681,10 @@ mod tests {
     #[test]
     fn pdca_envelope_refuses_missing_claims() {
         let dir = tempfile::TempDir::new().unwrap();
-        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let claims =
+            crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
+                .unwrap();
+        let l0 = Arc::new(L0Store::open_for_claims(dir.path(), &claims).unwrap());
         let manager = CheckpointManager::with_persistence(l0);
 
         let error = manager
@@ -699,11 +702,11 @@ mod tests {
     #[test]
     fn pdca_resume_requires_matching_claims_and_skips_completed_write_step() {
         let dir = tempfile::TempDir::new().unwrap();
-        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
-        let manager = CheckpointManager::with_persistence(l0);
         let claims =
             crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
                 .unwrap();
+        let l0 = Arc::new(L0Store::open_for_claims(dir.path(), &claims).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
         let task = "iri://task/resume-file-write";
 
         // First entry completes Plan and submits Do's file_write before an
@@ -754,11 +757,11 @@ mod tests {
     #[test]
     fn pdca_envelope_does_not_use_plan_tools_allowed_as_advertisement() {
         let dir = tempfile::TempDir::new().unwrap();
-        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
-        let manager = CheckpointManager::with_persistence(l0);
         let claims =
             crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
                 .unwrap();
+        let l0 = Arc::new(L0Store::open_for_claims(dir.path(), &claims).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
         let plan_step = crate::core::sa::PlanStep {
             step_id: "plan".to_string(),
             role: crate::core::agent_instance::AgentRole::Plan,
@@ -788,7 +791,10 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempfile::TempDir::new().unwrap();
-        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let claims =
+            crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
+                .unwrap();
+        let l0 = Arc::new(L0Store::open_for_claims(dir.path(), &claims).unwrap());
         let mgr = CheckpointManager::with_persistence(l0.clone());
 
         // Create checkpoint (simulating running in a previous process)

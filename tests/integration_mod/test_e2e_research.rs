@@ -92,7 +92,7 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
 
     let gateway = Arc::new(UnifiedGateway::new(&settings).expect("Failed to create gateway"));
     let dir = TempDir::new().unwrap();
-    let l0 = Arc::new(L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap());
+    let l0 = super::writable_l0(dir.path().join("l0"));
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let core_config = CoreConfig::default();
