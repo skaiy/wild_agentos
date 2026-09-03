@@ -12,6 +12,7 @@ use crate::core::constitution::ConstitutionRegistry;
 use crate::core::context_compressor::{ContextWindowManager, ToolResultCompressor};
 use crate::core::relevance_tracker::RelevanceTracker;
 use crate::gateway::unified_gateway::{ChatMessage, UnifiedGateway};
+use crate::isolation::IsolationClaims;
 use crate::memory::l0_store::L0Store;
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
@@ -101,6 +102,12 @@ pub struct TaskContext {
     pub workspace_file_summary: Option<String>,
     /// Per-step tool allowlist from the plan. None = no step-level restriction.
     pub allowed_tools: Option<Vec<String>>,
+    /// Verified scope required before another agent may receive this task's
+    /// blackboard context in its prompt.
+    pub isolation_claims: Option<IsolationClaims>,
+    /// Explicit producer opt-in for sharing prompt context with agents in the
+    /// same verified scope. The default is agent-private.
+    pub share_prompt_context: bool,
 }
 
 impl TaskContext {
@@ -129,6 +136,8 @@ impl TaskContext {
             cycle_id: String::new(),
             workspace_file_summary: None,
             allowed_tools: None,
+            isolation_claims: None,
+            share_prompt_context: false,
         }
     }
 
@@ -143,6 +152,22 @@ impl TaskContext {
     pub fn with_identity(mut self, user_id: Option<String>, tenant_id: Option<String>) -> Self {
         self.user_id = user_id;
         self.tenant_id = tenant_id;
+        self
+    }
+
+    /// Attaches claims already verified by an authentication boundary.
+    ///
+    /// Prompt sharing remains disabled until [`Self::with_prompt_sharing`] is
+    /// also called.
+    pub fn with_isolation_claims(mut self, claims: IsolationClaims) -> Self {
+        self.isolation_claims = Some(claims);
+        self
+    }
+
+    /// Explicitly allows this agent's prompt context to be shared with agents
+    /// that present matching verified isolation claims.
+    pub fn with_prompt_sharing(mut self) -> Self {
+        self.share_prompt_context = true;
         self
     }
     pub fn with_cycle_id(mut self, cycle_id: &str) -> Self {
@@ -244,6 +269,8 @@ impl Default for TaskContext {
             cycle_id: String::new(),
             workspace_file_summary: None,
             allowed_tools: None,
+            isolation_claims: None,
+            share_prompt_context: false,
         }
     }
 }

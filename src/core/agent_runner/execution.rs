@@ -1583,7 +1583,21 @@ Output the summary report directly, not in JSON format."#,
                 "content": parsed.content,
                 "content_len": parsed.content.len(),
                 "is_valid_json": parsed.is_valid_json,
-                "has_native_reasoning": parsed.has_native_reasoning
+                "has_native_reasoning": parsed.has_native_reasoning,
+                "agent_id": agent.agent_id,
+                "prompt_visibility": if ctx.share_prompt_context {
+                    "shared"
+                } else {
+                    "agent_private"
+                },
+                "tenant_id": ctx
+                    .isolation_claims
+                    .as_ref()
+                    .map(|claims| claims.tenant_id()),
+                "project_id": ctx
+                    .isolation_claims
+                    .as_ref()
+                    .map(|claims| claims.project_id())
             });
             if let Some(ref thought) = parsed.thought {
                 node_json["has_thought"] = Value::Bool(true);
