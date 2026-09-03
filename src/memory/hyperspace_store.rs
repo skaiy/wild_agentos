@@ -568,8 +568,16 @@ impl HyperspaceStore {
         })?;
         let mut scoped_filter = filter.clone();
         scoped_filter.named_graph = Some(namespace);
-        self.search_with_filter_inner(query, &scoped_filter, limit)
-            .await
+        let namespace_prefix = format!("{namespace}#");
+        // Hyperspace treats an empty filter bitmap as an unfiltered search.
+        // Retain only the scoped engine IRIs as a fail-closed guard when the
+        // requested namespace has no indexed vectors.
+        Ok(self
+            .search_with_filter_inner(query, &scoped_filter, limit)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.iri.starts_with(&namespace_prefix))
+            .collect())
     }
 
     async fn search_with_filter_inner(
