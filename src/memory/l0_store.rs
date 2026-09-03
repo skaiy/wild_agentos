@@ -5,9 +5,11 @@
 use chrono::{DateTime, Utc};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
 
+use crate::isolation::IsolationClaims;
 use crate::jsonld::registry::{EntityLocation, IriRegistry, StorageLayer};
 use crate::CoreError;
 
@@ -90,9 +92,26 @@ const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entrie
 const TAG_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tag_index");
 const NAMED_GRAPH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("named_graph");
 
+fn tenant_path(l0_root: &Path, claims: &IsolationClaims) -> Result<PathBuf, CoreError> {
+    let minted_path = claims.l0_path().map_err(|e| CoreError::PermissionDenied {
+        agent: "l0_store".to_string(),
+        resource: l0_root.display().to_string(),
+        action: format!("open tenant L0 path with invalid verified claims: {e}"),
+    })?;
+    let tenant = minted_path
+        .file_name()
+        .ok_or_else(|| CoreError::PermissionDenied {
+            agent: "l0_store".to_string(),
+            resource: l0_root.display().to_string(),
+            action: "open tenant L0 path without a tenant segment".to_string(),
+        })?;
+    Ok(l0_root.join(tenant))
+}
+
 /// L0 Store
 pub struct L0Store {
     db: Database,
+    writable: bool,
     #[allow(dead_code)]
     config: L0Config,
     #[allow(dead_code)]
@@ -102,27 +121,67 @@ pub struct L0Store {
 }
 
 impl L0Store {
+    /// Opens the legacy shared L0 database in read-only compatibility mode.
+    ///
+    /// New writes require [`Self::open_for_claims`], which mints a tenant
+    /// directory. This constructor deliberately does not create the legacy
+    /// path, preserving existing history without treating it as tenant data.
     pub fn new(path: &str) -> Result<Self, CoreError> {
-        info!("Initializing L0 Store: {}", path);
+        let db_path = Path::new(path).join("l0.redb");
+        let db = Database::open(&db_path).map_err(|e| CoreError::StorageError {
+            message: format!("Failed to open legacy read-only database: {}", e),
+        })?;
 
-        std::fs::create_dir_all(path).map_err(|e| CoreError::StorageError {
+        Self::from_database(db, path.to_owned(), false)
+    }
+
+    /// Opens a writable L0 database scoped to verified tenant claims.
+    ///
+    /// `l0_root` is the local representation of the `/data/l0` root from the
+    /// isolation contract. Only the minted tenant path is created, on demand.
+    pub fn open_for_claims(
+        l0_root: impl AsRef<Path>,
+        claims: &IsolationClaims,
+    ) -> Result<Self, CoreError> {
+        let tenant_path = tenant_path(l0_root.as_ref(), claims)?;
+        info!(
+            "Initializing tenant-scoped L0 Store: {}",
+            tenant_path.display()
+        );
+
+        std::fs::create_dir_all(&tenant_path).map_err(|e| CoreError::StorageError {
             message: format!("Failed to create storage directory: {}", e),
         })?;
 
-        let db_path = std::path::Path::new(path).join("l0.redb");
-        let db_path_str = db_path.to_string_lossy();
-        let db = Database::create(db_path_str.as_ref()).map_err(|e| CoreError::StorageError {
+        let db_path = tenant_path.join("l0.redb");
+        let db = Database::create(&db_path).map_err(|e| CoreError::StorageError {
             message: format!("Failed to open database: {}", e),
         })?;
 
+        Self::from_database(db, tenant_path.to_string_lossy().into_owned(), true)
+    }
+
+    fn from_database(db: Database, path: String, writable: bool) -> Result<Self, CoreError> {
         // Ensure tables exist by opening them in a write transaction
-        {
+        if writable {
             let write_txn = db.begin_write().map_err(|e| CoreError::StorageError {
                 message: format!("Failed to begin write transaction: {}", e),
             })?;
-            let _ = write_txn.open_table(ENTRIES_TABLE);
-            let _ = write_txn.open_table(TAG_INDEX_TABLE);
-            let _ = write_txn.open_table(NAMED_GRAPH_TABLE);
+            write_txn
+                .open_table(ENTRIES_TABLE)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to open entries table: {}", e),
+                })?;
+            write_txn
+                .open_table(TAG_INDEX_TABLE)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to open tag index table: {}", e),
+                })?;
+            write_txn
+                .open_table(NAMED_GRAPH_TABLE)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to open named graph table: {}", e),
+                })?;
             write_txn.commit().map_err(|e| CoreError::StorageError {
                 message: format!("Failed to commit transaction: {}", e),
             })?;
@@ -145,12 +204,24 @@ impl L0Store {
 
         Ok(Self {
             db,
+            writable,
             config: L0Config {
-                path: path.to_string(),
+                path,
                 ..Default::default()
             },
             entry_count,
             iri_registry: None,
+        })
+    }
+
+    fn assert_writable(&self) -> Result<(), CoreError> {
+        if self.writable {
+            return Ok(());
+        }
+        Err(CoreError::PermissionDenied {
+            agent: "l0_store".to_string(),
+            resource: self.config.path.clone(),
+            action: "write L0 data without verified claims".to_string(),
         })
     }
 
@@ -250,6 +321,7 @@ impl L0Store {
     }
 
     pub fn store(&self, iri: &str, content: &str) -> Result<(), CoreError> {
+        self.assert_writable()?;
         let content_hash = compute_content_hash(content);
 
         let existing_entry = self.retrieve_without_update(iri)?;
@@ -387,6 +459,7 @@ impl L0Store {
     }
 
     pub fn store_entry(&self, entry: &L0Entry) -> Result<(), CoreError> {
+        self.assert_writable()?;
         let old_tags = self.get_entry_tags(&entry.iri)?;
         let old_named_graph = self.get_entry_named_graph(&entry.iri)?;
 
@@ -596,6 +669,9 @@ impl L0Store {
                     })?;
                 drop(read_txn);
 
+                if !self.writable {
+                    return Ok(Some(entry));
+                }
                 entry.access_count += 1;
                 entry.last_accessed = Utc::now();
                 self.store_entry(&entry)?;
@@ -607,6 +683,7 @@ impl L0Store {
     }
 
     pub fn delete(&self, iri: &str) -> Result<bool, CoreError> {
+        self.assert_writable()?;
         let old_tags = self.get_entry_tags(iri)?;
 
         for tag in &old_tags {
@@ -856,6 +933,7 @@ impl L0Store {
 
     /// Update entry MESI cache coherence state
     pub fn update_mesi_state(&self, iri: &str, state: MesiState) -> Result<(), CoreError> {
+        self.assert_writable()?;
         let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
             message: format!("Read transaction failed: {}", e),
         })?;
@@ -936,6 +1014,7 @@ impl L0Store {
 
     /// Delete all entries in a named graph
     pub fn delete_named_graph(&self, graph: &str) -> Result<usize, CoreError> {
+        self.assert_writable()?;
         let entries = self.query_by_named_graph(graph)?;
         let count = entries.len();
 
@@ -1065,6 +1144,7 @@ impl L0Store {
     }
 
     pub fn store_jsonld_node(&self, node: &serde_json::Value) -> Result<String, CoreError> {
+        self.assert_writable()?;
         let node_obj = node.as_object().ok_or_else(|| CoreError::StorageError {
             message: "JSON-LD node must be an object".to_string(),
         })?;
@@ -1284,10 +1364,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_store(dir: &tempfile::TempDir) -> L0Store {
+        let claims =
+            IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap();
+        L0Store::open_for_claims(dir.path(), &claims).unwrap()
+    }
+
     #[test]
     fn test_l0_store() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         store.store("iri://test/1", r#"{"test": true}"#).unwrap();
 
@@ -1299,6 +1385,50 @@ mod tests {
     }
 
     #[test]
+    fn tenant_scoped_stores_do_not_expose_other_tenant_entries() {
+        let dir = tempdir().unwrap();
+        let acme = IsolationClaims::from_verified("acme", "project", "actor").unwrap();
+        let other = IsolationClaims::from_verified("other", "project", "actor").unwrap();
+        let acme_path = dir.path().join("acme");
+        let other_path = dir.path().join("other");
+
+        assert!(!acme_path.exists());
+        assert!(!other_path.exists());
+
+        let acme_store = L0Store::open_for_claims(dir.path(), &acme).unwrap();
+        acme_store
+            .store("iri://checkpoint/task/1", "acme-only")
+            .unwrap();
+        let other_store = L0Store::open_for_claims(dir.path(), &other).unwrap();
+
+        assert!(acme_path.join("l0.redb").exists());
+        assert!(other_path.join("l0.redb").exists());
+        assert!(other_store
+            .retrieve("iri://checkpoint/task/1")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            acme_store
+                .retrieve("iri://checkpoint/task/1")
+                .unwrap()
+                .unwrap()
+                .content,
+            "acme-only"
+        );
+    }
+
+    #[test]
+    fn legacy_l0_store_rejects_writes_without_claims() {
+        let dir = tempdir().unwrap();
+        Database::create(dir.path().join("l0.redb")).unwrap();
+        let store = L0Store::new(dir.path().to_str().unwrap()).unwrap();
+
+        let error = store.store("iri://test/1", "unclaimed").unwrap_err();
+
+        assert!(matches!(error, CoreError::PermissionDenied { .. }));
+    }
+
+    #[test]
     fn test_mesi_state_default() {
         assert_eq!(MesiState::default(), MesiState::Shared);
     }
@@ -1306,7 +1436,7 @@ mod tests {
     #[test]
     fn test_update_mesi_state() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         store.store("iri://test/mesi", "content").unwrap();
         store
@@ -1320,7 +1450,7 @@ mod tests {
     #[test]
     fn test_tag_index() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         let entry = L0Entry {
             iri: "iri://test/tagged".to_string(),
@@ -1348,7 +1478,7 @@ mod tests {
     #[test]
     fn test_delete_cleans_tag_index() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         let entry = L0Entry {
             iri: "iri://test/del".to_string(),
@@ -1385,7 +1515,7 @@ mod tests {
     #[test]
     fn test_search_with_index_fallback() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         store
             .store("iri://test/fallback", "fallback content")
@@ -1400,7 +1530,7 @@ mod tests {
     #[test]
     fn test_entity_alignment() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         let mut entry1 = L0Entry {
             iri: "iri://test/entity".to_string(),
@@ -1461,7 +1591,7 @@ mod tests {
     #[test]
     fn test_query_by_type() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         let entry1 = L0Entry {
             iri: "iri://test/person1".to_string(),
@@ -1531,7 +1661,7 @@ mod tests {
     #[test]
     fn test_query_by_types() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         let entry1 = L0Entry {
             iri: "iri://test/entity1".to_string(),
@@ -1581,7 +1711,7 @@ mod tests {
     #[test]
     fn test_jsonld_node_storage() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         let node = serde_json::json!({
             "@id": "iri://test/person/alice",
@@ -1610,7 +1740,7 @@ mod tests {
     #[test]
     fn test_jsonld_node_merge() {
         let dir = tempdir().unwrap();
-        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let store = test_store(&dir);
 
         let node1 = serde_json::json!({
             "@id": "iri://test/person/bob",
