@@ -2,6 +2,8 @@ use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 use std::sync::Arc;
 
+use crate::isolation::IsolationClaims;
+
 use super::rdf_mapper::RdfMapper;
 use super::types::RdfQuad;
 
@@ -51,14 +53,58 @@ impl KnowledgeGraphStore {
         })
     }
 
-    pub fn write_quads(&self, quads: &[RdfQuad], graph: &str) -> Result<(), String> {
+    /// Writes are only permitted through [`Self::write_quads_for_claims`].
+    ///
+    /// Keeping this method as a failing compatibility shim prevents a caller
+    /// from silently continuing to write new data into a caller-supplied graph,
+    /// including the historical `graph:world` graph.
+    #[deprecated(note = "new graph writes require write_quads_for_claims with verified claims")]
+    pub fn write_quads(&self, _quads: &[RdfQuad], _graph: &str) -> Result<(), String> {
+        Err("verified isolation claims are required for graph writes".to_string())
+    }
+
+    /// Writes quads to the graph minted from verified tenant and project claims.
+    ///
+    /// The quad graph fields and any caller-selected graph are deliberately
+    /// ignored: new data can only enter `graph://{tenant}/{project}`.
+    pub fn write_quads_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        quads: &[RdfQuad],
+    ) -> Result<(), String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
         if quads.is_empty() {
             return Ok(());
         }
-        let sparql = RdfMapper::quads_to_sparql_insert(quads, graph);
+        let sparql = RdfMapper::quads_to_sparql_insert(quads, &graph);
         self.store
             .update(&sparql)
             .map_err(|e| format!("SPARQL INSERT failed: {}", e))
+    }
+
+    /// Executes a SPARQL query exclusively against the graph minted from
+    /// verified tenant and project claims.
+    ///
+    /// Queries containing `GRAPH` are rejected instead of trusting a
+    /// caller-supplied graph target. This makes the scope non-bypassable and
+    /// prevents `GRAPH ?g` from enumerating another tenant's graph.
+    pub fn query_sparql_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        sparql: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        if sparql.to_uppercase().contains("GRAPH") {
+            return Err(
+                "scoped SPARQL queries must not contain GRAPH; the claims graph is applied automatically"
+                    .to_string(),
+            );
+        }
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        self.query_sparql(sparql, Some(&graph))
     }
 
     pub fn delete_quads_for_source(&self, source_file: &str, graph: &str) -> Result<usize, String> {
@@ -261,6 +307,33 @@ impl KnowledgeGraphStore {
         self.query_sparql(&sparql, None)
     }
 
+    /// Searches entities in the graph minted from verified claims only.
+    pub fn search_entities_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        keyword: &str,
+        entity_type: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let escaped = Self::escape_sparql_string(keyword);
+        let type_filter = entity_type.map_or_else(String::new, |entity_type| {
+            format!(
+                "?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{}> .",
+                entity_type
+            )
+        });
+        self.query_sparql_for_claims(
+            claims,
+            &format!(
+                "SELECT DISTINCT ?s ?label WHERE {{
+                    ?s <http://www.w3.org/2000/01/rdf-schema#label> ?label .
+                    {}
+                    FILTER(CONTAINS(LCASE(STR(?label)), LCASE(\"{}\")))
+                }}",
+                type_filter, escaped
+            ),
+        )
+    }
+
     pub fn get_neighbors(
         &self,
         entity_id: &str,
@@ -344,6 +417,74 @@ impl KnowledgeGraphStore {
         }))
     }
 
+    /// Traverses neighbours in the graph minted from verified claims only.
+    pub fn get_neighbors_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        entity_id: &str,
+        depth: usize,
+    ) -> Result<serde_json::Value, String> {
+        if depth == 0 || depth > 3 {
+            return Ok(serde_json::json!({
+                "entity": entity_id,
+                "neighbors": [],
+                "depth": depth
+            }));
+        }
+
+        let mut all_neighbors = Vec::new();
+        let mut visited = std::collections::HashSet::from([entity_id.to_string()]);
+        let mut current_level = vec![entity_id.to_string()];
+
+        for level in 0..depth {
+            let mut next_level = Vec::new();
+            for node_id in &current_level {
+                let node = format!("<{}>", node_id);
+                let out_sparql = format!("SELECT ?p ?o WHERE {{ {} ?p ?o . }}", node);
+                for row in self.query_sparql_for_claims(claims, &out_sparql)? {
+                    if let (Some(pred), Some(obj)) = (
+                        row.get("?p").and_then(|v| v.as_str()),
+                        row.get("?o").and_then(|v| v.as_str()),
+                    ) {
+                        let obj_clean = obj.trim_start_matches('<').trim_end_matches('>');
+                        all_neighbors.push(serde_json::json!({
+                            "source": node_id, "predicate": pred, "target": obj_clean,
+                            "direction": "outgoing", "level": level + 1
+                        }));
+                        if visited.insert(obj_clean.to_string()) && level + 1 < depth {
+                            next_level.push(obj_clean.to_string());
+                        }
+                    }
+                }
+
+                let in_sparql = format!("SELECT ?s ?p WHERE {{ ?s ?p {} . }}", node);
+                for row in self.query_sparql_for_claims(claims, &in_sparql)? {
+                    if let (Some(subj), Some(pred)) = (
+                        row.get("?s").and_then(|v| v.as_str()),
+                        row.get("?p").and_then(|v| v.as_str()),
+                    ) {
+                        let subj_clean = subj.trim_start_matches('<').trim_end_matches('>');
+                        all_neighbors.push(serde_json::json!({
+                            "source": subj_clean, "predicate": pred, "target": node_id,
+                            "direction": "incoming", "level": level + 1
+                        }));
+                        if visited.insert(subj_clean.to_string()) && level + 1 < depth {
+                            next_level.push(subj_clean.to_string());
+                        }
+                    }
+                }
+            }
+            current_level = next_level;
+        }
+
+        Ok(serde_json::json!({
+            "entity": entity_id,
+            "neighbors": all_neighbors,
+            "depth": depth,
+            "total_found": all_neighbors.len()
+        }))
+    }
+
     fn escape_sparql_string(s: &str) -> String {
         let mut escaped = String::with_capacity(s.len());
         for c in s.chars() {
@@ -402,6 +543,10 @@ mod tests {
     static KNOWS: &str = "http://example.org/knows";
     static TEST_GRAPH: &str = "http://test/graph";
 
+    fn claims() -> IsolationClaims {
+        IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap()
+    }
+
     fn make_quad(s: &str, p: &str, o: RdfValue) -> RdfQuad {
         RdfQuad {
             subject: s.to_string(),
@@ -436,10 +581,10 @@ mod tests {
             ),
         ];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
         let results = store
-            .query_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", Some(TEST_GRAPH))
+            .query_sparql_for_claims(&claims(), "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
             .unwrap();
 
         assert_eq!(results.len(), 3, "should return 3 triples");
@@ -462,7 +607,7 @@ mod tests {
     fn test_write_empty_quads() {
         let store = KnowledgeGraphStore::new().unwrap();
         let result = store.write_quads(&[], TEST_GRAPH);
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -502,20 +647,26 @@ mod tests {
             ),
         ];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
-        let results = store.search_entities("alice", None).unwrap();
+        let results = store
+            .search_entities_for_claims(&claims(), "alice", None)
+            .unwrap();
         assert_eq!(results.len(), 1, "fuzzy search should find Alice");
         let label = results[0].get("?label").and_then(|v| v.as_str()).unwrap();
         assert!(label.contains("Alice"));
 
-        let person_results = store.search_entities("o", Some(PERSON)).unwrap();
+        let person_results = store
+            .search_entities_for_claims(&claims(), "o", Some(PERSON))
+            .unwrap();
         assert!(
             person_results.len() >= 2,
             "search by type Person should find at least 2"
         );
 
-        let vehicle_results = store.search_entities("alice", Some(VEHICLE)).unwrap();
+        let vehicle_results = store
+            .search_entities_for_claims(&claims(), "alice", Some(VEHICLE))
+            .unwrap();
         assert_eq!(vehicle_results.len(), 0, "Alice is not Vehicle type");
     }
 
@@ -529,19 +680,25 @@ mod tests {
             RdfValue::Literal("Alice".to_string()),
         )];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
-        let upper = store.search_entities("ALICE", None).unwrap();
+        let upper = store
+            .search_entities_for_claims(&claims(), "ALICE", None)
+            .unwrap();
         assert_eq!(
             upper.len(),
             1,
             "case-insensitive search should find results"
         );
 
-        let lower = store.search_entities("alice", None).unwrap();
+        let lower = store
+            .search_entities_for_claims(&claims(), "alice", None)
+            .unwrap();
         assert_eq!(lower.len(), 1);
 
-        let mixed = store.search_entities("AlIcE", None).unwrap();
+        let mixed = store
+            .search_entities_for_claims(&claims(), "AlIcE", None)
+            .unwrap();
         assert_eq!(mixed.len(), 1);
     }
 
@@ -587,9 +744,11 @@ mod tests {
             ),
         ];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
-        let result = store.get_neighbors("http://example.org/alice", 1).unwrap();
+        let result = store
+            .get_neighbors_for_claims(&claims(), "http://example.org/alice", 1)
+            .unwrap();
 
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
         assert!(
@@ -625,9 +784,11 @@ mod tests {
             ),
         ];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
-        let result = store.get_neighbors("http://example.org/alice", 2).unwrap();
+        let result = store
+            .get_neighbors_for_claims(&claims(), "http://example.org/alice", 2)
+            .unwrap();
 
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
         assert!(
@@ -688,15 +849,11 @@ mod tests {
             RdfValue::Literal("X".to_string()),
         )];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
-        let results = store
-            .query_sparql("SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }", None)
-            .unwrap();
-        assert!(
-            !results.is_empty(),
-            "using GRAPH ?g should query triples in named graph"
-        );
+        let result = store
+            .query_sparql_for_claims(&claims(), "SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }");
+        assert!(result.is_err(), "claims-scoped queries must reject GRAPH");
     }
 
     #[test]
@@ -709,13 +866,11 @@ mod tests {
             RdfValue::Literal("X".to_string()),
         )];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
-        let sparql = format!(
-            "SELECT ?s ?p ?o WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}",
-            TEST_GRAPH
-        );
-        let results = store.query_sparql(&sparql, Some(TEST_GRAPH)).unwrap();
+        let results = store
+            .query_sparql_for_claims(&claims(), "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+            .unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -729,23 +884,20 @@ mod tests {
 
         for i in 0..3 {
             store
-                .write_quads(
+                .write_quads_for_claims(
+                    &claims(),
                     &[make_quad(
                         &format!("http://example.org/n{}", i),
                         RDFS_LABEL,
                         RdfValue::Literal(format!("N{}", i)),
                     )],
-                    TEST_GRAPH,
                 )
                 .unwrap();
         }
 
         // 带 LIMIT 的查询不得把 LIMIT 包进 GRAPH 大括号内（回归：expected OPTIONAL）
         let results = store
-            .query_sparql(
-                "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 2",
-                Some(TEST_GRAPH),
-            )
+            .query_sparql_for_claims(&claims(), "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 2")
             .unwrap();
         assert_eq!(results.len(), 2, "LIMIT 应保留在 GRAPH 包装之外并生效");
     }
@@ -760,9 +912,11 @@ mod tests {
             RdfValue::Iri("http://example.org/bob".to_string()),
         )];
 
-        store.write_quads(&quads, TEST_GRAPH).unwrap();
+        store.write_quads_for_claims(&claims(), &quads).unwrap();
 
-        let result = store.get_neighbors("http://example.org/bob", 1).unwrap();
+        let result = store
+            .get_neighbors_for_claims(&claims(), "http://example.org/bob", 1)
+            .unwrap();
 
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
         let incoming: Vec<_> = neighbors
@@ -778,5 +932,57 @@ mod tests {
             incoming[0].get("source").and_then(|v| v.as_str()),
             Some("http://example.org/alice")
         );
+    }
+
+    #[test]
+    fn claims_scope_new_writes_and_preserves_legacy_world_graph() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-b", "actor-b").unwrap();
+
+        // This is historical data, not a migration target for claims-scoped
+        // reads or writes.
+        store
+            .store
+            .update(
+                "INSERT DATA { GRAPH <graph:world> {
+                    <http://example.org/legacy> <http://example.org/name> \"legacy\" .
+                }}",
+            )
+            .unwrap();
+
+        let quad = make_quad(
+            "http://example.org/tenant-a",
+            RDFS_LABEL,
+            RdfValue::Literal("Tenant A only".to_string()),
+        );
+        store.write_quads_for_claims(&tenant_a, &[quad]).unwrap();
+
+        let a_results = store
+            .query_sparql_for_claims(
+                &tenant_a,
+                "SELECT ?s WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> \"Tenant A only\" }",
+            )
+            .unwrap();
+        assert_eq!(a_results.len(), 1);
+
+        let b_results = store
+            .query_sparql_for_claims(
+                &tenant_b,
+                "SELECT ?s WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> \"Tenant A only\" }",
+            )
+            .unwrap();
+        assert!(
+            b_results.is_empty(),
+            "tenant B must not see tenant A's newly written triples"
+        );
+
+        let legacy_results = store
+            .query_sparql(
+                "SELECT ?s WHERE { ?s <http://example.org/name> \"legacy\" }",
+                Some("graph:world"),
+            )
+            .unwrap();
+        assert_eq!(legacy_results.len(), 1, "legacy graph:world remains intact");
     }
 }
