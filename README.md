@@ -98,6 +98,14 @@ Results >8KB auto-generate conversational micro-tools (e.g., "search_in_results"
 ### 12. MCP Integration — One Protocol to Connect Them All
 Standard **Model Context Protocol** connects GitHub, Slack, Jira, and any MCP-compatible server. Dynamic tool discovery at runtime. Supports both HTTP SSE and stdio transport modes with repeatable `--mcp-server` CLI flags.
 
+#### Third-party MCP disclosure
+
+An MCP server is a third party. It receives the JSON-RPC requests Wild AgentOS sends to it, including the selected tool name and arguments, and returns its tool results to the Agent. Only connect servers you trust with the task data you choose to send.
+
+For `--mcp-server-stdio`, Wild AgentOS starts the server as a child process. That process inherits the Agent process environment, with any server-specific environment variables overlaid. Environment sanitization is tracked in [#26](https://github.com/skaiy/wild_agentos/issues/26) (implementation [#37](https://github.com/skaiy/wild_agentos/pull/37)); until that protection is applied to stdio MCP launches, do not put secrets in the Agent environment when starting a third-party server.
+
+MCP failures are fail-loud: a failed connection is reported as `status=error:...`, clears any discovered tools, and returns an error to the caller. Failed tool calls are also returned as errors—they are not skipped and never replaced with a `simulated` result.
+
 ### 13. Checkpoint & Recovery — Crash-Proof Long-Running Tasks
 Session state snapshots at critical points with full restoration on crash. Enables hour/day-long agent tasks and post-mortem replay debugging. `--resume <task_iri>` and `--list-checkpoints` commands for explicit session management.
 
