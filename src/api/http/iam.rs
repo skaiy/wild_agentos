@@ -30,6 +30,10 @@ pub struct JwtClaims {
     /// Subject = user_id
     pub sub: String,
     pub tenant_id: String,
+    /// Project scope for isolation. Legacy tokens without this claim use
+    /// the `default` project.
+    #[serde(default)]
+    pub project_id: Option<String>,
     #[serde(default)]
     pub roles: Vec<String>,
     /// Unix timestamp 过期时间。
@@ -156,9 +160,15 @@ fn verify_jwt(token: &str) -> Option<UserIdentity> {
     val.set_required_spec_claims(&["sub", "exp"]);
     match decode::<JwtClaims>(token, &key, &val) {
         Ok(data) => {
+            let project_id = data
+                .claims
+                .project_id
+                .as_deref()
+                .filter(|project_id| !project_id.is_empty())
+                .unwrap_or("default");
             let isolation_claims = IsolationClaims::from_verified(
                 data.claims.tenant_id.clone(),
-                "default",
+                project_id,
                 data.claims.sub.clone(),
             )
             .ok()?;
@@ -204,8 +214,9 @@ mod tests {
     };
     use base64::{engine::general_purpose::STANDARD, Engine};
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde::Serialize;
 
-    use super::{AuthMethod, JwtClaims, UserIdentity};
+    use super::{verify_jwt, AuthMethod, JwtClaims, UserIdentity};
     use crate::api::http::TEST_ENV_LOCK;
 
     #[tokio::test]
@@ -278,6 +289,7 @@ mod tests {
             &JwtClaims {
                 sub: "service".to_string(),
                 tenant_id: "acme".to_string(),
+                project_id: None,
                 roles: vec!["DA".to_string()],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
@@ -295,9 +307,111 @@ mod tests {
             .unwrap();
         assert_eq!(identity.auth_method, AuthMethod::Jwt);
         assert_eq!(identity.tenant_id, "acme");
+        assert_eq!(
+            identity.isolation_claims().unwrap().graph_iri().unwrap(),
+            "graph://acme/default"
+        );
         assert!(identity.require_role("DA").is_ok());
 
         restore_strict_mode(previous);
+    }
+
+    #[test]
+    fn legacy_jwt_without_project_claim_uses_default_project() {
+        #[derive(Serialize)]
+        struct LegacyJwtClaims {
+            sub: String,
+            tenant_id: String,
+            exp: usize,
+        }
+
+        let token = encode(
+            &Header::default(),
+            &LegacyJwtClaims {
+                sub: "service".to_string(),
+                tenant_id: "acme".to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+        )
+        .unwrap();
+
+        let identity = verify_jwt(&token).unwrap();
+        let claims = identity.isolation_claims().unwrap();
+        assert_eq!(claims.project_id(), "default");
+        assert_eq!(claims.graph_iri().unwrap(), "graph://acme/default");
+        assert_eq!(claims.vector_namespace().unwrap(), "vector://acme/default");
+    }
+
+    #[test]
+    fn jwt_with_empty_project_claim_uses_default_project() {
+        let token = encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "service".to_string(),
+                tenant_id: "acme".to_string(),
+                project_id: Some(String::new()),
+                roles: vec![],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+        )
+        .unwrap();
+
+        let claims = verify_jwt(&token)
+            .unwrap()
+            .isolation_claims()
+            .unwrap()
+            .clone();
+        assert_eq!(claims.project_id(), "default");
+    }
+
+    #[test]
+    fn jwt_project_claim_mints_project_scoped_names() {
+        let token = encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "service".to_string(),
+                tenant_id: "acme".to_string(),
+                project_id: Some("research_1".to_string()),
+                roles: vec![],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+        )
+        .unwrap();
+
+        let claims = verify_jwt(&token)
+            .unwrap()
+            .isolation_claims()
+            .unwrap()
+            .clone();
+        assert_eq!(claims.project_id(), "research_1");
+        assert_eq!(claims.graph_iri().unwrap(), "graph://acme/research_1");
+        assert_eq!(
+            claims.vector_namespace().unwrap(),
+            "vector://acme/research_1"
+        );
+    }
+
+    #[test]
+    fn unsafe_jwt_project_claims_fail_closed() {
+        for project_id in [".", "..", "a/b"] {
+            let token = encode(
+                &Header::default(),
+                &JwtClaims {
+                    sub: "service".to_string(),
+                    tenant_id: "acme".to_string(),
+                    project_id: Some(project_id.to_string()),
+                    roles: vec![],
+                    exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                },
+                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            )
+            .unwrap();
+
+            assert!(verify_jwt(&token).is_none(), "{project_id:?} was accepted");
+        }
     }
 
     fn restore_strict_mode(previous: Option<std::ffi::OsString>) {
