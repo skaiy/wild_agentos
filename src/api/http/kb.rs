@@ -2202,6 +2202,7 @@ mod kb_isolation_http_tests {
             &super::super::iam::JwtClaims {
                 sub: format!("{tenant_id}-user"),
                 tenant_id: tenant_id.to_string(),
+                project_id: None,
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },

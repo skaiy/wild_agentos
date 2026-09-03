@@ -599,6 +599,7 @@ mod tests {
                 &JwtClaims {
                     sub: user.to_string(),
                     tenant_id: tenant.to_string(),
+                    project_id: None,
                     roles: vec!["DA".to_string()],
                     exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 },
@@ -751,4 +752,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
-
