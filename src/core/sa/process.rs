@@ -8,6 +8,43 @@ use super::agent::SupervisorAgent;
 use super::types::*;
 
 impl SupervisorAgent {
+    /// Resume an interrupted task from claims-verified PDCA envelopes.
+    ///
+    /// Only the roles whose completion envelopes match `claims` are skipped.
+    /// This prevents completed side-effecting Do steps from being dispatched
+    /// again after process re-entry.
+    #[instrument(skip(self, user_input, claims), fields(task_iri = %task_iri))]
+    pub async fn resume_task(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+        claims: crate::isolation::IsolationClaims,
+    ) -> Result<TaskResult, CoreError> {
+        let checkpoints = crate::core::checkpoint::CheckpointManager::with_persistence(
+            self.runner.l0_store.clone(),
+        );
+        let resumed = checkpoints
+            .read_pdca_resume(task_iri, Some(&claims))?
+            .ok_or_else(|| CoreError::Internal {
+                message: format!("No successful PDCA envelope found for task {}", task_iri),
+            })?;
+
+        info!(
+            task_iri = %task_iri,
+            last_step = ?resumed.last_successful.step,
+            completed_steps = ?resumed.completed_steps,
+            "Resuming task from verified PDCA envelope"
+        );
+        self.isolation_claims = Some(claims);
+        let (identity_user, identity_tenant) = self.read_task_identity(task_iri);
+        let ctx = TaskContext::new(task_iri, user_input, self.max_iterations)
+            .with_identity(identity_user, identity_tenant)
+            .with_resumed_messages(Vec::new(), 0, 0)
+            .with_resumed_pdca_steps(resumed.completed_steps);
+        self.process_task_with_context(user_input, task_iri, ctx)
+            .await
+    }
+
     #[instrument(skip(self, user_input), fields(task_iri = %task_iri))]
     pub async fn process_task(
         &mut self,
@@ -361,6 +398,7 @@ impl SupervisorAgent {
                     &five_w2h_iri,
                     resumed,
                     cycle_feedback.clone(),
+                    ctx.resumed_pdca_steps.clone(),
                 )
                 .await?;
 
