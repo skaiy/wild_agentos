@@ -1,8 +1,12 @@
 # 17. Isolation Contract
 
-`src/isolation/` is a kernel contract for scoped identity and future storage
-names. It is not an identity provider (IdP), authentication implementation, or
-storage migration.
+`src/isolation/` is a kernel contract for scoped identity and storage names.
+It is not an identity provider (IdP), an OIDC or Keycloak integration, a
+17-state IAM workflow, or a storage migration.
+
+This document describes the state of `main` as of 2026-09-03. It distinguishes
+the storage paths that are wired today from historical paths that remain live.
+Do not treat a minted name as proof that existing data has moved to it.
 
 ## Trusted claims boundary
 
@@ -16,17 +20,18 @@ The caller of this API is responsible for verifying those values at an
 authentication boundary. The isolation module does not read HTTP requests,
 parse JSON bodies, inspect headers, or validate credentials.
 
-`X-Identity` is a development simulation only. It is not a production tenant
-identity source and must not be treated as one by new code or deployments.
-Making the HTTP boundary fail closed is tracked separately in issue #24; this
-contract does not change HTTP behavior.
+`X-Identity` is a development simulation only. It never creates
+`IsolationClaims` and is not a production tenant identity source. JWT identities
+verified by the current HTTP boundary do create claims; that boundary currently
+validates HS256 JWTs using `AGENTOS_JWT_SECRET`, not OIDC or Keycloak. Unverified
+requests have no claims and cannot use the claims-scoped graph or blob paths.
 
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
 
 ## Naming contract, not a migration
 
-Claims mint names for a future isolated layout:
+Claims mint the following isolated layout:
 
 | Mint | Contract |
 | --- | --- |
@@ -39,15 +44,62 @@ Minting validates the tenant and project as safe identifier segments and fails
 closed for empty values, `.` / `..`, path separators, and other unsafe
 characters. It does not create a directory or access a backend.
 
-Minting is **not** a data migration. Do not remap or rewrite the existing live
-key spaces:
+Minting is **not** a data migration. The following historical live key spaces
+remain in place and have not been remapped or rewritten:
 
-- named graph: `graph:world`
-- vector tag: `tenant:<id>`
-- L0 storage: `./data/l0_store` with `l0.redb`
-- blob key: `tenant:default/kb/...`
+- named graph: `graph:world` (not migrated)
+- vector tag: `tenant:<id>` (not migrated; vector isolation is not wired)
+- L0 storage: `./data/l0_store` with `l0.redb` (not migrated; L0 isolation is
+  not wired)
+- blob key: `tenant:default/kb/...` (not migrated)
 
-Storage wiring and migration require a separately scoped change.
+Do not change, delete, or assume ownership of these historical paths as part of
+new isolation work. Each migration requires a separately scoped change.
+
+## Current wiring
+
+### Spend gate
+
+The tenant tool-call spend gate is active only when
+`AGENTOS_TENANT_TOOL_CALL_CAP` is set to a valid cap. When it is unset, callers
+do not need `IsolationClaims`. When it is set, each metered tool call requires
+verified claims and calls over the per-tenant cap are rejected. This is a
+process-local counter, not a billing ledger.
+
+### Graph
+
+New production graph writes use `IsolationClaims::from_verified` and
+`graph_iri()` to target `graph://{tenant}/{project}`. Production compatibility
+write, query, entity-search, neighbour, and delete APIs reject calls without
+verified claims; they do not silently read or write `graph:world`. Graph queries
+remain SPARQL 1.1 against Oxigraph.
+
+The HTTP knowledge-base graph import and stats handlers have not yet been
+converted to the claims-scoped graph interface. Import selects the graph stored
+in the knowledge-base record, and its `clear_before` branch updates that graph
+directly; its legacy write call then fails in production because it has no
+claims. Stats likewise calls the legacy query shim and returns a null triple
+count when that call is rejected. Do not describe either handler as
+claims-scoped or assume it migrates `graph:world`.
+
+### Blob
+
+`BlobStore::put`, `get`, `delete`, and `exists` take `IsolationClaims` and only
+accept a relative key. The backend mints `{tenant}/` with
+`object_key_prefix()`, so new objects use keys such as
+`{tenant}/kb/<kbid>/<sha256>`. HTTP upload, raw-document retrieval, and
+rebuild paths require JWT-verified claims before using the BlobStore.
+
+Existing `tenant:default/kb/...` objects are still historical objects. No
+read-through compatibility mapping or migration has moved them to the new
+prefix.
+
+### Vector and L0
+
+`vector_namespace()` and `l0_path()` are naming helpers only. Vector isolation
+(issue #48 / PR #54) and L0 isolation (issue #49 / PR #55) are not wired on
+`main`. Existing vector `tenant:<id>` tags and `./data/l0_store` / `l0.redb`
+remain live historical storage, not isolated replacements.
 
 ## Graph interface
 
