@@ -48,9 +48,8 @@ Minting is **not** a data migration. The following historical live key spaces
 remain in place and have not been remapped or rewritten:
 
 - named graph: `graph:world` (not migrated)
-- vector tag: `tenant:<id>` (not migrated; vector isolation is not wired)
-- L0 storage: `./data/l0_store` with `l0.redb` (not migrated; L0 isolation is
-  not wired)
+- vector tag: `tenant:<id>` (not migrated)
+- L0 storage: `./data/l0_store/l0.redb` (not migrated)
 - blob key: `tenant:default/kb/...` (not migrated)
 
 Do not change, delete, or assume ownership of these historical paths as part of
@@ -94,12 +93,22 @@ Existing `tenant:default/kb/...` objects are still historical objects. No
 read-through compatibility mapping or migration has moved them to the new
 prefix.
 
-### Vector and L0
+### Vector
 
-`vector_namespace()` and `l0_path()` are naming helpers only. Vector isolation
-(issue #48 / PR #54) and L0 isolation (issue #49 / PR #55) are not wired on
-`main`. Existing vector `tenant:<id>` tags and `./data/l0_store` / `l0.redb`
-remain live historical storage, not isolated replacements.
+Claims-scoped vector upsert, search, and delete use the namespace minted by
+`vector_namespace()` (`vector://{tenant}/{project}`); it scopes both the stored
+IRI and the JSON-LD named-graph metadata. Production unscoped upsert, search,
+filtered search, hybrid search, and delete APIs fail closed because they lack
+verified claims. Historical `tenant:<id>` rows have not been migrated and are
+not returned by claims-scoped search.
+
+### L0
+
+`L0Store::open_for_claims` creates and writes only the tenant directory minted
+from `l0_path()` under its supplied L0 root (the `/data/l0/{tenant}` contract).
+In production, `L0Store::new` opens the historical shared database read-only;
+writes through it fail closed. The historical
+`./data/l0_store/l0.redb` database has not been migrated.
 
 ## Graph interface
 
