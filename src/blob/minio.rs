@@ -5,7 +5,8 @@ use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
 
-use super::{env_nonempty, BlobStore};
+use super::{env_nonempty, scoped_key, BlobStore};
+use crate::isolation::IsolationClaims;
 use crate::CoreError;
 
 /// S3 兼容对象存储（MinIO）。经 `MINIO_*` 环境变量配置，采用 path-style 寻址。
@@ -46,10 +47,17 @@ impl MinioBlobStore {
 
 #[async_trait]
 impl BlobStore for MinioBlobStore {
-    async fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> Result<(), CoreError> {
+    async fn put(
+        &self,
+        claims: &IsolationClaims,
+        key: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), CoreError> {
+        let key = scoped_key(claims, key)?;
         let resp = self
             .bucket
-            .put_object_with_content_type(key, bytes, content_type)
+            .put_object_with_content_type(&key, bytes, content_type)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("minio put: {e}"),
@@ -63,10 +71,11 @@ impl BlobStore for MinioBlobStore {
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Vec<u8>, CoreError> {
+    async fn get(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError> {
+        let key = scoped_key(claims, key)?;
         let resp = self
             .bucket
-            .get_object(key)
+            .get_object(&key)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("minio get: {e}"),
@@ -80,9 +89,10 @@ impl BlobStore for MinioBlobStore {
         Ok(resp.bytes().to_vec())
     }
 
-    async fn delete(&self, key: &str) -> Result<(), CoreError> {
+    async fn delete(&self, claims: &IsolationClaims, key: &str) -> Result<(), CoreError> {
+        let key = scoped_key(claims, key)?;
         self.bucket
-            .delete_object(key)
+            .delete_object(&key)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("minio delete: {e}"),
@@ -90,8 +100,9 @@ impl BlobStore for MinioBlobStore {
         Ok(())
     }
 
-    async fn exists(&self, key: &str) -> Result<bool, CoreError> {
-        match self.bucket.head_object(key).await {
+    async fn exists(&self, claims: &IsolationClaims, key: &str) -> Result<bool, CoreError> {
+        let key = scoped_key(claims, key)?;
+        match self.bucket.head_object(&key).await {
             Ok((_, code)) => Ok((200..300).contains(&code)),
             Err(_) => Ok(false),
         }
