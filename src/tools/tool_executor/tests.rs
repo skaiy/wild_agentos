@@ -175,8 +175,9 @@ mod tests {
     fn advertised_bash_file_read_and_file_write_execute() {
         rt().block_on(async {
             let executor = ToolExecutor::new();
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("advertised.txt");
+            let path = std::env::current_dir()
+                .unwrap()
+                .join(format!("advertised-{}.txt", uuid::Uuid::new_v4()));
             let path = path.to_string_lossy().into_owned();
             let advertised = vec![
                 "bash".to_string(),
@@ -187,7 +188,7 @@ mod tests {
             let write = executor
                 .execute_with_security_context(
                     "file_write",
-                    json!({"path": path, "content": "advertised"}),
+                    json!({"path": path.clone(), "content": "advertised"}),
                     security_context(),
                     &advertised,
                 )
@@ -198,13 +199,13 @@ mod tests {
             let read = executor
                 .execute_with_security_context(
                     "file_read",
-                    json!({"path": path}),
+                    json!({"path": path.clone()}),
                     security_context(),
                     &advertised,
                 )
                 .await
                 .unwrap();
-            assert_eq!(read["content"], "advertised");
+            assert_eq!(read["lines"], json!(["advertised"]));
 
             let bash = executor
                 .execute_with_security_context(
@@ -217,6 +218,7 @@ mod tests {
                 .unwrap();
             assert_eq!(bash["exit_code"], 0);
             assert_eq!(bash["stdout"], "advertised");
+            std::fs::remove_file(path).unwrap();
         });
     }
 
