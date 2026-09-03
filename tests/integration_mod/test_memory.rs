@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tempfile::tempdir;
+use wild_agent_os_core::isolation::IsolationClaims;
 use wild_agent_os_core::memory::l0_store::L0Store;
 use wild_agent_os_core::memory::l1_session::L1Session;
 use wild_agent_os_core::memory::l2_blackboard::Blackboard;
@@ -83,23 +84,48 @@ fn test_memory_manager_with_vector_store() {
 
     rt.block_on(async {
         let store = Arc::new(HyperspaceStore::open(vdir.path(), embed).unwrap());
+        let claims =
+            IsolationClaims::from_verified("test-tenant", "memory-project", "test-agent").unwrap();
 
         // Insert entries via HyperspaceStore
         store
-            .upsert("iri://vec/1", "memory search test alpha", &["tag_a".into()])
+            .upsert_with_claims(
+                &claims,
+                "iri://vec/1",
+                "memory search test alpha",
+                &["tag_a".into()],
+            )
             .await
             .unwrap();
         store
-            .upsert("iri://vec/2", "memory search test beta", &["tag_a".into()])
+            .upsert_with_claims(
+                &claims,
+                "iri://vec/2",
+                "memory search test beta",
+                &["tag_a".into()],
+            )
             .await
             .unwrap();
         store
-            .upsert("iri://vec/3", "unrelated gamma entry", &["tag_b".into()])
+            .upsert_with_claims(
+                &claims,
+                "iri://vec/3",
+                "unrelated gamma entry",
+                &["tag_b".into()],
+            )
             .await
             .unwrap();
 
         // Search without filter – all match because FallbackEmbeddingService returns unit vector
-        let all = store.search("test", 10).await.unwrap();
+        let all = store
+            .search_with_claims(
+                &claims,
+                "test",
+                &wild_agent_os_core::memory::hyperspace_store::HybridSearchFilter::new(),
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             all.len(),
             3,
@@ -108,7 +134,8 @@ fn test_memory_manager_with_vector_store() {
 
         // Filter by tag
         let filtered = store
-            .search_with_filter(
+            .search_with_claims(
+                &claims,
                 "test",
                 &wild_agent_os_core::memory::hyperspace_store::HybridSearchFilter::new()
                     .with_must_tags(vec!["tag_a".into()]),
@@ -118,16 +145,25 @@ fn test_memory_manager_with_vector_store() {
             .unwrap();
         assert_eq!(filtered.len(), 2, "Only tag_a entries");
 
-        // Hybrid search (query + tag filter)
+        // Claims-aware query with tag filtering.
         let hybrid = store
-            .hybrid_search("search", &["tag_a".into()], &[], None, 10)
+            .search_with_claims(
+                &claims,
+                "search",
+                &wild_agent_os_core::memory::hyperspace_store::HybridSearchFilter::new()
+                    .with_must_tags(vec!["tag_a".into()]),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(hybrid.len(), 2);
 
         // Count & delete
         assert_eq!(store.count().await.unwrap(), 3);
-        store.delete("iri://vec/1").await.unwrap();
+        store
+            .delete_with_claims(&claims, "iri://vec/1")
+            .await
+            .unwrap();
         assert_eq!(store.count().await.unwrap(), 2);
     });
 }
@@ -144,6 +180,8 @@ fn test_full_pipeline_with_vector_store() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     rt.block_on(async {
+        let claims =
+            IsolationClaims::from_verified("test-tenant", "memory-project", "test-agent").unwrap();
         // Build full stack with vector store
         let l0 = Arc::new(L0Store::new(_dir.path().to_string_lossy().as_ref()).unwrap());
         let l2 = Arc::new(Blackboard::new().unwrap());
@@ -167,7 +205,8 @@ fn test_full_pipeline_with_vector_store() {
         // Upsert via MemoryManager's vector store reference
         mm.vector_store()
             .unwrap()
-            .upsert(
+            .upsert_with_claims(
+                &claims,
                 "iri://mm/1",
                 "MemoryManager threaded vector store",
                 &["mm".into()],

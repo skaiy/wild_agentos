@@ -653,6 +653,19 @@ impl HyperspaceStore {
     }
 
     /// Hybrid search combining free-text and tag filtering.
+    #[cfg(not(test))]
+    pub async fn hybrid_search(
+        &self,
+        _query: &str,
+        _must_tags: &[String],
+        _should_tags: &[String],
+        _min_importance: Option<f32>,
+        _limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        Err(unverified_claims_error("vector hybrid search"))
+    }
+
+    #[cfg(test)]
     pub async fn hybrid_search(
         &self,
         query: &str,
@@ -671,7 +684,29 @@ impl HyperspaceStore {
     }
 
     /// Delete a vector entry by IRI.
+    #[cfg(not(test))]
+    pub async fn delete(&self, _iri: &str) -> Result<(), CoreError> {
+        Err(unverified_claims_error("vector delete"))
+    }
+
+    #[cfg(test)]
     pub async fn delete(&self, iri: &str) -> Result<(), CoreError> {
+        self.delete_inner(iri).await
+    }
+
+    /// Deletes only the entry addressed inside the verified claims namespace.
+    pub async fn delete_with_claims(
+        &self,
+        claims: &IsolationClaims,
+        iri: &str,
+    ) -> Result<(), CoreError> {
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        self.delete_inner(&format!("{namespace}#{iri}")).await
+    }
+
+    async fn delete_inner(&self, iri: &str) -> Result<(), CoreError> {
         self.engine
             .delete(iri)
             .await
