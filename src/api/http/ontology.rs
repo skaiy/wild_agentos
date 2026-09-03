@@ -4,18 +4,16 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::{
+    isolation::IsolationClaims,
+    knowledge_graph::store::{ClaimsGraphUpdate, KnowledgeGraphStore},
+};
 
-use super::AppState;
+use super::{iam::UserIdentity, AppState};
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 
@@ -33,7 +31,9 @@ fn sparql_literal(s: &str) -> String {
 /// 数据源为 Oxigraph 元命名图（`graph:ontology/meta`）：首启由 `ensure_seeded` 幂等
 /// 把硬编码 `ev_repair_ontology()` 写入图谱，之后读路径解析 `meta:json` 快照重建。
 /// 存储不可用时回退硬编码定义，保证只读契约零回归。
-pub(crate) async fn ontology_types_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn ontology_types_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     use crate::knowledge_graph::ontology_store::OntologyStore;
     let ont = (|| {
         let store = OntologyStore::with_shared_store(state.kg_store.clone()).ok()?;
@@ -92,8 +92,12 @@ fn ontology_store_ready(
 /// POST /api/v1/ontology/object-types — 新建或更新对象类型（幂等 upsert）。
 pub(crate) async fn upsert_object_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(obj): Json<crate::knowledge_graph::ontology_layer::ObjectType>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -111,9 +115,13 @@ pub(crate) async fn upsert_object_type_handler(
 /// PUT /api/v1/ontology/object-types/:id — 更新对象类型（id 以路径为准）。
 pub(crate) async fn update_object_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(mut obj): Json<crate::knowledge_graph::ontology_layer::ObjectType>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     obj.id = id;
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
@@ -132,8 +140,12 @@ pub(crate) async fn update_object_type_handler(
 /// DELETE /api/v1/ontology/object-types/:id — 删除对象类型；被引用返回 409。
 pub(crate) async fn delete_object_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -151,8 +163,12 @@ pub(crate) async fn delete_object_type_handler(
 /// POST /api/v1/ontology/link-types — 新建或更新链接类型（校验 source/target 存在）。
 pub(crate) async fn upsert_link_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(link): Json<crate::knowledge_graph::ontology_layer::LinkType>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -170,9 +186,13 @@ pub(crate) async fn upsert_link_type_handler(
 /// PUT /api/v1/ontology/link-types/:id — 更新链接类型（id 以路径为准）。
 pub(crate) async fn update_link_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(mut link): Json<crate::knowledge_graph::ontology_layer::LinkType>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     link.id = id;
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
@@ -191,8 +211,12 @@ pub(crate) async fn update_link_type_handler(
 /// DELETE /api/v1/ontology/link-types/:id — 删除链接类型（无下游引用，直接删）。
 pub(crate) async fn delete_link_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -222,8 +246,12 @@ pub(crate) async fn delete_link_type_handler(
 /// POST /api/v1/ontology/action-types — 新建或更新动作类型（幂等 upsert；applies_to 校验）。
 pub(crate) async fn upsert_action_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(action): Json<crate::knowledge_graph::ontology_layer::ActionType>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -241,9 +269,13 @@ pub(crate) async fn upsert_action_type_handler(
 /// PUT /api/v1/ontology/action-types/:id — 更新动作类型（id 以路径为准）。
 pub(crate) async fn update_action_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(mut action): Json<crate::knowledge_graph::ontology_layer::ActionType>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     action.id = id;
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
@@ -262,8 +294,12 @@ pub(crate) async fn update_action_type_handler(
 /// DELETE /api/v1/ontology/action-types/:id — 删除动作类型（叶子元素，直接删）。
 pub(crate) async fn delete_action_type_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -281,8 +317,12 @@ pub(crate) async fn delete_action_type_handler(
 /// POST /api/v1/ontology/function-defs — 新建或更新函数（幂等 upsert；applies_to 校验）。
 pub(crate) async fn upsert_function_def_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(func): Json<crate::knowledge_graph::ontology_layer::FunctionDef>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -300,9 +340,13 @@ pub(crate) async fn upsert_function_def_handler(
 /// PUT /api/v1/ontology/function-defs/:id — 更新函数（id 以路径为准）。
 pub(crate) async fn update_function_def_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(mut func): Json<crate::knowledge_graph::ontology_layer::FunctionDef>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     func.id = id;
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
@@ -321,8 +365,12 @@ pub(crate) async fn update_function_def_handler(
 /// DELETE /api/v1/ontology/function-defs/:id — 删除函数（叶子元素，直接删）。
 pub(crate) async fn delete_function_def_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -340,11 +388,15 @@ pub(crate) async fn delete_function_def_handler(
 // ─── 动力层执行器（ActionType invoke）──────────────────────────────────
 //
 // 让知识图谱从"只读"变为"可写可执行"：依据 ActionType 做参数校验 + 前置条件检查，
-// 再把 side-effect 以 SPARQL 写回新能源车维修知识包的命名图（graph:pack/ev-repair）。
-
-/// 新能源车维修知识包的命名图（写回隔离单元）。
-const EV_PACK_GRAPH: &str = "graph:pack/ev-repair";
+// 再把 side-effect 以 SPARQL 写回 JWT claims 铸造的命名图。
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
+
+fn unauthorized_isolation_claims() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "verified JWT isolation claims are required" })),
+    )
+}
 
 /// 本体实例 IRI：https://agentos.ontology/ev/{ObjectType}/{key}
 fn ev_instance_iri(obj_type: &str, key: &str) -> String {
@@ -383,32 +435,17 @@ fn lit_decimal(n: f64) -> String {
 }
 
 /// 属性 upsert：先删旧值再写新值（idempotent）。obj 为完整对象项。
-fn upsert_prop_stmts(subject: &str, prop: &str, obj: &str) -> Vec<String> {
+fn upsert_prop_stmts(subject: &str, prop: &str, obj: &str) -> Vec<ClaimsGraphUpdate> {
     vec![
-        format!(
-            "DELETE WHERE {{ GRAPH <{g}> {{ <{s}> <{p}> ?old }} }}",
-            g = EV_PACK_GRAPH,
-            s = subject,
-            p = prop
-        ),
-        format!(
-            "INSERT DATA {{ GRAPH <{g}> {{ <{s}> <{p}> {o} }} }}",
-            g = EV_PACK_GRAPH,
-            s = subject,
-            p = prop,
-            o = obj
-        ),
+        ClaimsGraphUpdate::delete_where(format!("<{subject}> <{prop}> ?old")),
+        ClaimsGraphUpdate::insert_data(format!("<{subject}> <{prop}> {obj}")),
     ]
 }
 
 /// 命名图内对象是否存在（前置条件检查）。
-fn ev_object_exists(kg: &KnowledgeGraphStore, iri: &str) -> bool {
-    let q = format!(
-        "SELECT ?o WHERE {{ GRAPH <{g}> {{ <{iri}> ?p ?o }} }} LIMIT 1",
-        g = EV_PACK_GRAPH,
-        iri = iri,
-    );
-    kg.query_sparql(&q, None)
+fn ev_object_exists(kg: &KnowledgeGraphStore, claims: &IsolationClaims, iri: &str) -> bool {
+    let q = format!("SELECT ?o WHERE {{ <{iri}> ?p ?o }} LIMIT 1");
+    kg.query_sparql_for_claims(claims, &q)
         .map(|r| !r.is_empty())
         .unwrap_or(false)
 }
@@ -419,13 +456,18 @@ fn ev_object_exists(kg: &KnowledgeGraphStore, iri: &str) -> bool {
 /// - 业务对象（Vehicle / Battery / RepairOrder…）：业务数据不入图谱，未来经 MCP
 ///   对接业务库查询；当前 MCP 未接入，回退查询命名图以保持向后兼容——接入 MCP 后
 ///   只需替换 Business 分支，调用方（build_action_effects）无需改动。
-fn resolve_object_exists(kg: &KnowledgeGraphStore, object_type: &str, key: &str) -> bool {
+fn resolve_object_exists(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    object_type: &str,
+    key: &str,
+) -> bool {
     use crate::knowledge_graph::ontology_layer::{object_kind_of, ObjectKind};
     let iri = ev_instance_iri(object_type, key);
     match object_kind_of(object_type) {
-        ObjectKind::Knowledge => ev_object_exists(kg, &iri),
+        ObjectKind::Knowledge => ev_object_exists(kg, claims, &iri),
         // TODO(MCP): 业务库接入后改为经 MCP 查询业务对象是否存在；当前回退命名图。
-        ObjectKind::Business => ev_object_exists(kg, &iri),
+        ObjectKind::Business => ev_object_exists(kg, claims, &iri),
     }
 }
 
@@ -469,7 +511,7 @@ const BUILTIN_EXECUTABLE_ACTIONS: &[&str] = &["GenerateRepairOrder"];
 // 失败即回滚"，等价一次可回滚事务。仅隔离**数据**（命名图级），不隔离计算/进程；
 // 计算沙箱（任意代码执行）见 docs 记录，待有需要再实现。
 //
-//   1. 为本次 invoke 生成 per-invocation 影子图 IRI（graph:pack/ev-repair/staging/<uuid>）
+//   1. 为本次 invoke 生成 JWT claims 图派生的 per-invocation 影子图
 //   2. 把 side-effect 语句里的生产图 IRI 重定向到影子图，写入影子图（生产图零改动）
 //   3. 对影子图跑 ASK 护栏（三元组数上限 / 谓词命名空间白名单），任一命中即视为违规
 //   4. 通过 → ADD 影子图到生产图 + DROP 影子图（提交）；违规 → DROP 影子图（回滚）
@@ -483,40 +525,23 @@ const SANDBOX_ALLOWED_PRED_PREFIXES: &[&str] = &[
     "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
 ];
 
-/// 生成本次 invoke 的影子图 IRI。
-fn staging_graph_iri() -> String {
-    format!(
-        "{}/staging/{}",
-        EV_PACK_GRAPH,
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-/// 把 side-effect 语句中出现的生产图 IRI 重定向到影子图。
-/// 语句均由 build_action_effects 以 `GRAPH <EV_PACK_GRAPH>` 形式硬编码构造，做定向替换即可。
-fn redirect_to_staging(stmt: &str, staging: &str) -> String {
-    stmt.replace(
-        &format!("GRAPH <{}>", EV_PACK_GRAPH),
-        &format!("GRAPH <{}>", staging),
-    )
-}
-
 /// 护栏后校验：对影子图跑 ASK，返回违规项列表（空=通过）。
-fn sandbox_guardrail_violations(kg: &KnowledgeGraphStore, staging: &str) -> Vec<String> {
+fn sandbox_guardrail_violations(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    staging_id: &str,
+) -> Result<Vec<String>, String> {
     let mut violations = Vec::new();
 
     // 护栏1：三元组数上限。
-    let count_q = format!(
-        "SELECT (COUNT(*) AS ?c) WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}",
-        g = staging
-    );
+    let count_q = format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s ?p ?o }}");
     let n = kg
-        .query_sparql(&count_q, None)
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
+        .query_staging_for_claims(claims, staging_id, &count_q)?
+        .into_iter()
+        .next()
         .and_then(|row| row.get("?c").and_then(|v| v.as_str().map(String::from)))
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+        .ok_or_else(|| "护栏三元组计数查询返回无效结果".to_string())?;
     if n > SANDBOX_MAX_TRIPLES {
         violations.push(format!(
             "写回三元组数 {} 超过上限 {}",
@@ -529,39 +554,36 @@ fn sandbox_guardrail_violations(kg: &KnowledgeGraphStore, staging: &str) -> Vec<
         .iter()
         .map(|p| format!("STRSTARTS(STR(?p), \"{}\")", p))
         .collect();
-    let ask_q = format!(
-        "ASK {{ GRAPH <{g}> {{ ?s ?p ?o . FILTER(!({allow})) }} }}",
-        g = staging,
+    let foreign_q = format!(
+        "SELECT ?p WHERE {{ ?s ?p ?o . FILTER(!({allow})) }} LIMIT 1",
         allow = filters.join(" || ")
     );
-    let has_foreign = kg
-        .query_sparql(&ask_q, None)
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .and_then(|row| row.get("result").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    let has_foreign = !kg
+        .query_staging_for_claims(claims, staging_id, &foreign_q)?
+        .is_empty();
     if has_foreign {
         violations.push("存在越权谓词（不在允许的命名空间白名单内）".to_string());
     }
 
-    violations
+    Ok(violations)
 }
 
 /// 经影子图提交一批写回语句：写影子图 → 护栏 → 提交/回滚。
 /// 返回 Ok(护栏报告 JSON) 表示已提交；Err((状态码, 消息, 违规列表)) 表示回滚。
 fn commit_via_staging(
     kg: &KnowledgeGraphStore,
-    statements: &[String],
+    claims: &IsolationClaims,
+    statements: &[ClaimsGraphUpdate],
 ) -> Result<Value, (StatusCode, String, Vec<String>)> {
-    let staging = staging_graph_iri();
+    let staging_id = uuid::Uuid::new_v4().simple().to_string();
+    let staging = kg
+        .staging_graph_iri_for_claims(claims, &staging_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e, vec![]))?;
 
     // 1. 写入影子图（生产图零改动）。任一失败即清理并报错。
     for stmt in statements {
-        let staged = redirect_to_staging(stmt, &staging);
-        if let Err(e) = kg.store_arc().update(&staged) {
-            let _ = kg
-                .store_arc()
-                .update(&format!("DROP SILENT GRAPH <{}>", staging));
+        if let Err(e) = kg.update_staging_for_claims(claims, &staging_id, stmt) {
+            let _ = kg.drop_staging_for_claims(claims, &staging_id);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("影子图写入失败: {e}"),
@@ -571,11 +593,19 @@ fn commit_via_staging(
     }
 
     // 2. 护栏后校验。违规即回滚（DROP 影子图），生产图不受影响。
-    let violations = sandbox_guardrail_violations(kg, &staging);
+    let violations = match sandbox_guardrail_violations(kg, claims, &staging_id) {
+        Ok(violations) => violations,
+        Err(e) => {
+            let _ = kg.drop_staging_for_claims(claims, &staging_id);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("护栏校验失败，已回滚: {e}"),
+                vec![],
+            ));
+        }
+    };
     if !violations.is_empty() {
-        let _ = kg
-            .store_arc()
-            .update(&format!("DROP SILENT GRAPH <{}>", staging));
+        let _ = kg.drop_staging_for_claims(claims, &staging_id);
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "护栏校验未通过，已回滚（生产图未改动）".to_string(),
@@ -584,24 +614,15 @@ fn commit_via_staging(
     }
 
     // 3. 提交：合并影子图到生产图，再删除影子图。
-    let merge = format!(
-        "ADD SILENT GRAPH <{s}> TO <{p}>",
-        s = staging,
-        p = EV_PACK_GRAPH
-    );
-    if let Err(e) = kg.store_arc().update(&merge) {
-        let _ = kg
-            .store_arc()
-            .update(&format!("DROP SILENT GRAPH <{}>", staging));
+    if let Err(e) = kg.commit_staging_for_claims(claims, &staging_id) {
+        let _ = kg.drop_staging_for_claims(claims, &staging_id);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("影子图合并到生产图失败: {e}"),
             vec![],
         ));
     }
-    let _ = kg
-        .store_arc()
-        .update(&format!("DROP SILENT GRAPH <{}>", staging));
+    let _ = kg.drop_staging_for_claims(claims, &staging_id);
 
     Ok(json!({
         "sandbox": "staging_graph",
@@ -612,10 +633,15 @@ fn commit_via_staging(
 
 pub(crate) async fn invoke_action_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(action_id): axum::extract::Path<String>,
     Json(req): Json<ActionInvokeRequest>,
 ) -> impl IntoResponse {
     use crate::knowledge_graph::ontology_store::OntologyStore;
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims(),
+    };
     // 执行分派解耦：动作定义改从存储读取（首启幂等 seed），存储不可用时回退硬编码。
     let ont = (|| {
         let store = OntologyStore::with_shared_store(state.kg_store.clone()).ok()?;
@@ -671,7 +697,8 @@ pub(crate) async fn invoke_action_handler(
 
     // 2. 前置条件 + 3. 组装 side-effect 写回 SPARQL（按动作分派）。
     let now = chrono::Utc::now().to_rfc3339();
-    let (statements, result_meta) = match build_action_effects(&action_id, &req, &kg, &now) {
+    let (statements, result_meta) = match build_action_effects(&action_id, &req, &kg, claims, &now)
+    {
         Ok(v) => v,
         Err((code, msg)) => return (code, Json(json!({ "error": msg }))),
     };
@@ -682,15 +709,15 @@ pub(crate) async fn invoke_action_handler(
             Json(json!({
                 "status": "dry_run",
                 "action": action_id,
-                "graph": EV_PACK_GRAPH,
-                "sparql": statements,
+                "graph": claims.graph_iri().expect("verified claims were validated"),
+                "sparql": statements.iter().map(ClaimsGraphUpdate::sparql).collect::<Vec<_>>(),
                 "result": result_meta,
             })),
         );
     }
 
     // 4. 数据沙箱写回：先写影子图 → 护栏后校验 → 通过才合并到生产图，失败即回滚。
-    let sandbox = match commit_via_staging(&kg, &statements) {
+    let sandbox = match commit_via_staging(&kg, claims, &statements) {
         Ok(report) => report,
         Err((code, msg, violations)) => {
             return (
@@ -706,7 +733,7 @@ pub(crate) async fn invoke_action_handler(
         Json(json!({
             "status": "ok",
             "action": action_id,
-            "graph": EV_PACK_GRAPH,
+            "graph": claims.graph_iri().expect("verified claims were validated"),
             "applied": statements.len(),
             "result": result_meta,
             "sandbox": sandbox,
@@ -719,9 +746,9 @@ fn build_action_effects(
     action_id: &str,
     req: &ActionInvokeRequest,
     kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
     now: &str,
-) -> Result<(Vec<String>, Value), (StatusCode, String)> {
-    let g = EV_PACK_GRAPH;
+) -> Result<(Vec<ClaimsGraphUpdate>, Value), (StatusCode, String)> {
     let bad = |m: String| (StatusCode::BAD_REQUEST, m);
     match action_id {
         // 依据已确诊故障码为车辆创建维修工单，并建立 forVehicle / diagnoses 链接。
@@ -733,11 +760,11 @@ fn build_action_effects(
             let vin = p_str(&req.params, "vehicle_vin").unwrap();
             let vehicle_iri = ev_instance_iri("Vehicle", &vin);
             // 车辆为业务对象：当前回退命名图校验，未来经 MCP 业务库校验（见 resolve_object_exists）。
-            if !resolve_object_exists(kg, "Vehicle", &vin) {
+            if !resolve_object_exists(kg, claims, "Vehicle", &vin) {
                 return Err(bad(format!("前置条件不满足：车辆VIN不存在于图谱 ({vin})")));
             }
             let fault_iri = ev_instance_iri("FaultCode", &fault_code);
-            if !resolve_object_exists(kg, "FaultCode", &fault_code) {
+            if !resolve_object_exists(kg, claims, "FaultCode", &fault_code) {
                 return Err(bad(format!(
                     "前置条件不满足：故障码未确诊/不存在 ({fault_code})"
                 )));
@@ -815,11 +842,7 @@ fn build_action_effects(
                     v = lit_decimal(c)
                 ));
             }
-            let stmt = format!(
-                "INSERT DATA {{ GRAPH <{g}> {{ {t} . }} }}",
-                g = g,
-                t = triples.join(" .\n")
-            );
+            let stmt = ClaimsGraphUpdate::insert_data(format!("{} .", triples.join(" .\n")));
             Ok((
                 vec![stmt],
                 json!({ "order_id": order_id, "order_iri": order_iri, "vehicle": vehicle_iri, "fault_code": fault_iri }),
@@ -834,7 +857,7 @@ fn build_action_effects(
             }
             let bat_iri = ev_instance_iri("Battery", &battery_id);
             // 电池为业务对象：当前回退命名图校验，未来经 MCP 业务库校验。
-            if !resolve_object_exists(kg, "Battery", &battery_id) {
+            if !resolve_object_exists(kg, claims, "Battery", &battery_id) {
                 return Err(bad(format!(
                     "前置条件不满足：电池对象不存在 ({battery_id})"
                 )));
@@ -852,7 +875,7 @@ fn build_action_effects(
             let model_id = p_str(&req.params, "model_id").unwrap();
             let reason = p_str(&req.params, "recall_reason").unwrap();
             let model_iri = ev_instance_iri("VehicleModel", &model_id);
-            if !resolve_object_exists(kg, "VehicleModel", &model_id) {
+            if !resolve_object_exists(kg, claims, "VehicleModel", &model_id) {
                 return Err(bad(format!("前置条件不满足：车型对象不存在 ({model_id})")));
             }
             let mut stmts = upsert_prop_stmts(&model_iri, &ev_prop_iri("recalled"), &lit("true"));
@@ -881,7 +904,7 @@ fn build_action_effects(
             let question = p_str(&req.params, "question").unwrap();
             let answer = p_str(&req.params, "answer").unwrap();
             let fault_iri = ev_instance_iri("FaultCode", &code);
-            if !resolve_object_exists(kg, "FaultCode", &code) {
+            if !resolve_object_exists(kg, claims, "FaultCode", &code) {
                 return Err(bad(format!("前置条件不满足：故障码对象不存在 ({code})")));
             }
             let faq_id = format!("FAQ-{}", uuid::Uuid::new_v4().hyphenated());
@@ -919,11 +942,7 @@ fn build_action_effects(
                     f = faq_iri
                 ),
             ];
-            let stmt = format!(
-                "INSERT DATA {{ GRAPH <{g}> {{ {t} . }} }}",
-                g = g,
-                t = triples.join(" .\n")
-            );
+            let stmt = ClaimsGraphUpdate::insert_data(format!("{} .", triples.join(" .\n")));
             Ok((
                 vec![stmt],
                 json!({ "faq_id": faq_id, "faq_iri": faq_iri, "fault_code": fault_iri }),
@@ -936,7 +955,6 @@ fn build_action_effects(
     }
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────────
 // ontology CRUD 集成测试（原与 skill_manifest_tests 混放，随 skills 拆分迁出后独立）
 // ──────────────────────────────────────────────────────────────────────────────
@@ -945,11 +963,12 @@ mod ontology_crud_tests {
     use super::*;
     use crate::core::core_types::{CoreConfig, SemanticCore};
     use crate::tools::prompt_registry::PromptRegistry;
+    use axum::http::StatusCode;
     use axum::{
         routing::{get, post, put},
         Router,
     };
-    use axum::http::StatusCode;
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use tower::ServiceExt;
 
     use super::super::{api_gov::ApiUsageState, AppState, TEST_ENV_LOCK};
@@ -1004,6 +1023,21 @@ mod ontology_crud_tests {
         })
     }
 
+    fn test_jwt(tenant: &str) -> String {
+        encode(
+            &Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: "ontology-tester".to_string(),
+                tenant_id: tenant.to_string(),
+                project_id: Some("repair".to_string()),
+                roles: vec![],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+        )
+        .unwrap()
+    }
+
     /// 阶段0 无回归：GET /api/v1/ontology/types 改读 Oxigraph 元命名图后，
     /// 响应须与硬编码 ev_repair_ontology() 逐字段一致（首启由 ensure_seeded 幂等 seed）。
     #[tokio::test]
@@ -1054,6 +1088,7 @@ mod ontology_crud_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
         let app = Router::new()
             .route("/api/v1/ontology/types", get(ontology_types_handler))
             .route(
@@ -1079,6 +1114,7 @@ mod ontology_crud_tests {
                 .method("POST")
                 .uri(uri.to_string())
                 .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
                 .body(axum::body::Body::from(body.to_string()))
                 .unwrap()
         };
@@ -1086,6 +1122,7 @@ mod ontology_crud_tests {
             axum::http::Request::builder()
                 .method("DELETE")
                 .uri(uri.to_string())
+                .header("authorization", format!("Bearer {token}"))
                 .body(axum::body::Body::empty())
                 .unwrap()
         };
@@ -1096,6 +1133,19 @@ mod ontology_crud_tests {
             "label": "小部件", "description": "测试", "icon": "Box", "color": "blue",
             "primary_key": "name", "title_property": "name", "properties": []
         });
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/object-types")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(obj.to_string()))
+            .unwrap();
+        let r = app.clone().oneshot(unauthenticated).await.unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "无 JWT 的 upsert 必须拒绝"
+        );
+
         let r = app
             .clone()
             .oneshot(post_json("/api/v1/ontology/object-types", obj))
@@ -1173,6 +1223,7 @@ mod ontology_crud_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
         let app = Router::new()
             .route("/api/v1/ontology/types", get(ontology_types_handler))
             .route(
@@ -1202,6 +1253,7 @@ mod ontology_crud_tests {
                 .method("POST")
                 .uri(uri.to_string())
                 .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
                 .body(axum::body::Body::from(body.to_string()))
                 .unwrap()
         };
@@ -1209,9 +1261,23 @@ mod ontology_crud_tests {
             axum::http::Request::builder()
                 .method("DELETE")
                 .uri(uri.to_string())
+                .header("authorization", format!("Bearer {token}"))
                 .body(axum::body::Body::empty())
                 .unwrap()
         };
+
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/actions/GenerateRepairOrder/invoke")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(json!({}).to_string()))
+            .unwrap();
+        let r = app.clone().oneshot(unauthenticated).await.unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "无 JWT 的 invoke 必须拒绝"
+        );
 
         // 1) 新建自定义动作（applies_to=FaultCode，已 seed）
         let action = json!({
@@ -1334,27 +1400,86 @@ mod ontology_crud_tests {
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
-}
 
+    #[tokio::test]
+    async fn tenant_a_invoke_writes_are_invisible_to_tenant_b() {
+        let tmp = std::env::temp_dir().join(format!("agentos_ontinvoke_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state = make_state(&tmp);
+        let claims_a =
+            crate::isolation::IsolationClaims::from_verified("tenant-a", "repair", "tester")
+                .unwrap();
+        let claims_b =
+            crate::isolation::IsolationClaims::from_verified("tenant-b", "repair", "tester")
+                .unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let seed = format!(
+            "<{}> a <{}> . <{}> a <{}> .",
+            ev_instance_iri("Vehicle", "LVIN123"),
+            ev_term_iri("Vehicle"),
+            ev_instance_iri("FaultCode", "P0A80"),
+            ev_term_iri("FaultCode"),
+        );
+        kg.update_for_claims(&claims_a, &ClaimsGraphUpdate::insert_data(seed))
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/actions/:id/invoke",
+                post(invoke_action_handler),
+            )
+            .with_state(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/actions/GenerateRepairOrder/invoke")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+            .body(axum::body::Body::from(
+                json!({"target": "P0A80", "params": {"vehicle_vin": "LVIN123"}}).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query = format!(
+            "SELECT ?o WHERE {{ ?o a <{}> }}",
+            ev_term_iri("RepairOrder")
+        );
+        assert!(!kg
+            .query_sparql_for_claims(&claims_a, &query)
+            .unwrap()
+            .is_empty());
+        assert!(kg
+            .query_sparql_for_claims(&claims_b, &query)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}
 
 /// 动力层执行器（ActionType invoke）单测：参数/前置条件校验 + SPARQL 组装。
 #[cfg(test)]
 mod ontology_action_tests {
     use super::*;
+    use crate::isolation::IsolationClaims;
     use crate::knowledge_graph::store::KnowledgeGraphStore;
     use oxigraph::store::Store;
 
-    /// 预置车辆/故障码/电池/车型实例于 graph:pack/ev-repair。
-    fn seeded_kg() -> KnowledgeGraphStore {
+    fn test_claims(tenant: &str) -> IsolationClaims {
+        IsolationClaims::from_verified(tenant, "repair", "tester").unwrap()
+    }
+
+    /// 预置车辆/故障码/电池/车型实例于调用方的 claims 图。
+    fn seeded_kg(claims: &IsolationClaims) -> KnowledgeGraphStore {
         let store = Arc::new(Store::new().unwrap());
         let seed = format!(
-            "INSERT DATA {{ GRAPH <{g}> {{ \
+            "\
              <{veh}> a <{vehc}> . \
              <{fault}> a <{faultc}> . \
              <{bat}> a <{batc}> . \
              <{model}> a <{modelc}> . \
-             }} }}",
-            g = EV_PACK_GRAPH,
+             ",
             veh = ev_instance_iri("Vehicle", "LVIN123"),
             vehc = ev_term_iri("Vehicle"),
             fault = ev_instance_iri("FaultCode", "P0A80"),
@@ -1364,8 +1489,10 @@ mod ontology_action_tests {
             model = ev_instance_iri("VehicleModel", "M-001"),
             modelc = ev_term_iri("VehicleModel"),
         );
-        store.update(&seed).unwrap();
-        KnowledgeGraphStore::with_shared_store(store).unwrap()
+        let kg = KnowledgeGraphStore::with_shared_store(store).unwrap();
+        kg.update_for_claims(claims, &ClaimsGraphUpdate::insert_data(seed))
+            .unwrap();
+        kg
     }
 
     fn mk_req(target: Option<&str>, params: Value, dry_run: bool) -> ActionInvokeRequest {
@@ -1389,80 +1516,103 @@ mod ontology_action_tests {
 
     #[test]
     fn test_generate_repair_order_ok() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(
             Some("P0A80"),
             json!({"vehicle_vin": "LVIN123", "assigned_to": "张工", "estimated_cost": 1200}),
             false,
         );
-        let (stmts, meta) =
-            build_action_effects("GenerateRepairOrder", &r, &kg, "2026-01-01T00:00:00Z").unwrap();
+        let (stmts, meta) = build_action_effects(
+            "GenerateRepairOrder",
+            &r,
+            &kg,
+            &claims,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
         assert_eq!(stmts.len(), 1);
         let s = &stmts[0];
-        assert!(s.contains("RepairOrder"));
-        assert!(s.contains("forVehicle"));
-        assert!(s.contains("diagnoses"));
-        assert!(s.contains("张工"));
-        assert!(s.contains("1200"));
+        assert!(s.sparql().contains("RepairOrder"));
+        assert!(s.sparql().contains("forVehicle"));
+        assert!(s.sparql().contains("diagnoses"));
+        assert!(s.sparql().contains("张工"));
+        assert!(s.sparql().contains("1200"));
         assert!(meta["order_id"].as_str().unwrap().starts_with("RO-"));
     }
 
     #[test]
     fn test_generate_repair_order_missing_vehicle_precondition() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(Some("P0A80"), json!({"vehicle_vin": "UNKNOWN"}), false);
-        let err = build_action_effects("GenerateRepairOrder", &r, &kg, "t").unwrap_err();
+        let err = build_action_effects("GenerateRepairOrder", &r, &kg, &claims, "t").unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("车辆VIN不存在"));
     }
 
     #[test]
     fn test_generate_repair_order_missing_target() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(None, json!({"vehicle_vin": "LVIN123"}), false);
-        let err = build_action_effects("GenerateRepairOrder", &r, &kg, "t").unwrap_err();
+        let err = build_action_effects("GenerateRepairOrder", &r, &kg, &claims, "t").unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     // ── 数据沙箱（staging-graph）单测 ──────────────────────────────────
 
     #[test]
-    fn test_redirect_to_staging_rewrites_graph_iri() {
-        let stmt = format!(
-            "INSERT DATA {{ GRAPH <{}> {{ <a> <b> <c> }} }}",
-            EV_PACK_GRAPH
-        );
-        let staging = "graph:pack/ev-repair/staging/abc";
-        let out = redirect_to_staging(&stmt, staging);
-        assert!(out.contains(&format!("GRAPH <{}>", staging)));
-        assert!(!out.contains(&format!("GRAPH <{}> {{", EV_PACK_GRAPH)));
+    fn test_effects_do_not_select_a_graph() {
+        let update = ClaimsGraphUpdate::insert_data("<a> <b> <c>");
+        assert!(!update.sparql().to_uppercase().contains("GRAPH"));
     }
 
     /// 合法写回：经影子图护栏通过 → 合并到生产图；影子图删除、生产图可见新数据。
     #[test]
     fn test_sandbox_commit_merges_to_production() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(Some("P0A80"), json!({"vehicle_vin": "LVIN123"}), false);
-        let (stmts, _meta) =
-            build_action_effects("GenerateRepairOrder", &r, &kg, "2026-01-01T00:00:00Z").unwrap();
+        let (stmts, _meta) = build_action_effects(
+            "GenerateRepairOrder",
+            &r,
+            &kg,
+            &claims,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
 
-        let report = commit_via_staging(&kg, &stmts).expect("护栏应通过并提交");
+        let report = commit_via_staging(&kg, &claims, &stmts).expect("护栏应通过并提交");
         assert_eq!(report["guardrails_passed"], json!(true));
 
-        // 生产图应能查到新建的维修工单类型三元组。
+        // claims 图应能查到新建的维修工单类型三元组。
         let q = format!(
-            "SELECT ?o WHERE {{ GRAPH <{g}> {{ ?o a <{c}> }} }}",
-            g = EV_PACK_GRAPH,
-            c = ev_term_iri("RepairOrder")
+            "SELECT ?o WHERE {{ ?o a <{}> }}",
+            ev_term_iri("RepairOrder")
         );
-        let rows = kg.query_sparql(&q, None).unwrap();
+        let rows = kg.query_sparql_for_claims(&claims, &q).unwrap();
         assert!(!rows.is_empty(), "生产图应可见已提交的维修工单");
+        let tenant_b = test_claims("tenant-b");
+        assert!(
+            kg.query_sparql_for_claims(&tenant_b, &q)
+                .unwrap()
+                .is_empty(),
+            "tenant B must not see tenant A invoke writes"
+        );
 
         // 影子图应已删除（无残留）。
-        let staging = report["staging_graph"].as_str().unwrap();
-        let sq = format!("SELECT ?s WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}", staging);
+        let staging_id = report["staging_graph"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let sq = "SELECT ?s WHERE { ?s ?p ?o }";
         assert!(
-            kg.query_sparql(&sq, None).unwrap().is_empty(),
+            kg.query_staging_for_claims(&claims, staging_id, sq)
+                .unwrap()
+                .is_empty(),
             "影子图应已清理"
         );
     }
@@ -1470,28 +1620,25 @@ mod ontology_action_tests {
     /// 越权谓词：护栏应拦截并回滚（返回 422），生产图零改动。
     #[test]
     fn test_sandbox_rollback_on_foreign_predicate() {
-        let kg = seeded_kg();
-        // 统计生产图当前三元组数（回滚后应不变）。
-        let count_q = format!(
-            "SELECT (COUNT(*) AS ?c) WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}",
-            EV_PACK_GRAPH
-        );
-        let before = kg.query_sparql(&count_q, None).unwrap()[0]["?c"]
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
+        // 统计 claims 图当前三元组数（回滚后应不变）。
+        let count_q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }";
+        let before = kg.query_sparql_for_claims(&claims, count_q).unwrap()[0]["?c"]
             .as_str()
             .unwrap()
             .to_string();
 
         // 构造带越权谓词（不在白名单命名空间）的语句。
-        let foreign = format!(
-            "INSERT DATA {{ GRAPH <{g}> {{ <https://agentos.ontology/ev/X/1> <http://evil.example/pwn> \"x\" }} }}",
-            g = EV_PACK_GRAPH
+        let foreign = ClaimsGraphUpdate::insert_data(
+            "<https://agentos.ontology/ev/X/1> <http://evil.example/pwn> \"x\"",
         );
-        let err = commit_via_staging(&kg, &[foreign]).unwrap_err();
+        let err = commit_via_staging(&kg, &claims, &[foreign]).unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(err.2.iter().any(|v| v.contains("越权谓词")));
 
         // 生产图三元组数不变（已回滚）。
-        let after = kg.query_sparql(&count_q, None).unwrap()[0]["?c"]
+        let after = kg.query_sparql_for_claims(&claims, count_q).unwrap()[0]["?c"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1500,75 +1647,81 @@ mod ontology_action_tests {
 
     #[test]
     fn test_update_battery_soh_ok_and_range() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let ok = mk_req(None, json!({"battery_id": "BAT-001", "soh": 87.5}), false);
-        let (stmts, meta) = build_action_effects("UpdateBatterySoh", &ok, &kg, "t").unwrap();
+        let (stmts, meta) =
+            build_action_effects("UpdateBatterySoh", &ok, &kg, &claims, "t").unwrap();
         assert_eq!(stmts.len(), 4); // soh upsert(2) + soh_updated_at upsert(2)
-        assert!(stmts.iter().any(|s| s.contains("DELETE WHERE")));
-        assert!(stmts.iter().any(|s| s.contains("87.5")));
+        assert!(stmts.iter().any(|s| s.sparql().contains("DELETE WHERE")));
+        assert!(stmts.iter().any(|s| s.sparql().contains("87.5")));
         assert_eq!(meta["soh"], 87.5);
 
         let bad = mk_req(None, json!({"battery_id": "BAT-001", "soh": 150}), false);
-        let err = build_action_effects("UpdateBatterySoh", &bad, &kg, "t").unwrap_err();
+        let err = build_action_effects("UpdateBatterySoh", &bad, &kg, &claims, "t").unwrap_err();
         assert!(err.1.contains("0-100"));
     }
 
     #[test]
     fn test_update_battery_soh_missing_battery() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(None, json!({"battery_id": "NOPE", "soh": 50}), false);
-        let err = build_action_effects("UpdateBatterySoh", &r, &kg, "t").unwrap_err();
+        let err = build_action_effects("UpdateBatterySoh", &r, &kg, &claims, "t").unwrap_err();
         assert!(err.1.contains("电池对象不存在"));
     }
 
     #[test]
     fn test_mark_recall_ok() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(
             None,
             json!({"model_id": "M-001", "recall_reason": "电池批次缺陷"}),
             false,
         );
-        let (stmts, meta) = build_action_effects("MarkRecall", &r, &kg, "t").unwrap();
+        let (stmts, meta) = build_action_effects("MarkRecall", &r, &kg, &claims, "t").unwrap();
         assert_eq!(stmts.len(), 6); // 三个属性各 upsert(2)
-        assert!(stmts.iter().any(|s| s.contains("recalled")));
-        assert!(stmts.iter().any(|s| s.contains("电池批次缺陷")));
+        assert!(stmts.iter().any(|s| s.sparql().contains("recalled")));
+        assert!(stmts.iter().any(|s| s.sparql().contains("电池批次缺陷")));
         assert_eq!(meta["recalled"], true);
     }
 
     #[test]
     fn test_append_faq_ok_and_links_fault() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(
             Some("P0A80"),
             json!({"question": "报警怎么办？", "answer": "请尽快检修"}),
             false,
         );
-        let (stmts, meta) = build_action_effects("AppendFaq", &r, &kg, "t").unwrap();
+        let (stmts, meta) = build_action_effects("AppendFaq", &r, &kg, &claims, "t").unwrap();
         assert_eq!(stmts.len(), 1);
-        assert!(stmts[0].contains("relatedFaq"));
-        assert!(stmts[0].contains("报警怎么办"));
+        assert!(stmts[0].sparql().contains("relatedFaq"));
+        assert!(stmts[0].sparql().contains("报警怎么办"));
         assert!(meta["faq_id"].as_str().unwrap().starts_with("FAQ-"));
     }
 
     #[test]
     fn test_append_faq_missing_fault_precondition() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(
             Some("NON_EXIST"),
             json!({"question": "q", "answer": "a"}),
             false,
         );
-        let err = build_action_effects("AppendFaq", &r, &kg, "t").unwrap_err();
+        let err = build_action_effects("AppendFaq", &r, &kg, &claims, "t").unwrap_err();
         assert!(err.1.contains("故障码对象不存在"));
     }
 
     #[test]
     fn test_unknown_action() {
-        let kg = seeded_kg();
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
         let r = mk_req(None, json!({}), false);
-        let err = build_action_effects("NoSuchAction", &r, &kg, "t").unwrap_err();
+        let err = build_action_effects("NoSuchAction", &r, &kg, &claims, "t").unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }
-

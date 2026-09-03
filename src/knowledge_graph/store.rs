@@ -12,6 +12,32 @@ pub struct KnowledgeGraphStore {
     default_graph: String,
 }
 
+/// A mutation whose target graph is minted by [`KnowledgeGraphStore`] from
+/// verified claims. The payload is graph-local SPARQL only.
+#[derive(Debug, Clone)]
+pub enum ClaimsGraphUpdate {
+    InsertData(String),
+    DeleteWhere(String),
+}
+
+impl ClaimsGraphUpdate {
+    pub fn insert_data(triples: impl Into<String>) -> Self {
+        Self::InsertData(triples.into())
+    }
+
+    pub fn delete_where(pattern: impl Into<String>) -> Self {
+        Self::DeleteWhere(pattern.into())
+    }
+
+    /// The graph-local mutation, useful for dry-run responses.
+    pub fn sparql(&self) -> String {
+        match self {
+            Self::InsertData(triples) => format!("INSERT DATA {{ {} }}", triples),
+            Self::DeleteWhere(pattern) => format!("DELETE WHERE {{ {} }}", pattern),
+        }
+    }
+}
+
 impl KnowledgeGraphStore {
     /// Create KG Store using a unified shared Oxigraph Store
     pub fn with_shared_store(store: Arc<Store>) -> Result<Self, String> {
@@ -118,6 +144,123 @@ impl KnowledgeGraphStore {
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {}", e))?;
         self.query_sparql_in_graph(sparql, Some(&graph))
+    }
+
+    /// Writes a graph-local mutation to a graph minted from verified claims.
+    ///
+    /// The mutation payload cannot name a graph. This prevents callers from
+    /// turning an otherwise claims-scoped write into a cross-tenant write.
+    pub fn update_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        update: &ClaimsGraphUpdate,
+    ) -> Result<(), String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        self.update_in_claims_graph(&graph, update)
+    }
+
+    /// Writes a graph-local mutation to a staging graph derived from verified
+    /// claims. `staging_id` is an opaque, safe invocation identifier.
+    pub fn update_staging_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+        update: &ClaimsGraphUpdate,
+    ) -> Result<(), String> {
+        let graph = self.staging_graph_iri_for_claims(claims, staging_id)?;
+        self.update_in_claims_graph(&graph, update)
+    }
+
+    /// Queries only the staging graph derived from verified claims.
+    pub fn query_staging_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+        sparql: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        if sparql.to_uppercase().contains("GRAPH") {
+            return Err("claims-scoped staging queries must not contain GRAPH".to_string());
+        }
+        let graph = self.staging_graph_iri_for_claims(claims, staging_id)?;
+        self.query_sparql_in_graph(sparql, Some(&graph))
+    }
+
+    /// Merges the staging graph derived from verified claims into its minted
+    /// production graph. Neither graph is caller-selectable.
+    pub fn commit_staging_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<(), String> {
+        let staging = self.staging_graph_iri_for_claims(claims, staging_id)?;
+        let production = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        self.store
+            .update(&format!("ADD SILENT GRAPH <{staging}> TO <{production}>"))
+            .map_err(|e| format!("claims-scoped staging merge failed: {}", e))
+    }
+
+    /// Removes the staging graph derived from verified claims.
+    pub fn drop_staging_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<(), String> {
+        let staging = self.staging_graph_iri_for_claims(claims, staging_id)?;
+        self.store
+            .update(&format!("DROP SILENT GRAPH <{staging}>"))
+            .map_err(|e| format!("claims-scoped staging cleanup failed: {}", e))
+    }
+
+    /// Returns the opaque staging graph IRI derived from a minted production
+    /// graph. Callers cannot provide a complete graph IRI.
+    pub fn staging_graph_iri_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<String, String> {
+        if staging_id.is_empty()
+            || !staging_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(
+                "staging identifier must contain only ASCII letters, digits, '-' or '_'"
+                    .to_string(),
+            );
+        }
+        let production = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        Ok(format!("{production}/staging/{staging_id}"))
+    }
+
+    fn update_in_claims_graph(
+        &self,
+        graph: &str,
+        update: &ClaimsGraphUpdate,
+    ) -> Result<(), String> {
+        let payload = match update {
+            ClaimsGraphUpdate::InsertData(triples) => triples,
+            ClaimsGraphUpdate::DeleteWhere(pattern) => pattern,
+        };
+        if payload.to_uppercase().contains("GRAPH") {
+            return Err("claims-scoped updates must not contain GRAPH".to_string());
+        }
+        let sparql = match update {
+            ClaimsGraphUpdate::InsertData(triples) => {
+                format!("INSERT DATA {{ GRAPH <{graph}> {{ {triples} }} }}")
+            }
+            ClaimsGraphUpdate::DeleteWhere(pattern) => {
+                format!("DELETE WHERE {{ GRAPH <{graph}> {{ {pattern} }} }}")
+            }
+        };
+        self.store
+            .update(&sparql)
+            .map_err(|e| format!("claims-scoped SPARQL update failed: {}", e))
     }
 
     /// Deletes are only permitted through
