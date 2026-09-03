@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.5-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.6-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,7 @@
 
 | 版本 | 发布日期 | 核心升级与融合特性 |
 |------|----------|-------------------|
+| **v0.1.6** | **2026-09-04** | **隔离与加固**<br>• 经验证 JWT 租户/项目声明现在负责铸造图、Blob、向量和 L0 目标；HTTP KG、本体、知识库、chat RAG 以及运行时图/向量工具均按声明隔离，缺少声明时拒绝访问。<br>• 新建用户 Agent 会写入经验证范围；公共 API Key chat 明确不使用租户 RAG。<br>• 新增可选 `AGENTOS_TENANT_TOOL_CALL_CAP`、MCP 行为披露、bash 子进程环境清理、工具 schema 强制校验和 PDCA L0 envelope。<br>• 详见[隔离契约](docs/17-isolation-contract.md)；历史键未迁移。 |
 | **v0.1.5** | **2026-08-18** | **认知因果引擎与图治理升级**<br>• **Causal Engine 因果引擎**：新增独立因果分析子系统 `CausalEngine`、`FusionEngine`、`CausalStore` 和类型化的 `CausalFactor`。支持智能体运行的因果推理与多因素融合分析，用于根因识别、故障链传播以及决策因果图谱构建。<br>• **统一图存储后端 (Unified Graph)**：将原零散图读写接口收敛为单一、高性能的 `GraphBackend`。<br>• **图特征计算与相似度**：支持对认知快照进行度中心性、PageRank 等图特征向量计算，并比对计算认知相似度。<br>• **快照时间线 (Snapshot Timeline)**：会话级定点历史恢复与基于 diff 的版本差异回滚。<br>• **技能中心 CRUD 与系统守卫**：支持应用级（`skill://`）技能的新建、详情解析（含 Input/Output Schema）、编辑与删除；对系统级（`iri://`）内置技能执行严格的 **403 只读保护**。 |
 | **v0.1.4** | **2026-07-06** | **统一模型注册中心与向量热桥接**<br>• **三合一收敛**：原「大模型网关」「向量/Embedding」「模型资源」Tab 合并收敛为单一的**模型注册中心**，实现统一管理。<br>• **自动拉取型号**：支持调用外部 `/v1/models` 并根据名称关键词自动对文本、VL、向量等型号进行模态预判。<br>• **向量服务热桥接**：在模型页面直接将型号「设为生效向量」，实现免重启热切换向量库并自动后台重建索引。 |
 | **v0.1.3** | **2026-07-06** | **多模态 (VL) 支持与 Agent 多模型能力挂载**<br>• **多模态智能网关**：支持对 `ChatContent` 中包含的文本与图片（Base64/URL）进行解析，自动路由至多模态大模型。<br>• **能力槽多模型挂载**：支持在 Agent 中挂载不同的型号到对应的功能槽（例如 chat 槽挂载 DeepSeek，vision 槽挂载 Gemini）。 |
