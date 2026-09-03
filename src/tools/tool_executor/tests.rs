@@ -170,8 +170,8 @@ mod tests {
                 .execute_with_claims(
                     "knowledge_import_json",
                     json!({
-                        "json_data": r#"{"id":"only-a","label":"Tenant A entity"}"#,
-                        "mapping_config": r#"{"id_field":"id","label_field":"label"}"#,
+                        "json_data": r#"{"id":"only-a","type":"http://example.org/Person","label":"Tenant A entity"}"#,
+                        "mapping_config": r#"{"id_field":"id","type_field":"type","label_field":"label"}"#,
                         "graph": "graph:world"
                     }),
                     Some(tenant_a.clone()),
