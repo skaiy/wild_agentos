@@ -645,8 +645,18 @@ pub(crate) async fn update_knowledge_base_handler(
 /// 向量类型：返回 namespace；chunks 暂无按命名空间枚举接口，返回 null 并附说明。
 pub(crate) async fn knowledge_base_stats_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for graph storage" })),
+            )
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -677,38 +687,36 @@ pub(crate) async fn knowledge_base_stats_handler(
         "updated_at": kb.get("updated_at").cloned().unwrap_or(Value::Null),
     });
     if kb_type == "graph" {
-        let graph_iri = kb
-            .get("graph")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let triples = if graph_iri.is_empty() {
-            json!(0)
-        } else {
-            match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
-                Ok(kg) => {
-                    let q = format!(
-                        "SELECT (COUNT(*) AS ?c) WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}",
-                        g = graph_iri
-                    );
-                    match kg.query_sparql(&q, None) {
-                        Ok(rows) => rows
-                            .first()
-                            .and_then(|r| r.get("?c"))
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .map(|n| json!(n))
-                            .unwrap_or(json!(0)),
-                        Err(e) => {
-                            tracing::warn!("KB stats graph count failed: {}", e);
-                            json!(null)
-                        }
+        let graph_iri = match claims.graph_iri() {
+            Ok(graph_iri) => graph_iri,
+            Err(e) => {
+                tracing::warn!("KB stats invalid verified graph scope: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "invalid verified graph scope" })),
+                );
+            }
+        };
+        let triples = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+            Ok(kg) => {
+                let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }";
+                match kg.query_sparql_for_claims(claims, q) {
+                    Ok(rows) => rows
+                        .first()
+                        .and_then(|r| r.get("?c"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(|n| json!(n))
+                        .unwrap_or(json!(0)),
+                    Err(e) => {
+                        tracing::warn!("KB stats graph count failed: {}", e);
+                        json!(null)
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("KB stats KG store failed: {}", e);
-                    json!(null)
-                }
+            }
+            Err(e) => {
+                tracing::warn!("KB stats KG store failed: {}", e);
+                json!(null)
             }
         };
         stats["graph"] = json!(graph_iri);
@@ -749,6 +757,15 @@ pub(crate) async fn ingest_knowledge_base_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<IngestRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for vector storage" })),
+            )
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -771,17 +788,16 @@ pub(crate) async fn ingest_knowledge_base_handler(
             Json(json!({ "error": "仅向量知识库支持 ingest" })),
         );
     }
-    let namespace = kb
-        .get("vector_namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if namespace.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "该向量库缺少 vector_namespace" })),
-        );
-    }
+    let namespace = match claims.vector_namespace() {
+        Ok(namespace) => namespace,
+        Err(e) => {
+            tracing::warn!("KB ingest invalid verified vector namespace: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "invalid verified vector namespace" })),
+            );
+        }
+    };
     let store = match state.vector_store.load_full() {
         Some(s) => s,
         None => {
@@ -803,22 +819,12 @@ pub(crate) async fn ingest_knowledge_base_handler(
             Json(json!({ "error": "texts/text 不能为空" })),
         );
     }
-    let tags = vec![namespace.clone(), format!("tenant:{}", identity.tenant_id)];
+    let tags = Vec::new();
     let mut count = 0usize;
     for text in &texts {
         for chunk in chunk_text(text, 500) {
-            let iri = format!("{}#chunk/{}", namespace, uuid::Uuid::new_v4().hyphenated());
-            match store
-                .upsert_with_metadata(
-                    &iri,
-                    &chunk,
-                    &tags,
-                    Some(0.5),
-                    None,
-                    Some(namespace.as_str()),
-                )
-                .await
-            {
+            let iri = format!("chunk/{}", uuid::Uuid::new_v4().hyphenated());
+            match store.upsert_with_claims(claims, &iri, &chunk, &tags).await {
                 Ok(_) => count += 1,
                 Err(e) => {
                     return (
@@ -845,9 +851,19 @@ pub struct SearchRequest {
 /// POST /api/v1/kb/bases/:id/search — 对向量知识库做语义相似检索（供 admin/QA 直接验证召回）。
 pub(crate) async fn search_knowledge_base_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<SearchRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for vector storage" })),
+            )
+        }
+    };
     let query = req.query.trim().to_string();
     if query.is_empty() {
         return (
@@ -877,17 +893,16 @@ pub(crate) async fn search_knowledge_base_handler(
             Json(json!({ "error": "仅向量知识库支持 search" })),
         );
     }
-    let namespace = kb
-        .get("vector_namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if namespace.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "该向量库缺少 vector_namespace" })),
-        );
-    }
+    let namespace = match claims.vector_namespace() {
+        Ok(namespace) => namespace,
+        Err(e) => {
+            tracing::warn!("KB search invalid verified vector namespace: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "invalid verified vector namespace" })),
+            );
+        }
+    };
     let store = match state.vector_store.load_full() {
         Some(s) => s,
         None => {
@@ -898,8 +913,11 @@ pub(crate) async fn search_knowledge_base_handler(
         }
     };
     let limit = req.limit.unwrap_or(5).clamp(1, 20);
-    let filter = HybridSearchFilter::new().with_named_graph(namespace.clone());
-    match store.search_with_filter(&query, &filter, limit).await {
+    let filter = HybridSearchFilter::new();
+    match store
+        .search_with_claims(claims, &query, &filter, limit)
+        .await
+    {
         Ok(hits) => {
             let results: Vec<Value> = hits
                 .iter()
@@ -1001,17 +1019,16 @@ pub(crate) async fn upload_knowledge_base_handler(
             Json(json!({ "error": "仅向量知识库支持文件上传" })),
         );
     }
-    let namespace = kb
-        .get("vector_namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if namespace.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "该向量库缺少 vector_namespace" })),
-        );
-    }
+    let namespace = match claims.vector_namespace() {
+        Ok(namespace) => namespace,
+        Err(e) => {
+            tracing::warn!("KB upload invalid verified vector namespace: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "invalid verified vector namespace" })),
+            );
+        }
+    };
     let store = match state.vector_store.load_full() {
         Some(s) => s,
         None => {
@@ -1083,7 +1100,7 @@ pub(crate) async fn upload_knowledge_base_handler(
     // 当前仅实现固定长度分块；其余策略降级为 fixed 并在响应标注。
     let applied_strategy = "fixed";
 
-    let base_tags = vec![namespace.clone(), format!("tenant:{}", identity.tenant_id)];
+    let base_tags = Vec::new();
     let blob = state.blob_store.clone();
     let mut file_results: Vec<Value> = Vec::new();
     let mut ledger_entries: Vec<Value> = Vec::new();
@@ -1120,16 +1137,9 @@ pub(crate) async fn upload_knowledge_base_handler(
             doc_tags.push(format!("doc:{}", doc_id));
             let text = String::from_utf8_lossy(&bytes).to_string();
             for chunk in chunk_text(&text, chunk_size) {
-                let iri = format!("{}#chunk/{}", namespace, uuid::Uuid::new_v4().hyphenated());
+                let iri = format!("chunk/{}", uuid::Uuid::new_v4().hyphenated());
                 match store
-                    .upsert_with_metadata(
-                        &iri,
-                        &chunk,
-                        &doc_tags,
-                        Some(min_importance),
-                        None,
-                        Some(namespace.as_str()),
-                    )
+                    .upsert_with_claims(claims, &iri, &chunk, &doc_tags)
                     .await
                 {
                     Ok(_) => {
@@ -1399,18 +1409,6 @@ pub(crate) async fn reindex_knowledge_base_handler(
         )
             .into_response();
     }
-    let namespace = kb
-        .get("vector_namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if namespace.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "该向量库缺少 vector_namespace" })),
-        )
-            .into_response();
-    }
     if state.vector_store.load().is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1437,11 +1435,6 @@ pub(crate) async fn reindex_knowledge_base_handler(
         )
             .into_response();
     }
-    let tenant = kb
-        .get("tenant_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
     // 标记 reindexing 并落盘，避免并发重复触发。
     {
         let mut guard = state.knowledge_bases.write().await;
@@ -1462,7 +1455,7 @@ pub(crate) async fn reindex_knowledge_base_handler(
     let state2 = state.clone();
     let id2 = id.clone();
     tokio::spawn(async move {
-        run_kb_reindex(state2, claims, id2, namespace, tenant, docs).await;
+        run_kb_reindex(state2, claims, id2, docs).await;
     });
     (
         StatusCode::ACCEPTED,
@@ -1476,8 +1469,6 @@ async fn run_kb_reindex(
     state: Arc<AppState>,
     claims: crate::isolation::IsolationClaims,
     id: String,
-    namespace: String,
-    tenant: String,
     docs: Vec<Value>,
 ) {
     let store = match state.vector_store.load_full() {
@@ -1505,10 +1496,6 @@ async fn run_kb_reindex(
             .get("chunk_size")
             .and_then(|v| v.as_u64())
             .unwrap_or(500) as usize;
-        let min_importance = doc
-            .get("min_importance")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5) as f32;
         let has_blob_ref = doc
             .get("blob_ref")
             .and_then(|b| b.get("key"))
@@ -1518,7 +1505,7 @@ async fn run_kb_reindex(
         if let Some(arr) = doc.get("chunk_iris").and_then(|v| v.as_array()) {
             for it in arr {
                 if let Some(iri) = it.as_str() {
-                    let _ = store.delete(iri).await;
+                    let _ = store.delete_with_claims(&claims, iri).await;
                 }
             }
         }
@@ -1555,26 +1542,12 @@ async fn run_kb_reindex(
         };
         // ③ 重新分块 embedding 写入。
         let text = String::from_utf8_lossy(&bytes).to_string();
-        let tags = vec![
-            namespace.clone(),
-            format!("tenant:{}", tenant),
-            format!("doc:{}", doc_id),
-        ];
+        let tags = vec![format!("doc:{}", doc_id)];
         let mut new_iris: Vec<String> = Vec::new();
         let mut err: Option<String> = None;
         for chunk in chunk_text(&text, chunk_size) {
-            let iri = format!("{}#chunk/{}", namespace, uuid::Uuid::new_v4().hyphenated());
-            match store
-                .upsert_with_metadata(
-                    &iri,
-                    &chunk,
-                    &tags,
-                    Some(min_importance),
-                    None,
-                    Some(namespace.as_str()),
-                )
-                .await
-            {
+            let iri = format!("chunk/{}", uuid::Uuid::new_v4().hyphenated());
+            match store.upsert_with_claims(&claims, &iri, &chunk, &tags).await {
                 Ok(_) => new_iris.push(iri),
                 Err(e) => {
                     err = Some(format!("写入失败: {e}"));
@@ -1800,9 +1773,19 @@ fn kb_quads_from_triples(text: &str) -> Result<Vec<RdfQuad>, String> {
 /// 字段：file（文件）、format（csv|jsonl|triples，缺省按扩展名推断）、schema（可选）、clear_before（可选）。
 pub(crate) async fn import_graph_knowledge_base_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for graph storage" })),
+            )
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -1825,17 +1808,16 @@ pub(crate) async fn import_graph_knowledge_base_handler(
             Json(json!({ "error": "仅图谱知识库支持三元组导入" })),
         );
     }
-    let graph_iri = kb
-        .get("graph")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if graph_iri.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "该图谱库缺少命名图 graph" })),
-        );
-    }
+    let graph_iri = match claims.graph_iri() {
+        Ok(graph_iri) => graph_iri,
+        Err(e) => {
+            tracing::warn!("KB import invalid verified graph scope: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "invalid verified graph scope" })),
+            );
+        }
+    };
 
     let mut format: Option<String> = None;
     let mut schema = String::new();
@@ -1980,7 +1962,7 @@ pub(crate) async fn import_graph_knowledge_base_handler(
             )
         }
     };
-    match kg.write_quads(&quads, &graph_iri) {
+    match kg.write_quads_for_claims(claims, &quads) {
         Ok(()) => {
             let _ = state.kg_store.flush();
             (
@@ -2139,5 +2121,237 @@ mod kb_ingest_tests {
         let new_pack_id = packs[0]["id"].as_str().unwrap();
         assert_eq!(agents[0]["knowledge_pack_ids"], json!([new_pack_id]));
         assert_eq!(agents[0]["knowledge_graph"], json!(""));
+    }
+}
+
+#[cfg(test)]
+mod kb_isolation_http_tests {
+    use super::*;
+    use crate::api::http::{api_gov::ApiUsageState, AppState, TEST_ENV_LOCK};
+    use crate::core::core_types::{CoreConfig, SemanticCore};
+    use crate::gateway::UnifiedGateway;
+    use crate::memory::embedding_service::FallbackEmbeddingService;
+    use crate::memory::hyperspace_store::HyperspaceStore;
+    use crate::tools::prompt_registry::PromptRegistry;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        routing::{get, post},
+        Router,
+    };
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use tower::ServiceExt;
+
+    fn test_state(tmp: &std::path::Path) -> Arc<AppState> {
+        let l0 = tmp.join("l0");
+        std::fs::create_dir_all(&l0).unwrap();
+        let core = Arc::new(
+            SemanticCore::new(CoreConfig {
+                max_node_size: 1024,
+                max_projection_size: 2048,
+                l0_storage_path: l0.to_str().unwrap().to_string(),
+                event_buffer_size: 10,
+                enable_metrics: false,
+                eviction_config: None,
+            })
+            .unwrap(),
+        );
+        let gateway = Arc::new(
+            UnifiedGateway::new(&crate::config::GatewaySettings {
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                default_model: "test-model".into(),
+                timeout_seconds: 30,
+                max_retries: 1,
+                retry_base_ms: 500,
+                use_responses_api: false,
+                model_mapping: std::collections::HashMap::new(),
+            })
+            .unwrap(),
+        );
+        let vector_store = HyperspaceStore::open(
+            &tmp.join("vectors"),
+            Arc::new(FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        Arc::new(AppState {
+            core,
+            gateway,
+            kg_store: Arc::new(oxigraph::store::Store::new().unwrap()),
+            config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
+            agents_info: json!({ "count": 0, "agents": [] }),
+            mcp_servers: Arc::new(tokio::sync::RwLock::new(vec![])),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![])),
+            prompts: Arc::new(PromptRegistry::new()),
+            kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::from_pointee(vector_store)),
+            blob_store: None,
+            task_executor: None,
+            batch_manager: None,
+            api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_usage: Arc::new(ApiUsageState::default()),
+        })
+    }
+
+    fn jwt(tenant_id: &str) -> String {
+        encode(
+            &Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: format!("{tenant_id}-user"),
+                tenant_id: tenant_id.to_string(),
+                roles: vec![],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+        )
+        .unwrap()
+    }
+
+    async fn response_json(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn graph_import_and_stats_require_claims_and_isolate_tenants() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        state.knowledge_bases.write().await.push(json!({
+            "id": "graph-kb",
+            "kb_type": "graph",
+            "graph": "graph:world"
+        }));
+        let app = Router::new()
+            .route("/kb/:id/import", post(import_graph_knowledge_base_handler))
+            .route("/kb/:id/stats", get(knowledge_base_stats_handler))
+            .with_state(state.clone());
+
+        let unauthenticated = Request::builder()
+            .method("POST")
+            .uri("/kb/graph-kb/import")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            response_json(&app, unauthenticated).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let unauthenticated_stats = Request::builder()
+            .uri("/kb/graph-kb/stats")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            response_json(&app, unauthenticated_stats).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let boundary = "kb-boundary";
+        let csv =
+            "subject,predicate,object\nhttp://example.test/a,http://example.test/p,tenant A\n";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.csv\"\r\n\r\n{csv}\r\n--{boundary}--\r\n"
+        );
+        let imported = Request::builder()
+            .method("POST")
+            .uri("/kb/graph-kb/import")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(response_json(&app, imported).await.0, StatusCode::OK);
+
+        let a_stats = Request::builder()
+            .uri("/kb/graph-kb/stats")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(response_json(&app, a_stats).await.1["triples"], json!(1));
+        let b_stats = Request::builder()
+            .uri("/kb/graph-kb/stats")
+            .header("authorization", format!("Bearer {}", jwt("tenant-b")))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(response_json(&app, b_stats).await.1["triples"], json!(0));
+
+        let legacy = state
+            .kg_store
+            .query("SELECT ?s WHERE { GRAPH <graph:world> { ?s ?p ?o } }")
+            .unwrap();
+        assert_eq!(legacy.into_solutions().unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn vector_ingest_and_search_require_claims_and_isolate_tenants() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        state.knowledge_bases.write().await.push(json!({
+            "id": "vector-kb",
+            "kb_type": "vector",
+            "vector_namespace": "tenant:legacy"
+        }));
+        let app = Router::new()
+            .route("/kb/:id/ingest", post(ingest_knowledge_base_handler))
+            .route("/kb/:id/search", post(search_knowledge_base_handler))
+            .with_state(state);
+
+        let unauthenticated = Request::builder()
+            .method("POST")
+            .uri("/kb/vector-kb/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"private battery instructions"}"#))
+            .unwrap();
+        assert_eq!(
+            response_json(&app, unauthenticated).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let unauthenticated_search = Request::builder()
+            .method("POST")
+            .uri("/kb/vector-kb/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"battery instructions"}"#))
+            .unwrap();
+        assert_eq!(
+            response_json(&app, unauthenticated_search).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let ingested = Request::builder()
+            .method("POST")
+            .uri("/kb/vector-kb/ingest")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"private battery instructions"}"#))
+            .unwrap();
+        assert_eq!(response_json(&app, ingested).await.0, StatusCode::OK);
+
+        let search = |tenant_id| {
+            Request::builder()
+                .method("POST")
+                .uri("/kb/vector-kb/search")
+                .header("authorization", format!("Bearer {}", jwt(tenant_id)))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"battery instructions"}"#))
+                .unwrap()
+        };
+        assert_eq!(
+            response_json(&app, search("tenant-a")).await.1["count"],
+            json!(1)
+        );
+        assert_eq!(
+            response_json(&app, search("tenant-b")).await.1["count"],
+            json!(0)
+        );
     }
 }
