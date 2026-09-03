@@ -98,7 +98,6 @@ pub(crate) fn save_knowledge_packs(packs: &[Value]) -> std::io::Result<()> {
     std::fs::write(&path, content)
 }
 
-
 /// 遍历所有向量 KB，逐个后台重建索引（从 BlobStore 原文台账）。返回排队重建的 KB 数。
 /// 无 BlobStore 或无原文台账的 KB 将被跳过（存量向量已作废，需重新上传）。
 pub(crate) async fn spawn_reindex_all_vector_kbs(state: Arc<AppState>) -> usize {
@@ -106,65 +105,9 @@ pub(crate) async fn spawn_reindex_all_vector_kbs(state: Arc<AppState>) -> usize 
         tracing::warn!("BlobStore 未启用，跳过自动重建（存量向量已作废，需重新上传原文）");
         return 0;
     }
-    let targets: Vec<(String, String, String, Vec<Value>)> = {
-        let guard = state.knowledge_bases.read().await;
-        guard
-            .iter()
-            .filter_map(|kb| {
-                if kb.get("kb_type").and_then(|v| v.as_str()) != Some("vector") {
-                    return None;
-                }
-                let id = kb.get("id").and_then(|v| v.as_str())?.to_string();
-                let namespace = kb
-                    .get("vector_namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if namespace.is_empty() {
-                    return None;
-                }
-                let tenant = kb
-                    .get("tenant_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default")
-                    .to_string();
-                let docs = kb
-                    .get("documents")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                if docs.is_empty() {
-                    return None;
-                }
-                Some((id, namespace, tenant, docs))
-            })
-            .collect()
-    };
-    let count = targets.len();
-    for (id, namespace, tenant, docs) in targets {
-        {
-            let mut guard = state.knowledge_bases.write().await;
-            if let Some(o) = guard
-                .iter_mut()
-                .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-                .and_then(|b| b.as_object_mut())
-            {
-                o.insert("reindex_status".into(), json!("reindexing"));
-                o.insert(
-                    "reindex_started_at".into(),
-                    json!(chrono::Utc::now().to_rfc3339()),
-                );
-            }
-            let _ = save_knowledge_bases(&guard);
-        }
-        let st = state.clone();
-        tokio::spawn(async move {
-            run_kb_reindex(st, id, namespace, tenant, docs).await;
-        });
-    }
-    count
+    tracing::warn!("自动重建缺少已验证 isolation claims，跳过 BlobStore 读取");
+    0
 }
-
 
 // ─── 知识库分类管理 CRUD ──────────────────────────────────────────────────────
 
@@ -177,7 +120,9 @@ pub struct KbCategoryCreateRequest {
 /// GET /api/v1/knowledge-packs — 返回知识包清单（内置种子 + 用户创建，均持久化于 data/knowledge_packs.json）。
 ///
 /// 每个知识包关联 N 个知识库分类 / N 个图知识库 / N 个向量知识库，可被 Agent 挂载。
-pub(crate) async fn list_knowledge_packs_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_knowledge_packs_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let packs = state.knowledge_packs.read().await.clone();
     Json(json!({ "count": packs.len(), "knowledge_packs": packs }))
 }
@@ -358,9 +303,10 @@ pub(crate) async fn delete_knowledge_pack_handler(
     )
 }
 
-
 /// GET /api/v1/kb/categories — 返回全部知识库分类
-pub(crate) async fn list_kb_categories_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_kb_categories_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let categories = state.kb_categories.read().await.clone();
     Json(json!({ "count": categories.len(), "categories": categories }))
 }
@@ -468,7 +414,9 @@ fn sparql_literal(s: &str) -> String {
 }
 
 /// GET /api/v1/kb/bases — 返回全部知识库
-pub(crate) async fn list_knowledge_bases_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_knowledge_bases_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let bases = state.knowledge_bases.read().await.clone();
     Json(json!({ "count": bases.len(), "bases": bases }))
 }
@@ -972,7 +920,6 @@ pub(crate) async fn search_knowledge_base_handler(
 /// KB 上传/导入单文件体积上限（60MB，覆盖前端提示的 50MB/文件 + 编码开销）。
 pub(crate) const KB_UPLOAD_MAX_BYTES: usize = 60 * 1024 * 1024;
 
-
 /// 依扩展名判断向量库上传文件是否为当前可解析的纯文本类型。
 /// 返回 Some(()) 表示直读文本；None 表示暂无解析器（PDF/Word 等），走诚实降级。
 fn kb_text_ext(name: &str) -> Option<()> {
@@ -1023,6 +970,15 @@ pub(crate) async fn upload_knowledge_base_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
+            )
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -1143,11 +1099,11 @@ pub(crate) async fn upload_knowledge_base_handler(
         let content_type = kb_content_type(&name);
         let size = bytes.len();
         // ① 原文落盘：无论能否解析都持久化，为重建索引/预览/溯源留底。
-        let blob_key = format!("tenant:{}/kb/{}/{}", identity.tenant_id, id, doc_id);
+        let blob_key = format!("kb/{id}/{doc_id}");
         let mut blob_ref = Value::Null;
         let mut persist_err: Option<String> = None;
         if let Some(b) = &blob {
-            match b.put(&blob_key, &bytes, &content_type).await {
+            match b.put(claims, &blob_key, &bytes, &content_type).await {
                 Ok(_) => blob_ref = json!({ "backend": b.backend(), "key": blob_key }),
                 Err(e) => persist_err = Some(format!("原文落盘失败: {e}")),
             }
@@ -1312,6 +1268,7 @@ fn rfc5987_encode(s: &str) -> String {
 /// GET /api/v1/kb/bases/:id/documents/:doc_id/raw — 经 core 代理从 BlobStore 返回原文（不暴露 MinIO）。
 pub(crate) async fn kb_document_raw_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path((id, doc_id)): axum::extract::Path<(String, String)>,
 ) -> Response {
     let doc = {
@@ -1335,18 +1292,24 @@ pub(crate) async fn kb_document_raw_handler(
                 .into_response()
         }
     };
-    let key = doc
+    let has_blob_ref = doc
         .get("blob_ref")
         .and_then(|b| b.get("key"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    let key = match key {
-        Some(k) => k,
+        .is_some_and(|key| !key.is_empty());
+    if !has_blob_ref {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "该文档原文未持久化（BlobStore 未启用时上传）" })),
+        )
+            .into_response();
+    }
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
         None => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "该文档原文未持久化（BlobStore 未启用时上传）" })),
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
             )
                 .into_response()
         }
@@ -1361,7 +1324,8 @@ pub(crate) async fn kb_document_raw_handler(
                 .into_response()
         }
     };
-    match blob.get(&key).await {
+    let key = format!("kb/{id}/{doc_id}");
+    match blob.get(claims, &key).await {
         Ok(bytes) => {
             let ct = doc
                 .get("content_type")
@@ -1391,7 +1355,6 @@ pub(crate) async fn kb_document_raw_handler(
     }
 }
 
-
 /// POST /api/v1/kb/bases/:id/reindex — 按当前 embedding/分块重建向量索引（异步）。
 /// 从 documents 台账拉原文 → 删旧 chunk → 重新分块 embedding 写新 → 更新台账与状态。
 pub(crate) async fn reindex_knowledge_base_handler(
@@ -1402,6 +1365,16 @@ pub(crate) async fn reindex_knowledge_base_handler(
     if let Err(e) = identity.require_role("DA") {
         return e.into_response();
     }
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims.clone(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
+            )
+                .into_response()
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -1489,7 +1462,7 @@ pub(crate) async fn reindex_knowledge_base_handler(
     let state2 = state.clone();
     let id2 = id.clone();
     tokio::spawn(async move {
-        run_kb_reindex(state2, id2, namespace, tenant, docs).await;
+        run_kb_reindex(state2, claims, id2, namespace, tenant, docs).await;
     });
     (
         StatusCode::ACCEPTED,
@@ -1501,6 +1474,7 @@ pub(crate) async fn reindex_knowledge_base_handler(
 /// 后台重建任务：逐文档从 BlobStore 拉原文，删旧 chunk 后按当前 embedding 重新入库，回写台账。
 async fn run_kb_reindex(
     state: Arc<AppState>,
+    claims: crate::isolation::IsolationClaims,
     id: String,
     namespace: String,
     tenant: String,
@@ -1535,12 +1509,11 @@ async fn run_kb_reindex(
             .get("min_importance")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.5) as f32;
-        let key = doc
+        let has_blob_ref = doc
             .get("blob_ref")
             .and_then(|b| b.get("key"))
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+            .is_some_and(|key| !key.is_empty());
         // ① 删旧 chunk（幂等，忽略单条失败）。
         if let Some(arr) = doc.get("chunk_iris").and_then(|v| v.as_array()) {
             for it in arr {
@@ -1550,7 +1523,7 @@ async fn run_kb_reindex(
             }
         }
         // ② 无原文或非可解析类型：无法重建，保留留底状态。
-        if key.is_none() || kb_text_ext(&filename).is_none() {
+        if !has_blob_ref || kb_text_ext(&filename).is_none() {
             if let Some(o) = doc.as_object_mut() {
                 o.insert("chunks".into(), json!(0));
                 o.insert("chunk_iris".into(), json!([]));
@@ -1565,8 +1538,8 @@ async fn run_kb_reindex(
             updated.push(doc);
             continue;
         }
-        let key = key.unwrap();
-        let bytes = match blob.get(&key).await {
+        let key = format!("kb/{id}/{doc_id}");
+        let bytes = match blob.get(&claims, &key).await {
             Ok(b) => b,
             Err(e) => {
                 any_failed = true;
@@ -2030,8 +2003,6 @@ pub(crate) async fn import_graph_knowledge_base_handler(
     }
 }
 
-
-
 // ──────────────────────────────────────────────────────────────────────────────
 /// §9 知识库图谱摄取回归单测：固化两处已修复缺陷——
 ///   1) 中文 IRI 保留（kb_sanitize_id 不再把非 ASCII 折叠成 `_`，避免碰撞/损坏）；
@@ -2039,6 +2010,7 @@ pub(crate) async fn import_graph_knowledge_base_handler(
 #[cfg(test)]
 mod kb_ingest_tests {
     use super::*;
+    use crate::isolation::IsolationClaims;
     use crate::knowledge_graph::store::KnowledgeGraphStore;
 
     /// 回归：中文实体/关系名应原样保留 Unicode，仅对 IRIREF 禁用字符做百分号编码。
@@ -2094,19 +2066,20 @@ mod kb_ingest_tests {
     #[test]
     fn test_graph_stats_count_binding_key() {
         let kg = KnowledgeGraphStore::new().expect("in-mem store");
-        let graph = "iri://kb/test-cn-stats";
+        let claims =
+            IsolationClaims::from_verified("kb-test-tenant", "stats-project", "test-actor")
+                .expect("verified claims");
         let csv = "subject,predicate,object,object_type\n\
                    车型:测试001,属于品牌,品牌:比亚迪,iri\n\
                    车型:测试001,续航里程,605,literal\n";
         let quads = kb_quads_from_csv(csv).expect("csv parse");
-        kg.write_quads(&quads, graph).expect("write quads");
+        kg.write_quads_for_claims(&claims, &quads)
+            .expect("write quads");
 
-        // 与 knowledge_base_stats_handler 完全一致的计数查询。
-        let q = format!(
-            "SELECT (COUNT(*) AS ?c) WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}",
-            g = graph
-        );
-        let rows = kg.query_sparql(&q, None).expect("count query");
+        // Claims-scoped queries apply the named graph automatically.
+        let rows = kg
+            .query_sparql_for_claims(&claims, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+            .expect("count query");
         let first = rows.first().expect("one row");
         // 关键回归：绑定键带 `?` 前缀。
         assert!(first.get("c").is_none(), "绑定键不应是 `c`");
@@ -2143,7 +2116,8 @@ mod kb_ingest_tests {
             json!(["ev-repair-fault-kb"])
         );
         // 幂等：二次运行无变更。
-        let (a2, p2) = crate::api::http::agents::migrate_legacy_agent_graphs(&mut agents, &mut packs);
+        let (a2, p2) =
+            crate::api::http::agents::migrate_legacy_agent_graphs(&mut agents, &mut packs);
         assert!(!a2 && !p2, "幂等：清空后不再变更");
     }
 

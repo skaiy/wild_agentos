@@ -60,7 +60,6 @@ fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-
 /// POST /api/v1/images/upload — 图片上传（multipart，复用 BlobStore）。
 /// 字段：file（单个图片）。校验类型 ∈ {png,jpeg,webp,gif} 且 ≤10MiB。
 /// 返回 { image_id, url, content_type, size, data_uri? }，url 供 image_url 直接引用。
@@ -128,17 +127,24 @@ pub(crate) async fn upload_image_handler(
         }
     };
     let ct = image_ct_from_ext(ext).to_string();
-    let tenant = identity.tenant_id.clone();
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
+            )
+        }
+    };
     let uuid = uuid::Uuid::new_v4().simple().to_string();
-    let key = format!("images/tenant:{tenant}/{uuid}.{ext}");
-    if let Err(e) = blob.put(&key, &bytes, &ct).await {
+    let key = format!("images/{uuid}.{ext}");
+    if let Err(e) = blob.put(claims, &key, &bytes, &ct).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("图片落盘失败: {e}") })),
         );
     }
-    // image_id 编码 tenant 与文件名（tenant__uuid.ext），raw 代理据此还原受控 key。
-    let image_id = format!("{tenant}__{uuid}.{ext}");
+    let image_id = format!("{uuid}.{ext}");
     let raw_url = format!("/api/v1/images/{image_id}/raw");
     let data_uri = if bytes.len() <= IMAGE_DATA_URI_MAX_BYTES {
         Some(format!("data:{};base64,{}", ct, STANDARD.encode(&bytes)))
@@ -158,32 +164,33 @@ pub(crate) async fn upload_image_handler(
 }
 
 /// GET /api/v1/images/:image_id/raw — 经 core 代理从 BlobStore 返回图片（不暴露 MinIO）。
-/// image_id 形如 `<tenant>__<uuid>.<ext>`，还原受控 key `images/tenant:<tenant>/<uuid>.<ext>`。
+/// image_id 形如 `<uuid>.<ext>`，由已验证 claims 还原受控 key。
 pub(crate) async fn image_raw_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(image_id): axum::extract::Path<String>,
 ) -> Response {
-    let (tenant, fname) = match image_id.split_once("__") {
-        Some((t, f)) if !t.is_empty() && !f.is_empty() => (t, f),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "非法 image_id" })),
-            )
-                .into_response()
-        }
-    };
     // 防路径穿越：文件名段不得含分隔符或相对路径片段。
-    if tenant.contains('/') || fname.contains('/') || fname.contains("..") {
+    if image_id.is_empty() || image_id.contains('/') || image_id.contains("..") {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "非法 image_id" })),
         )
             .into_response();
     }
-    let ext = fname.rsplit('.').next().unwrap_or("");
+    let ext = image_id.rsplit('.').next().unwrap_or("");
     let ct = image_ct_from_ext(ext).to_string();
-    let key = format!("images/tenant:{tenant}/{fname}");
+    let key = format!("images/{image_id}");
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
+            )
+                .into_response()
+        }
+    };
     let blob = match &state.blob_store {
         Some(b) => b.clone(),
         None => {
@@ -194,7 +201,7 @@ pub(crate) async fn image_raw_handler(
                 .into_response()
         }
     };
-    match blob.get(&key).await {
+    match blob.get(claims, &key).await {
         Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response(),
         Err(_) => (
             StatusCode::NOT_FOUND,
@@ -573,4 +580,3 @@ pub(crate) async fn activate_embedding_handler(
         })),
     )
 }
-

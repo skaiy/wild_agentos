@@ -21,6 +21,8 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::isolation::IsolationClaims;
+
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +52,7 @@ pub struct UserIdentity {
     pub tenant_id: String,
     pub roles: Vec<String>,
     pub auth_method: AuthMethod,
+    isolation_claims: Option<IsolationClaims>,
 }
 
 impl UserIdentity {
@@ -59,7 +62,12 @@ impl UserIdentity {
             tenant_id: "default".to_string(),
             roles: vec![],
             auth_method: AuthMethod::Anonymous,
+            isolation_claims: None,
         }
+    }
+    /// Returns claims only when the authentication boundary verified them.
+    pub fn isolation_claims(&self) -> Option<&IsolationClaims> {
+        self.isolation_claims.as_ref()
     }
     /// 检查调用方是否具有指定角色（任一匹配）。
     pub fn has_role(&self, role: &str) -> bool {
@@ -119,6 +127,7 @@ impl<S: Send + Sync> FromRequestParts<S> for UserIdentity {
                             tenant_id: str_field(&claims, "tenant_id", "default"),
                             roles: arr_field(&claims, "roles"),
                             auth_method: AuthMethod::Base64Header,
+                            isolation_claims: None,
                         });
                     }
                 }
@@ -146,12 +155,21 @@ fn verify_jwt(token: &str) -> Option<UserIdentity> {
     let mut val = Validation::new(Algorithm::HS256);
     val.set_required_spec_claims(&["sub", "exp"]);
     match decode::<JwtClaims>(token, &key, &val) {
-        Ok(data) => Some(UserIdentity {
-            user_id: data.claims.sub,
-            tenant_id: data.claims.tenant_id,
-            roles: data.claims.roles,
-            auth_method: AuthMethod::Jwt,
-        }),
+        Ok(data) => {
+            let isolation_claims = IsolationClaims::from_verified(
+                data.claims.tenant_id.clone(),
+                "default",
+                data.claims.sub.clone(),
+            )
+            .ok()?;
+            Some(UserIdentity {
+                user_id: data.claims.sub,
+                tenant_id: data.claims.tenant_id,
+                roles: data.claims.roles,
+                auth_method: AuthMethod::Jwt,
+                isolation_claims: Some(isolation_claims),
+            })
+        }
         Err(e) => {
             tracing::debug!("JWT verify failed: {}", e);
             None
