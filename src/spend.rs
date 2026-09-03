@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::isolation::IsolationClaims;
 
 /// Environment variable containing the maximum number of metered tool calls
-/// permitted per tenant in this process. When unset, usage is still attributed
-/// to verified claims but no limit is applied.
+/// permitted per tenant in this process. When unset, the gate is inactive so
+/// existing callers that do not yet provide claims continue to work.
 pub const TENANT_TOOL_CALL_CAP_ENV: &str = "AGENTOS_TENANT_TOOL_CALL_CAP";
 
 /// A process-local, tenant-scoped hard cap for LLM-initiated tool invocations.
@@ -72,13 +72,21 @@ impl TenantSpendGate {
 
     /// Reserves one billable tool invocation before it can execute.
     ///
-    /// Missing claims and exhausted caps fail closed. The `DashMap` entry lock
-    /// makes the check-and-increment atomic for each tenant.
+    /// An unset cap leaves the gate inactive, including for callers without
+    /// claims. Once a cap is configured, missing claims and exhausted caps
+    /// fail closed. The `DashMap` entry lock makes the check-and-increment
+    /// atomic for each tenant.
     pub fn reserve_tool_call(
         &self,
         claims: Option<&IsolationClaims>,
     ) -> Result<(), TenantSpendError> {
-        let claims = claims.ok_or(TenantSpendError::MissingClaims)?;
+        let Some(claims) = claims else {
+            return if self.cap.is_some() || self.configuration_error.is_some() {
+                Err(TenantSpendError::MissingClaims)
+            } else {
+                Ok(())
+            };
+        };
         if let Some(reason) = &self.configuration_error {
             return Err(TenantSpendError::MisconfiguredCap {
                 reason: reason.clone(),
@@ -135,7 +143,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_claims_are_rejected_without_default_attribution() {
+    fn missing_claims_are_allowed_when_cap_is_unset() {
+        let gate = TenantSpendGate::new(None);
+
+        assert!(gate.reserve_tool_call(None).is_ok());
+    }
+
+    #[test]
+    fn missing_claims_are_rejected_when_cap_is_configured() {
         let gate = TenantSpendGate::new(Some(1));
 
         assert_eq!(
