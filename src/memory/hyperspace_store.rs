@@ -126,6 +126,7 @@ pub struct HyperspaceStore {
     embed: Arc<dyn EmbeddingService>,
 }
 
+#[cfg(not(test))]
 fn unverified_claims_error(operation: &str) -> CoreError {
     CoreError::Internal {
         message: format!("{operation} requires verified IsolationClaims"),
