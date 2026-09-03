@@ -415,6 +415,11 @@ fn kb_belongs_to_claims(kb: &Value, claims: &IsolationClaims) -> bool {
         && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
 }
 
+/// Server-derived filter tag that separates KBs sharing a claims namespace.
+fn kb_vector_tag(kb_id: &str) -> String {
+    format!("kb:{kb_id}")
+}
+
 /// GET /api/v1/kb/bases — 返回全部知识库
 pub(crate) async fn list_knowledge_bases_handler(
     State(state): State<Arc<AppState>>,
@@ -854,7 +859,7 @@ pub(crate) async fn ingest_knowledge_base_handler(
             Json(json!({ "error": "texts/text 不能为空" })),
         );
     }
-    let tags = Vec::new();
+    let tags = vec![kb_vector_tag(&id)];
     let mut count = 0usize;
     for text in &texts {
         for chunk in chunk_text(text, 500) {
@@ -948,7 +953,7 @@ pub(crate) async fn search_knowledge_base_handler(
         }
     };
     let limit = req.limit.unwrap_or(5).clamp(1, 20);
-    let filter = HybridSearchFilter::new();
+    let filter = HybridSearchFilter::new().with_must_tags(vec![kb_vector_tag(&id)]);
     match store
         .search_with_claims(claims, &query, &filter, limit)
         .await
@@ -1135,7 +1140,7 @@ pub(crate) async fn upload_knowledge_base_handler(
     // 当前仅实现固定长度分块；其余策略降级为 fixed 并在响应标注。
     let applied_strategy = "fixed";
 
-    let base_tags = Vec::new();
+    let base_tags = vec![kb_vector_tag(&id)];
     let blob = state.blob_store.clone();
     let mut file_results: Vec<Value> = Vec::new();
     let mut ledger_entries: Vec<Value> = Vec::new();
@@ -1577,7 +1582,7 @@ async fn run_kb_reindex(
         };
         // ③ 重新分块 embedding 写入。
         let text = String::from_utf8_lossy(&bytes).to_string();
-        let tags = vec![format!("doc:{}", doc_id)];
+        let tags = vec![kb_vector_tag(&id), format!("doc:{}", doc_id)];
         let mut new_iris: Vec<String> = Vec::new();
         let mut err: Option<String> = None;
         for chunk in chunk_text(&text, chunk_size) {
@@ -2288,6 +2293,21 @@ mod kb_isolation_http_tests {
         assert_eq!(created["base"]["graph"], json!("graph://tenant-a/default"));
         let kb_id = created["id"].as_str().unwrap().to_string();
 
+        let rename = Request::builder().method("PUT").uri(format!("/kb/bases/{kb_id}"))
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header("content-type", "application/json").body(Body::from(r#"{"name":"tenant A renamed"}"#)).unwrap();
+        assert_eq!(response_json(&app, rename).await.0, StatusCode::OK);
+        let metadata = state.kg_store.query(
+            "SELECT ?name ?type WHERE { GRAPH <graph://tenant-a/default> {
+                ?s <https://agentos.ontology/meta/kbName> ?name ;
+                   <https://agentos.ontology/meta/kbType> ?type
+            }}",
+        ).unwrap();
+        let oxigraph::sparql::QueryResults::Solutions(metadata) = metadata else {
+            panic!("expected SPARQL solutions");
+        };
+        assert_eq!(metadata.count(), 1, "rename must replace only kbName and retain kbType");
+
         let list = |tenant: &str| Request::builder().uri("/kb/bases")
             .header("authorization", format!("Bearer {}", jwt(tenant)))
             .body(Body::empty()).unwrap();
@@ -2316,16 +2336,6 @@ mod kb_isolation_http_tests {
             let body = if method == "PUT" { Body::from(r#"{"name":"must fail"}"#) } else { Body::empty() };
             assert_eq!(response_json(&app, builder.body(body).unwrap()).await.0, StatusCode::UNAUTHORIZED);
         }
-
-        let metadata = state.kg_store.query(
-            "SELECT ?s WHERE { GRAPH <graph://tenant-a/default> {
-                ?s <https://agentos.ontology/meta/kbName> \"tenant A catalog\"
-            }}",
-        ).unwrap();
-        let oxigraph::sparql::QueryResults::Solutions(metadata) = metadata else {
-            panic!("expected SPARQL solutions");
-        };
-        assert_eq!(metadata.count(), 1, "catalog metadata must use claims graph");
 
         if let Some(previous_data_dir) = previous_data_dir {
             std::env::set_var("AGENTOS_DATA_DIR", previous_data_dir);
@@ -2418,7 +2428,12 @@ mod kb_isolation_http_tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
         state.knowledge_bases.write().await.push(json!({
-            "id": "vector-kb",
+            "id": "vector-kb-a",
+            "kb_type": "vector",
+            "vector_namespace": "tenant:legacy"
+        }));
+        state.knowledge_bases.write().await.push(json!({
+            "id": "vector-kb-b",
             "kb_type": "vector",
             "vector_namespace": "tenant:legacy"
         }));
@@ -2429,7 +2444,7 @@ mod kb_isolation_http_tests {
 
         let unauthenticated = Request::builder()
             .method("POST")
-            .uri("/kb/vector-kb/ingest")
+            .uri("/kb/vector-kb-a/ingest")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"text":"private battery instructions"}"#))
             .unwrap();
@@ -2439,7 +2454,7 @@ mod kb_isolation_http_tests {
         );
         let unauthenticated_search = Request::builder()
             .method("POST")
-            .uri("/kb/vector-kb/search")
+            .uri("/kb/vector-kb-a/search")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"query":"battery instructions"}"#))
             .unwrap();
@@ -2450,28 +2465,33 @@ mod kb_isolation_http_tests {
 
         let ingested = Request::builder()
             .method("POST")
-            .uri("/kb/vector-kb/ingest")
+            .uri("/kb/vector-kb-a/ingest")
             .header("authorization", format!("Bearer {}", jwt("tenant-a")))
             .header("content-type", "application/json")
             .body(Body::from(r#"{"text":"private battery instructions"}"#))
             .unwrap();
         assert_eq!(response_json(&app, ingested).await.0, StatusCode::OK);
 
-        let search = |tenant_id| {
+        let search = |tenant_id, kb_id| {
             Request::builder()
                 .method("POST")
-                .uri("/kb/vector-kb/search")
+                .uri(format!("/kb/{kb_id}/search"))
                 .header("authorization", format!("Bearer {}", jwt(tenant_id)))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"query":"battery instructions"}"#))
                 .unwrap()
         };
         assert_eq!(
-            response_json(&app, search("tenant-a")).await.1["count"],
+            response_json(&app, search("tenant-a", "vector-kb-a")).await.1["count"],
             json!(1)
         );
         assert_eq!(
-            response_json(&app, search("tenant-b")).await.1["count"],
+            response_json(&app, search("tenant-a", "vector-kb-b")).await.1["count"],
+            json!(0),
+            "KB B must not retrieve entries ingested into KB A in the same claims namespace"
+        );
+        assert_eq!(
+            response_json(&app, search("tenant-b", "vector-kb-a")).await.1["count"],
             json!(0)
         );
     }
