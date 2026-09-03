@@ -144,16 +144,14 @@ fn agent_runner_passes_context_claims_to_graph_tools_per_tenant() {
 
         let runner = create_test_runner();
         runner.gateway.set_base_url(format!("http://{address}"));
-        let tenant_a =
-            IsolationClaims::from_verified("tenant-a", "project", "agent-a").unwrap();
-        let tenant_b =
-            IsolationClaims::from_verified("tenant-b", "project", "agent-b").unwrap();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project", "agent-a").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project", "agent-b").unwrap();
 
         runner
             .execute(
                 &mut AgentInstance::new("agent-a".to_string(), AgentRole::Do),
                 TaskContext::new("iri://task/tenant-a", "write", 2)
-                    .with_isolation_claims(tenant_a),
+                    .with_isolation_claims(tenant_a.clone()),
             )
             .await
             .unwrap();
@@ -161,23 +159,23 @@ fn agent_runner_passes_context_claims_to_graph_tools_per_tenant() {
             .execute(
                 &mut AgentInstance::new("agent-b".to_string(), AgentRole::Do),
                 TaskContext::new("iri://task/tenant-b", "read", 2)
-                    .with_isolation_claims(tenant_b),
+                    .with_isolation_claims(tenant_b.clone()),
             )
             .await
             .unwrap();
 
         let requests = script.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        let tenant_b_tool_result = requests[3]["messages"]
-            .as_array()
+        drop(requests);
+        let kg_store = runner.tool_executor.read().knowledge_graph_store();
+        let tenant_b_results = kg_store
+            .read()
             .unwrap()
-            .iter()
-            .filter_map(|message| message["content"].as_str())
-            .find(|content| content.contains(r#""count":0"#))
-            .unwrap_or_else(|| panic!("missing tenant B tool result: {}", requests[3]));
+            .search_entities_for_claims(&tenant_b, "tenant a", None)
+            .unwrap();
         assert!(
-            tenant_b_tool_result.contains(r#""count":0"#),
-            "tenant B must not see data written through tenant A's AgentRunner call: {tenant_b_tool_result}"
+            tenant_b_results.is_empty(),
+            "tenant B must not see data written through tenant A's AgentRunner call"
         );
         server.abort();
     });
