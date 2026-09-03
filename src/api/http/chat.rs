@@ -1189,9 +1189,10 @@ mod tests {
         let state = make_state();
         let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
 
-        let err = build_chat_context(&state, "agent-a", "P0A80", &[], Some(&tenant_b))
-            .await
-            .unwrap_err();
+        let err = match build_chat_context(&state, "agent-a", "P0A80", &[], Some(&tenant_b)).await {
+            Err(err) => err,
+            Ok(_) => panic!("tenant B accessed tenant A's agent"),
+        };
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
