@@ -31,6 +31,8 @@ pub mod graph_backend;
 /// **Experimental** — API may change without notice.
 /// Renamed from `gnn` to `graph_features` for clarity.
 pub mod graph_features;
+/// Isolation contracts for verified tenant, project, and actor identity.
+pub mod isolation;
 
 #[cfg(feature = "ontology")]
 pub mod ontology;
