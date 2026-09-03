@@ -85,6 +85,8 @@ pub struct TaskContext {
     pub resumed_turn_count: u32,
     /// Tool call count restored from checkpoint
     pub resumed_tool_count: u32,
+    /// PDCA roles restored from immutable, claims-verified envelopes.
+    pub resumed_pdca_steps: Vec<crate::core::sa::PdcaStepKind>,
     /// JSON-LD workflow definition (optional, replaces LLM-generated plan)
     pub workflow_jsonld: Option<String>,
     /// Expected output (passed from PlanStep, for DA/CA reference)
@@ -128,6 +130,7 @@ impl TaskContext {
             resumed_messages: None,
             resumed_turn_count: 0,
             resumed_tool_count: 0,
+            resumed_pdca_steps: Vec::new(),
             workflow_jsonld: None,
             expected_output: String::new(),
             success_criteria: String::new(),
@@ -229,6 +232,15 @@ impl TaskContext {
         self
     }
 
+    /// Set PDCA roles which completed before an interrupted task re-entry.
+    pub fn with_resumed_pdca_steps(
+        mut self,
+        completed_steps: Vec<crate::core::sa::PdcaStepKind>,
+    ) -> Self {
+        self.resumed_pdca_steps = completed_steps;
+        self
+    }
+
     pub fn add_completed_step(&mut self, step: &str) {
         self.completed_steps.push(step.to_string());
         if let Some(pos) = self.pending_steps.iter().position(|s| s == step) {
@@ -261,6 +273,7 @@ impl Default for TaskContext {
             resumed_messages: None,
             resumed_turn_count: 0,
             resumed_tool_count: 0,
+            resumed_pdca_steps: Vec::new(),
             workflow_jsonld: None,
             expected_output: String::new(),
             success_criteria: String::new(),

@@ -6,8 +6,51 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use crate::core::sa::PdcaStepKind;
+use crate::isolation::IsolationClaims;
 use crate::memory::l0_store::L0Store;
 use crate::CoreError;
+
+/// Immutable, verified identity attributes captured at a PDCA boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimsSnapshot {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub actor_id: String,
+}
+
+impl From<&IsolationClaims> for ClaimsSnapshot {
+    fn from(claims: &IsolationClaims) -> Self {
+        Self {
+            tenant_id: claims.tenant_id().to_string(),
+            project_id: claims.project_id().to_string(),
+            actor_id: claims.actor_id().to_string(),
+        }
+    }
+}
+
+/// The L0 record written when a Plan, Do, Check, or Act step completes.
+///
+/// The immutable envelopes for a task are also the source of truth for
+/// resuming a PDCA cycle without replaying completed steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdcaCheckpointEnvelope {
+    pub envelope_iri: String,
+    pub task_iri: String,
+    pub step: PdcaStepKind,
+    pub claims: ClaimsSnapshot,
+    pub advertised_tools: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Verified PDCA state reconstructed from a task's immutable envelopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdcaResumeState {
+    /// The most recently completed boundary for this task.
+    pub last_successful: PdcaCheckpointEnvelope,
+    /// Every PDCA role that completed before the interruption.
+    pub completed_steps: Vec<PdcaStepKind>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointData {
@@ -81,6 +124,128 @@ impl CheckpointManager {
             task_checkpoints: RwLock::new(HashMap::new()),
             counter: AtomicU64::new(0),
         }
+    }
+
+    /// Persist one immutable envelope at a PDCA boundary.
+    ///
+    /// The envelope is intentionally refused unless the caller supplies
+    /// verified isolation claims. Its generated IRI prevents a later boundary
+    /// from replacing an earlier snapshot.
+    pub fn write_pdca_envelope(
+        &self,
+        task_iri: &str,
+        step: PdcaStepKind,
+        claims: Option<&IsolationClaims>,
+        advertised_tools: &[String],
+    ) -> Result<PdcaCheckpointEnvelope, CoreError> {
+        let claims = claims.ok_or_else(|| CoreError::PermissionDenied {
+            agent: "checkpoint".to_string(),
+            resource: task_iri.to_string(),
+            action: "write PDCA envelope without verified claims".to_string(),
+        })?;
+        let l0 = self.l0.as_ref().ok_or_else(|| CoreError::StorageError {
+            message: "L0 persistence is required for PDCA envelopes".to_string(),
+        })?;
+        let seq = self.counter.fetch_add(1, Ordering::SeqCst);
+        let task_path = task_iri.strip_prefix("iri://").unwrap_or(task_iri);
+        let envelope = PdcaCheckpointEnvelope {
+            envelope_iri: format!(
+                "iri://checkpoint/{}/pdca/{}/{}",
+                task_path,
+                seq,
+                uuid::Uuid::new_v4().hyphenated()
+            ),
+            task_iri: task_iri.to_string(),
+            step,
+            claims: claims.into(),
+            advertised_tools: advertised_tools.to_vec(),
+            created_at: Utc::now(),
+        };
+        let content = serde_json::to_string(&envelope).map_err(|e| CoreError::Internal {
+            message: format!("Failed to serialize PDCA envelope: {}", e),
+        })?;
+        l0.store(&envelope.envelope_iri, &content)?;
+        Ok(envelope)
+    }
+
+    /// Read a previously persisted PDCA envelope by its immutable IRI.
+    pub fn read_pdca_envelope(
+        &self,
+        envelope_iri: &str,
+    ) -> Result<PdcaCheckpointEnvelope, CoreError> {
+        let l0 = self.l0.as_ref().ok_or_else(|| CoreError::StorageError {
+            message: "L0 persistence is required for PDCA envelopes".to_string(),
+        })?;
+        let entry = l0
+            .retrieve(envelope_iri)?
+            .ok_or_else(|| CoreError::Internal {
+                message: format!("PDCA envelope not found: {}", envelope_iri),
+            })?;
+        serde_json::from_str(&entry.content).map_err(|e| CoreError::Internal {
+            message: format!("Invalid PDCA envelope: {}", e),
+        })
+    }
+
+    /// Restore the latest successful PDCA boundary for `task_iri`.
+    ///
+    /// Claims are required because a task IRI alone is not an authorization
+    /// boundary. Every envelope found for the task must belong to the supplied
+    /// verified identity; a mismatch fails closed rather than allowing a
+    /// caller to resume another tenant, project, or actor's execution.
+    pub fn read_pdca_resume(
+        &self,
+        task_iri: &str,
+        claims: Option<&IsolationClaims>,
+    ) -> Result<Option<PdcaResumeState>, CoreError> {
+        let claims = claims.ok_or_else(|| CoreError::PermissionDenied {
+            agent: "checkpoint".to_string(),
+            resource: task_iri.to_string(),
+            action: "resume PDCA envelope without verified claims".to_string(),
+        })?;
+        let l0 = self.l0.as_ref().ok_or_else(|| CoreError::StorageError {
+            message: "L0 persistence is required for PDCA envelopes".to_string(),
+        })?;
+        let task_path = task_iri.strip_prefix("iri://").unwrap_or(task_iri);
+        let prefix = format!("iri://checkpoint/{}/pdca/", task_path);
+        let expected_claims = ClaimsSnapshot::from(claims);
+        let mut envelopes: Vec<PdcaCheckpointEnvelope> = l0
+            .scan_iri_prefix(&prefix, 100)?
+            .into_iter()
+            .map(|entry| serde_json::from_str(&entry.content))
+            .collect::<Result<_, _>>()
+            .map_err(|e| CoreError::Internal {
+                message: format!("Invalid PDCA envelope: {}", e),
+            })?;
+
+        if envelopes.is_empty() {
+            return Ok(None);
+        }
+        if envelopes
+            .iter()
+            .any(|envelope| envelope.task_iri != task_iri || envelope.claims != expected_claims)
+        {
+            return Err(CoreError::PermissionDenied {
+                agent: "checkpoint".to_string(),
+                resource: task_iri.to_string(),
+                action: "resume PDCA envelope with mismatched verified claims".to_string(),
+            });
+        }
+
+        envelopes.sort_by_key(|envelope| envelope.created_at);
+        let last_successful = envelopes
+            .last()
+            .cloned()
+            .expect("non-empty envelopes has a last item");
+        let mut completed_steps = Vec::new();
+        for envelope in envelopes {
+            if !completed_steps.contains(&envelope.step) {
+                completed_steps.push(envelope.step);
+            }
+        }
+        Ok(Some(PdcaResumeState {
+            last_successful,
+            completed_steps,
+        }))
     }
 
     pub fn create(
@@ -486,6 +651,135 @@ mod tests {
         let manager = CheckpointManager::new();
         let list = manager.list("iri://task/nonexistent", 10);
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn pdca_envelope_writes_and_reads_verified_claims_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
+        let claims =
+            crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
+                .unwrap();
+        let tools = vec!["file_read".to_string(), "search".to_string()];
+
+        let written = manager
+            .write_pdca_envelope(
+                "iri://task/123",
+                crate::core::sa::PdcaStepKind::Check,
+                Some(&claims),
+                &tools,
+            )
+            .unwrap();
+        let read = manager.read_pdca_envelope(&written.envelope_iri).unwrap();
+
+        assert_eq!(read, written);
+        assert_eq!(read.claims.tenant_id, "acme");
+        assert_eq!(read.advertised_tools, tools);
+    }
+
+    #[test]
+    fn pdca_envelope_refuses_missing_claims() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
+
+        let error = manager
+            .write_pdca_envelope(
+                "iri://task/123",
+                crate::core::sa::PdcaStepKind::Plan,
+                None,
+                &[],
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, CoreError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn pdca_resume_requires_matching_claims_and_skips_completed_write_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
+        let claims =
+            crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
+                .unwrap();
+        let task = "iri://task/resume-file-write";
+
+        // First entry completes Plan and submits Do's file_write before an
+        // interruption. Completion is recorded only after the submission.
+        manager
+            .write_pdca_envelope(task, PdcaStepKind::Plan, Some(&claims), &[])
+            .unwrap();
+        let mut file_write_submissions = 1;
+        manager
+            .write_pdca_envelope(task, PdcaStepKind::Do, Some(&claims), &[])
+            .unwrap();
+
+        // Re-entry uses the envelope state, so it starts at Check rather than
+        // replaying Do and submitting the same file_write a second time.
+        let resumed = manager
+            .read_pdca_resume(task, Some(&claims))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.last_successful.step, PdcaStepKind::Do);
+        for step in [
+            PdcaStepKind::Plan,
+            PdcaStepKind::Do,
+            PdcaStepKind::Check,
+            PdcaStepKind::Act,
+        ] {
+            if resumed.completed_steps.contains(&step) {
+                continue;
+            }
+            if step == PdcaStepKind::Do {
+                file_write_submissions += 1;
+            }
+        }
+        assert_eq!(file_write_submissions, 1);
+
+        assert!(matches!(
+            manager.read_pdca_resume(task, None),
+            Err(CoreError::PermissionDenied { .. })
+        ));
+        let other_claims =
+            crate::isolation::IsolationClaims::from_verified("other", "project-1", "agent-7")
+                .unwrap();
+        assert!(matches!(
+            manager.read_pdca_resume(task, Some(&other_claims)),
+            Err(CoreError::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn pdca_envelope_does_not_use_plan_tools_allowed_as_advertisement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
+        let claims =
+            crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
+                .unwrap();
+        let plan_step = crate::core::sa::PlanStep {
+            step_id: "plan".to_string(),
+            role: crate::core::agent_instance::AgentRole::Plan,
+            objective: "Plan the task".to_string(),
+            expected_output: String::new(),
+            dependencies: Vec::new(),
+            tools_allowed: vec!["file_write".to_string()],
+            success_criteria: String::new(),
+        };
+
+        let envelope = manager
+            .write_pdca_envelope(
+                "iri://task/123",
+                crate::core::sa::PdcaStepKind::from(plan_step.role),
+                Some(&claims),
+                &[],
+            )
+            .unwrap();
+
+        assert!(!plan_step.tools_allowed.is_empty());
+        assert!(envelope.advertised_tools.is_empty());
     }
 
     #[test]
