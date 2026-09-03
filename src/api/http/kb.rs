@@ -14,6 +14,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{RdfQuad, RdfValue};
 use crate::memory::hyperspace_store::HybridSearchFilter;
@@ -405,19 +406,37 @@ pub struct KnowledgeBaseCreateRequest {
     pub category_id: Option<String>,
 }
 
-/// SPARQL 字面量转义。
-fn sparql_literal(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+/// Catalog entries are visible only within their verified tenant/project scope.
+///
+/// Records without this scope are historical and deliberately remain outside
+/// the claims-scoped catalog rather than being migrated on read.
+fn kb_belongs_to_claims(kb: &Value, claims: &IsolationClaims) -> bool {
+    kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+        && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
 }
 
 /// GET /api/v1/kb/bases — 返回全部知识库
 pub(crate) async fn list_knowledge_bases_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
 ) -> impl IntoResponse {
-    let bases = state.knowledge_bases.read().await.clone();
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
+    let bases: Vec<Value> = state
+        .knowledge_bases
+        .read()
+        .await
+        .iter()
+        .filter(|kb| kb_belongs_to_claims(kb, claims))
+        .cloned()
+        .collect();
     Json(json!({ "count": bases.len(), "bases": bases }))
 }
 
@@ -427,6 +446,15 @@ pub(crate) async fn create_knowledge_base_handler(
     identity: UserIdentity,
     Json(req): Json<KnowledgeBaseCreateRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -456,15 +484,29 @@ pub(crate) async fn create_knowledge_base_handler(
     }
 
     let kb_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    // 图类型：租户隔离命名图 + 落盘元数据三元组（Wild AgentOS 底座）
+    // Graph names are always minted from verified claims; request data never
+    // selects a write target.
     let graph_iri = if req.kb_type == "graph" {
-        let iri = format!("tenant:{}/kb/{}", identity.tenant_id, kb_id);
-        let insert = format!(
-            "INSERT DATA {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> \"{n}\" . <{g}> <https://agentos.ontology/meta/kbType> \"graph\" }} }}",
-            g = iri,
-            n = sparql_literal(&req.name),
-        );
-        if let Err(e) = state.kg_store.update(&insert) {
+        let iri = match claims.graph_iri() {
+            Ok(iri) => iri,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("invalid verified graph scope: {e}") })),
+                )
+            }
+        };
+        let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+            Ok(kg) => kg,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e })),
+                )
+            }
+        };
+        if let Err(e) = kg.upsert_kb_catalog_metadata_for_claims(claims, &kb_id, &req.name, "graph")
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("命名图初始化失败: {e}") })),
@@ -478,7 +520,15 @@ pub(crate) async fn create_knowledge_base_handler(
 
     // 向量类型：分配隔离命名空间，供运行时向量检索按 namespace 过滤。
     let vector_namespace = if req.kb_type == "vector" {
-        format!("vec:tenant/{}/kb/{}", identity.tenant_id, kb_id)
+        match claims.vector_namespace() {
+            Ok(namespace) => namespace,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("invalid verified vector namespace: {e}") })),
+                )
+            }
+        }
     } else {
         String::new()
     };
@@ -490,8 +540,9 @@ pub(crate) async fn create_knowledge_base_handler(
         "category_id": req.category_id.unwrap_or_default(),
         "graph": graph_iri.clone().unwrap_or_default(),
         "vector_namespace": vector_namespace,
-        "tenant_id": identity.tenant_id,
-        "created_by": identity.user_id,
+        "tenant_id": claims.tenant_id(),
+        "project_id": claims.project_id(),
+        "created_by": claims.actor_id(),
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
     let mut guard = state.knowledge_bases.write().await;
@@ -503,39 +554,61 @@ pub(crate) async fn create_knowledge_base_handler(
     )
 }
 
-/// DELETE /api/v1/kb/bases/:id — 删除知识库并持久化（图类型同时清空命名图）
+/// DELETE /api/v1/kb/bases/:id — 删除 claims-scoped 知识库目录条目。
 pub(crate) async fn delete_knowledge_base_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
     let mut guard = state.knowledge_bases.write().await;
     let removed = guard
         .iter()
-        .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        .find(|b| {
+            b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                && kb_belongs_to_claims(b, claims)
+        })
         .cloned();
-    let before = guard.len();
-    guard.retain(|b| b.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
-    if guard.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "knowledge base not found", "id": id })),
-        );
-    }
-    let _ = save_knowledge_bases(&guard);
-    // 图类型：清空命名图三元组
-    if let Some(b) = removed {
-        if let Some(g) = b
-            .get("graph")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            let clear = format!("DELETE WHERE {{ GRAPH <{g}> {{ ?s ?p ?o . }} }}");
-            if let Err(e) = state.kg_store.update(&clear) {
-                tracing::warn!(graph = %g, "KB graph clear skipped: {}", e);
-            }
-            let _ = state.kg_store.flush();
+    let removed = match removed {
+        Some(removed) => removed,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "knowledge base not found", "id": id })),
+            )
         }
+    };
+    if removed.get("kb_type").and_then(Value::as_str) == Some("graph") {
+        let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+            Ok(kg) => kg,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e })),
+                )
+            }
+        };
+        if let Err(e) = kg.delete_kb_catalog_metadata_for_claims(claims, &id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("KB catalog metadata delete failed: {e}") })),
+            );
+        }
+        let _ = state.kg_store.flush();
     }
+    guard.retain(|b| {
+        !(b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+            && kb_belongs_to_claims(b, claims))
+    });
+    let _ = save_knowledge_bases(&guard);
     (
         StatusCode::OK,
         Json(json!({ "status": "deleted", "id": id })),
@@ -553,9 +626,19 @@ pub struct KnowledgeBaseUpdateRequest {
 /// 不改 kb_type/graph/vector_namespace/tenant；图类型改名时同步命名图 kbName 元三元组。
 pub(crate) async fn update_knowledge_base_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<KnowledgeBaseUpdateRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
     // 校验分类存在（若指定非空）
     if let Some(cat_id) = req.category_id.as_deref().filter(|s| !s.is_empty()) {
         let exists = state
@@ -574,10 +657,10 @@ pub(crate) async fn update_knowledge_base_handler(
 
     let (updated, is_graph, graph_iri, name_changed) = {
         let mut guard = state.knowledge_bases.write().await;
-        let kb = match guard
-            .iter_mut()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-        {
+        let kb = match guard.iter_mut().find(|b| {
+            b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                && kb_belongs_to_claims(b, claims)
+        }) {
             Some(k) => k,
             None => {
                 return (
@@ -616,21 +699,27 @@ pub(crate) async fn update_knowledge_base_handler(
         (updated, is_graph, graph_iri, name_changed)
     };
 
-    // 图类型改名：同步命名图 kbName 元三元组
+    // Graph catalog metadata is written only through claims-scoped store APIs.
     if is_graph && !graph_iri.is_empty() {
         if let Some(new_name) = name_changed {
-            let sparql = format!(
-                "DELETE {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> ?o }} }} \
-                 INSERT {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> \"{n}\" }} }} \
-                 WHERE {{ OPTIONAL {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> ?o }} }} }}",
-                g = graph_iri,
-                n = sparql_literal(&new_name),
-            );
-            if let Err(e) = state.kg_store.update(&sparql) {
-                tracing::warn!(graph = %graph_iri, "KB rename meta sync skipped: {}", e);
-            } else {
-                let _ = state.kg_store.flush();
+            let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+                Ok(kg) => kg,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": e })),
+                    )
+                }
+            };
+            if let Err(e) =
+                kg.upsert_kb_catalog_metadata_for_claims(claims, &id, &new_name, "graph")
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("KB catalog metadata update failed: {e}") })),
+                );
             }
+            let _ = state.kg_store.flush();
         }
     }
 
@@ -2136,7 +2225,7 @@ mod kb_isolation_http_tests {
     use axum::{
         body::{to_bytes, Body},
         http::Request,
-        routing::{get, post},
+        routing::{get, post, put},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -2219,6 +2308,123 @@ mod kb_isolation_http_tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn kb_catalog_requires_claims_and_isolates_tenants() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
+        let state = test_state(tmp.path());
+        let app = Router::new()
+            .route(
+                "/kb/bases",
+                get(list_knowledge_bases_handler).post(create_knowledge_base_handler),
+            )
+            .route(
+                "/kb/bases/:id",
+                put(update_knowledge_base_handler).delete(delete_knowledge_base_handler),
+            )
+            .with_state(state.clone());
+
+        let no_jwt = Request::builder()
+            .method("POST")
+            .uri("/kb/bases")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"private","kb_type":"graph"}"#))
+            .unwrap();
+        assert_eq!(
+            response_json(&app, no_jwt).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // `graph` and `vector_namespace` are unknown request fields and must
+        // not override the canonical graph minted from verified claims.
+        let create = Request::builder()
+            .method("POST")
+            .uri("/kb/bases")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"tenant A catalog","kb_type":"graph","graph":"tenant:evil/kb/x","vector_namespace":"vector://evil/project"}"#,
+            ))
+            .unwrap();
+        let (status, created) = response_json(&app, create).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["base"]["graph"], json!("graph://tenant-a/default"));
+        let kb_id = created["id"].as_str().unwrap().to_string();
+
+        let list = |tenant: &str| {
+            Request::builder()
+                .uri("/kb/bases")
+                .header("authorization", format!("Bearer {}", jwt(tenant)))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            response_json(&app, list("tenant-a")).await.1["count"],
+            json!(1)
+        );
+        assert_eq!(
+            response_json(&app, list("tenant-b")).await.1["count"],
+            json!(0)
+        );
+
+        let other_tenant_delete = Request::builder()
+            .method("DELETE")
+            .uri(format!("/kb/bases/{kb_id}"))
+            .header("authorization", format!("Bearer {}", jwt("tenant-b")))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            response_json(&app, other_tenant_delete).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let no_jwt_update = Request::builder()
+            .method("PUT")
+            .uri(format!("/kb/bases/{kb_id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"must fail"}"#))
+            .unwrap();
+        assert_eq!(
+            response_json(&app, no_jwt_update).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let no_jwt_delete = Request::builder()
+            .method("DELETE")
+            .uri(format!("/kb/bases/{kb_id}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            response_json(&app, no_jwt_delete).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let metadata = state
+            .kg_store
+            .query(
+                "SELECT ?s WHERE { GRAPH <graph://tenant-a/default> {
+                    ?s <https://agentos.ontology/meta/kbName> \"tenant A catalog\"
+                }}",
+            )
+            .unwrap();
+        let oxigraph::sparql::QueryResults::Solutions(metadata) = metadata else {
+            panic!("expected SPARQL solutions");
+        };
+        assert_eq!(
+            metadata.count(),
+            1,
+            "catalog metadata must use claims graph"
+        );
+
+        if let Some(previous_data_dir) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", previous_data_dir);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
     }
 
     #[tokio::test]

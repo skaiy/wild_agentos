@@ -97,6 +97,67 @@ impl KnowledgeGraphStore {
             .map_err(|e| format!("SPARQL INSERT failed: {}", e))
     }
 
+    /// Upserts KB catalog metadata in the graph minted from verified claims.
+    ///
+    /// The catalog entry subject is derived from the server-generated KB id.
+    /// Neither the caller nor the entry controls the target graph.
+    pub fn upsert_kb_catalog_metadata_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        kb_id: &str,
+        name: &str,
+        kb_type: &str,
+    ) -> Result<(), String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        let subject = Self::kb_catalog_subject(kb_id);
+        let delete = format!(
+            "DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> <https://agentos.ontology/meta/kbName> ?o }} }}"
+        );
+        self.store
+            .update(&delete)
+            .map_err(|e| format!("KB catalog metadata delete failed: {}", e))?;
+        let quads = [
+            RdfQuad {
+                subject: subject.clone(),
+                predicate: "https://agentos.ontology/meta/kbName".to_string(),
+                object: super::types::RdfValue::Literal(name.to_string()),
+                graph: None,
+            },
+            RdfQuad {
+                subject,
+                predicate: "https://agentos.ontology/meta/kbType".to_string(),
+                object: super::types::RdfValue::Literal(kb_type.to_string()),
+                graph: None,
+            },
+        ];
+        self.write_quads_for_claims(claims, &quads)
+    }
+
+    /// Deletes one server-generated KB catalog entry from the claims graph.
+    pub fn delete_kb_catalog_metadata_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        kb_id: &str,
+    ) -> Result<(), String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        let subject = Self::kb_catalog_subject(kb_id);
+        let delete = format!("DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> ?p ?o }} }}");
+        self.store
+            .update(&delete)
+            .map_err(|e| format!("KB catalog metadata delete failed: {}", e))
+    }
+
+    fn kb_catalog_subject(kb_id: &str) -> String {
+        format!(
+            "https://agentos.ontology/kb/{}",
+            RdfMapper::sanitize_id(kb_id)
+        )
+    }
+
     /// Executes a SPARQL query exclusively against the graph minted from
     /// verified tenant and project claims.
     ///
