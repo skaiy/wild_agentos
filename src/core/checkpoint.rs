@@ -679,6 +679,44 @@ mod tests {
     }
 
     #[test]
+    fn pdca_envelopes_are_stored_in_the_verified_tenants_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tenant_a =
+            crate::isolation::IsolationClaims::from_verified("tenant-a", "project", "agent-a")
+                .unwrap();
+        let tenant_b =
+            crate::isolation::IsolationClaims::from_verified("tenant-b", "project", "agent-b")
+                .unwrap();
+        let tenant_a_dir = dir.path().join("tenant-a");
+        let tenant_b_dir = dir.path().join("tenant-b");
+
+        assert!(!tenant_a_dir.exists());
+        assert!(!tenant_b_dir.exists());
+
+        let manager_a = CheckpointManager::with_persistence(Arc::new(
+            L0Store::open_for_claims(dir.path(), &tenant_a).unwrap(),
+        ));
+        let envelope = manager_a
+            .write_pdca_envelope(
+                "iri://task/tenant-isolation",
+                PdcaStepKind::Plan,
+                Some(&tenant_a),
+                &[],
+            )
+            .unwrap();
+
+        let manager_b = CheckpointManager::with_persistence(Arc::new(
+            L0Store::open_for_claims(dir.path(), &tenant_b).unwrap(),
+        ));
+        assert!(tenant_a_dir.join("l0.redb").exists());
+        assert!(tenant_b_dir.join("l0.redb").exists());
+        assert!(matches!(
+            manager_b.read_pdca_envelope(&envelope.envelope_iri),
+            Err(CoreError::Internal { .. })
+        ));
+    }
+
+    #[test]
     fn pdca_envelope_refuses_missing_claims() {
         let dir = tempfile::TempDir::new().unwrap();
         let claims =

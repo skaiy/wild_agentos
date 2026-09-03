@@ -151,6 +151,9 @@ pub struct TaskExecSpec {
     pub task_iri: String,
     pub include_thought: bool,
     pub include_tool_calls: bool,
+    /// Claims minted by the verified HTTP authentication boundary. Absent
+    /// claims deliberately leave L0 writes on the legacy read-only path.
+    pub isolation_claims: Option<crate::isolation::IsolationClaims>,
 }
 
 /// 任务执行器抽象：把「触发并驱动一次任务端到端执行」与 HTTP 传输层解耦。
