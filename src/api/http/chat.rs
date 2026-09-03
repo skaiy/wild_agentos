@@ -993,7 +993,7 @@ pub(crate) async fn openai_chat_completions_handler(
     let message = last_user
         .map(|m| m.content.as_text().trim().to_string())
         .unwrap_or_default();
-    // 提取末条 user 消息内的图片 URL(image_url 部件),供 VL 透传给 build_rag_context。
+    // 提取末条 user 消息内的图片 URL(image_url 部件),供 VL 透传给 build_chat_context。
     let images: Vec<String> = last_user
         .map(|m| m.content.image_urls())
         .unwrap_or_default();
