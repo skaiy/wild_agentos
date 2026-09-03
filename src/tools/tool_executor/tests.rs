@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::RuntimeHookConfig;
+use crate::isolation::IsolationClaims;
 use crate::tools::builtin::hooks::HookRunner;
 use crate::tools::builtin::permissions::{PermissionMode, PermissionPolicy};
 
@@ -152,6 +153,87 @@ mod tests {
 
     fn security_context() -> SecurityContext {
         SecurityContext::new("agent:test", "DA").with_task("iri://tasks/security-test")
+    }
+
+    fn claims(tenant: &str) -> IsolationClaims {
+        IsolationClaims::from_verified(tenant, "project", "agent").unwrap()
+    }
+
+    #[test]
+    fn graph_tools_use_claims_scope_and_ignore_tool_supplied_graphs() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let tenant_a = claims("tenant-a");
+            let tenant_b = claims("tenant-b");
+
+            let imported = executor
+                .execute_with_claims(
+                    "knowledge_import_json",
+                    json!({
+                        "json_data": r#"{"id":"only-a","type":"http://example.org/Person","label":"Tenant A entity"}"#,
+                        "mapping_config": r#"{"id_field":"id","type_field":"type","label_field":"label"}"#,
+                        "graph": "graph:world"
+                    }),
+                    Some(tenant_a.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(imported["graph"], "graph://tenant-a/project");
+
+            let a_results = executor
+                .execute_with_claims(
+                    "knowledge_query",
+                    json!({
+                        "sparql": "SELECT ?s WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> \"Tenant A entity\" }",
+                        "named_graph": "graph:world"
+                    }),
+                    Some(tenant_a),
+                )
+                .await
+                .unwrap();
+            assert_eq!(a_results["count"], 1);
+
+            let b_results = executor
+                .execute_with_claims(
+                    "knowledge_query",
+                    json!({
+                        "sparql": "SELECT ?s WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> \"Tenant A entity\" }",
+                        "named_graph": "graph://tenant-a/project"
+                    }),
+                    Some(tenant_b),
+                )
+                .await
+                .unwrap();
+            assert_eq!(b_results["count"], 0);
+        });
+    }
+
+    #[test]
+    fn graph_and_vector_tools_fail_closed_without_claims() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            for (tool, input) in [
+                (
+                    "knowledge_query",
+                    json!({"sparql": "SELECT * WHERE { ?s ?p ?o }"}),
+                ),
+                ("kg_search", json!({"keyword": "anything"})),
+                (
+                    "knowledge_neighbors",
+                    json!({"entity_id": "iri://entity/a"}),
+                ),
+                (
+                    "kb_vector_search",
+                    json!({"query": "anything", "namespace": "vector://other/project"}),
+                ),
+            ] {
+                let error = executor.execute(tool, input).await.unwrap_err();
+                assert!(
+                    error.contains("verified isolation claims"),
+                    "{tool} must explicitly reject missing claims: {error}"
+                );
+            }
+        });
     }
 
     #[test]

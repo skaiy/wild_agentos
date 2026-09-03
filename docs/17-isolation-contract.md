@@ -84,6 +84,15 @@ write targets. Requests without claims receive `401`; these handlers do not
 migrate historical `tenant:` graphs or read through `graph:world`. Graph queries
 remain SPARQL 1.1 against Oxigraph.
 
+### Runtime tools
+
+SA execution passes boundary-verified `IsolationClaims` to graph and vector
+builtins. Their `graph`, `named_graph`, and `namespace` arguments never select
+storage targets: reads and writes use the graph or vector namespace minted from
+claims, and calls without claims return an explicit error. No read-only public
+ontology exception is wired for runtime tools. Historical `graph:world` data is
+not migrated or read through by this path.
+
 ### Blob
 
 `BlobStore::put`, `get`, `delete`, and `exists` take `IsolationClaims` and only
