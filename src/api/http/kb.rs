@@ -16,7 +16,6 @@ use serde_json::{json, Value};
 
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{RdfQuad, RdfValue};
-use crate::memory::hyperspace_store::HybridSearchFilter;
 use crate::isolation::IsolationClaims;
 
 use super::iam::UserIdentity;
@@ -953,9 +952,8 @@ pub(crate) async fn search_knowledge_base_handler(
         }
     };
     let limit = req.limit.unwrap_or(5).clamp(1, 20);
-    let filter = HybridSearchFilter::new().with_must_tags(vec![kb_vector_tag(&id)]);
     match store
-        .search_with_claims(claims, &query, &filter, limit)
+        .search_with_claims_and_required_tags(claims, &query, &[kb_vector_tag(&id)], limit)
         .await
     {
         Ok(hits) => {
