@@ -149,7 +149,10 @@ impl SemanticCore {
         let events = Arc::new(EventBus::new(config.event_buffer_size));
         let validation = Arc::new(ValidationEngine::new(config.max_node_size));
         let skills = Arc::new(SkillRegistry::new());
-        let checkpoints = Arc::new(CheckpointManager::new());
+        // Without verified claims this is the legacy read-only store. Keeping
+        // it attached makes attempted PDCA persistence fail closed instead of
+        // silently falling back to an in-memory checkpoint manager.
+        let checkpoints = Arc::new(CheckpointManager::with_persistence(l0_store.clone()));
         let projection = Arc::new(l3_projection::ProjectionEngine::new(
             blackboard.clone(),
             config.max_projection_size,
