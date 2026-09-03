@@ -471,6 +471,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_bash_child_does_not_inherit_parent_secret() {
+        const SECRET_KEY: &str = "AGENTOS_CHILD_ENV_TEST_SECRET";
+        std::env::set_var(SECRET_KEY, "parent-only-secret");
+
+        let result = rt().block_on(async {
+            super::super::builtins::execute_bash(json!({
+                "command": format!("printenv {SECRET_KEY} >/dev/null && exit 1 || exit 0"),
+            }))
+            .await
+            .unwrap()
+        });
+
+        std::env::remove_var(SECRET_KEY);
+        assert_eq!(
+            result["exit_code"], 0,
+            "secret must not be inherited by bash child: {:?}",
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_bash_sandbox_status_reported() {
         rt().block_on(async {
             let result = super::super::builtins::execute_bash(json!({
