@@ -821,6 +821,7 @@ pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
     }
     std::fs::write(&params.path, &params.content).map_err(|e| format!("Write error: {}", e))?;
+    verify_file_write_effect(&params.path, &params.content)?;
     Ok(json!({
         "path": params.path,
         "bytes_written": params.content.len(),
@@ -850,6 +851,19 @@ fn validate_file_write_effect(
         );
     }
     Ok(())
+}
+
+/// Re-read the target after mutation so the reported success is backed by a
+/// workspace artifact instead of the write call's return value alone.
+fn verify_file_write_effect(path: &str, expected_content: &str) -> Result<(), String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) if content == expected_content && !content.is_empty() => Ok(()),
+        Ok(_) => Err(format!(
+            "Write verification failed: {} does not contain the requested artifact",
+            path
+        )),
+        Err(error) => Err(format!("Write verification read error: {}", error)),
+    }
 }
 
 pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
@@ -2185,6 +2199,16 @@ mod tests {
         assert!(validate_file_write_effect(Some("before"), "after").is_ok());
         assert!(validate_file_write_effect(None, "").is_err());
         assert!(validate_file_write_effect(Some("unchanged"), "unchanged").is_err());
+    }
+
+    #[test]
+    fn file_write_verifies_the_created_artifact() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        std::fs::write(&path, "expected").unwrap();
+
+        assert!(verify_file_write_effect(&path, "expected").is_ok());
+        assert!(verify_file_write_effect(&path, "different").is_err());
     }
 
     #[test]
