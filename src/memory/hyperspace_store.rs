@@ -567,8 +567,8 @@ impl HyperspaceStore {
             message: format!("invalid verified vector namespace: {e}"),
         })?;
         let mut scoped_filter = filter.clone();
-        scoped_filter.named_graph = Some(namespace);
         let namespace_prefix = format!("{namespace}#");
+        scoped_filter.named_graph = Some(namespace);
         // Hyperspace treats an empty filter bitmap as an unfiltered search.
         // Retain only the scoped engine IRIs as a fail-closed guard when the
         // requested namespace has no indexed vectors.
