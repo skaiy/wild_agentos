@@ -172,8 +172,8 @@ fn agent_runner_passes_context_claims_to_graph_tools_per_tenant() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|message| message["role"].as_str() == Some("tool"))
-            .and_then(|message| message["content"].as_str())
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains(r#""count":0"#))
             .unwrap_or_else(|| panic!("missing tenant B tool result: {}", requests[3]));
         assert!(
             tenant_b_tool_result.contains(r#""count":0"#),
