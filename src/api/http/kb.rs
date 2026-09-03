@@ -2288,7 +2288,10 @@ mod kb_isolation_http_tests {
             .kg_store
             .query("SELECT ?s WHERE { GRAPH <graph:world> { ?s ?p ?o } }")
             .unwrap();
-        assert_eq!(legacy.into_solutions().unwrap().count(), 0);
+        let oxigraph::sparql::QueryResults::Solutions(legacy) = legacy else {
+            panic!("expected SPARQL solutions");
+        };
+        assert_eq!(legacy.count(), 0);
     }
 
     #[tokio::test]
