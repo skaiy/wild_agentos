@@ -306,6 +306,7 @@ impl SupervisorAgent {
         five_w2h_iri: &str,
         resumed_messages: Option<Vec<crate::gateway::unified_gateway::ChatMessage>>,
         initial_prev_summary: Option<String>,
+        resumed_pdca_steps: Vec<PdcaStepKind>,
     ) -> Result<TaskResult, CoreError> {
         let cycle_id = self
             .active_cycles
@@ -349,7 +350,17 @@ impl SupervisorAgent {
 
         // Resume mode: determine which phase to start from
         // Load latest checkpoint from L0 to resolve phase tags
-        let resume_skip_phases: Vec<AgentRole> = if resumed_messages.is_some() {
+        let resume_skip_phases: Vec<AgentRole> = if !resumed_pdca_steps.is_empty() {
+            resumed_pdca_steps
+                .iter()
+                .map(|step| match step {
+                    PdcaStepKind::Plan => AgentRole::Plan,
+                    PdcaStepKind::Do => AgentRole::Do,
+                    PdcaStepKind::Check => AgentRole::Check,
+                    PdcaStepKind::Act => AgentRole::Act,
+                })
+                .collect()
+        } else if resumed_messages.is_some() {
             let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
                 self.runner.l0_store.clone(),
             );
@@ -1295,17 +1306,22 @@ impl SupervisorAgent {
             let cp_name = format!("step_complete_{}", role_name);
             let tags = vec![role_name.clone(), "step_complete".to_string()];
 
-            if let Err(e) = cm.write_pdca_envelope(
-                task_iri,
-                PdcaStepKind::from(step.role),
-                self.isolation_claims.as_ref(),
-                // Per-turn schema capture lands in #38. Plan metadata is not
-                // evidence that a schema was advertised to this model turn.
-                &[],
-            ) {
-                warn!("[checkpoint] PDCA envelope save refused: {}", e);
-            } else {
-                info!("[checkpoint] PDCA {} envelope saved", role_name);
+            if last_result
+                .as_ref()
+                .is_some_and(|result| result.status == "success")
+            {
+                if let Err(e) = cm.write_pdca_envelope(
+                    task_iri,
+                    PdcaStepKind::from(step.role),
+                    self.isolation_claims.as_ref(),
+                    // Per-turn schema capture lands in #38. Plan metadata is not
+                    // evidence that a schema was advertised to this model turn.
+                    &[],
+                ) {
+                    warn!("[checkpoint] PDCA envelope save refused: {}", e);
+                } else {
+                    info!("[checkpoint] PDCA {} envelope saved", role_name);
+                }
             }
 
             let session_msgs_json: String = if let Some(ref bb) = self.blackboard {
