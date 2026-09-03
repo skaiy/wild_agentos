@@ -1440,7 +1440,13 @@ mod tests {
     #[test]
     fn legacy_l0_store_rejects_writes_without_claims() {
         let dir = tempdir().unwrap();
-        Database::create(dir.path().join("l0.redb")).unwrap();
+        let db = Database::create(dir.path().join("l0.redb")).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        write_txn.open_table(ENTRIES_TABLE).unwrap();
+        write_txn.open_table(TAG_INDEX_TABLE).unwrap();
+        write_txn.open_table(NAMED_GRAPH_TABLE).unwrap();
+        write_txn.commit().unwrap();
+        drop(db);
         let store = L0Store::open_legacy_readonly(dir.path().to_str().unwrap()).unwrap();
 
         let error = store.store("iri://test/1", "unclaimed").unwrap_err();

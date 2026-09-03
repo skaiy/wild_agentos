@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod support;
+
 use wild_agent_os_core::core::event_bus::EventBus;
 use wild_agent_os_core::core::five_w2h::{
     FillStage, HowDetail, HowMuchDetail, Task5W2H, WhenDetail, WhereDetail,
@@ -12,7 +14,7 @@ use wild_agent_os_core::perception::proactive_engine::ProactiveEngine;
 
 fn setup_test_env() -> (Arc<L0Store>, Arc<Blackboard>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let l0 = Arc::new(L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap());
+    let l0 = support::writable_l0(dir.path().join("l0"));
     let l2 = Arc::new(Blackboard::new().unwrap());
     (l0, l2, dir)
 }

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+mod support;
+
 use wild_agent_os_core::config::settings::{AgentSettings, GatewaySettings};
 use wild_agent_os_core::core::agent_runner::AgentRunner;
 use wild_agent_os_core::core::event_bus::EventBus;
@@ -133,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ========== 测试 6: L0 存储 ==========
     print_section("测试 6: L0 存储");
 
-    let l0 = Arc::new(L0Store::new(&format!("{}/l0", OUTPUT_DIR))?);
+    let l0 = support::writable_l0(format!("{}/l0", OUTPUT_DIR));
 
     l0.store(iri, &json_ld.to_string())?;
 

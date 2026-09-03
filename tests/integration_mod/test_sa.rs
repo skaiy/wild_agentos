@@ -31,7 +31,7 @@ fn test_gateway_settings() -> GatewaySettings {
 fn make_sa() -> SupervisorAgent {
     let l2 = Arc::new(Blackboard::new().unwrap());
     let l0_dir = tempfile::tempdir().unwrap();
-    let l0 = Arc::new(L0Store::new(l0_dir.path().to_string_lossy().as_ref()).unwrap());
+    let l0 = super::writable_l0(l0_dir.path());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
         l0.clone(),

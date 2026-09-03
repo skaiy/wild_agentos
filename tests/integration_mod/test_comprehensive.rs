@@ -79,7 +79,7 @@ struct TestInfra {
 fn setup_infra() -> TestInfra {
     let l0_dir = tempfile::tempdir().unwrap();
     let l0_path = l0_dir.path().join("l0");
-    let l0 = Arc::new(L0Store::new(l0_path.to_string_lossy().as_ref()).unwrap());
+    let l0 = super::writable_l0(l0_path);
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
