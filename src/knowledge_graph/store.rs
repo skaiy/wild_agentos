@@ -107,7 +107,36 @@ impl KnowledgeGraphStore {
         self.query_sparql_in_graph(sparql, Some(&graph))
     }
 
-    pub fn delete_quads_for_source(&self, source_file: &str, graph: &str) -> Result<usize, String> {
+    /// Deletes are only permitted through
+    /// [`Self::delete_quads_for_source_for_claims`].
+    #[deprecated(
+        note = "graph deletes require delete_quads_for_source_for_claims with verified claims"
+    )]
+    pub fn delete_quads_for_source(
+        &self,
+        _source_file: &str,
+        _graph: &str,
+    ) -> Result<usize, String> {
+        Err("verified isolation claims are required for graph deletes".to_string())
+    }
+
+    /// Deletes source quads from the graph minted from verified claims.
+    pub fn delete_quads_for_source_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        source_file: &str,
+    ) -> Result<usize, String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        self.delete_quads_for_source_in_graph(source_file, &graph)
+    }
+
+    fn delete_quads_for_source_in_graph(
+        &self,
+        source_file: &str,
+        graph: &str,
+    ) -> Result<usize, String> {
         let safe_file = RdfMapper::sanitize_id(source_file);
         let subject_iri = format!("iri://entity/file:{}", safe_file);
         let delete_sparql = format!(
@@ -127,8 +156,32 @@ impl KnowledgeGraphStore {
         Ok(0)
     }
 
-    #[allow(deprecated)]
+    /// Deletes are only permitted through
+    /// [`Self::delete_quads_by_subject_prefix_for_claims`].
+    #[deprecated(
+        note = "graph deletes require delete_quads_by_subject_prefix_for_claims with verified claims"
+    )]
     pub fn delete_quads_by_subject_prefix(
+        &self,
+        _prefix: &str,
+        _graph: &str,
+    ) -> Result<usize, String> {
+        Err("verified isolation claims are required for graph deletes".to_string())
+    }
+
+    /// Deletes matching quads from the graph minted from verified claims.
+    pub fn delete_quads_by_subject_prefix_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        prefix: &str,
+    ) -> Result<usize, String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        self.delete_quads_by_subject_prefix_in_graph(prefix, &graph)
+    }
+
+    fn delete_quads_by_subject_prefix_in_graph(
         &self,
         prefix: &str,
         graph: &str,
