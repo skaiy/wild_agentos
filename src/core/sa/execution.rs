@@ -1295,6 +1295,17 @@ impl SupervisorAgent {
             let cp_name = format!("step_complete_{}", role_name);
             let tags = vec![role_name.clone(), "step_complete".to_string()];
 
+            if let Err(e) = cm.write_pdca_envelope(
+                task_iri,
+                PdcaStepKind::from(step.role),
+                self.isolation_claims.as_ref(),
+                &step.tools_allowed,
+            ) {
+                warn!("[checkpoint] PDCA envelope save refused: {}", e);
+            } else {
+                info!("[checkpoint] PDCA {} envelope saved", role_name);
+            }
+
             let session_msgs_json: String = if let Some(ref bb) = self.blackboard {
                 let filter = crate::memory::l2_blackboard::QueryFilter {
                     role: None,

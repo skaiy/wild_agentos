@@ -4,6 +4,26 @@ use std::collections::HashMap;
 use crate::core::agent_instance::AgentRole;
 use crate::CoreError;
 
+/// A boundary in a Plan-Do-Check-Act cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PdcaStepKind {
+    Plan,
+    Do,
+    Check,
+    Act,
+}
+
+impl From<AgentRole> for PdcaStepKind {
+    fn from(role: AgentRole) -> Self {
+        match role {
+            AgentRole::Plan => Self::Plan,
+            AgentRole::Do => Self::Do,
+            AgentRole::Check => Self::Check,
+            AgentRole::Act => Self::Act,
+        }
+    }
+}
+
 /// 5 categories, 16 predefined intervention actions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InterventionAction {

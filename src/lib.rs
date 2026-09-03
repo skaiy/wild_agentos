@@ -32,6 +32,8 @@ pub mod graph_backend;
 /// Renamed from `gnn` to `graph_features` for clarity.
 pub mod graph_features;
 
+pub mod isolation;
+
 #[cfg(feature = "ontology")]
 pub mod ontology;
 

@@ -7,6 +7,7 @@ use crate::core::agent_runner::AgentRunner;
 use crate::core::event_bus::{Event, EventBus};
 use crate::core::relevance_tracker::RelevanceTracker;
 use crate::core::supplementary_store::SupplementaryInputStore;
+use crate::isolation::IsolationClaims;
 use crate::jsonld::type_router::TypeRouter;
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l2_blackboard::Blackboard;
@@ -49,6 +50,8 @@ pub struct SupervisorAgent {
     pub(super) relevance_tracker: RelevanceTracker,
     /// Timeout for intervention/LLM execution (seconds)
     pub(super) execution_timeout_secs: u64,
+    /// Verified identity captured in PDCA boundary envelopes.
+    pub(super) isolation_claims: Option<IsolationClaims>,
 }
 
 impl SupervisorAgent {
@@ -110,11 +113,18 @@ impl SupervisorAgent {
             embedder: None,
             relevance_tracker: RelevanceTracker::new(0.6),
             execution_timeout_secs: 30,
+            isolation_claims: None,
         }
     }
 
     pub fn with_execution_timeout(mut self, secs: u64) -> Self {
         self.execution_timeout_secs = secs;
+        self
+    }
+
+    /// Attach claims verified by the authentication boundary for PDCA snapshots.
+    pub fn with_isolation_claims(mut self, claims: IsolationClaims) -> Self {
+        self.isolation_claims = Some(claims);
         self
     }
 
