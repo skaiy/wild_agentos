@@ -14,10 +14,10 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{RdfQuad, RdfValue};
 use crate::memory::hyperspace_store::HybridSearchFilter;
+use crate::isolation::IsolationClaims;
 
 use super::iam::UserIdentity;
 use super::{data_dir, expand_iri, AppState};
@@ -422,18 +422,9 @@ pub(crate) async fn list_knowledge_bases_handler(
 ) -> impl IntoResponse {
     let claims = match identity.isolation_claims() {
         Some(claims) => claims,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
-            )
-        }
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "verified isolation claims required for KB catalog" }))),
     };
-    let bases: Vec<Value> = state
-        .knowledge_bases
-        .read()
-        .await
-        .iter()
+    let bases: Vec<Value> = state.knowledge_bases.read().await.iter()
         .filter(|kb| kb_belongs_to_claims(kb, claims))
         .cloned()
         .collect();
@@ -448,12 +439,7 @@ pub(crate) async fn create_knowledge_base_handler(
 ) -> impl IntoResponse {
     let claims = match identity.isolation_claims() {
         Some(claims) => claims,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
-            )
-        }
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "verified isolation claims required for KB catalog" }))),
     };
     if req.name.trim().is_empty() {
         return (
@@ -484,29 +470,18 @@ pub(crate) async fn create_knowledge_base_handler(
     }
 
     let kb_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    // Graph names are always minted from verified claims; request data never
-    // selects a write target.
+    // Graph names are minted from verified claims; request data cannot select
+    // a catalog metadata write target.
     let graph_iri = if req.kb_type == "graph" {
         let iri = match claims.graph_iri() {
             Ok(iri) => iri,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("invalid verified graph scope: {e}") })),
-                )
-            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("invalid verified graph scope: {e}") }))),
         };
         let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
             Ok(kg) => kg,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": e })),
-                )
-            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))),
         };
-        if let Err(e) = kg.upsert_kb_catalog_metadata_for_claims(claims, &kb_id, &req.name, "graph")
-        {
+        if let Err(e) = kg.upsert_kb_catalog_metadata_for_claims(claims, &kb_id, &req.name, "graph") {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("命名图初始化失败: {e}") })),
@@ -522,12 +497,7 @@ pub(crate) async fn create_knowledge_base_handler(
     let vector_namespace = if req.kb_type == "vector" {
         match claims.vector_namespace() {
             Ok(namespace) => namespace,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("invalid verified vector namespace: {e}") })),
-                )
-            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("invalid verified vector namespace: {e}") }))),
         }
     } else {
         String::new()
@@ -562,12 +532,7 @@ pub(crate) async fn delete_knowledge_base_handler(
 ) -> impl IntoResponse {
     let claims = match identity.isolation_claims() {
         Some(claims) => claims,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
-            )
-        }
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "verified isolation claims required for KB catalog" }))),
     };
     let mut guard = state.knowledge_bases.write().await;
     let removed = guard
@@ -579,22 +544,12 @@ pub(crate) async fn delete_knowledge_base_handler(
         .cloned();
     let removed = match removed {
         Some(removed) => removed,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "knowledge base not found", "id": id })),
-            )
-        }
+        None => return (StatusCode::NOT_FOUND, Json(json!({ "error": "knowledge base not found", "id": id }))),
     };
     if removed.get("kb_type").and_then(Value::as_str) == Some("graph") {
         let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
             Ok(kg) => kg,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": e })),
-                )
-            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))),
         };
         if let Err(e) = kg.delete_kb_catalog_metadata_for_claims(claims, &id) {
             return (
@@ -632,12 +587,7 @@ pub(crate) async fn update_knowledge_base_handler(
 ) -> impl IntoResponse {
     let claims = match identity.isolation_claims() {
         Some(claims) => claims,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
-            )
-        }
+        None => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "verified isolation claims required for KB catalog" }))),
     };
     // 校验分类存在（若指定非空）
     if let Some(cat_id) = req.category_id.as_deref().filter(|s| !s.is_empty()) {
@@ -657,10 +607,13 @@ pub(crate) async fn update_knowledge_base_handler(
 
     let (updated, is_graph, graph_iri, name_changed) = {
         let mut guard = state.knowledge_bases.write().await;
-        let kb = match guard.iter_mut().find(|b| {
-            b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                && kb_belongs_to_claims(b, claims)
-        }) {
+        let kb = match guard
+            .iter_mut()
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
+        {
             Some(k) => k,
             None => {
                 return (
@@ -699,21 +652,14 @@ pub(crate) async fn update_knowledge_base_handler(
         (updated, is_graph, graph_iri, name_changed)
     };
 
-    // Graph catalog metadata is written only through claims-scoped store APIs.
+    // 图类型改名：同步命名图 kbName 元三元组
     if is_graph && !graph_iri.is_empty() {
         if let Some(new_name) = name_changed {
             let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
                 Ok(kg) => kg,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": e })),
-                    )
-                }
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))),
             };
-            if let Err(e) =
-                kg.upsert_kb_catalog_metadata_for_claims(claims, &id, &new_name, "graph")
-            {
+            if let Err(e) = kg.upsert_kb_catalog_metadata_for_claims(claims, &id, &new_name, "graph") {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": format!("KB catalog metadata update failed: {e}") })),
@@ -2318,107 +2264,54 @@ mod kb_isolation_http_tests {
         std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
         let state = test_state(tmp.path());
         let app = Router::new()
-            .route(
-                "/kb/bases",
-                get(list_knowledge_bases_handler).post(create_knowledge_base_handler),
-            )
-            .route(
-                "/kb/bases/:id",
-                put(update_knowledge_base_handler).delete(delete_knowledge_base_handler),
-            )
+            .route("/kb/bases", get(list_knowledge_bases_handler).post(create_knowledge_base_handler))
+            .route("/kb/bases/:id", put(update_knowledge_base_handler).delete(delete_knowledge_base_handler))
             .with_state(state.clone());
 
-        let no_jwt = Request::builder()
-            .method("POST")
-            .uri("/kb/bases")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"private","kb_type":"graph"}"#))
-            .unwrap();
-        assert_eq!(
-            response_json(&app, no_jwt).await.0,
-            StatusCode::UNAUTHORIZED
-        );
+        let unauthenticated = Request::builder()
+            .method("POST").uri("/kb/bases").header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"private","kb_type":"graph"}"#)).unwrap();
+        assert_eq!(response_json(&app, unauthenticated).await.0, StatusCode::UNAUTHORIZED);
 
-        // `graph` and `vector_namespace` are unknown request fields and must
-        // not override the canonical graph minted from verified claims.
+        // Unknown client graph/namespace inputs cannot override the claims mint.
         let create = Request::builder()
-            .method("POST")
-            .uri("/kb/bases")
+            .method("POST").uri("/kb/bases")
             .header("authorization", format!("Bearer {}", jwt("tenant-a")))
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"name":"tenant A catalog","kb_type":"graph","graph":"tenant:evil/kb/x","vector_namespace":"vector://evil/project"}"#,
-            ))
-            .unwrap();
+            .body(Body::from(r#"{"name":"tenant A catalog","kb_type":"graph","graph":"tenant:evil/kb/x","vector_namespace":"vector://evil/project"}"#)).unwrap();
         let (status, created) = response_json(&app, create).await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(created["base"]["graph"], json!("graph://tenant-a/default"));
         let kb_id = created["id"].as_str().unwrap().to_string();
 
-        let list = |tenant: &str| {
-            Request::builder()
-                .uri("/kb/bases")
-                .header("authorization", format!("Bearer {}", jwt(tenant)))
-                .body(Body::empty())
-                .unwrap()
-        };
-        assert_eq!(
-            response_json(&app, list("tenant-a")).await.1["count"],
-            json!(1)
-        );
-        assert_eq!(
-            response_json(&app, list("tenant-b")).await.1["count"],
-            json!(0)
-        );
+        let list = |tenant: &str| Request::builder().uri("/kb/bases")
+            .header("authorization", format!("Bearer {}", jwt(tenant)))
+            .body(Body::empty()).unwrap();
+        assert_eq!(response_json(&app, list("tenant-a")).await.1["count"], json!(1));
+        assert_eq!(response_json(&app, list("tenant-b")).await.1["count"], json!(0));
 
-        let other_tenant_delete = Request::builder()
-            .method("DELETE")
-            .uri(format!("/kb/bases/{kb_id}"))
-            .header("authorization", format!("Bearer {}", jwt("tenant-b")))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            response_json(&app, other_tenant_delete).await.0,
-            StatusCode::NOT_FOUND
-        );
+        let other_tenant_delete = Request::builder().method("DELETE").uri(format!("/kb/bases/{kb_id}"))
+            .header("authorization", format!("Bearer {}", jwt("tenant-b"))).body(Body::empty()).unwrap();
+        assert_eq!(response_json(&app, other_tenant_delete).await.0, StatusCode::NOT_FOUND);
 
-        let no_jwt_update = Request::builder()
-            .method("PUT")
-            .uri(format!("/kb/bases/{kb_id}"))
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"must fail"}"#))
-            .unwrap();
-        assert_eq!(
-            response_json(&app, no_jwt_update).await.0,
-            StatusCode::UNAUTHORIZED
-        );
+        for method in ["PUT", "DELETE"] {
+            let mut builder = Request::builder().method(method).uri(format!("/kb/bases/{kb_id}"));
+            if method == "PUT" {
+                builder = builder.header("content-type", "application/json");
+            }
+            let body = if method == "PUT" { Body::from(r#"{"name":"must fail"}"#) } else { Body::empty() };
+            assert_eq!(response_json(&app, builder.body(body).unwrap()).await.0, StatusCode::UNAUTHORIZED);
+        }
 
-        let no_jwt_delete = Request::builder()
-            .method("DELETE")
-            .uri(format!("/kb/bases/{kb_id}"))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            response_json(&app, no_jwt_delete).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-
-        let metadata = state
-            .kg_store
-            .query(
-                "SELECT ?s WHERE { GRAPH <graph://tenant-a/default> {
-                    ?s <https://agentos.ontology/meta/kbName> \"tenant A catalog\"
-                }}",
-            )
-            .unwrap();
+        let metadata = state.kg_store.query(
+            "SELECT ?s WHERE { GRAPH <graph://tenant-a/default> {
+                ?s <https://agentos.ontology/meta/kbName> \"tenant A catalog\"
+            }}",
+        ).unwrap();
         let oxigraph::sparql::QueryResults::Solutions(metadata) = metadata else {
             panic!("expected SPARQL solutions");
         };
-        assert_eq!(
-            metadata.count(),
-            1,
-            "catalog metadata must use claims graph"
-        );
+        assert_eq!(metadata.count(), 1, "catalog metadata must use claims graph");
 
         if let Some(previous_data_dir) = previous_data_dir {
             std::env::set_var("AGENTOS_DATA_DIR", previous_data_dir);
