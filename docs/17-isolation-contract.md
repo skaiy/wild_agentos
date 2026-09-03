@@ -25,9 +25,12 @@ parse JSON bodies, inspect headers, or validate credentials.
 verified by the current HTTP boundary do create claims; that boundary currently
 validates HS256 JWTs using `AGENTOS_JWT_SECRET`, not OIDC or Keycloak. Unverified
 requests have no claims and cannot use the claims-scoped graph or blob paths.
-The current JWT shape has no `project_id` claim, so verified JWT identities mint
-the project as `default`; optional JWT `project_id` with a default fallback is
-not on `main` yet.
+`JwtClaims.project_id` is an optional `Option<String>` field with a serde
+default. A verified JWT without `project_id`, or with an empty `project_id`,
+mints the `default` project. A non-empty value is passed to
+`IsolationClaims::from_verified`; unsafe values such as `.`, `..`, or path
+separators (for example `a/b`) fail closed there before graph, vector, L0, or
+blob names are minted. In that case `verify_jwt` produces no identity.
 
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
