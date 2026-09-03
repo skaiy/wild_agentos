@@ -7,8 +7,8 @@ use tree_sitter::{Language, Node, Parser, Tree};
 
 use super::rdf_mapper::RdfMapper;
 use super::store::KnowledgeGraphStore;
-use crate::isolation::IsolationClaims;
 use super::types::{EdgeDef, LLMExtractionOutput, NodeDef, RdfMappingResult};
+use crate::isolation::IsolationClaims;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodeLanguage {
@@ -178,7 +178,10 @@ impl CodeAstExtractor {
         if lang == CodeLanguage::Unknown {
             return Err(format!(
                 "unsupported file type: {}",
-                file_path.extension().and_then(|e| e.to_str()).unwrap_or("?")
+                file_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("?")
             ));
         }
 

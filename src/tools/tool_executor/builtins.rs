@@ -15,7 +15,6 @@ use crate::knowledge_graph::rdf_mapper::RdfMapper;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{BridgeRelationType, EdgeDef, NodeDef, RdfQuad, RdfValue};
 use crate::memory::{HybridSearchFilter, HyperspaceStore};
-use crate::isolation::IsolationClaims;
 use crate::tools::builtin::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
@@ -1778,7 +1777,9 @@ pub(super) async fn execute_knowledge_extract(
     let store = kg_store
         .write()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    let graph = claims.graph_iri().map_err(|e| format!("invalid verified graph scope: {e}"))?;
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
     store.write_quads_for_claims(&claims, &result.quads)?;
 
     Ok(json!({
@@ -1958,7 +1959,9 @@ pub(super) async fn execute_knowledge_import_json(
         }));
     }
 
-    let graph = claims.graph_iri().map_err(|e| format!("invalid verified graph scope: {e}"))?;
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
 
     let extraction = crate::knowledge_graph::types::LLMExtractionOutput {
         nodes: nodes.clone(),
@@ -1994,7 +1997,9 @@ pub(super) async fn execute_ontology_register(
         return Err("terms array cannot be empty".to_string());
     }
 
-    let graph = claims.graph_iri().map_err(|e| format!("invalid verified graph scope: {e}"))?;
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
     let mut quads = Vec::new();
 
     for term in terms {
@@ -2091,7 +2096,9 @@ pub(super) async fn execute_knowledge_bridge_with_store(
         BridgeRelationType::RelatedTo => "https://agentos.ontology/bridge/relatedTo",
     };
 
-    let bridge_graph = claims.graph_iri().map_err(|e| format!("invalid verified graph scope: {e}"))?;
+    let bridge_graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
     let quad = RdfQuad {
         subject: entity_iri,
         predicate: predicate.to_string(),
@@ -2122,7 +2129,9 @@ pub(super) async fn execute_knowledge_extract_code(
         return Err("file_path parameter cannot be empty".to_string());
     }
     // `named_graph` is intentionally ignored; claims select the graph.
-    let graph = claims.graph_iri().map_err(|e| format!("invalid verified graph scope: {e}"))?;
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
     let force = input["force"].as_bool().unwrap_or(false);
 
     let store = kg_store
@@ -2131,8 +2140,10 @@ pub(super) async fn execute_knowledge_extract_code(
 
     if force {
         let result = CodeAstExtractor::extract_from_file(&file_path, &graph)?;
-        store
-            .delete_quads_by_subject_prefix_for_claims(&claims, &format!("iri://entity/file:{}", file_path))?;
+        store.delete_quads_by_subject_prefix_for_claims(
+            &claims,
+            &format!("iri://entity/file:{}", file_path),
+        )?;
         store.write_quads_for_claims(&claims, &result.quads)?;
         Ok(json!({
             "success": true,

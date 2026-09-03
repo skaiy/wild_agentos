@@ -39,7 +39,9 @@ pub(super) fn require_isolation_claims() -> Result<IsolationClaims, String> {
         .try_with(|claims| claims.clone())
         .ok()
         .flatten()
-        .ok_or_else(|| "verified isolation claims are required for graph and vector tools".to_string())
+        .ok_or_else(|| {
+            "verified isolation claims are required for graph and vector tools".to_string()
+        })
 }
 
 /// Tool input structs

@@ -213,10 +213,19 @@ mod tests {
         rt().block_on(async {
             let executor = ToolExecutor::new();
             for (tool, input) in [
-                ("knowledge_query", json!({"sparql": "SELECT * WHERE { ?s ?p ?o }"})),
+                (
+                    "knowledge_query",
+                    json!({"sparql": "SELECT * WHERE { ?s ?p ?o }"}),
+                ),
                 ("kg_search", json!({"keyword": "anything"})),
-                ("knowledge_neighbors", json!({"entity_id": "iri://entity/a"})),
-                ("kb_vector_search", json!({"query": "anything", "namespace": "vector://other/project"})),
+                (
+                    "knowledge_neighbors",
+                    json!({"entity_id": "iri://entity/a"}),
+                ),
+                (
+                    "kb_vector_search",
+                    json!({"query": "anything", "namespace": "vector://other/project"}),
+                ),
             ] {
                 let error = executor.execute(tool, input).await.unwrap_err();
                 assert!(
