@@ -136,7 +136,10 @@ impl AgentOSService {
             scheduler.clone(),
         )));
 
-        let checkpoints = Arc::new(CheckpointManager::new());
+        // The startup L0 handle stays legacy read-only when no claims are
+        // available. HTTP execution replaces it with a tenant-scoped,
+        // claims-verified handle before PDCA begins.
+        let checkpoints = Arc::new(CheckpointManager::with_persistence(l0.clone()));
 
         let eb_checkpoint = event_bus.clone();
         let cp_clone = checkpoints.clone();
@@ -349,6 +352,7 @@ impl AgentOSService {
                 skills: self.skills.clone(),
                 blackboard: self.blackboard.clone(),
                 l0: self.l0.clone(),
+                l0_root: std::path::PathBuf::from(&self.settings.memory.l0.path),
                 memory_manager: self.memory_manager.clone(),
                 templates: self.templates.clone(),
                 scheduler: self.scheduler.clone(),
@@ -700,7 +704,11 @@ pub struct HttpTaskExecutor {
     gateway: Arc<UnifiedGateway>,
     skills: Arc<SkillRegistry>,
     blackboard: Arc<Blackboard>,
+    /// Compatibility L0 opened during startup. It is read-only and is used
+    /// only when a request has no verified JWT claims.
     l0: Arc<L0Store>,
+    /// Root under which `open_for_claims` mints a tenant directory on demand.
+    l0_root: std::path::PathBuf,
     memory_manager: Arc<tokio::sync::Mutex<MemoryManager>>,
     templates: Arc<TemplateEngine>,
     scheduler: Arc<MemoryScheduler>,
@@ -714,11 +722,38 @@ pub struct HttpTaskExecutor {
 #[async_trait::async_trait]
 impl crate::api::http::TaskExecutor for HttpTaskExecutor {
     async fn execute(&self, spec: crate::api::http::TaskExecSpec) {
+        let l0 = match spec.isolation_claims.as_ref() {
+            Some(claims) => match L0Store::open_for_claims(&self.l0_root, claims) {
+                Ok(l0) => Arc::new(l0),
+                Err(error) => {
+                    let emitter = ExecutionEventEmitter::with_options(
+                        &spec.task_iri,
+                        None,
+                        Some(self.event_bus.clone()),
+                        spec.include_thought,
+                        spec.include_tool_calls,
+                    );
+                    emitter.emit_error("L0InitializationError", &error.to_string(), "L0", false);
+                    emitter.emit_completion("failed", &error.to_string(), None);
+                    self.event_bus
+                        .emit(
+                            &spec.task_iri,
+                            "TASK_FAILED",
+                            "SA",
+                            &serde_json::json!({"status": "failed", "summary": error.to_string()})
+                                .to_string(),
+                        )
+                        .await;
+                    return;
+                }
+            },
+            None => self.l0.clone(),
+        };
         let mut sa = build_supervisor_agent(
             self.gateway.clone(),
             self.skills.clone(),
             self.blackboard.clone(),
-            self.l0.clone(),
+            l0,
             self.memory_manager.clone(),
             self.templates.clone(),
             self.scheduler.clone(),
@@ -728,6 +763,9 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             self.vector_store.clone(),
             &self.settings,
         );
+        if let Some(claims) = spec.isolation_claims.clone() {
+            sa = sa.with_isolation_claims(claims);
+        }
 
         let emitter = ExecutionEventEmitter::with_options(
             &spec.task_iri,

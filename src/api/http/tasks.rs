@@ -16,6 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::iam::UserIdentity;
 use super::{AppState, TaskExecSpec};
 
 #[derive(Deserialize)]
@@ -48,16 +49,18 @@ pub struct StreamEventResponse {
 
 pub(crate) async fn create_task_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<TaskRequest>,
 ) -> impl IntoResponse {
     match state
         .core
-        .init_task(
+        .init_task_with_tenant(
             &req.user_input,
             None,
             None,
             req.user_id.as_deref(),
             req.session_id.as_deref(),
+            identity.isolation_claims().map(|claims| claims.tenant_id()),
         )
         .await
     {
@@ -95,6 +98,7 @@ pub(crate) async fn get_task_handler(
 
 pub(crate) async fn stream_task_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<StreamTaskRequest>,
 ) -> impl IntoResponse {
     let task_iri = req
@@ -115,6 +119,7 @@ pub(crate) async fn stream_task_handler(
                 task_iri: task_iri.clone(),
                 include_thought: req.include_thought.unwrap_or(true),
                 include_tool_calls: req.include_tool_calls.unwrap_or(true),
+                isolation_claims: identity.isolation_claims().cloned(),
             };
             tokio::spawn(async move {
                 executor.execute(spec).await;
