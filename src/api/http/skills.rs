@@ -466,7 +466,7 @@ pub(crate) fn iri_from_git_url(url: &str) -> String {
 }
 
 /// POST /api/v1/skills/import-git — 从 Git 仓库导入技能。
-/// 需要 DA 角色（X-Identity 头）。
+/// 需要 DA 角色。
 pub(crate) async fn import_git_skill_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
@@ -865,10 +865,10 @@ mod tests {
     use crate::core::core_types::{CoreConfig, SemanticCore};
     use crate::tools::prompt_registry::PromptRegistry;
     use axum::{
+        http::StatusCode,
         routing::{get, post},
         Router,
     };
-    use axum::http::StatusCode;
     use base64::Engine;
     use serde_json::Value;
     use tower::ServiceExt;
@@ -1147,7 +1147,7 @@ version: \"2.0.0\"\n\
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    /// POST /api/v1/skills/import-git 无 X-Identity 头 → 403（严格模式）
+    /// POST /api/v1/skills/import-git 无 JWT → 403（严格模式）
     #[tokio::test]
     async fn test_import_git_403_no_role() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1168,7 +1168,7 @@ version: \"2.0.0\"\n\
             .method("POST")
             .uri("/api/v1/skills/import-git")
             .header("content-type", "application/json")
-            // 故意不带 X-Identity
+            // 故意不带 JWT
             .body(axum::body::Body::from(body))
             .unwrap();
 
@@ -1180,15 +1180,17 @@ version: \"2.0.0\"\n\
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    /// POST /api/v1/skills/import-git 带 DA 角色但 repo_url 为空 → 400
+    /// POST /api/v1/skills/import-git 的 dev-only X-Identity 模拟带 DA 角色但 repo_url 为空 → 400
     #[tokio::test]
-    async fn test_import_git_400_empty_url() {
+    async fn test_import_git_dev_only_400_empty_url() {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("importgit_400_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let strict_mode = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
 
         let state = make_state(&tmp);
 
@@ -1214,6 +1216,9 @@ version: \"2.0.0\"\n\
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         std::env::remove_var("AGENTOS_DATA_DIR");
+        if let Some(value) = strict_mode {
+            std::env::set_var("AGENTOS_AUTH_STRICT", value);
+        }
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1221,7 +1226,7 @@ version: \"2.0.0\"\n\
 
     use base64::engine::general_purpose::STANDARD as B64;
 
-    /// 构造带 DA 角色的 X-Identity 头值。
+    /// 构造带 DA 角色的 dev-only X-Identity 头值。
     fn da_identity(user: &str) -> String {
         B64.encode(
             serde_json::json!({"user_id": user, "tenant_id": "t-test", "roles": ["DA"]})

@@ -144,7 +144,6 @@ pub struct AppState {
     /// 进程内限流/配额/并发用量状态（对外调用面）。
     pub api_usage: Arc<ApiUsageState>,
 }
-
 /// 流式任务执行规格：由 HTTP 流处理器构造并传入执行器。
 #[derive(Clone)]
 pub struct TaskExecSpec {
@@ -514,8 +513,9 @@ mod tests {
     /// → 绑定专用知识库 → 跨租户会话隔离查询 → 持久化落盘断言。
     #[tokio::test]
     async fn test_battery_assistant_e2e_tenant_isolation() {
+        use super::iam::JwtClaims;
         use crate::core::core_types::{CoreConfig, SemanticCore};
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use jsonwebtoken::{encode, EncodingKey, Header};
 
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 隔离持久化目录 + 启用严格鉴权（验证匿名 403）
@@ -571,14 +571,14 @@ mod tests {
             router: &Router,
             uri: &str,
             body: Value,
-            ident: Option<&str>,
+            bearer_token: Option<&str>,
         ) -> (StatusCode, Value) {
             let mut b = axum::http::Request::builder()
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/json");
-            if let Some(id) = ident {
-                b = b.header("x-identity", id);
+            if let Some(token) = bearer_token {
+                b = b.header("authorization", format!("Bearer {token}"));
             }
             let req = b.body(axum::body::Body::from(body.to_string())).unwrap();
             let resp = router.clone().oneshot(req).await.unwrap();
@@ -591,8 +591,17 @@ mod tests {
         }
 
         let id_of = |user: &str, tenant: &str| -> String {
-            STANDARD
-                .encode(json!({"user_id": user, "tenant_id": tenant, "roles": ["DA"]}).to_string())
+            encode(
+                &Header::default(),
+                &JwtClaims {
+                    sub: user.to_string(),
+                    tenant_id: tenant.to_string(),
+                    roles: vec!["DA".to_string()],
+                    exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                },
+                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            )
+            .unwrap()
         };
         let id_a = id_of("svc-tesla", "t-tesla");
         let id_b = id_of("svc-byd", "t-byd");
@@ -739,5 +748,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
-
 

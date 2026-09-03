@@ -7,7 +7,8 @@
  *   3. 匿名（user_id="anonymous"）         —— 无凭据回退
  *
  * AGENTOS_JWT_SECRET 环境变量控制签名密钥。
- * AGENTOS_AUTH_STRICT=true 强制执行角色校验（默认 false，适合本地开发）。
+ * AGENTOS_AUTH_STRICT=true 强制执行角色校验，并拒绝 X-Identity（默认 false，
+ * 适合本地开发）。严格模式中，JWT 是唯一可用的 HTTP 身份来源。
  */
 
 use axum::{
@@ -69,8 +70,7 @@ impl UserIdentity {
         if self.has_role(role) {
             return Ok(());
         }
-        let strict = std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true");
-        if !strict && self.auth_method == AuthMethod::Anonymous {
+        if !auth_strict() && self.auth_method == AuthMethod::Anonymous {
             return Ok(());
         }
         Err((
@@ -105,6 +105,12 @@ impl<S: Send + Sync> FromRequestParts<S> for UserIdentity {
         }
         // 2. X-Identity base64-JSON（开发模拟）
         if let Some(hdr) = parts.headers.get("x-identity") {
+            if auth_strict() {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "X-Identity is disabled when AGENTOS_AUTH_STRICT=true".to_string(),
+                ));
+            }
             if let Ok(val) = hdr.to_str() {
                 if let Ok(bytes) = STANDARD.decode(val) {
                     if let Ok(claims) = serde_json::from_slice::<Value>(&bytes) {
@@ -124,6 +130,10 @@ impl<S: Send + Sync> FromRequestParts<S> for UserIdentity {
 }
 
 // ─── JWT 验签 ─────────────────────────────────────────────────────────────────
+
+fn auth_strict() -> bool {
+    std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true")
+}
 
 fn jwt_secret() -> String {
     std::env::var("AGENTOS_JWT_SECRET")
@@ -166,4 +176,117 @@ fn arr_field(v: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        extract::FromRequestParts,
+        http::{Request, StatusCode},
+    };
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    use super::{AuthMethod, JwtClaims, UserIdentity};
+    use crate::api::http::TEST_ENV_LOCK;
+
+    #[tokio::test]
+    async fn strict_mode_rejects_forged_x_identity_before_claims_are_created() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        let forged = STANDARD.encode(r#"{"tenant_id":"evil","roles":["DA"]}"#);
+        let (mut parts, _) = Request::builder()
+            .header("x-identity", forged)
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let rejection = UserIdentity::from_request_parts(&mut parts, &())
+            .await
+            .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+
+        restore_strict_mode(previous);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_does_not_read_tenant_identity_from_request_body() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        let (mut parts, _) = Request::builder()
+            .body(r#"{"tenant_id":"evil","roles":["DA"]}"#)
+            .unwrap()
+            .into_parts();
+
+        let identity = UserIdentity::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(identity.auth_method, AuthMethod::Anonymous);
+        assert_ne!(identity.tenant_id, "evil");
+        assert!(identity.require_role("DA").is_err());
+
+        restore_strict_mode(previous);
+    }
+
+    #[tokio::test]
+    async fn dev_only_x_identity_simulation_is_explicitly_tagged() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        let simulated = STANDARD.encode(r#"{"user_id":"developer","tenant_id":"dev-tenant"}"#);
+        let (mut parts, _) = Request::builder()
+            .header("x-identity", simulated)
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let identity = UserIdentity::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(identity.auth_method, AuthMethod::Base64Header);
+        assert_eq!(identity.tenant_id, "dev-tenant");
+        restore_strict_mode(previous);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_accepts_a_valid_jwt_identity() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        let token = encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "service".to_string(),
+                tenant_id: "acme".to_string(),
+                roles: vec!["DA".to_string()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+        )
+        .unwrap();
+        let (mut parts, _) = Request::builder()
+            .header("authorization", format!("Bearer {token}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let identity = UserIdentity::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(identity.auth_method, AuthMethod::Jwt);
+        assert_eq!(identity.tenant_id, "acme");
+        assert!(identity.require_role("DA").is_ok());
+
+        restore_strict_mode(previous);
+    }
+
+    fn restore_strict_mode(previous: Option<std::ffi::OsString>) {
+        if let Some(value) = previous {
+            std::env::set_var("AGENTOS_AUTH_STRICT", value);
+        } else {
+            std::env::remove_var("AGENTOS_AUTH_STRICT");
+        }
+    }
 }
