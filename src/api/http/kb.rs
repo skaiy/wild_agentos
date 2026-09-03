@@ -105,63 +105,8 @@ pub(crate) async fn spawn_reindex_all_vector_kbs(state: Arc<AppState>) -> usize 
         tracing::warn!("BlobStore 未启用，跳过自动重建（存量向量已作废，需重新上传原文）");
         return 0;
     }
-    let targets: Vec<(String, String, String, Vec<Value>)> = {
-        let guard = state.knowledge_bases.read().await;
-        guard
-            .iter()
-            .filter_map(|kb| {
-                if kb.get("kb_type").and_then(|v| v.as_str()) != Some("vector") {
-                    return None;
-                }
-                let id = kb.get("id").and_then(|v| v.as_str())?.to_string();
-                let namespace = kb
-                    .get("vector_namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if namespace.is_empty() {
-                    return None;
-                }
-                let tenant = kb
-                    .get("tenant_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default")
-                    .to_string();
-                let docs = kb
-                    .get("documents")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                if docs.is_empty() {
-                    return None;
-                }
-                Some((id, namespace, tenant, docs))
-            })
-            .collect()
-    };
-    let count = targets.len();
-    for (id, namespace, tenant, docs) in targets {
-        {
-            let mut guard = state.knowledge_bases.write().await;
-            if let Some(o) = guard
-                .iter_mut()
-                .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-                .and_then(|b| b.as_object_mut())
-            {
-                o.insert("reindex_status".into(), json!("reindexing"));
-                o.insert(
-                    "reindex_started_at".into(),
-                    json!(chrono::Utc::now().to_rfc3339()),
-                );
-            }
-            let _ = save_knowledge_bases(&guard);
-        }
-        let st = state.clone();
-        tokio::spawn(async move {
-            run_kb_reindex(st, id, namespace, tenant, docs).await;
-        });
-    }
-    count
+    tracing::warn!("自动重建缺少已验证 isolation claims，跳过 BlobStore 读取");
+    0
 }
 
 // ─── 知识库分类管理 CRUD ──────────────────────────────────────────────────────
@@ -1025,6 +970,15 @@ pub(crate) async fn upload_knowledge_base_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
+            )
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -1145,11 +1099,11 @@ pub(crate) async fn upload_knowledge_base_handler(
         let content_type = kb_content_type(&name);
         let size = bytes.len();
         // ① 原文落盘：无论能否解析都持久化，为重建索引/预览/溯源留底。
-        let blob_key = format!("tenant:{}/kb/{}/{}", identity.tenant_id, id, doc_id);
+        let blob_key = format!("kb/{id}/{doc_id}");
         let mut blob_ref = Value::Null;
         let mut persist_err: Option<String> = None;
         if let Some(b) = &blob {
-            match b.put(&blob_key, &bytes, &content_type).await {
+            match b.put(claims, &blob_key, &bytes, &content_type).await {
                 Ok(_) => blob_ref = json!({ "backend": b.backend(), "key": blob_key }),
                 Err(e) => persist_err = Some(format!("原文落盘失败: {e}")),
             }
@@ -1314,6 +1268,7 @@ fn rfc5987_encode(s: &str) -> String {
 /// GET /api/v1/kb/bases/:id/documents/:doc_id/raw — 经 core 代理从 BlobStore 返回原文（不暴露 MinIO）。
 pub(crate) async fn kb_document_raw_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path((id, doc_id)): axum::extract::Path<(String, String)>,
 ) -> Response {
     let doc = {
@@ -1337,18 +1292,24 @@ pub(crate) async fn kb_document_raw_handler(
                 .into_response()
         }
     };
-    let key = doc
+    let has_blob_ref = doc
         .get("blob_ref")
         .and_then(|b| b.get("key"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    let key = match key {
-        Some(k) => k,
+        .is_some_and(|key| !key.is_empty());
+    if !has_blob_ref {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "该文档原文未持久化（BlobStore 未启用时上传）" })),
+        )
+            .into_response();
+    }
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
         None => {
             return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "该文档原文未持久化（BlobStore 未启用时上传）" })),
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
             )
                 .into_response()
         }
@@ -1363,7 +1324,8 @@ pub(crate) async fn kb_document_raw_handler(
                 .into_response()
         }
     };
-    match blob.get(&key).await {
+    let key = format!("kb/{id}/{doc_id}");
+    match blob.get(claims, &key).await {
         Ok(bytes) => {
             let ct = doc
                 .get("content_type")
@@ -1403,6 +1365,16 @@ pub(crate) async fn reindex_knowledge_base_handler(
     if let Err(e) = identity.require_role("DA") {
         return e.into_response();
     }
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims.clone(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
+            )
+                .into_response()
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -1490,7 +1462,7 @@ pub(crate) async fn reindex_knowledge_base_handler(
     let state2 = state.clone();
     let id2 = id.clone();
     tokio::spawn(async move {
-        run_kb_reindex(state2, id2, namespace, tenant, docs).await;
+        run_kb_reindex(state2, claims, id2, namespace, tenant, docs).await;
     });
     (
         StatusCode::ACCEPTED,
@@ -1502,6 +1474,7 @@ pub(crate) async fn reindex_knowledge_base_handler(
 /// 后台重建任务：逐文档从 BlobStore 拉原文，删旧 chunk 后按当前 embedding 重新入库，回写台账。
 async fn run_kb_reindex(
     state: Arc<AppState>,
+    claims: crate::isolation::IsolationClaims,
     id: String,
     namespace: String,
     tenant: String,
@@ -1536,12 +1509,11 @@ async fn run_kb_reindex(
             .get("min_importance")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.5) as f32;
-        let key = doc
+        let has_blob_ref = doc
             .get("blob_ref")
             .and_then(|b| b.get("key"))
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+            .is_some_and(|key| !key.is_empty());
         // ① 删旧 chunk（幂等，忽略单条失败）。
         if let Some(arr) = doc.get("chunk_iris").and_then(|v| v.as_array()) {
             for it in arr {
@@ -1551,7 +1523,7 @@ async fn run_kb_reindex(
             }
         }
         // ② 无原文或非可解析类型：无法重建，保留留底状态。
-        if key.is_none() || kb_text_ext(&filename).is_none() {
+        if !has_blob_ref || kb_text_ext(&filename).is_none() {
             if let Some(o) = doc.as_object_mut() {
                 o.insert("chunks".into(), json!(0));
                 o.insert("chunk_iris".into(), json!([]));
@@ -1566,8 +1538,8 @@ async fn run_kb_reindex(
             updated.push(doc);
             continue;
         }
-        let key = key.unwrap();
-        let bytes = match blob.get(&key).await {
+        let key = format!("kb/{id}/{doc_id}");
+        let bytes = match blob.get(&claims, &key).await {
             Ok(b) => b,
             Err(e) => {
                 any_failed = true;
