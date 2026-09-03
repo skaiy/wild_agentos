@@ -54,8 +54,11 @@ impl SupervisorAgent {
         // F1 多租户接线：从 blackboard 读取 HTTP 层写入的 user_id/tenant_id，
         // 注入 TaskContext，使身份血缘从 HTTP 入口贯穿 PA→DA→CA 全链路 session。
         let (identity_user, identity_tenant) = self.read_task_identity(task_iri);
-        let ctx = TaskContext::new(task_iri, user_input, self.max_iterations)
+        let mut ctx = TaskContext::new(task_iri, user_input, self.max_iterations)
             .with_identity(identity_user, identity_tenant);
+        if let Some(claims) = self.isolation_claims.clone() {
+            ctx = ctx.with_isolation_claims(claims);
+        }
         self.process_task_with_context(user_input, task_iri, ctx)
             .await
     }
@@ -68,6 +71,11 @@ impl SupervisorAgent {
         task_iri: &str,
         ctx: TaskContext,
     ) -> Result<TaskResult, CoreError> {
+        // A caller may supply claims on TaskContext directly. Keep the SA's
+        // verified boundary in sync so every PDCA step inherits them.
+        if let Some(claims) = ctx.isolation_claims.clone() {
+            self.isolation_claims = Some(claims);
+        }
         let cycle_id = self.start_cycle(user_input, task_iri).await?;
 
         let mut five_w2h = self.extract_5w2h_from_input(user_input).await;

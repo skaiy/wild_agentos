@@ -1961,7 +1961,6 @@ Output the summary report directly, not in JSON format."#,
                         });
 
                         for c in calls {
-                            tc += 1;
                             let name = &c.function.name;
                             let args_raw = &c.function.arguments;
                             let args: Value = serde_json::from_str(args_raw).unwrap_or_default();
@@ -1971,6 +1970,36 @@ Output the summary report directly, not in JSON format."#,
                                 &args_raw.chars().take(100).collect::<String>()
                             );
 
+                            // Tool invocations are the first billable path. Reserve before
+                            // emitting an execution event or entering the tool executor, so a
+                            // rejected action cannot cause a side effect. Attribution requires
+                            // verified isolation claims; no fallback tenant is permitted.
+                            if let Err(error) = self
+                                .tenant_spend_gate
+                                .reserve_tool_call(ctx.isolation_claims.as_ref())
+                            {
+                                let result = json!({
+                                    "error": error.to_string(),
+                                    "code": "tenant_spend_cap_rejected",
+                                });
+                                let result_str =
+                                    serde_json::to_string(&result).unwrap_or_else(|_| {
+                                        "{\"error\":\"tenant spend cap rejected\"}".to_string()
+                                    });
+                                warn!(tool = %name, error = %error, "Tool call rejected by tenant spend gate");
+                                errs.push(format!("{}: {}", name, error));
+                                messages.push(ChatMessage {
+                                    role: "tool".to_string(),
+                                    content: result_str.into(),
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(c.id.clone()),
+                                    reasoning_content: None,
+                                });
+                                continue;
+                            }
+
+                            tc += 1;
                             // Emit tool_call event for TUI display
                             if let Some(ref event_bus) = self.event_bus {
                                 let tce = ExecutionEvent {

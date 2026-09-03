@@ -33,8 +33,8 @@ pub mod graph_backend;
 pub mod graph_features;
 /// Isolation contracts for verified tenant, project, and actor identity.
 pub mod isolation;
-
-pub mod isolation;
+/// Tenant-scoped hard caps for metered kernel actions.
+pub mod spend;
 
 #[cfg(feature = "ontology")]
 pub mod ontology;

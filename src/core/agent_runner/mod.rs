@@ -26,6 +26,7 @@ use crate::methodology::{
     MethodologyRegistry,
 };
 use crate::root_cause::RootCauseEngine;
+use crate::spend::TenantSpendGate;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::hooks::HookManager;
 use crate::tools::sharing::SharingProtocol;
@@ -364,6 +365,8 @@ pub struct AgentRunner {
     pub prefetch_engine: Option<Arc<PrefetchEngine>>,
     pub unified_graph_store: Option<Arc<oxigraph::store::Store>>,
     pub tool_controller: Option<crate::core::tool_controller::ToolController>,
+    /// Process-local tenant spend gate for LLM-initiated tool invocations.
+    pub tenant_spend_gate: Arc<TenantSpendGate>,
     pub total_prompt_tokens: Arc<AtomicU64>,
     pub total_completion_tokens: Arc<AtomicU64>,
     /// Prompt/completion token count from the last API call (non-cumulative, stores only the latest round)
@@ -448,6 +451,7 @@ impl AgentRunner {
             prefetch_engine: None,
             unified_graph_store: None,
             tool_controller: None,
+            tenant_spend_gate: Arc::new(TenantSpendGate::from_env()),
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
             last_prompt_tokens: Arc::new(AtomicU64::new(0)),
