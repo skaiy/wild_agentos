@@ -40,7 +40,6 @@ pub struct ProjectionRequest {
     pub params: Option<HashMap<String, String>>,
 }
 
-
 #[derive(Deserialize)]
 pub struct KgImportRequest {
     pub nodes: Vec<NodeDef>,
@@ -141,8 +140,9 @@ pub(crate) async fn emit_event_handler(
     Json(json!({"event_id": event_id, "status": "emitted"}))
 }
 
-
-pub(crate) async fn stream_batch_events_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn stream_batch_events_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let event_bus = state.core.events.clone();
     let mut rx = event_bus.subscribe();
 
@@ -184,9 +184,10 @@ pub(crate) async fn stream_batch_events_handler(State(state): State<Arc<AppState
 // 方案A 平台运维态：L2 黑板浏览器（只读）+ 批处理 Agent 运维台
 // ============================================================
 
-
 /// GET /api/v1/blackboard/tasks — 列出黑板上所有任务（平台/任务态，跨租户）。
-pub(crate) async fn list_blackboard_tasks_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_blackboard_tasks_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let tasks = state.core.blackboard.list_task_summaries();
     Json(json!({ "count": tasks.len(), "tasks": tasks }))
 }
@@ -238,7 +239,9 @@ pub(crate) async fn list_blackboard_nodes_handler(
 }
 
 /// GET /api/v1/batch/agents — 列出所有批处理 Agent 及其状态/窗口/指标/配置摘要（平台运维态）。
-pub(crate) async fn list_batch_agents_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_batch_agents_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let mgr_arc = match &state.batch_manager {
         Some(m) => m.clone(),
         None => {
@@ -371,10 +374,29 @@ fn expand_extraction(mut extraction: LLMExtractionOutput) -> LLMExtractionOutput
 
 pub(crate) async fn kg_import_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<KgImportRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "verified isolation claims required for graph storage"})),
+            )
+        }
+    };
     let store = state.kg_store.clone();
-    let graph_iri = expand_iri(&req.graph);
+    let graph_iri = match claims.graph_iri() {
+        Ok(graph_iri) => graph_iri,
+        Err(e) => {
+            tracing::warn!("KG import invalid verified graph scope: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "invalid verified graph scope"})),
+            );
+        }
+    };
 
     if req.clear_before {
         let clear = format!("DELETE WHERE {{ GRAPH <{}> {{ ?s ?p ?o . }} }}", graph_iri);
@@ -394,7 +416,7 @@ pub(crate) async fn kg_import_handler(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     };
 
-    match kg.write_quads(&result.quads, &graph_iri) {
+    match kg.write_quads_for_claims(claims, &result.quads) {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
@@ -402,7 +424,7 @@ pub(crate) async fn kg_import_handler(
                 "entity_count": result.entity_count,
                 "relation_count": result.relation_count,
                 "quad_count": result.quads.len(),
-                "graph": req.graph,
+                "graph": graph_iri,
             })),
         ),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
@@ -411,16 +433,25 @@ pub(crate) async fn kg_import_handler(
 
 pub(crate) async fn kg_query_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<KgQueryRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "verified isolation claims required for graph storage"})),
+            )
+        }
+    };
     let store = state.kg_store.clone();
     let kg = match KnowledgeGraphStore::with_shared_store(store) {
         Ok(kg) => kg,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     };
 
-    let named_graph = req.named_graph.as_deref().map(expand_iri);
-    match kg.query_sparql(&req.sparql, named_graph.as_deref()) {
+    match kg.query_sparql_for_claims(claims, &req.sparql) {
         Ok(results) => (
             StatusCode::OK,
             Json(json!({
@@ -432,4 +463,3 @@ pub(crate) async fn kg_query_handler(
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
     }
 }
-
