@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_allowed_rejects_unlisted_tool() {
+    fn advertised_schema_rejects_unadvertised_tool() {
         rt().block_on(async {
             let executor = ToolExecutor::new();
             let result = executor
@@ -163,11 +163,109 @@ mod tests {
                     "bash",
                     json!({"command": "ls"}),
                     security_context(),
-                    Some(&["file_read".to_string()]),
+                    &["file_read".to_string()],
                 )
                 .await
                 .unwrap();
-            assert_eq!(result["error"], "Tool not allowed: bash");
+            assert_eq!(result["error"], "Tool not advertised for this turn: bash");
+        });
+    }
+
+    #[test]
+    fn advertised_bash_file_read_and_file_write_execute() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("advertised.txt");
+            let path = path.to_string_lossy().into_owned();
+            let advertised = vec![
+                "bash".to_string(),
+                "file_read".to_string(),
+                "file_write".to_string(),
+            ];
+
+            let write = executor
+                .execute_with_security_context(
+                    "file_write",
+                    json!({"path": path, "content": "advertised"}),
+                    security_context(),
+                    &advertised,
+                )
+                .await
+                .unwrap();
+            assert_eq!(write["success"], true);
+
+            let read = executor
+                .execute_with_security_context(
+                    "file_read",
+                    json!({"path": path}),
+                    security_context(),
+                    &advertised,
+                )
+                .await
+                .unwrap();
+            assert_eq!(read["content"], "advertised");
+
+            let bash = executor
+                .execute_with_security_context(
+                    "bash",
+                    json!({"command": "printf advertised"}),
+                    security_context(),
+                    &advertised,
+                )
+                .await
+                .unwrap();
+            assert_eq!(bash["exit_code"], 0);
+            assert_eq!(bash["stdout"], "advertised");
+        });
+    }
+
+    #[test]
+    fn old_micro_reader_is_rejected_when_next_turn_does_not_advertise_it() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let micro_name = "read_full_result_turn_one";
+            executor.store_micro_tool_data(
+                "iri://tool-result/turn-one",
+                json!({"content": "turn one data"}),
+            );
+            executor.register_micro_tool(
+                micro_name,
+                MicroToolContext {
+                    call_id: "turn-one".to_string(),
+                    storage_key: "iri://tool-result/turn-one".to_string(),
+                    tool_name: "file_read".to_string(),
+                    entity_types: vec![],
+                    preview_size: 100,
+                },
+            );
+
+            let first_turn = vec![micro_name.to_string()];
+            let first_result = executor
+                .execute_with_security_context(
+                    micro_name,
+                    json!({}),
+                    security_context(),
+                    &first_turn,
+                )
+                .await
+                .unwrap();
+            assert_eq!(first_result["content"], "turn one data");
+
+            let next_turn = vec!["file_read".to_string()];
+            let rejected = executor
+                .execute_with_security_context(
+                    micro_name,
+                    json!({}),
+                    security_context(),
+                    &next_turn,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rejected["error"],
+                format!("Tool not advertised for this turn: {}", micro_name)
+            );
         });
     }
 
@@ -194,7 +292,7 @@ mod tests {
                     "file_write",
                     json!({"path": target, "content": "blocked"}),
                     security_context(),
-                    None,
+                    &["file_write".to_string()],
                 )
                 .await
                 .unwrap();
@@ -235,7 +333,7 @@ mod tests {
                         tool,
                         json!({"path": "."}),
                         security_context(),
-                        None,
+                        &[tool.to_string()],
                     )
                     .await;
                 let err = match outcome {
@@ -269,7 +367,7 @@ mod tests {
                     "unregistered_tool",
                     json!({}),
                     security_context(),
-                    None,
+                    &["unregistered_tool".to_string()],
                 )
                 .await
                 .unwrap();
@@ -297,8 +395,7 @@ mod tests {
             // Exit code 1 = "no matching process" — correct: our own PID was
             // filtered out, and nothing else matches the unique marker.
             assert_eq!(
-                result["exit_code"],
-                1,
+                result["exit_code"], 1,
                 "own PID must be excluded: {:?}",
                 result
             );

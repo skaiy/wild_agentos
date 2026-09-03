@@ -232,13 +232,6 @@ impl super::AgentRunner {
     ) -> Result<TaskResult, CoreError> {
         use crate::core::biz_agent::{AgentConfig, BizAgent};
 
-        let ctx = match plan_step {
-            Some(ref step) if !step.tools_allowed.is_empty() => {
-                ctx.with_allowed_tools(step.tools_allowed.clone())
-            }
-            _ => ctx,
-        };
-
         // AgentInit hook
         {
             let mut hook_ctx = HookContext::new(
@@ -1380,23 +1373,26 @@ Output the summary report directly, not in JSON format."#,
                 tools.len()
             );
 
-            let response = {
-                // Refresh tools list before each call to ensure newly registered
-                // micro-tools (e.g. read_full_result_*) are included.
-                let current_tools = self
-                    .tool_executor
-                    .read()
-                    .tool_definitions_for_role(&agent.role.to_string());
-                let tools = if current_tools.is_empty() {
-                    None
-                } else {
-                    Some(current_tools)
-                };
-                // 流式调用：逐 token 推送 LLM_CONTENT 供任务控制台「逐字输出」，
-                // 聚合回完整响应后主循环逻辑保持不变；失败自动回退非流式。
-                self.chat_stream_collecting(&model, messages.clone(), tools, &ctx, agent)
-                    .await?
+            // The schema payload is the authoritative executable set for this
+            // turn. Keep its names for tool-call validation after the response.
+            let current_tools = self
+                .tool_executor
+                .read()
+                .tool_definitions_for_role(&agent.role.to_string());
+            let advertised_tools: Vec<String> = current_tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect();
+            let tools = if current_tools.is_empty() {
+                None
+            } else {
+                Some(current_tools)
             };
+            // 流式调用：逐 token 推送 LLM_CONTENT 供任务控制台「逐字输出」，
+            // 聚合回完整响应后主循环逻辑保持不变；失败自动回退非流式。
+            let response = self
+                .chat_stream_collecting(&model, messages.clone(), tools, &ctx, agent)
+                .await?;
 
             // Accumulate token usage
             if let Some(ref usage) = response.usage {
@@ -2012,7 +2008,7 @@ Output the summary report directly, not in JSON format."#,
                                         &agent.role.to_string(),
                                     )
                                     .with_task(&ctx.task_iri),
-                                    ctx.allowed_tools.as_deref(),
+                                    &advertised_tools,
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));
