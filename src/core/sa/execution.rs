@@ -1299,7 +1299,9 @@ impl SupervisorAgent {
                 task_iri,
                 PdcaStepKind::from(step.role),
                 self.isolation_claims.as_ref(),
-                &step.tools_allowed,
+                // Per-turn schema capture lands in #38. Plan metadata is not
+                // evidence that a schema was advertised to this model turn.
+                &[],
             ) {
                 warn!("[checkpoint] PDCA envelope save refused: {}", e);
             } else {

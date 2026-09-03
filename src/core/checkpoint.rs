@@ -626,6 +626,37 @@ mod tests {
     }
 
     #[test]
+    fn pdca_envelope_does_not_use_plan_tools_allowed_as_advertisement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let manager = CheckpointManager::with_persistence(l0);
+        let claims =
+            crate::isolation::IsolationClaims::from_verified("acme", "project-1", "agent-7")
+                .unwrap();
+        let plan_step = crate::core::sa::PlanStep {
+            step_id: "plan".to_string(),
+            role: crate::core::agent_instance::AgentRole::Plan,
+            objective: "Plan the task".to_string(),
+            expected_output: String::new(),
+            dependencies: Vec::new(),
+            tools_allowed: vec!["file_write".to_string()],
+            success_criteria: String::new(),
+        };
+
+        let envelope = manager
+            .write_pdca_envelope(
+                "iri://task/123",
+                crate::core::sa::PdcaStepKind::from(plan_step.role),
+                Some(&claims),
+                &[],
+            )
+            .unwrap();
+
+        assert!(!plan_step.tools_allowed.is_empty());
+        assert!(envelope.advertised_tools.is_empty());
+    }
+
+    #[test]
     fn test_list_via_l0_scan_cross_process() {
         use crate::memory::l0_store::L0Store;
         use std::sync::Arc;
