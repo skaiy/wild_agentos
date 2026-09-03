@@ -1688,6 +1688,20 @@ Output the summary report directly, not in JSON format."#,
                         };
                     let jsonld_output =
                         self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);
+                    let skipped_workspace_write = agent.role == AgentRole::Do
+                        && action_tracker.requires_post_write_verification();
+                    let (status, verdict, final_summary) = if skipped_workspace_write {
+                        (
+                            "partial_success".to_string(),
+                            Some(crate::core::agent_runner::TaskVerdict::PartialSuccess),
+                            format!(
+                                "{}\n\nWorkspace write was skipped or failed without a detectable artifact. Re-verify the workspace before treating this Do step as complete.",
+                                final_summary
+                            ),
+                        )
+                    } else {
+                        ("success".to_string(), None, final_summary)
+                    };
 
                     if let Some(ref jsonld) = jsonld_output {
                         if let Ok(node) = JsonLdNode::from_json(jsonld) {
@@ -1756,8 +1770,8 @@ Output the summary report directly, not in JSON format."#,
                     };
                     return Ok(TaskResult {
                         task_iri: ctx.task_iri,
-                        status: "success".to_string(),
-                        verdict: None,
+                        status,
+                        verdict,
                         summary: final_summary,
                         output: Some(output_value),
                         jsonld_output,
