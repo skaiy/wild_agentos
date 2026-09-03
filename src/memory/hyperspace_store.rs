@@ -306,12 +306,6 @@ impl HyperspaceStore {
 
     // ── Public API (mirrors old VectorStore) ─────────────────────────────────
 
-    /// Store a vector entry by IRI, embedding its text content.
-    pub async fn upsert(&self, iri: &str, text: &str, tags: &[String]) -> Result<u32, CoreError> {
-        self.upsert_with_metadata(iri, text, tags, None, None, None)
-            .await
-    }
-
     /// Legacy unscoped write API.
     ///
     /// Production callers must use [`Self::upsert_with_claims`] so the vector
