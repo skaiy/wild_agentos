@@ -34,10 +34,13 @@ impl SupervisorAgent {
 
         // Query context from L2 blackboard (replaces prev_summary)
         // Use query_nodes_filtered for role/cycle-aware context (AA uses prev_summary)
-        let prev_agent_summary = context.prev_agent_summary.clone();
+        let sharing_permitted = context.share_prompt_context && context.isolation_claims.is_some();
+        let prev_agent_summary = sharing_permitted.then(|| context.prev_agent_summary.clone()).flatten();
         let prev_summary = if role == AgentRole::Act {
             prev_agent_summary.clone()
-        } else if let Some(blackboard) = &self.blackboard {
+        } else if let (Some(blackboard), Some(claims)) =
+            (&self.blackboard, context.isolation_claims.as_ref())
+        {
             let prev_role = match role {
                 AgentRole::Do => Some(AgentRole::Plan),
                 AgentRole::Check => Some(AgentRole::Do),
@@ -51,7 +54,14 @@ impl SupervisorAgent {
                 node_type: None,
             };
             let nodes = blackboard
-                .query_nodes_filtered(&context.task_iri, &filter)
+                .query_prompt_nodes(
+                    &context.task_iri,
+                    &filter,
+                    crate::memory::l2_blackboard::PromptReadScope {
+                        agent_id: &agent.agent_id,
+                        claims,
+                    },
+                )
                 .unwrap_or_default();
             if !nodes.is_empty() {
                 let mut contents: Vec<String> = Vec::new();
@@ -101,7 +111,7 @@ impl SupervisorAgent {
         // silently falling back to prev_agent_summary.
         //
         // Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
-        let prev_summary = if prev_summary.is_none() {
+        let prev_summary = if sharing_permitted && prev_summary.is_none() {
             if let Some(ref sched) = self.scheduler {
                 match sched
                     .context_request_with_decay(role, &context.task_iri, 0.5)

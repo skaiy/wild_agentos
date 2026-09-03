@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use crate::core::agent_instance::AgentRole;
+use crate::isolation::IsolationClaims;
 use crate::memory::l0_store::MesiState;
 use crate::{CoreConfig, CoreError};
 
@@ -21,6 +22,17 @@ pub struct QueryFilter {
     pub role: Option<AgentRole>,
     pub cycle_id: Option<String>,
     pub node_type: Option<String>,
+}
+
+/// Scope used to select blackboard nodes suitable for prompt construction.
+///
+/// A scope must be built from verified claims. It is intentionally separate
+/// from general blackboard queries, which may serve operational tooling but
+/// must not become an implicit prompt source.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptReadScope<'a> {
+    pub agent_id: &'a str,
+    pub claims: &'a IsolationClaims,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -721,6 +733,25 @@ impl Blackboard {
             }
         }
         Ok(nodes)
+    }
+
+    /// Returns only nodes that may be injected into `scope.agent_id`'s prompt.
+    ///
+    /// Nodes are agent-private by default. A node authored by another agent is
+    /// eligible only when its author explicitly marked it `"shared"` and its
+    /// recorded tenant/project scope matches the reader's verified claims.
+    /// Missing provenance fails closed.
+    pub fn query_prompt_nodes(
+        &self,
+        task_iri: &str,
+        filter: &QueryFilter,
+        scope: PromptReadScope<'_>,
+    ) -> Result<Vec<Arc<Node>>, CoreError> {
+        let nodes = self.query_nodes_filtered(task_iri, filter)?;
+        Ok(nodes
+            .into_iter()
+            .filter(|node| node_visible_in_prompt(node, scope))
+            .collect())
     }
 
     pub fn get_task_nodes(&self, task_iri: &str) -> Vec<String> {
@@ -1814,6 +1845,31 @@ impl Blackboard {
     }
 }
 
+fn node_visible_in_prompt(node: &Node, scope: PromptReadScope<'_>) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&node.json_ld) else {
+        return false;
+    };
+
+    let Some(author) = value.get("agent_id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(tenant_id) = value.get("tenant_id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(project_id) = value.get("project_id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if tenant_id != scope.claims.tenant_id() || project_id != scope.claims.project_id() {
+        return false;
+    }
+
+    author == scope.agent_id
+        || value
+            .get("prompt_visibility")
+            .and_then(|v| v.as_str())
+            == Some("shared")
+}
+
 fn extract_task_iri(node_iri: &str) -> Option<String> {
     if let Some(rest) = node_iri.strip_prefix("iri://task/") {
         let task_id = rest.split('/').next().unwrap_or(rest);
@@ -2795,5 +2851,65 @@ mod tests {
             msgs_future.is_empty(),
             "Should not find messages after future timestamp"
         );
+    }
+
+    #[test]
+    fn agent_reasoning_is_private_in_other_agent_prompts_by_default() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let task_iri = "iri://task/prompt-isolation";
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "requester").unwrap();
+        let private_turn = serde_json::json!({
+            "@id": "iri://task/prompt-isolation/turn-a-private",
+            "@type": "AgentTurn",
+            "role": "Do",
+            "agent_id": "agent-a",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "prompt_visibility": "agent_private",
+            "thought": "agent A's private reasoning trace",
+            "content": "agent A's result"
+        });
+        bb.write_node(
+            "iri://task/prompt-isolation/turn-a-private",
+            &private_turn.to_string(),
+            &config,
+        )
+        .unwrap();
+
+        let scope = PromptReadScope {
+            agent_id: "agent-b",
+            claims: &claims,
+        };
+        let visible = bb
+            .query_prompt_nodes(task_iri, &QueryFilter::default(), scope)
+            .unwrap();
+        assert!(
+            visible.is_empty(),
+            "agent A's private reasoning must not enter agent B's prompt"
+        );
+
+        let shared_turn = serde_json::json!({
+            "@id": "iri://task/prompt-isolation/turn-a-shared",
+            "@type": "AgentTurn",
+            "role": "Do",
+            "agent_id": "agent-a",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "prompt_visibility": "shared",
+            "content": "explicitly shared result"
+        });
+        bb.write_node(
+            "iri://task/prompt-isolation/turn-a-shared",
+            &shared_turn.to_string(),
+            &config,
+        )
+        .unwrap();
+
+        let visible = bb
+            .query_prompt_nodes(task_iri, &QueryFilter::default(), scope)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].json_ld.contains("explicitly shared result"));
     }
 }
