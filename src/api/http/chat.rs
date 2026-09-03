@@ -18,17 +18,25 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
+use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::memory::hyperspace_store::HybridSearchFilter;
 
 use super::api_gov;
-use super::{expand_iri, AppState};
+use super::iam::UserIdentity;
+use super::AppState;
 
 #[derive(Deserialize)]
 pub struct AgentChatRequest {
     pub message: String,
     #[serde(default)]
     pub images: Vec<String>,
+    /// Legacy client-directed retrieval targets are deliberately ignored.
+    #[serde(default, rename = "named_graph")]
+    _named_graph: Option<String>,
+    /// Legacy client-directed retrieval targets are deliberately ignored.
+    #[serde(default, rename = "vector_namespace")]
+    _vector_namespace: Option<String>,
 }
 
 /// 仅保留 ASCII 字母/数字/下划线组成、长度≥3 且包含数字或下划线（或长度≥4）的片段，
@@ -155,9 +163,10 @@ fn build_action_suggestions(sources: &[Value]) -> Vec<Value> {
     ]
 }
 
-/// POST /api/v1/agents/:id/chat — 内部单轮 RAG 问答（管理面，无入站鉴权）。
+/// POST /api/v1/agents/:id/chat — 内部单轮 RAG 问答（必须携带验证过的 JWT claims）。
 pub(crate) async fn agent_chat_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<AgentChatRequest>,
 ) -> impl IntoResponse {
@@ -168,7 +177,16 @@ pub(crate) async fn agent_chat_handler(
             Json(json!({ "error": "message 不能为空" })),
         );
     }
-    let (status, body) = run_agent_rag(&state, &id, &message, &req.images).await;
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for chat RAG" })),
+            )
+        }
+    };
+    let (status, body) = run_agent_rag(&state, &id, &message, &req.images, Some(claims)).await;
     (status, Json(body))
 }
 
@@ -226,14 +244,16 @@ async fn resolve_agent_model(state: &Arc<AppState>, agent: &Value, keys: &[&str]
         .unwrap_or_else(|| state.gateway.default_model())
 }
 
-/// 单轮 RAG 检索与提示组装：定位 Agent → 图/向量检索 → 组装上下文与提示消息。
+/// 单轮聊天上下文组装。提供 claims 时执行 claims-scoped RAG；未提供时不访问
+/// tenant 图或向量库，供 API-key 的公开聊天面使用。
 /// 返回可复用的 RagContext，供内部 chat、对外 public chat、SSE 流式与 OpenAI 兼容层共用。
 /// `images` 为随消息透传的图片 URL 列表（非空即走 VL：选 vision 模型 + 组多部件 user 消息）。
-async fn build_rag_context(
+async fn build_chat_context(
     state: &Arc<AppState>,
     id: &str,
     message: &str,
     images: &[String],
+    claims: Option<&IsolationClaims>,
 ) -> Result<RagContext, (StatusCode, Value)> {
     let message = message.to_string();
     let has_image = !images.is_empty();
@@ -278,145 +298,64 @@ async fn build_rag_context(
         &["chat"]
     };
     let selected_model = resolve_agent_model(state, &agent, model_keys).await;
-    // 2a. 解析 Agent 的知识来源：展开知识包 → 命名图集合 + 向量命名空间集合。
-    let mut graph_iris: Vec<String> = Vec::new();
-    let mut vector_namespaces: Vec<String> = Vec::new();
-    let pack_ids: Vec<String> = agent
-        .get("knowledge_pack_ids")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !pack_ids.is_empty() {
-        let packs = state.knowledge_packs.read().await;
-        let bases = state.knowledge_bases.read().await;
-        let ids_of = |pack: &Value, key: &str| -> Vec<String> {
-            pack.get(key)
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        for pid in &pack_ids {
-            let pack = match packs
-                .iter()
-                .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(pid.as_str()))
-            {
-                Some(p) => p,
-                None => continue,
-            };
-            if let Some(g) = pack
-                .get("named_graph")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                graph_iris.push(expand_iri(g));
-            }
-            if let Some(ns) = pack
-                .get("vector_namespace")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                vector_namespaces.push(ns.to_string());
-            }
-            for gid in ids_of(pack, "graph_kb_ids") {
-                if let Some(kb) = bases
-                    .iter()
-                    .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(gid.as_str()))
-                {
-                    if let Some(g) = kb
-                        .get("graph")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        graph_iris.push(expand_iri(g));
-                    }
-                }
-            }
-            for vid in ids_of(pack, "vector_kb_ids") {
-                if let Some(kb) = bases
-                    .iter()
-                    .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(vid.as_str()))
-                {
-                    if let Some(ns) = kb
-                        .get("vector_namespace")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        vector_namespaces.push(ns.to_string());
-                    }
-                }
-            }
-        }
-    }
-    graph_iris.sort();
-    graph_iris.dedup();
-    vector_namespaces.sort();
-    vector_namespaces.dedup();
-
-    // 2b. 图知识库检索：对每个命名图执行故障码/品牌召回（先按故障码，全空再按品牌）。
+    // 2. Claims-scoped RAG. Agent configuration and request JSON never select
+    // graph/vector targets: the stores mint those names from verified claims.
     let mut rows: Vec<Value> = Vec::new();
-    {
-        let kg = state.kg_store.clone();
-        if let Ok(store) = KnowledgeGraphStore::with_shared_store(kg) {
-            let codes = extract_code_tokens(&message);
-            let brands = extract_brand_labels(&message);
-            if !codes.is_empty() {
-                let conds: Vec<String> = codes
-                    .iter()
-                    .map(|t| format!("CONTAINS(LCASE(STR(?code)), \"{}\")", t))
-                    .collect();
-                let q = build_fault_query(&conds.join(" || "), 6);
-                for graph_iri in &graph_iris {
-                    rows.extend(store.query_sparql(&q, Some(graph_iri)).unwrap_or_default());
-                }
-            }
-            if rows.is_empty() && !brands.is_empty() {
-                let conds: Vec<String> = brands
-                    .iter()
-                    .map(|b| format!("CONTAINS(STR(?brand), \"{}\")", b.replace('"', "")))
-                    .collect();
-                let q = format!(
-                    "SELECT ?code ?label ?meaning ?can_drive ?repair ?models ?brand WHERE {{ \
-                        ?n a <{f}> . \
-                        ?n <{m}/code> ?code . \
-                        ?n <{br}> ?bn . ?bn <{rl}> ?brand . \
-                        OPTIONAL {{ ?n <{rl}> ?label }} \
-                        OPTIONAL {{ ?n <{m}/meaning> ?meaning }} \
-                        OPTIONAL {{ ?n <{m}/can_drive> ?can_drive }} \
-                        OPTIONAL {{ ?n <{m}/repair> ?repair }} \
-                        OPTIONAL {{ ?n <{m}/models> ?models }} \
-                        FILTER( {flt} ) \
-                    }} LIMIT 6",
-                    f = ONT_FAULT,
-                    m = META,
-                    rl = RDFS_LABEL,
-                    br = ONT_BRAND_REL,
-                    flt = conds.join(" || "),
-                );
-                for graph_iri in &graph_iris {
-                    rows.extend(store.query_sparql(&q, Some(graph_iri)).unwrap_or_default());
-                }
-            }
-        }
-    }
-
-    // 2c. 向量知识库检索：对每个命名空间做语义相似检索（向量库启用时）。
     let mut vector_hits: Vec<(String, f32)> = Vec::new();
-    if let Some(vstore) = state.vector_store.load_full() {
-        for ns in &vector_namespaces {
-            let filter = HybridSearchFilter::new().with_named_graph(ns.clone());
-            if let Ok(hits) = vstore.search_with_filter(&message, &filter, 5).await {
-                for h in hits {
-                    vector_hits.push((h.text, h.score));
-                }
-            }
+    if let Some(claims) = claims {
+        let kg = state.kg_store.clone();
+        let store = KnowledgeGraphStore::with_shared_store(kg).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("chat graph retrieval unavailable: {e}") }),
+            )
+        })?;
+        let codes = extract_code_tokens(&message);
+        let brands = extract_brand_labels(&message);
+        if !codes.is_empty() {
+            let conds: Vec<String> = codes
+                .iter()
+                .map(|t| format!("CONTAINS(LCASE(STR(?code)), \"{}\")", t))
+                .collect();
+            let q = build_fault_query(&conds.join(" || "), 6);
+            rows = store.query_sparql_for_claims(claims, &q).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("chat graph retrieval failed: {e}") }),
+                )
+            })?;
+        }
+        if rows.is_empty() && !brands.is_empty() {
+            let conds: Vec<String> = brands
+                .iter()
+                .map(|b| format!("CONTAINS(STR(?brand), \"{}\")", b.replace('"', "")))
+                .collect();
+            let q = format!(
+                "SELECT ?code ?label ?meaning ?can_drive ?repair ?models ?brand WHERE {{ \
+                    ?n a <{f}> . ?n <{m}/code> ?code . ?n <{br}> ?bn . ?bn <{rl}> ?brand . \
+                    OPTIONAL {{ ?n <{rl}> ?label }} OPTIONAL {{ ?n <{m}/meaning> ?meaning }} \
+                    OPTIONAL {{ ?n <{m}/can_drive> ?can_drive }} OPTIONAL {{ ?n <{m}/repair> ?repair }} \
+                    OPTIONAL {{ ?n <{m}/models> ?models }} FILTER( {flt} ) }} LIMIT 6",
+                f = ONT_FAULT, m = META, rl = RDFS_LABEL, br = ONT_BRAND_REL, flt = conds.join(" || "),
+            );
+            rows = store.query_sparql_for_claims(claims, &q).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("chat graph retrieval failed: {e}") }),
+                )
+            })?;
+        }
+        if let Some(vstore) = state.vector_store.load_full() {
+            let hits = vstore
+                .search_with_claims(claims, &message, &HybridSearchFilter::new(), 5)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({ "error": format!("chat vector retrieval failed: {e}") }),
+                    )
+                })?;
+            vector_hits.extend(hits.into_iter().map(|h| (h.text, h.score)));
         }
     }
 
@@ -529,8 +468,9 @@ async fn run_agent_rag(
     id: &str,
     message: &str,
     images: &[String],
+    claims: Option<&IsolationClaims>,
 ) -> (StatusCode, Value) {
-    let rc = match build_rag_context(state, id, message, images).await {
+    let rc = match build_chat_context(state, id, message, images, claims).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -580,7 +520,6 @@ async fn run_agent_rag(
         }
     }
 }
-
 
 // ─── 对外发布：Public API（入站密钥鉴权 + scope + 限流/配额 + 审计）──────────────
 
@@ -743,6 +682,8 @@ async fn public_gate(
 }
 
 /// POST /api/v1/public/agents/:id/chat — 对外单轮问答。
+/// API keys do not carry verified tenant/project claims, so this endpoint
+/// deliberately performs no tenant RAG and never falls back to another graph.
 pub(crate) async fn public_agent_chat_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -763,7 +704,7 @@ pub(crate) async fn public_agent_chat_handler(
         )
             .into_response();
     }
-    let (status, body) = run_agent_rag(&state, &id, &message, &[]).await;
+    let (status, body) = run_agent_rag(&state, &id, &message, &[], None).await;
     touch_key_last_used(&state, &ctx.key_id).await;
     write_public_audit(&ctx, &id, "chat", status.as_u16(), started, "ok");
     (status, Json(body)).into_response()
@@ -912,7 +853,9 @@ pub(crate) async fn public_agent_chat_stream_handler(
         )
             .into_response();
     }
-    let rc = match build_rag_context(&state, &id, &message, &[]).await {
+    // Public API-key chat has no verified IsolationClaims, so it never reads
+    // tenant graph/vector data.
+    let rc = match build_chat_context(&state, &id, &message, &[], None).await {
         Ok(c) => c,
         Err((status, body)) => {
             write_public_audit(&ctx, &id, "chat_stream", status.as_u16(), started, "error");
@@ -1062,7 +1005,8 @@ pub(crate) async fn openai_chat_completions_handler(
             "invalid_request_error",
         );
     }
-    let rc = match build_rag_context(&state, &id, &message, &images).await {
+    // OpenAI-compatible API-key chat follows the same explicit no-tenant-RAG policy.
+    let rc = match build_chat_context(&state, &id, &message, &images, None).await {
         Ok(c) => c,
         Err((status, body)) => {
             write_public_audit(&ctx, &id, endpoint, status.as_u16(), started, "error");
@@ -1111,5 +1055,128 @@ pub(crate) async fn openai_chat_completions_handler(
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::core_types::{CoreConfig, SemanticCore};
+    use crate::tools::prompt_registry::PromptRegistry;
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use tower::ServiceExt;
+
+    use super::super::api_gov::ApiUsageState;
+
+    fn make_state() -> Arc<AppState> {
+        let l0 = std::env::temp_dir().join(format!("chat_rag_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&l0).unwrap();
+        let core = Arc::new(
+            SemanticCore::new(CoreConfig {
+                max_node_size: 1024,
+                max_projection_size: 2048,
+                l0_storage_path: l0.to_string_lossy().into_owned(),
+                event_buffer_size: 10,
+                enable_metrics: false,
+                eviction_config: None,
+            })
+            .unwrap(),
+        );
+        let gateway = Arc::new(
+            crate::gateway::UnifiedGateway::new(&crate::config::GatewaySettings {
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                default_model: "test-model".into(),
+                timeout_seconds: 30,
+                max_retries: 1,
+                retry_base_ms: 500,
+                use_responses_api: false,
+                model_mapping: std::collections::HashMap::new(),
+            })
+            .unwrap(),
+        );
+        Arc::new(AppState {
+            core,
+            gateway,
+            kg_store: Arc::new(oxigraph::store::Store::new().unwrap()),
+            config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
+            agents_info: json!({ "count": 0, "agents": [] }),
+            mcp_servers: Arc::new(tokio::sync::RwLock::new(vec![])),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![json!({
+                "id": "agent-1", "name": "Test agent",
+                "knowledge_pack_ids": ["attacker-pack"]
+            })])),
+            prompts: Arc::new(PromptRegistry::new()),
+            kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
+            // An attacker-controlled legacy pack target must not affect chat retrieval.
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![json!({
+                "id": "attacker-pack",
+                "named_graph": "graph://tenant-b/project-1",
+                "vector_namespace": "vector://tenant-b/project-1"
+            })])),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            blob_store: None,
+            task_executor: None,
+            batch_manager: None,
+            api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_usage: Arc::new(ApiUsageState::default()),
+        })
+    }
+
+    fn insert_fault(store: &oxigraph::store::Store, claims: &IsolationClaims, code: &str) {
+        let graph = claims.graph_iri().unwrap();
+        store
+            .update(&format!(
+                "INSERT DATA {{ GRAPH <{graph}> {{ \
+                    <https://example.test/fault/{code}> a <{ONT_FAULT}> ; \
+                    <{META}/code> \"{code}\" ; <{RDFS_LABEL}> \"isolated fault\" . \
+                }} }}"
+            ))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claims_scoped_chat_retrieval_isolates_tenants_and_ignores_legacy_targets() {
+        let state = make_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
+        insert_fault(&state.kg_store, &tenant_a, "P0A80");
+        insert_fault(&state.kg_store, &tenant_b, "P0A81");
+
+        let a = build_chat_context(&state, "agent-1", "P0A80", &[], Some(&tenant_a))
+            .await
+            .unwrap();
+        assert_eq!(a.retrieved, 1);
+        assert_eq!(a.sources[0]["code"], "P0A80");
+
+        // The same request cannot enumerate tenant A when claims mint tenant B's graph.
+        let b = build_chat_context(&state, "agent-1", "P0A80", &[], Some(&tenant_b))
+            .await
+            .unwrap();
+        assert_eq!(b.retrieved, 0);
+    }
+
+    #[tokio::test]
+    async fn chat_without_verified_identity_returns_unauthorized_not_empty_rag_success() {
+        let state = make_state();
+        let router = Router::new()
+            .route("/api/v1/agents/:id/chat", post(agent_chat_handler))
+            .with_state(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/agent-1/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"message":"P0A80","named_graph":"graph://tenant-b/project-1","vector_namespace":"vector://tenant-b/project-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

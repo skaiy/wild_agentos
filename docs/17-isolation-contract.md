@@ -105,6 +105,16 @@ search, filtered search, hybrid search, and delete APIs fail closed because they
 lack verified claims. Historical `tenant:<id>` rows have not been migrated and
 are not returned by claims-scoped search.
 
+### Chat RAG
+
+The internal agent chat RAG endpoint requires JWT-verified `IsolationClaims`.
+Its graph and vector retrieval targets are minted from those claims; client
+`named_graph` and `vector_namespace` fields and agent knowledge-pack target
+configuration are ignored. Retrieval errors are returned rather than being
+silently converted into an empty result. Public API-key chat does not carry
+tenant/project claims and therefore performs no tenant RAG at all—it never
+falls back to a tenant graph or vector namespace.
+
 ### L0
 
 `L0Store::open_for_claims` creates and writes only the tenant directory minted
