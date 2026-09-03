@@ -1,5 +1,6 @@
 use serde_json::json;
 use wild_agent_os_core::config::settings::ToolResultRouterSettings;
+use wild_agent_os_core::isolation::IsolationClaims;
 use wild_agent_os_core::tools::result_router::graphify::GraphifyEngine;
 use wild_agent_os_core::tools::result_router::micro_tools::MicroToolGenerator;
 use wild_agent_os_core::tools::result_router::router::ResultRouter;
@@ -94,12 +95,14 @@ fn test_text_summary_generation() {
 #[test]
 fn test_graphify_json_array() {
     let mut engine = GraphifyEngine::new(100).unwrap();
+    let claims = IsolationClaims::from_verified("integration-tenant", "graphify", "test")
+        .expect("verified test claims");
     let items: Vec<serde_json::Value> = (0..10)
         .map(|i| json!({"id": format!("item_{}", i), "name": format!("item_{}", i), "value": i * 10}))
         .collect();
-    let result = engine.graphify_json(&json!(items), "integ_call_1", 100);
+    let result = engine.graphify_json_for_claims(&claims, &json!(items), "integ_call_1", 100);
     assert!(result.entity_count > 0);
-    assert!(result.graph_name.contains("integ_call_1"));
+    assert_eq!(result.graph_name, claims.graph_iri().unwrap());
     assert!(!result.summary.is_empty());
 }
 
@@ -172,8 +175,14 @@ fn test_full_pipeline_json_graphify() {
 
     if let RouteDecision::Graphify { call_id, .. } = decision {
         let mut engine = GraphifyEngine::new(settings.max_graph_entities).unwrap();
-        let graphify_result =
-            engine.graphify_json(&json!(items), &call_id, settings.max_graph_entities);
+        let claims = IsolationClaims::from_verified("integration-tenant", "pipeline", "test")
+            .expect("verified test claims");
+        let graphify_result = engine.graphify_json_for_claims(
+            &claims,
+            &json!(items),
+            &call_id,
+            settings.max_graph_entities,
+        );
         assert!(graphify_result.entity_count > 0);
 
         let analysis = SchemaAnalysis {
