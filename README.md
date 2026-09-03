@@ -236,6 +236,7 @@ cargo build -p wild-code-cli --release
 ## 📚 Documentation
 
 - **Memory System** → [`docs/03-memory-system.md`](docs/03-memory-system.md) (L0 redb · HyperspaceEngine · Oxigraph SPARQL)
+- **Isolation Contract** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md) (verified claims and future naming; no storage migration)
 - **Design Detail** → [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) · [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
