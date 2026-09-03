@@ -23,33 +23,51 @@ pub type SharedBatchManager = Arc<tokio::sync::Mutex<Option<BatchAgentManager>>>
 /// embedding 配置变更时通过 `ArcSwapOption::store` 原子换入新维度的库，无需重启进程。
 pub type SharedVectorStore = Arc<arc_swap::ArcSwapOption<HyperspaceStore>>;
 
-pub mod api_gov;
 pub mod iam;
+pub mod api_gov;
 use api_gov::{ApiClient, ApiKey, ApiUsageState};
-pub mod agents;
 pub mod api_clients;
+pub mod prompts;
+pub mod agents;
+pub mod tasks;
+pub mod runtime;
+pub mod mcp;
+pub mod guard;
+pub mod skills;
+pub mod ontology;
+pub mod kb;
 pub mod chat;
 pub mod config;
 pub mod core_ops;
-pub mod guard;
-pub mod kb;
-pub mod mcp;
 pub mod models;
-pub mod ontology;
-pub mod prompts;
-pub mod runtime;
-pub mod skills;
-pub mod tasks;
 
 use agents::{
     create_agent_handler, delete_agent_handler, list_agents_handler, load_user_agents,
     migrate_legacy_agent_graphs, save_user_agents, update_agent_handler,
 };
-use chat::{
-    agent_chat_handler, openai_chat_completions_handler, openai_list_models_handler,
-    public_agent_chat_handler, public_agent_chat_stream_handler,
+use tasks::{
+    create_task_handler, get_execution_details_handler, get_realtime_status_handler,
+    get_task_handler, list_task_trends_handler, stream_task_handler,
+};
+use runtime::{
+    health_handler, metrics_handler, unified_stats_handler,
+};
+use mcp::{
+    list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler,
 };
 use guard::{guard_audit_handler, guard_stats_handler};
+use skills::{
+    delete_skill_handler, import_git_skill_handler, list_pipeline_runs_handler,
+    list_skills_handler, load_user_skills, pipeline_rerun_handler, register_skill_handler,
+    skill_manifest_handler,
+};
+use ontology::{
+    delete_action_type_handler, delete_function_def_handler, delete_link_type_handler,
+    delete_object_type_handler, invoke_action_handler, ontology_types_handler,
+    update_action_type_handler, update_function_def_handler, update_link_type_handler,
+    update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
+    upsert_link_type_handler, upsert_object_type_handler,
+};
 use kb::{
     create_kb_category_handler, create_knowledge_base_handler, create_knowledge_pack_handler,
     delete_kb_category_handler, delete_knowledge_base_handler, delete_knowledge_pack_handler,
@@ -61,23 +79,9 @@ use kb::{
     update_knowledge_base_handler, update_knowledge_pack_handler, upload_knowledge_base_handler,
     KB_UPLOAD_MAX_BYTES,
 };
-use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
-use ontology::{
-    delete_action_type_handler, delete_function_def_handler, delete_link_type_handler,
-    delete_object_type_handler, invoke_action_handler, ontology_types_handler,
-    update_action_type_handler, update_function_def_handler, update_link_type_handler,
-    update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
-    upsert_link_type_handler, upsert_object_type_handler,
-};
-use runtime::{health_handler, metrics_handler, unified_stats_handler};
-use skills::{
-    delete_skill_handler, import_git_skill_handler, list_pipeline_runs_handler,
-    list_skills_handler, load_user_skills, pipeline_rerun_handler, register_skill_handler,
-    skill_manifest_handler,
-};
-use tasks::{
-    create_task_handler, get_execution_details_handler, get_realtime_status_handler,
-    get_task_handler, list_task_trends_handler, stream_task_handler,
+use chat::{
+    agent_chat_handler, openai_chat_completions_handler, openai_list_models_handler,
+    public_agent_chat_handler, public_agent_chat_stream_handler,
 };
 
 use api_clients::{
@@ -85,21 +89,21 @@ use api_clients::{
     list_api_audit_handler, list_api_clients_handler, revoke_api_key_handler,
     update_api_client_handler,
 };
+use prompts::{
+    activate_prompt_handler, canary_prompt_handler, create_prompt_handler, delete_prompt_handler,
+    list_prompts_handler, resolve_prompt_handler,
+};
 use config::{config_handler, hot_reload_models, update_config_handler};
-pub(crate) use core_ops::expand_iri;
 use core_ops::{
     control_batch_agent_handler, emit_event_handler, get_projection_handler, kg_import_handler,
     kg_query_handler, list_batch_agents_handler, list_blackboard_nodes_handler,
     list_blackboard_tasks_handler, read_node_handler, stream_batch_events_handler,
     write_node_handler,
 };
+pub(crate) use core_ops::expand_iri;
 use models::{
     activate_embedding_handler, image_raw_handler, provider_models_handler, test_model_handler,
     upload_image_handler, IMAGE_UPLOAD_MAX_BYTES,
-};
-use prompts::{
-    activate_prompt_handler, canary_prompt_handler, create_prompt_handler, delete_prompt_handler,
-    list_prompts_handler, resolve_prompt_handler,
 };
 
 pub struct AppState {
@@ -174,10 +178,12 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+
 /// Prompt 版本注册表的持久化文件路径。
 fn prompts_store_path() -> std::path::PathBuf {
     data_dir().join("prompts.json")
 }
+
 
 /// 按 embedding 配置打开向量库（HyperspaceStore），包进可原子热替换的 `SharedVectorStore`。
 /// 初始化失败则内层为 None（向量检索禁用，不影响图检索）。
@@ -477,6 +483,7 @@ pub fn build_router(
         .route("/api/v1/prompts/:id", delete(delete_prompt_handler))
         .with_state(state)
 }
+
 
 #[cfg(test)]
 mod tests {
