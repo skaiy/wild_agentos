@@ -77,10 +77,21 @@ New production graph writes use `IsolationClaims::from_verified` and
 `graph_iri()` to target `graph://{tenant}/{project}`. Production compatibility
 write, query, entity-search, neighbour, and delete APIs reject calls without
 verified claims; they do not silently read or write `graph:world`. The HTTP
-knowledge-base graph import and stats handlers now require JWT-verified claims
-and use that claims-scoped graph. Requests without claims receive `401`; neither
-handler migrates or reads through `graph:world`. Graph queries remain SPARQL 1.1
-against Oxigraph.
+knowledge-base graph import, stats, and catalog CRUD handlers now require
+JWT-verified claims and use that claims-scoped graph. Catalog metadata is written
+through claims-scoped store APIs; client graph/namespace fields are ignored as
+write targets. Requests without claims receive `401`; these handlers do not
+migrate historical `tenant:` graphs or read through `graph:world`. Graph queries
+remain SPARQL 1.1 against Oxigraph.
+
+### Runtime tools
+
+SA execution passes boundary-verified `IsolationClaims` to graph and vector
+builtins. Their `graph`, `named_graph`, and `namespace` arguments never select
+storage targets: reads and writes use the graph or vector namespace minted from
+claims, and calls without claims return an explicit error. No read-only public
+ontology exception is wired for runtime tools. Historical `graph:world` data is
+not migrated or read through by this path.
 
 ### Blob
 

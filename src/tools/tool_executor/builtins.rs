@@ -30,6 +30,7 @@ pub(super) async fn execute_kb_vector_search(
     input: Value,
     store: Option<Arc<HyperspaceStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let query = input
         .get("query")
         .and_then(|v| v.as_str())
@@ -44,12 +45,6 @@ pub(super) async fn execute_kb_vector_search(
         .and_then(|v| v.as_u64())
         .unwrap_or(5)
         .clamp(1, 20);
-    let namespace = input
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty());
-
     let store = match store {
         Some(s) => s,
         None => {
@@ -61,12 +56,11 @@ pub(super) async fn execute_kb_vector_search(
         }
     };
 
-    let filter = match &namespace {
-        Some(ns) => HybridSearchFilter::new().with_named_graph(ns.clone()),
-        None => HybridSearchFilter::new(),
-    };
+    // `namespace` is intentionally ignored. Claims mint the only searchable
+    // namespace, so an LLM cannot select another tenant's vectors.
+    let filter = HybridSearchFilter::new();
     let hits = store
-        .search_with_filter(&query, &filter, limit)
+        .search_with_claims(&claims, &query, &filter, limit)
         .await
         .map_err(|e| format!("向量检索失败: {e}"))?;
     let results: Vec<Value> = hits
@@ -1754,6 +1748,7 @@ pub(super) async fn execute_knowledge_extract(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let text = input["text"].as_str().unwrap_or("").to_string();
     if text.is_empty() {
         return Err("text parameter cannot be empty".to_string());
@@ -1782,8 +1777,10 @@ pub(super) async fn execute_knowledge_extract(
     let store = kg_store
         .write()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    let graph = store.default_graph();
-    store.write_quads(&result.quads, graph)?;
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
+    store.write_quads_for_claims(&claims, &result.quads)?;
 
     Ok(json!({
         "success": true,
@@ -1798,16 +1795,16 @@ pub(super) async fn execute_knowledge_query(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let sparql = input["sparql"].as_str().unwrap_or("").to_string();
     if sparql.is_empty() {
         return Err("sparql parameter cannot be empty".to_string());
     }
-    let named_graph = input["named_graph"].as_str().map(String::from);
-
     let store = kg_store
         .read()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    let results = store.query_sparql(&sparql, named_graph.as_deref())?;
+    // `named_graph` is intentionally ignored; the claims graph is automatic.
+    let results = store.query_sparql_for_claims(&claims, &sparql)?;
 
     Ok(json!({
         "success": true,
@@ -1820,6 +1817,7 @@ pub(super) async fn execute_knowledge_search(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let keyword = input["keyword"].as_str().unwrap_or("").to_string();
     if keyword.is_empty() {
         return Err("keyword parameter cannot be empty".to_string());
@@ -1829,7 +1827,7 @@ pub(super) async fn execute_knowledge_search(
     let store = kg_store
         .read()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    let results = store.search_entities(&keyword, entity_type.as_deref())?;
+    let results = store.search_entities_for_claims(&claims, &keyword, entity_type.as_deref())?;
 
     Ok(json!({
         "success": true,
@@ -1843,6 +1841,7 @@ pub(super) async fn execute_knowledge_neighbors(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let entity_id = input["entity_id"].as_str().unwrap_or("").to_string();
     if entity_id.is_empty() {
         return Err("entity_id parameter cannot be empty".to_string());
@@ -1852,7 +1851,7 @@ pub(super) async fn execute_knowledge_neighbors(
     let store = kg_store
         .read()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    let result = store.get_neighbors(&entity_id, depth)?;
+    let result = store.get_neighbors_for_claims(&claims, &entity_id, depth)?;
 
     Ok(json!({
         "success": true,
@@ -1864,6 +1863,7 @@ pub(super) async fn execute_knowledge_import_json(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let json_data_str = input["json_data"].as_str().unwrap_or("");
     if json_data_str.is_empty() {
         return Err("json_data parameter cannot be empty".to_string());
@@ -1959,12 +1959,9 @@ pub(super) async fn execute_knowledge_import_json(
         }));
     }
 
-    let graph = {
-        let store = kg_store
-            .read()
-            .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-        store.default_graph().to_string()
-    };
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
 
     let extraction = crate::knowledge_graph::types::LLMExtractionOutput {
         nodes: nodes.clone(),
@@ -1976,7 +1973,7 @@ pub(super) async fn execute_knowledge_import_json(
         let store = kg_store
             .write()
             .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-        store.write_quads(&result.quads, &graph)?;
+        store.write_quads_for_claims(&claims, &result.quads)?;
     }
 
     Ok(json!({
@@ -1992,6 +1989,7 @@ pub(super) async fn execute_ontology_register(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let terms = input["terms"]
         .as_array()
         .ok_or("terms parameter must be an array")?;
@@ -1999,7 +1997,9 @@ pub(super) async fn execute_ontology_register(
         return Err("terms array cannot be empty".to_string());
     }
 
-    let graph = "graph:ontology";
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
     let mut quads = Vec::new();
 
     for term in terms {
@@ -2023,27 +2023,27 @@ pub(super) async fn execute_ontology_register(
             subject: iri.clone(),
             predicate: "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string(),
             object: RdfValue::Iri(type_iri.to_string()),
-            graph: Some(graph.to_string()),
+            graph: Some(graph.clone()),
         });
         quads.push(RdfQuad {
             subject: iri.clone(),
             predicate: "http://www.w3.org/2000/01/rdf-schema#label".to_string(),
             object: RdfValue::Literal(label),
-            graph: Some(graph.to_string()),
+            graph: Some(graph.clone()),
         });
         if !description.is_empty() {
             quads.push(RdfQuad {
                 subject: iri.clone(),
                 predicate: "http://www.w3.org/2000/01/rdf-schema#comment".to_string(),
                 object: RdfValue::Literal(description),
-                graph: Some(graph.to_string()),
+                graph: Some(graph.clone()),
             });
         }
         quads.push(RdfQuad {
             subject: iri,
             predicate: "https://agentos.ontology/meta/termType".to_string(),
             object: RdfValue::Literal(term_type),
-            graph: Some(graph.to_string()),
+            graph: Some(graph.clone()),
         });
     }
 
@@ -2052,7 +2052,7 @@ pub(super) async fn execute_ontology_register(
         let store = kg_store
             .write()
             .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-        store.write_quads(&quads, graph)?;
+        store.write_quads_for_claims(&claims, &quads)?;
     }
 
     Ok(json!({
@@ -2066,6 +2066,7 @@ pub(super) async fn execute_knowledge_bridge_with_store(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let entity_id = input["entity_id"].as_str().unwrap_or("").to_string();
     if entity_id.is_empty() {
         return Err("entity_id parameter cannot be empty".to_string());
@@ -2095,18 +2096,20 @@ pub(super) async fn execute_knowledge_bridge_with_store(
         BridgeRelationType::RelatedTo => "https://agentos.ontology/bridge/relatedTo",
     };
 
-    let bridge_graph = "graph:bridge";
+    let bridge_graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
     let quad = RdfQuad {
         subject: entity_iri,
         predicate: predicate.to_string(),
         object: RdfValue::Iri(skill_iri.to_string()),
-        graph: Some(bridge_graph.to_string()),
+        graph: Some(bridge_graph.clone()),
     };
 
     let store = kg_store
         .write()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    store.write_quads(&[quad], bridge_graph)?;
+    store.write_quads_for_claims(&claims, &[quad])?;
 
     Ok(json!({
         "success": true,
@@ -2120,14 +2123,15 @@ pub(super) async fn execute_knowledge_extract_code(
     input: Value,
     kg_store: Arc<RwLock<KnowledgeGraphStore>>,
 ) -> Result<Value, String> {
+    let claims = super::require_isolation_claims()?;
     let file_path = input["file_path"].as_str().unwrap_or("").to_string();
     if file_path.is_empty() {
         return Err("file_path parameter cannot be empty".to_string());
     }
-    let graph = input["named_graph"]
-        .as_str()
-        .unwrap_or("graph:code")
-        .to_string();
+    // `named_graph` is intentionally ignored; claims select the graph.
+    let graph = claims
+        .graph_iri()
+        .map_err(|e| format!("invalid verified graph scope: {e}"))?;
     let force = input["force"].as_bool().unwrap_or(false);
 
     let store = kg_store
@@ -2136,9 +2140,11 @@ pub(super) async fn execute_knowledge_extract_code(
 
     if force {
         let result = CodeAstExtractor::extract_from_file(&file_path, &graph)?;
-        store
-            .delete_quads_by_subject_prefix(&format!("iri://entity/file:{}", file_path), &graph)?;
-        store.write_quads(&result.quads, &graph)?;
+        store.delete_quads_by_subject_prefix_for_claims(
+            &claims,
+            &format!("iri://entity/file:{}", file_path),
+        )?;
+        store.write_quads_for_claims(&claims, &result.quads)?;
         Ok(json!({
             "success": true,
             "file_path": file_path,
@@ -2150,7 +2156,7 @@ pub(super) async fn execute_knowledge_extract_code(
         }))
     } else {
         use crate::knowledge_graph::code_ast::IncrementalResult;
-        let result = CodeAstExtractor::extract_incremental(&file_path, &graph, &store)?;
+        let result = CodeAstExtractor::extract_incremental_for_claims(&file_path, &claims, &store)?;
         match result {
             IncrementalResult::Unchanged => Ok(json!({
                 "success": true,

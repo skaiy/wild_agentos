@@ -8,6 +8,7 @@ use tree_sitter::{Language, Node, Parser, Tree};
 use super::rdf_mapper::RdfMapper;
 use super::store::KnowledgeGraphStore;
 use super::types::{EdgeDef, LLMExtractionOutput, NodeDef, RdfMappingResult};
+use crate::isolation::IsolationClaims;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodeLanguage {
@@ -142,9 +143,90 @@ fn get_cached_hash(store: &KnowledgeGraphStore, file_path: &str, graph: &str) ->
     }
 }
 
+fn get_cached_hash_for_claims(
+    store: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    file_path: &str,
+) -> Option<String> {
+    let subject_iri = format!("iri://entity/file:{}", file_path);
+    let sparql = format!(
+        "SELECT ?hash WHERE {{ <{}> <https://agentos.ontology/meta/contentHash> ?hash . }}",
+        subject_iri
+    );
+    match store.query_sparql_for_claims(claims, &sparql) {
+        Ok(results) if !results.is_empty() => results[0]
+            .get("?hash")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        _ => None,
+    }
+}
+
 pub struct CodeAstExtractor;
 
 impl CodeAstExtractor {
+    /// Incrementally indexes source code in the graph minted from verified
+    /// claims. Callers cannot select a graph through tool input.
+    pub fn extract_incremental_for_claims(
+        path: &str,
+        claims: &IsolationClaims,
+        store: &KnowledgeGraphStore,
+    ) -> Result<IncrementalResult, String> {
+        let file_path = Path::new(path);
+        let lang = CodeLanguage::from_path(file_path);
+
+        if lang == CodeLanguage::Unknown {
+            return Err(format!(
+                "unsupported file type: {}",
+                file_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("?")
+            ));
+        }
+
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read file {}: {}", path, e))?;
+        let current_hash = compute_sha256(&source);
+        let cached_hash = get_cached_hash_for_claims(store, claims, path);
+
+        if cached_hash.as_ref() == Some(&current_hash) {
+            debug!(file = path, hash = %current_hash, "file content unchanged, skipping AST extraction");
+            return Ok(IncrementalResult::Unchanged);
+        }
+
+        let is_update = cached_hash.is_some();
+        let deleted_quads = if is_update {
+            store.delete_quads_by_subject_prefix_for_claims(
+                claims,
+                &format!("iri://entity/file:{}", path),
+            )?
+        } else {
+            0
+        };
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {e}"))?;
+        let result =
+            Self::extract_from_source_with_hash(&source, &lang, path, &graph, &current_hash)?;
+        store.write_quads_for_claims(claims, &result.quads)?;
+
+        if is_update {
+            Ok(IncrementalResult::Updated {
+                entity_count: result.entity_count,
+                relation_count: result.relation_count,
+                quad_count: result.quads.len(),
+                deleted_quads,
+            })
+        } else {
+            Ok(IncrementalResult::Created {
+                entity_count: result.entity_count,
+                relation_count: result.relation_count,
+                quad_count: result.quads.len(),
+            })
+        }
+    }
+
     pub fn extract_incremental(
         path: &str,
         graph: &str,
