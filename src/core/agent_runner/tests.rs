@@ -1,8 +1,13 @@
 use super::*;
-use crate::core::agent_instance::AgentRole;
+use crate::core::agent_instance::{AgentInstance, AgentRole};
+use crate::isolation::IsolationClaims;
 use crate::jsonld::JsonLdNode;
+use axum::{extract::State, routing::post, Json, Router};
 use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -54,6 +59,126 @@ fn create_test_runner() -> AgentRunner {
         templates,
         settings,
     )
+}
+
+#[derive(Clone)]
+struct ScriptedGateway {
+    responses: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn scripted_chat_completion(
+    State(script): State<ScriptedGateway>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    script.requests.lock().unwrap().push(request);
+    let response = match script.responses.fetch_add(1, Ordering::SeqCst) {
+        0 => json!({
+            "id": "tenant-a-write",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write-a",
+                        "type": "function",
+                        "function": {
+                            "name": "knowledge_import_json",
+                            "arguments": r#"{"json_data":"{\"id\":\"a-only\",\"type\":\"http://example.org/Person\",\"label\":\"Tenant A only\"}","mapping_config":"{\"id_field\":\"id\",\"type_field\":\"type\",\"label_field\":\"label\"}","graph":"graph:world"}"#
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        2 => json!({
+            "id": "tenant-b-read",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "read-b",
+                        "type": "function",
+                        "function": {
+                            "name": "knowledge_query",
+                            "arguments": r#"{"sparql":"SELECT ?s WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> \"Tenant A only\" }","named_graph":"graph://tenant-a/project"}"#
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        _ => json!({
+            "id": "complete",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": r#"{"action":"finish","summary":"complete"}"#
+                },
+                "finish_reason": "stop"
+            }]
+        }),
+    };
+    Json(response)
+}
+
+#[test]
+fn agent_runner_passes_context_claims_to_graph_tools_per_tenant() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let script = ScriptedGateway {
+            responses: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(scripted_chat_completion))
+            .with_state(script.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, app));
+
+        let runner = create_test_runner();
+        runner.gateway.set_base_url(format!("http://{address}"));
+        let tenant_a =
+            IsolationClaims::from_verified("tenant-a", "project", "agent-a").unwrap();
+        let tenant_b =
+            IsolationClaims::from_verified("tenant-b", "project", "agent-b").unwrap();
+
+        runner
+            .execute(
+                &mut AgentInstance::new("agent-a".to_string(), AgentRole::Do),
+                TaskContext::new("iri://task/tenant-a", "write", 2)
+                    .with_isolation_claims(tenant_a),
+            )
+            .await
+            .unwrap();
+        runner
+            .execute(
+                &mut AgentInstance::new("agent-b".to_string(), AgentRole::Do),
+                TaskContext::new("iri://task/tenant-b", "read", 2)
+                    .with_isolation_claims(tenant_b),
+            )
+            .await
+            .unwrap();
+
+        let requests = script.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let tenant_b_tool_result = requests[3]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .unwrap();
+        assert!(
+            tenant_b_tool_result.contains(r#""count":0"#),
+            "tenant B must not see data written through tenant A's AgentRunner call: {tenant_b_tool_result}"
+        );
+        server.abort();
+    });
 }
 
 #[test]
