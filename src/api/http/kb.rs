@@ -2232,12 +2232,16 @@ mod kb_isolation_http_tests {
     }
 
     fn jwt(tenant_id: &str) -> String {
+        jwt_for_scope(tenant_id, None)
+    }
+
+    fn jwt_for_scope(tenant_id: &str, project_id: Option<&str>) -> String {
         encode(
             &Header::default(),
             &super::super::iam::JwtClaims {
                 sub: format!("{tenant_id}-user"),
                 tenant_id: tenant_id.to_string(),
-                project_id: None,
+                project_id: project_id.map(str::to_owned),
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
@@ -2293,6 +2297,16 @@ mod kb_isolation_http_tests {
         let other_tenant_delete = Request::builder().method("DELETE").uri(format!("/kb/bases/{kb_id}"))
             .header("authorization", format!("Bearer {}", jwt("tenant-b"))).body(Body::empty()).unwrap();
         assert_eq!(response_json(&app, other_tenant_delete).await.0, StatusCode::NOT_FOUND);
+
+        let other_tenant_update = Request::builder().method("PUT").uri(format!("/kb/bases/{kb_id}"))
+            .header("authorization", format!("Bearer {}", jwt("tenant-b")))
+            .header("content-type", "application/json").body(Body::from(r#"{"name":"must not update"}"#)).unwrap();
+        assert_eq!(response_json(&app, other_tenant_update).await.0, StatusCode::NOT_FOUND);
+
+        let other_project_list = Request::builder().uri("/kb/bases")
+            .header("authorization", format!("Bearer {}", jwt_for_scope("tenant-a", Some("other-project"))))
+            .body(Body::empty()).unwrap();
+        assert_eq!(response_json(&app, other_project_list).await.1["count"], json!(0));
 
         for method in ["PUT", "DELETE"] {
             let mut builder = Request::builder().method(method).uri(format!("/kb/bases/{kb_id}"));
