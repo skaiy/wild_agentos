@@ -11,6 +11,7 @@ use hyperspace_engine::wal::WalSyncMode;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::isolation::IsolationClaims;
 use crate::memory::embedding_service::EmbeddingService;
 use crate::CoreError;
 
@@ -123,6 +124,13 @@ pub struct ScoredEntry {
 pub struct HyperspaceStore {
     engine: Arc<HyperspaceEngineImpl>,
     embed: Arc<dyn EmbeddingService>,
+}
+
+#[cfg(not(test))]
+fn unverified_claims_error(operation: &str) -> CoreError {
+    CoreError::Internal {
+        message: format!("{operation} requires verified IsolationClaims"),
+    }
 }
 
 impl HyperspaceStore {
@@ -299,14 +307,22 @@ impl HyperspaceStore {
 
     // ── Public API (mirrors old VectorStore) ─────────────────────────────────
 
-    /// Store a vector entry by IRI, embedding its text content.
-    pub async fn upsert(&self, iri: &str, text: &str, tags: &[String]) -> Result<u32, CoreError> {
-        self.upsert_with_metadata(iri, text, tags, None, None, None)
-            .await
+    /// Legacy unscoped write API.
+    ///
+    /// Production callers must use [`Self::upsert_with_claims`] so the vector
+    /// is stored in a namespace minted from verified claims. Unit tests retain
+    /// this API as a fixture compatibility shim.
+    #[cfg(not(test))]
+    pub async fn upsert(
+        &self,
+        _iri: &str,
+        _text: &str,
+        _tags: &[String],
+    ) -> Result<u32, CoreError> {
+        Err(unverified_claims_error("vector upsert"))
     }
 
-    /// 写入向量条目并自动附加 `tenant:<id>` 标签（多租户向量隔离）。
-    /// 搜索时配合 `HybridSearchFilter::with_tenant(tenant_id)` 使用即可实现完整隔离。
+    #[cfg(test)]
     pub async fn upsert_with_tenant(
         &self,
         iri: &str,
@@ -320,8 +336,105 @@ impl HyperspaceStore {
             .await
     }
 
+    /// Legacy unscoped write API retained only for unit-test fixtures.
+    #[cfg(test)]
+    pub async fn upsert(&self, iri: &str, text: &str, tags: &[String]) -> Result<u32, CoreError> {
+        self.upsert_with_metadata(iri, text, tags, None, None, None)
+            .await
+    }
+
+    /// Legacy tenant-tag write API.
+    ///
+    /// A caller-provided tenant string is not a verified vector namespace and
+    /// therefore cannot be used for production writes.
+    #[cfg(not(test))]
+    pub async fn upsert_with_tenant(
+        &self,
+        _iri: &str,
+        _text: &str,
+        _tags: &[String],
+        _tenant_id: &str,
+    ) -> Result<u32, CoreError> {
+        Err(unverified_claims_error("vector upsert"))
+    }
+
+    /// Stores an entry in the namespace minted from verified claims.
+    ///
+    /// The engine has no namespace primitive, so the minted namespace scopes
+    /// both the engine IRI and the JSON-LD named-graph metadata. This prevents
+    /// equal caller-supplied IRIs in different tenants/projects from
+    /// overwriting one another and makes every claims-aware search filter on
+    /// the same scope.
+    pub async fn upsert_with_claims(
+        &self,
+        claims: &IsolationClaims,
+        iri: &str,
+        text: &str,
+        tags: &[String],
+    ) -> Result<u32, CoreError> {
+        self.upsert_with_claims_and_metadata(claims, iri, text, tags, None, None)
+            .await
+    }
+
+    /// Stores an entry with metadata in the namespace minted from verified
+    /// claims.
+    pub async fn upsert_with_claims_and_metadata(
+        &self,
+        claims: &IsolationClaims,
+        iri: &str,
+        text: &str,
+        tags: &[String],
+        importance: Option<f32>,
+        jsonld_types: Option<&[String]>,
+    ) -> Result<u32, CoreError> {
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        let scoped_iri = format!("{namespace}#{iri}");
+        self.upsert_with_metadata_inner(
+            &scoped_iri,
+            text,
+            tags,
+            importance,
+            jsonld_types,
+            Some(&namespace),
+        )
+        .await
+    }
+
     /// Store a vector entry with full metadata.
+    ///
+    /// Production callers must use
+    /// [`Self::upsert_with_claims_and_metadata`]. This unscoped API is kept
+    /// for existing unit-test fixtures only.
+    #[cfg(not(test))]
     pub async fn upsert_with_metadata(
+        &self,
+        _iri: &str,
+        _text: &str,
+        _tags: &[String],
+        _importance: Option<f32>,
+        _jsonld_types: Option<&[String]>,
+        _named_graph: Option<&str>,
+    ) -> Result<u32, CoreError> {
+        Err(unverified_claims_error("vector upsert"))
+    }
+
+    #[cfg(test)]
+    pub async fn upsert_with_metadata(
+        &self,
+        iri: &str,
+        text: &str,
+        tags: &[String],
+        importance: Option<f32>,
+        jsonld_types: Option<&[String]>,
+        named_graph: Option<&str>,
+    ) -> Result<u32, CoreError> {
+        self.upsert_with_metadata_inner(iri, text, tags, importance, jsonld_types, named_graph)
+            .await
+    }
+
+    async fn upsert_with_metadata_inner(
         &self,
         iri: &str,
         text: &str,
@@ -388,13 +501,86 @@ impl HyperspaceStore {
     }
 
     /// Semantic search by query string.
+    #[cfg(not(test))]
+    pub async fn search(&self, _query: &str, _limit: u64) -> Result<Vec<ScoredEntry>, CoreError> {
+        Err(unverified_claims_error("vector search"))
+    }
+
+    #[cfg(test)]
     pub async fn search(&self, query: &str, limit: u64) -> Result<Vec<ScoredEntry>, CoreError> {
         self.search_with_filter(query, &HybridSearchFilter::new(), limit)
             .await
     }
 
     /// Semantic search with metadata filters.
+    ///
+    /// Production callers must use [`Self::search_with_claims`], which
+    /// overrides any caller-provided named graph with the namespace minted
+    /// from verified claims.
+    #[cfg(not(test))]
     pub async fn search_with_filter(
+        &self,
+        _query: &str,
+        _filter: &HybridSearchFilter,
+        _limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        Err(unverified_claims_error("vector search"))
+    }
+
+    #[cfg(test)]
+    pub async fn search_with_filter(
+        &self,
+        query: &str,
+        filter: &HybridSearchFilter,
+        limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        let vector = self.get_embedding(query).await;
+        let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
+            CoreError::Internal {
+                message: format!("EmbeddingVector: {e}"),
+            }
+        })?;
+
+        let filters = self.to_jsonld_filters(filter);
+        let results = self
+            .engine
+            .search(&vec, limit as usize, &filters)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace search: {e}"),
+            })?;
+
+        Ok(Self::scored_hits_to_entries(results))
+    }
+
+    /// Searches only entries in the vector namespace minted from verified
+    /// claims. Historical `tenant:<id>` rows have a different named graph and
+    /// are intentionally not included or migrated.
+    pub async fn search_with_claims(
+        &self,
+        claims: &IsolationClaims,
+        query: &str,
+        filter: &HybridSearchFilter,
+        limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        let mut scoped_filter = filter.clone();
+        let namespace_prefix = format!("{namespace}#");
+        scoped_filter.named_graph = Some(namespace);
+        // Hyperspace treats an empty filter bitmap as an unfiltered search.
+        // Retain only the scoped engine IRIs as a fail-closed guard when the
+        // requested namespace has no indexed vectors.
+        Ok(self
+            .search_with_filter_inner(query, &scoped_filter, limit)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.iri.starts_with(&namespace_prefix))
+            .collect())
+    }
+
+    async fn search_with_filter_inner(
         &self,
         query: &str,
         filter: &HybridSearchFilter,
@@ -467,6 +653,19 @@ impl HyperspaceStore {
     }
 
     /// Hybrid search combining free-text and tag filtering.
+    #[cfg(not(test))]
+    pub async fn hybrid_search(
+        &self,
+        _query: &str,
+        _must_tags: &[String],
+        _should_tags: &[String],
+        _min_importance: Option<f32>,
+        _limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        Err(unverified_claims_error("vector hybrid search"))
+    }
+
+    #[cfg(test)]
     pub async fn hybrid_search(
         &self,
         query: &str,
@@ -485,7 +684,29 @@ impl HyperspaceStore {
     }
 
     /// Delete a vector entry by IRI.
+    #[cfg(not(test))]
+    pub async fn delete(&self, _iri: &str) -> Result<(), CoreError> {
+        Err(unverified_claims_error("vector delete"))
+    }
+
+    #[cfg(test)]
     pub async fn delete(&self, iri: &str) -> Result<(), CoreError> {
+        self.delete_inner(iri).await
+    }
+
+    /// Deletes only the entry addressed inside the verified claims namespace.
+    pub async fn delete_with_claims(
+        &self,
+        claims: &IsolationClaims,
+        iri: &str,
+    ) -> Result<(), CoreError> {
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        self.delete_inner(&format!("{namespace}#{iri}")).await
+    }
+
+    async fn delete_inner(&self, iri: &str) -> Result<(), CoreError> {
         self.engine
             .delete(iri)
             .await
@@ -526,6 +747,7 @@ impl HyperspaceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isolation::IsolationClaims;
     use crate::memory::embedding_service::FallbackEmbeddingService;
 
     fn setup_store() -> HyperspaceStore {
@@ -847,5 +1069,51 @@ mod tests {
             .unwrap();
         assert_eq!(res_other.len(), 1);
         assert_eq!(res_other[0].iri, "ti:2");
+    }
+
+    #[tokio::test]
+    async fn claims_namespace_prevents_cross_tenant_recall() {
+        let store = setup_store();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "agent-a").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "agent-b").unwrap();
+
+        store
+            .upsert_with_claims(
+                &tenant_a,
+                "battery-guide",
+                "replace the battery in the tenant A vehicle",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let tenant_a_hits = store
+            .search_with_claims(
+                &tenant_a,
+                "replace the battery",
+                &HybridSearchFilter::new(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tenant_a_hits.len(), 1);
+        assert_eq!(
+            tenant_a_hits[0].iri,
+            "vector://tenant-a/project-1#battery-guide"
+        );
+
+        let tenant_b_hits = store
+            .search_with_claims(
+                &tenant_b,
+                "replace the battery",
+                &HybridSearchFilter::new(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tenant_b_hits.is_empty(),
+            "tenant B must not recall tenant A's namespaced vector"
+        );
     }
 }
