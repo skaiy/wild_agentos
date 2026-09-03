@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::rdf_mapper::RdfMapper;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
@@ -41,7 +42,41 @@ impl GraphifyEngine {
         max_entities: usize,
     ) -> GraphifyResult {
         let graph_name = format!("graph:tool-result:{}", call_id);
+        self.graphify_json_in_graph(json, graph_name, call_id, max_entities, None)
+    }
 
+    /// Converts a tool result into the graph minted from verified claims.
+    pub fn graphify_json_for_claims(
+        &mut self,
+        claims: &IsolationClaims,
+        json: &Value,
+        call_id: &str,
+        max_entities: usize,
+    ) -> GraphifyResult {
+        let graph_name = match claims.graph_iri() {
+            Ok(graph_name) => graph_name,
+            Err(e) => {
+                return GraphifyResult {
+                    graph_name: String::new(),
+                    entity_count: 0,
+                    relation_count: 0,
+                    entity_types: vec![],
+                    summary: format!("Graphify failed: invalid claims graph: {}", e),
+                    micro_tools: vec![],
+                }
+            }
+        };
+        self.graphify_json_in_graph(json, graph_name, call_id, max_entities, Some(claims))
+    }
+
+    fn graphify_json_in_graph(
+        &mut self,
+        json: &Value,
+        graph_name: String,
+        call_id: &str,
+        max_entities: usize,
+        claims: Option<&IsolationClaims>,
+    ) -> GraphifyResult {
         let (mut nodes, mut edges) = Self::json_to_graph(json, call_id, max_entities);
 
         Self::normalize_iris(&mut nodes, &mut edges);
@@ -52,7 +87,11 @@ impl GraphifyEngine {
         let output = LLMExtractionOutput { nodes, edges };
         let mapping = RdfMapper::map_extraction(&output, &graph_name);
 
-        if let Err(e) = self.store.write_quads(&mapping.quads, &graph_name) {
+        let write_result = match claims {
+            Some(claims) => self.store.write_quads_for_claims(claims, &mapping.quads),
+            None => self.store.write_quads(&mapping.quads, &graph_name),
+        };
+        if let Err(e) = write_result {
             return GraphifyResult {
                 graph_name,
                 entity_count: 0,
