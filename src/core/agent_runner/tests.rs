@@ -138,7 +138,9 @@ fn agent_runner_passes_context_claims_to_graph_tools_per_tenant() {
             .with_state(script.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(axum::serve(listener, app));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
         let runner = create_test_runner();
         runner.gateway.set_base_url(format!("http://{address}"));
