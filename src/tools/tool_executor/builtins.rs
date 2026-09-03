@@ -1044,6 +1044,8 @@ fn prepare_bash_spawn(
         let mut c = Command::new(launcher.program);
         c.args(launcher.args);
         c.current_dir(cwd);
+        c.env_clear();
+        c.envs(crate::tools::process_env::sanitized_child_environment());
         c.envs(launcher.env);
         c.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1055,6 +1057,8 @@ fn prepare_bash_spawn(
     }
     let mut c = Command::new("sh");
     c.arg("-lc").arg(command).current_dir(cwd);
+    c.env_clear();
+    c.envs(crate::tools::process_env::sanitized_child_environment());
     if sandbox_status.filesystem_active {
         c.env("HOME", cwd.join(".sandbox-home"));
         c.env("TMPDIR", cwd.join(".sandbox-tmp"));

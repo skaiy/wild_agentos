@@ -297,8 +297,7 @@ mod tests {
             // Exit code 1 = "no matching process" — correct: our own PID was
             // filtered out, and nothing else matches the unique marker.
             assert_eq!(
-                result["exit_code"],
-                1,
+                result["exit_code"], 1,
                 "own PID must be excluded: {:?}",
                 result
             );
@@ -368,6 +367,28 @@ mod tests {
             assert_eq!(result["exit_code"], 0);
             assert_eq!(result["stdout"], "ok");
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_child_does_not_inherit_parent_secret() {
+        const SECRET_KEY: &str = "AGENTOS_CHILD_ENV_TEST_SECRET";
+        std::env::set_var(SECRET_KEY, "parent-only-secret");
+
+        let result = rt().block_on(async {
+            super::super::builtins::execute_bash(json!({
+                "command": format!("printenv {SECRET_KEY} >/dev/null && exit 1 || exit 0"),
+            }))
+            .await
+            .unwrap()
+        });
+
+        std::env::remove_var(SECRET_KEY);
+        assert_eq!(
+            result["exit_code"], 0,
+            "secret must not be inherited by bash child: {:?}",
+            result
+        );
     }
 
     #[cfg(unix)]
