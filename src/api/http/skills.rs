@@ -1189,6 +1189,8 @@ version: \"2.0.0\"\n\
         let tmp = std::env::temp_dir().join(format!("importgit_400_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let strict_mode = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
 
         let state = make_state(&tmp);
 
@@ -1214,6 +1216,9 @@ version: \"2.0.0\"\n\
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         std::env::remove_var("AGENTOS_DATA_DIR");
+        if let Some(value) = strict_mode {
+            std::env::set_var("AGENTOS_AUTH_STRICT", value);
+        }
         let _ = std::fs::remove_dir_all(tmp);
     }
 
