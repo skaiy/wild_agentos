@@ -4,15 +4,11 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::iam::UserIdentity;
 use super::{data_dir, AppState};
 
 /// 用户态 Agent 的持久化文件路径。
@@ -57,7 +53,10 @@ fn extract_kb_uuid_from_graph(graph: &str) -> Option<String> {
 ///   3) 否则（原始命名图）→ 新建知识包 {named_graph: 原值}，挂载并清空。
 ///
 /// 返回 (agents_changed, packs_changed)；清空后再次运行不再产生变更（幂等）。
-pub(crate) fn migrate_legacy_agent_graphs(agents: &mut [Value], packs: &mut Vec<Value>) -> (bool, bool) {
+pub(crate) fn migrate_legacy_agent_graphs(
+    agents: &mut [Value],
+    packs: &mut Vec<Value>,
+) -> (bool, bool) {
     let mut agents_changed = false;
     let mut packs_changed = false;
     for agent in agents.iter_mut() {
@@ -185,8 +184,18 @@ pub struct AgentCreateRequest {
 /// POST /api/v1/agents — 创建用户态 Agent 并持久化
 pub(crate) async fn create_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<AgentCreateRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for agent creation" })),
+            )
+        }
+    };
     let agent = json!({
         "id": uuid::Uuid::new_v4().hyphenated().to_string(),
         "name": req.name,
@@ -198,6 +207,8 @@ pub(crate) async fn create_agent_handler(
         "icon": req.icon.unwrap_or_else(|| "Bot".to_string()),
         "color": req.color.unwrap_or_else(|| "bg-blue-500".to_string()),
         "source": "user",
+        "tenant_id": claims.tenant_id(),
+        "project_id": claims.project_id(),
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
     let id = agent["id"].as_str().unwrap_or("").to_string();
