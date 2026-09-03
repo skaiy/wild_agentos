@@ -121,12 +121,29 @@ pub struct L0Store {
 }
 
 impl L0Store {
+    /// Creates a writable isolated fixture store for in-crate tests.
+    ///
+    /// Production callers cannot use this constructor: production L0 writes
+    /// must use [`Self::open_for_claims`] with verified claims.
+    #[cfg(test)]
+    pub fn new(path: &str) -> Result<Self, CoreError> {
+        Self::open_writable(Path::new(path))
+    }
+
     /// Opens the legacy shared L0 database in read-only compatibility mode.
     ///
     /// New writes require [`Self::open_for_claims`], which mints a tenant
     /// directory. This constructor deliberately does not create the legacy
     /// path, preserving existing history without treating it as tenant data.
+    #[cfg(not(test))]
     pub fn new(path: &str) -> Result<Self, CoreError> {
+        Self::open_legacy_readonly(path)
+    }
+
+    /// Opens an existing historical shared L0 database without permitting
+    /// writes. This explicit API is also used to verify the fail-closed
+    /// compatibility path in tests.
+    pub fn open_legacy_readonly(path: &str) -> Result<Self, CoreError> {
         let db_path = Path::new(path).join("l0.redb");
         let db = Database::open(&db_path).map_err(|e| CoreError::StorageError {
             message: format!("Failed to open legacy read-only database: {}", e),
@@ -148,17 +165,20 @@ impl L0Store {
             "Initializing tenant-scoped L0 Store: {}",
             tenant_path.display()
         );
+        Self::open_writable(&tenant_path)
+    }
 
-        std::fs::create_dir_all(&tenant_path).map_err(|e| CoreError::StorageError {
+    fn open_writable(path: &Path) -> Result<Self, CoreError> {
+        std::fs::create_dir_all(path).map_err(|e| CoreError::StorageError {
             message: format!("Failed to create storage directory: {}", e),
         })?;
 
-        let db_path = tenant_path.join("l0.redb");
+        let db_path = path.join("l0.redb");
         let db = Database::create(&db_path).map_err(|e| CoreError::StorageError {
             message: format!("Failed to open database: {}", e),
         })?;
 
-        Self::from_database(db, tenant_path.to_string_lossy().into_owned(), true)
+        Self::from_database(db, path.to_string_lossy().into_owned(), true)
     }
 
     fn from_database(db: Database, path: String, writable: bool) -> Result<Self, CoreError> {
@@ -1421,7 +1441,7 @@ mod tests {
     fn legacy_l0_store_rejects_writes_without_claims() {
         let dir = tempdir().unwrap();
         Database::create(dir.path().join("l0.redb")).unwrap();
-        let store = L0Store::new(dir.path().to_str().unwrap()).unwrap();
+        let store = L0Store::open_legacy_readonly(dir.path().to_str().unwrap()).unwrap();
 
         let error = store.store("iri://test/1", "unclaimed").unwrap_err();
 
