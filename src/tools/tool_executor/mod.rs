@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::skill_graph::security::{SecurityContext, SecurityDecision, SecurityEngine};
 use crate::tools::builtin::hooks::HookRunner;
@@ -23,6 +24,23 @@ mod builtins;
 
 #[cfg(test)]
 mod tests;
+
+tokio::task_local! {
+    /// Verified identity supplied by the runtime boundary for one tool call.
+    ///
+    /// This is task-local rather than executor state: a shared executor can
+    /// serve concurrent tenants without one call's identity leaking into
+    /// another call.
+    static TOOL_ISOLATION_CLAIMS: Option<IsolationClaims>;
+}
+
+pub(super) fn require_isolation_claims() -> Result<IsolationClaims, String> {
+    TOOL_ISOLATION_CLAIMS
+        .try_with(|claims| claims.clone())
+        .ok()
+        .flatten()
+        .ok_or_else(|| "verified isolation claims are required for graph and vector tools".to_string())
+}
 
 /// Tool input structs
 #[derive(Debug, Deserialize)]
@@ -1159,6 +1177,21 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, input: Value) -> Result<Value, String> {
+        self.execute_with_claims(name, input, None).await
+    }
+
+    async fn execute_with_claims(
+        &self,
+        name: &str,
+        input: Value,
+        claims: Option<IsolationClaims>,
+    ) -> Result<Value, String> {
+        TOOL_ISOLATION_CLAIMS
+            .scope(claims, self.execute_inner(name, input))
+            .await
+    }
+
+    async fn execute_inner(&self, name: &str, input: Value) -> Result<Value, String> {
         let input_str = input.to_string();
 
         if let Some(ref policy) = self.permission_policy {
@@ -1243,6 +1276,21 @@ impl ToolExecutor {
         context: SecurityContext,
         advertised_tools: &[String],
     ) -> Result<Value, String> {
+        self.execute_with_security_context_and_claims(name, input, context, advertised_tools, None)
+            .await
+    }
+
+    /// Executes a tool with identity already verified by the runtime boundary.
+    ///
+    /// Tool arguments never carry claims or select graph/vector targets.
+    pub async fn execute_with_security_context_and_claims(
+        &self,
+        name: &str,
+        input: Value,
+        context: SecurityContext,
+        advertised_tools: &[String],
+        claims: Option<IsolationClaims>,
+    ) -> Result<Value, String> {
         if !advertised_tools.iter().any(|tool| tool == name) {
             return Ok(json!({
                 "error": format!("Tool not advertised for this turn: {}", name),
@@ -1293,7 +1341,7 @@ impl ToolExecutor {
             }
         }
 
-        self.execute(name, input).await
+        self.execute_with_claims(name, input, claims).await
     }
 
     /// Get tool handler (avoid holding lock across await)
