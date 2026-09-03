@@ -98,7 +98,6 @@ pub(crate) fn save_knowledge_packs(packs: &[Value]) -> std::io::Result<()> {
     std::fs::write(&path, content)
 }
 
-
 /// 遍历所有向量 KB，逐个后台重建索引（从 BlobStore 原文台账）。返回排队重建的 KB 数。
 /// 无 BlobStore 或无原文台账的 KB 将被跳过（存量向量已作废，需重新上传）。
 pub(crate) async fn spawn_reindex_all_vector_kbs(state: Arc<AppState>) -> usize {
@@ -165,7 +164,6 @@ pub(crate) async fn spawn_reindex_all_vector_kbs(state: Arc<AppState>) -> usize 
     count
 }
 
-
 // ─── 知识库分类管理 CRUD ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -177,7 +175,9 @@ pub struct KbCategoryCreateRequest {
 /// GET /api/v1/knowledge-packs — 返回知识包清单（内置种子 + 用户创建，均持久化于 data/knowledge_packs.json）。
 ///
 /// 每个知识包关联 N 个知识库分类 / N 个图知识库 / N 个向量知识库，可被 Agent 挂载。
-pub(crate) async fn list_knowledge_packs_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_knowledge_packs_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let packs = state.knowledge_packs.read().await.clone();
     Json(json!({ "count": packs.len(), "knowledge_packs": packs }))
 }
@@ -358,9 +358,10 @@ pub(crate) async fn delete_knowledge_pack_handler(
     )
 }
 
-
 /// GET /api/v1/kb/categories — 返回全部知识库分类
-pub(crate) async fn list_kb_categories_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_kb_categories_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let categories = state.kb_categories.read().await.clone();
     Json(json!({ "count": categories.len(), "categories": categories }))
 }
@@ -468,7 +469,9 @@ fn sparql_literal(s: &str) -> String {
 }
 
 /// GET /api/v1/kb/bases — 返回全部知识库
-pub(crate) async fn list_knowledge_bases_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub(crate) async fn list_knowledge_bases_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let bases = state.knowledge_bases.read().await.clone();
     Json(json!({ "count": bases.len(), "bases": bases }))
 }
@@ -972,7 +975,6 @@ pub(crate) async fn search_knowledge_base_handler(
 /// KB 上传/导入单文件体积上限（60MB，覆盖前端提示的 50MB/文件 + 编码开销）。
 pub(crate) const KB_UPLOAD_MAX_BYTES: usize = 60 * 1024 * 1024;
 
-
 /// 依扩展名判断向量库上传文件是否为当前可解析的纯文本类型。
 /// 返回 Some(()) 表示直读文本；None 表示暂无解析器（PDF/Word 等），走诚实降级。
 fn kb_text_ext(name: &str) -> Option<()> {
@@ -1390,7 +1392,6 @@ pub(crate) async fn kb_document_raw_handler(
             .into_response(),
     }
 }
-
 
 /// POST /api/v1/kb/bases/:id/reindex — 按当前 embedding/分块重建向量索引（异步）。
 /// 从 documents 台账拉原文 → 删旧 chunk → 重新分块 embedding 写新 → 更新台账与状态。
@@ -2030,8 +2031,6 @@ pub(crate) async fn import_graph_knowledge_base_handler(
     }
 }
 
-
-
 // ──────────────────────────────────────────────────────────────────────────────
 /// §9 知识库图谱摄取回归单测：固化两处已修复缺陷——
 ///   1) 中文 IRI 保留（kb_sanitize_id 不再把非 ASCII 折叠成 `_`，避免碰撞/损坏）；
@@ -2039,6 +2038,7 @@ pub(crate) async fn import_graph_knowledge_base_handler(
 #[cfg(test)]
 mod kb_ingest_tests {
     use super::*;
+    use crate::isolation::IsolationClaims;
     use crate::knowledge_graph::store::KnowledgeGraphStore;
 
     /// 回归：中文实体/关系名应原样保留 Unicode，仅对 IRIREF 禁用字符做百分号编码。
@@ -2094,19 +2094,20 @@ mod kb_ingest_tests {
     #[test]
     fn test_graph_stats_count_binding_key() {
         let kg = KnowledgeGraphStore::new().expect("in-mem store");
-        let graph = "iri://kb/test-cn-stats";
+        let claims =
+            IsolationClaims::from_verified("kb-test-tenant", "stats-project", "test-actor")
+                .expect("verified claims");
         let csv = "subject,predicate,object,object_type\n\
                    车型:测试001,属于品牌,品牌:比亚迪,iri\n\
                    车型:测试001,续航里程,605,literal\n";
         let quads = kb_quads_from_csv(csv).expect("csv parse");
-        kg.write_quads(&quads, graph).expect("write quads");
+        kg.write_quads_for_claims(&claims, &quads)
+            .expect("write quads");
 
-        // 与 knowledge_base_stats_handler 完全一致的计数查询。
-        let q = format!(
-            "SELECT (COUNT(*) AS ?c) WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }}",
-            g = graph
-        );
-        let rows = kg.query_sparql(&q, None).expect("count query");
+        // Claims-scoped queries apply the named graph automatically.
+        let rows = kg
+            .query_sparql_for_claims(&claims, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+            .expect("count query");
         let first = rows.first().expect("one row");
         // 关键回归：绑定键带 `?` 前缀。
         assert!(first.get("c").is_none(), "绑定键不应是 `c`");
@@ -2143,7 +2144,8 @@ mod kb_ingest_tests {
             json!(["ev-repair-fault-kb"])
         );
         // 幂等：二次运行无变更。
-        let (a2, p2) = crate::api::http::agents::migrate_legacy_agent_graphs(&mut agents, &mut packs);
+        let (a2, p2) =
+            crate::api::http::agents::migrate_legacy_agent_graphs(&mut agents, &mut packs);
         assert!(!a2 && !p2, "幂等：清空后不再变更");
     }
 
