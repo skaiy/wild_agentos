@@ -7,6 +7,47 @@ use crate::memory::l1_session::L1Session;
 
 use super::{TaskContext, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
 
+/// Removes reasoning fields from data projected into an agent prompt.
+///
+/// L3 projections may contain serialized JSON values from a shared
+/// blackboard. Reasoning belongs in the originating agent's L0 archive and
+/// must never cross this prompt boundary, even when the surrounding result is
+/// intentionally shared.
+fn strip_reasoning_from_projection(projection: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(projection) else {
+        return projection.to_string();
+    };
+    strip_reasoning_value(&mut value);
+    serde_json::to_string(&value).unwrap_or_else(|_| projection.to_string())
+}
+
+fn strip_reasoning_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.retain(|key, _| {
+                !matches!(key.as_str(), "thought" | "reasoning" | "reasoning_content")
+            });
+            for value in object.values_mut() {
+                strip_reasoning_value(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                strip_reasoning_value(value);
+            }
+        }
+        serde_json::Value::String(text) => {
+            if let Ok(mut nested) = serde_json::from_str::<serde_json::Value>(text) {
+                strip_reasoning_value(&mut nested);
+                if let Ok(sanitized) = serde_json::to_string(&nested) {
+                    *text = sanitized;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 impl super::AgentRunner {
     pub(super) fn build_agent_md_from_step(
         &self,
@@ -306,7 +347,10 @@ impl super::AgentRunner {
             .await
         {
             if !projection_str.is_empty() {
-                context_data.insert("context_summary".to_string(), projection_str);
+                context_data.insert(
+                    "context_summary".to_string(),
+                    strip_reasoning_from_projection(&projection_str),
+                );
             }
         }
 
@@ -520,5 +564,27 @@ impl super::AgentRunner {
             }
         }
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_reasoning_from_projection;
+
+    #[test]
+    fn projected_reasoning_is_removed_before_prompt_injection() {
+        let projection = r#"{
+            "artifacts": [{
+                "summary": "agent A completed the task",
+                "content": "{\"thought\":\"agent A private trace\",\"content\":\"shared result\"}",
+                "reasoning_content": "native private trace"
+            }]
+        }"#;
+
+        let prompt_context = strip_reasoning_from_projection(projection);
+
+        assert!(prompt_context.contains("shared result"));
+        assert!(!prompt_context.contains("agent A private trace"));
+        assert!(!prompt_context.contains("native private trace"));
     }
 }
