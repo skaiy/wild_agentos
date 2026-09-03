@@ -4,6 +4,26 @@
 //! boundary has already verified. This module is not an identity provider: it
 //! neither reads requests nor verifies credentials. Consequently, its only
 //! public claims constructor is [`IsolationClaims::from_verified`].
+//!
+//! The naming functions mint future, tenant-scoped names only. Minting is not
+//! a migration of existing data: this module does not create directories or
+//! access Oxigraph, Hyperspace, MinIO, or any other storage backend.
+//!
+//! ```compile_fail
+//! use wild_agent_os_core::isolation::IsolationClaims;
+//!
+//! let body = r#"{"tenant_id":"acme"}"#;
+//! let _claims = IsolationClaims::from_body(body);
+//! ```
+//!
+//! ```compile_fail
+//! use axum::http::HeaderMap;
+//! use wild_agent_os_core::isolation::IsolationClaims;
+//!
+//! let mut headers = HeaderMap::new();
+//! headers.insert("X-Identity", "eyJ0ZW5hbnRfaWQiOiJhY21lIn0=".parse().unwrap());
+//! let _claims = IsolationClaims::from_headers(&headers);
+//! ```
 
 use std::path::PathBuf;
 
