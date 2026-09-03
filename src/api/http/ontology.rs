@@ -554,16 +554,13 @@ fn sandbox_guardrail_violations(
         .iter()
         .map(|p| format!("STRSTARTS(STR(?p), \"{}\")", p))
         .collect();
-    let ask_q = format!(
-        "ASK {{ ?s ?p ?o . FILTER(!({allow})) }}",
+    let foreign_q = format!(
+        "SELECT ?p WHERE {{ ?s ?p ?o . FILTER(!({allow})) }} LIMIT 1",
         allow = filters.join(" || ")
     );
-    let has_foreign = kg
-        .query_staging_for_claims(claims, staging_id, &ask_q)?
-        .into_iter()
-        .next()
-        .and_then(|row| row.get("result").and_then(|v| v.as_bool()))
-        .ok_or_else(|| "护栏谓词检查返回无效结果".to_string())?;
+    let has_foreign = !kg
+        .query_staging_for_claims(claims, staging_id, &foreign_q)?
+        .is_empty();
     if has_foreign {
         violations.push("存在越权谓词（不在允许的命名空间白名单内）".to_string());
     }
