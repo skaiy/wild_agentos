@@ -811,11 +811,59 @@ pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
     let params: FileWriteInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     check_path_in_workspace(&params.path)?;
+    let existing_content = match std::fs::read_to_string(&params.path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Read before write error: {}", error)),
+    };
+    validate_file_write_effect(existing_content.as_deref(), &params.content)?;
     if let Some(parent) = std::path::Path::new(&params.path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
     }
     std::fs::write(&params.path, &params.content).map_err(|e| format!("Write error: {}", e))?;
-    Ok(json!({"path": params.path, "bytes_written": params.content.len(), "success": true}))
+    verify_file_write_effect(&params.path, &params.content)?;
+    Ok(json!({
+        "path": params.path,
+        "bytes_written": params.content.len(),
+        "effect_applied": true,
+        "success": true
+    }))
+}
+
+/// Reject writes that cannot provide a meaningful workspace artifact.
+///
+/// A Do agent must not report completion from an empty request or a request
+/// whose content is already present. Both cases leave the workspace unchanged.
+fn validate_file_write_effect(
+    existing_content: Option<&str>,
+    new_content: &str,
+) -> Result<(), String> {
+    if new_content.is_empty() {
+        return Err(
+            "Write skipped: content is empty; file_write requires a non-empty workspace artifact"
+                .to_string(),
+        );
+    }
+    if existing_content == Some(new_content) {
+        return Err(
+            "Write skipped: file already contains the requested content; re-verify the workspace before completing"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Re-read the target after mutation so the reported success is backed by a
+/// workspace artifact instead of the write call's return value alone.
+fn verify_file_write_effect(path: &str, expected_content: &str) -> Result<(), String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) if content == expected_content && !content.is_empty() => Ok(()),
+        Ok(_) => Err(format!(
+            "Write verification failed: {} does not contain the requested artifact",
+            path
+        )),
+        Err(error) => Err(format!("Write verification read error: {}", error)),
+    }
 }
 
 pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
@@ -2148,6 +2196,24 @@ pub(super) async fn execute_knowledge_extract_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_write_requires_a_detectable_effect() {
+        assert!(validate_file_write_effect(None, "created").is_ok());
+        assert!(validate_file_write_effect(Some("before"), "after").is_ok());
+        assert!(validate_file_write_effect(None, "").is_err());
+        assert!(validate_file_write_effect(Some("unchanged"), "unchanged").is_err());
+    }
+
+    #[test]
+    fn file_write_verifies_the_created_artifact() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        std::fs::write(&path, "expected").unwrap();
+
+        assert!(verify_file_write_effect(&path, "expected").is_ok());
+        assert!(verify_file_write_effect(&path, "different").is_err());
+    }
 
     #[test]
     fn test_is_build_or_vendored_dir() {

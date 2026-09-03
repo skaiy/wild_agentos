@@ -73,7 +73,11 @@ impl ActionTracker {
 
         match tool_name {
             "file_write" => {
-                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                if result.get("effect_applied") == Some(&Value::Bool(true)) {
+                    let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
+                        self.actions.push(action);
+                        return;
+                    };
                     action
                         .tool_args
                         .insert("path".to_string(), Value::String(path.to_string()));
@@ -133,5 +137,53 @@ impl ActionTracker {
 
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
+    }
+
+    /// Whether a declared workspace write was skipped or failed without any
+    /// later verified effect. The Do phase must pass this outcome to Check
+    /// instead of claiming successful completion.
+    pub fn requires_post_write_verification(&self) -> bool {
+        let attempted_file_write = self
+            .actions
+            .iter()
+            .any(|action| action.tool_name == "file_write");
+        let applied_file_write = self.actions.iter().any(|action| {
+            action.tool_name == "file_write"
+                && action.status == ActionStatus::Success
+                && (!action.files_created.is_empty() || !action.files_modified.is_empty())
+        });
+        attempted_file_write && !applied_file_write
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn skipped_file_write_requires_post_write_verification() {
+        let mut tracker = ActionTracker::new("iri://task/test", "Do");
+        tracker.record(
+            "file_write",
+            &json!({"path": "output.txt", "content": "unchanged"}),
+            &json!({"error": "Write skipped: file already contains the requested content"}),
+            0.01,
+        );
+
+        assert!(tracker.requires_post_write_verification());
+    }
+
+    #[test]
+    fn effectful_file_write_does_not_require_retry_verification() {
+        let mut tracker = ActionTracker::new("iri://task/test", "Do");
+        tracker.record(
+            "file_write",
+            &json!({"path": "output.txt", "content": "changed"}),
+            &json!({"success": true, "effect_applied": true}),
+            0.01,
+        );
+
+        assert!(!tracker.requires_post_write_verification());
     }
 }
