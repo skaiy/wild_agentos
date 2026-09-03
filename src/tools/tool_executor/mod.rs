@@ -1228,20 +1228,26 @@ impl ToolExecutor {
 
     /// Execute a tool behind the SkillGraph security gate.
     ///
-    /// Adds two checks on top of `execute`: the caller-supplied allowlist and
-    /// the graph-backed `SecurityEngine` decision for the resolved skill IRI.
+    /// Adds two checks on top of `execute`: the schemas advertised for this
+    /// model turn and the graph-backed `SecurityEngine` decision for the resolved skill IRI.
+    ///
+    /// The advertised set is an execution boundary, not a plan preference:
+    /// callers must capture it from the exact schema payload sent to the model.
+    /// In particular, a PDCA step's `tools_allowed` metadata must not be used
+    /// as a substitute for this per-turn boundary.
     /// A tool without a resolvable skill fails closed.
     pub async fn execute_with_security_context(
         &self,
         name: &str,
         input: Value,
         context: SecurityContext,
-        allowed_tools: Option<&[String]>,
+        advertised_tools: &[String],
     ) -> Result<Value, String> {
-        if let Some(allowed) = allowed_tools {
-            if !allowed.iter().any(|t| t == name) {
-                return Ok(json!({"error": format!("Tool not allowed: {}", name), "tool": name}));
-            }
+        if !advertised_tools.iter().any(|tool| tool == name) {
+            return Ok(json!({
+                "error": format!("Tool not advertised for this turn: {}", name),
+                "tool": name,
+            }));
         }
 
         let security_engine = { self.security_engine.read().clone() };

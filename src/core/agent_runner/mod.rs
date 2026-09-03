@@ -102,7 +102,8 @@ pub struct TaskContext {
     /// Summary of workspace file inventory (set by CodeCliEngine before passing to SA).
     /// Used by SA to decide verification-first routing when workspace has existing files.
     pub workspace_file_summary: Option<String>,
-    /// Per-step tool allowlist from the plan. None = no step-level restriction.
+    /// Per-step tool preferences from the plan. This is planning metadata only;
+    /// execution is constrained by the tool schemas advertised for each turn.
     pub allowed_tools: Option<Vec<String>>,
     /// Verified scope required before another agent may receive this task's
     /// blackboard context in its prompt.
@@ -144,8 +145,8 @@ impl TaskContext {
         }
     }
 
-    /// Restrict this step to the planned tool set. An empty list means the
-    /// plan expressed no restriction, so the allowlist stays disabled.
+    /// Record the planned tool preferences. An empty list means the plan did
+    /// not specify preferences; this never restricts runtime execution.
     pub fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
         self.allowed_tools = if tools.is_empty() { None } else { Some(tools) };
         self

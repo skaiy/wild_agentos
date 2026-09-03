@@ -774,27 +774,24 @@ impl super::AgentRunner {
                 guard_pending_pre_injections.clear();
             }
 
+            // The schema payload is the authoritative executable set for this
+            // turn. Keep its names for tool-call validation after the response.
+            let current_tools = self
+                .tool_executor
+                .read()
+                .tool_definitions_for_role(&agent.role.to_string());
+            let advertised_tools: Vec<String> = current_tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect();
+            let tools = if current_tools.is_empty() {
+                None
+            } else {
+                Some(current_tools)
+            };
             let mut stream = match self
                 .gateway
-                .stream_chat_with_params(
-                    &model,
-                    running_messages.clone(),
-                    None,
-                    None,
-                    {
-                        // Refresh the tools list before each call to include newly registered micro-tools
-                        let current_tools = self
-                            .tool_executor
-                            .read()
-                            .tool_definitions_for_role(&agent.role.to_string());
-                        if current_tools.is_empty() {
-                            None
-                        } else {
-                            Some(current_tools)
-                        }
-                    },
-                    None,
-                )
+                .stream_chat_with_params(&model, running_messages.clone(), None, None, tools, None)
                 .await
             {
                 Ok(s) => s,
@@ -942,7 +939,7 @@ impl super::AgentRunner {
                                         &agent.role.to_string(),
                                     )
                                     .with_task(&ctx.task_iri),
-                                    ctx.allowed_tools.as_deref(),
+                                    &advertised_tools,
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));
