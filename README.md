@@ -100,9 +100,9 @@ Standard **Model Context Protocol** connects GitHub, Slack, Jira, and any MCP-co
 
 #### Third-party MCP disclosure
 
-An MCP server is a third party. It receives the JSON-RPC requests Wild Code sends to it, including the selected tool name and arguments, and returns its tool results to the Agent. Only connect servers you trust with the task data you choose to send.
+An MCP server is a third party. It receives the JSON-RPC requests Wild AgentOS sends to it, including the selected tool name and arguments, and returns its tool results to the Agent. Only connect servers you trust with the task data you choose to send.
 
-For `--mcp-server-stdio`, Wild Code starts the server as a child process. That process inherits the Agent process environment, with any server-specific environment variables overlaid. Environment sanitization is tracked in [#26](https://github.com/skaiy/wild_agentos/issues/26) (implementation [#37](https://github.com/skaiy/wild_agentos/pull/37)); until that protection is applied to stdio MCP launches, do not put secrets in the Agent environment when starting a third-party server.
+For `--mcp-server-stdio`, Wild AgentOS starts the server as a child process. That process inherits the Agent process environment, with any server-specific environment variables overlaid. Environment sanitization is tracked in [#26](https://github.com/skaiy/wild_agentos/issues/26) (implementation [#37](https://github.com/skaiy/wild_agentos/pull/37)); until that protection is applied to stdio MCP launches, do not put secrets in the Agent environment when starting a third-party server.
 
 MCP failures are fail-loud: a failed connection is reported as `status=error:...`, clears any discovered tools, and returns an error to the caller. Failed tool calls are also returned as errors—they are not skipped and never replaced with a `simulated` result.
 
