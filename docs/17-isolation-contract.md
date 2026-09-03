@@ -4,7 +4,7 @@
 It is not an identity provider (IdP), an OIDC or Keycloak integration, a
 17-state IAM workflow, or a storage migration.
 
-This document describes the state of `main` as of 2026-09-03. It distinguishes
+This document describes the state of `main` as of 2026-09-04. It distinguishes
 the storage paths that are wired today from historical paths that remain live.
 Do not treat a minted name as proof that existing data has moved to it.
 
