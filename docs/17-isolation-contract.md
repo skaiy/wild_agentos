@@ -25,6 +25,9 @@ parse JSON bodies, inspect headers, or validate credentials.
 verified by the current HTTP boundary do create claims; that boundary currently
 validates HS256 JWTs using `AGENTOS_JWT_SECRET`, not OIDC or Keycloak. Unverified
 requests have no claims and cannot use the claims-scoped graph or blob paths.
+The current JWT shape has no `project_id` claim, so verified JWT identities mint
+the project as `default`; optional JWT `project_id` with a default fallback is
+not on `main` yet.
 
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
@@ -70,16 +73,11 @@ process-local counter, not a billing ledger.
 New production graph writes use `IsolationClaims::from_verified` and
 `graph_iri()` to target `graph://{tenant}/{project}`. Production compatibility
 write, query, entity-search, neighbour, and delete APIs reject calls without
-verified claims; they do not silently read or write `graph:world`. Graph queries
-remain SPARQL 1.1 against Oxigraph.
-
-The HTTP knowledge-base graph import and stats handlers have not yet been
-converted to the claims-scoped graph interface. Import selects the graph stored
-in the knowledge-base record, and its `clear_before` branch updates that graph
-directly; its legacy write call then fails in production because it has no
-claims. Stats likewise calls the legacy query shim and returns a null triple
-count when that call is rejected. Do not describe either handler as
-claims-scoped or assume it migrates `graph:world`.
+verified claims; they do not silently read or write `graph:world`. The HTTP
+knowledge-base graph import and stats handlers now require JWT-verified claims
+and use that claims-scoped graph. Requests without claims receive `401`; neither
+handler migrates or reads through `graph:world`. Graph queries remain SPARQL 1.1
+against Oxigraph.
 
 ### Blob
 
@@ -97,17 +95,21 @@ prefix.
 
 Claims-scoped vector upsert, search, and delete use the namespace minted by
 `vector_namespace()` (`vector://{tenant}/{project}`); it scopes both the stored
-IRI and the JSON-LD named-graph metadata. Production unscoped upsert, search,
-filtered search, hybrid search, and delete APIs fail closed because they lack
-verified claims. Historical `tenant:<id>` rows have not been migrated and are
-not returned by claims-scoped search.
+IRI and the JSON-LD named-graph metadata. HTTP knowledge-base vector ingest,
+search, upload, and reindex now require JWT-verified claims and use this
+namespace; requests without claims receive `401`. Production unscoped upsert,
+search, filtered search, hybrid search, and delete APIs fail closed because they
+lack verified claims. Historical `tenant:<id>` rows have not been migrated and
+are not returned by claims-scoped search.
 
 ### L0
 
 `L0Store::open_for_claims` creates and writes only the tenant directory minted
 from `l0_path()` under its supplied L0 root (the `/data/l0/{tenant}` contract).
-In production, `L0Store::new` opens the historical shared database read-only;
-writes through it fail closed. The historical
+Production HTTP task execution opens `open_for_claims` when JWT-verified claims
+are present, so PDCA persistence uses that tenant directory. Without claims it
+keeps the startup L0 store, which `L0Store::new` opened read-only; writes through
+that historical shared database fail closed. The historical
 `./data/l0_store/l0.redb` database has not been migrated.
 
 ## Graph interface
