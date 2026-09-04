@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dev_only_x_identity_simulation_is_explicitly_tagged() {
+    async fn isolation_contract_x_identity_never_creates_isolation_claims() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var_os("AGENTOS_AUTH_STRICT");
         std::env::remove_var("AGENTOS_AUTH_STRICT");
@@ -276,6 +276,10 @@ mod tests {
             .unwrap();
         assert_eq!(identity.auth_method, AuthMethod::Base64Header);
         assert_eq!(identity.tenant_id, "dev-tenant");
+        assert!(
+            identity.isolation_claims().is_none(),
+            "X-Identity is a development simulation, not a trusted claims source"
+        );
         restore_strict_mode(previous);
     }
 

@@ -1082,7 +1082,7 @@ mod ontology_crud_tests {
 
     /// 阶段1 CRUD：新建对象 → GET 可见 → 删除被引用返回 409 → 删链接后可删对象。
     #[tokio::test]
-    async fn test_ontology_object_link_crud() {
+    async fn isolation_contract_ontology_write_requires_jwt_and_uses_claims_scope() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("agentos_ontcrud_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1402,7 +1402,7 @@ mod ontology_crud_tests {
     }
 
     #[tokio::test]
-    async fn tenant_a_invoke_writes_are_invisible_to_tenant_b() {
+    async fn isolation_contract_ontology_actions_are_invisible_cross_tenant() {
         let tmp = std::env::temp_dir().join(format!("agentos_ontinvoke_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let state = make_state(&tmp);

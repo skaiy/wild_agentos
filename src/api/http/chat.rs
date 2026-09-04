@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claims_scoped_chat_retrieval_isolates_tenants_and_ignores_legacy_targets() {
+    async fn isolation_contract_chat_retrieval_isolates_tenants_and_ignores_client_targets() {
         let state = make_state();
         let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
         let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
@@ -1185,7 +1185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claims_scoped_chat_rejects_an_agent_owned_by_another_tenant() {
+    async fn isolation_contract_chat_rejects_cross_tenant_agent_access() {
         let state = make_state();
         let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
 
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_api_key_chat_context_performs_no_tenant_rag() {
+    async fn isolation_contract_public_api_key_chat_performs_no_tenant_rag() {
         let state = make_state();
         let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
         insert_fault(&state.kg_store, &tenant_a, "P0A80");
@@ -1211,7 +1211,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_without_verified_identity_returns_unauthorized_not_empty_rag_success() {
+    async fn isolation_contract_chat_without_verified_identity_returns_unauthorized_not_empty_success(
+    ) {
         let state = make_state();
         let router = Router::new()
             .route("/api/v1/agents/:id/chat", post(agent_chat_handler))
