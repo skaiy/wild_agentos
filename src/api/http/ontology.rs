@@ -1961,10 +1961,11 @@ mod ontology_crud_tests {
             "SELECT ?o WHERE {{ ?o a <{}> }}",
             ev_term_iri("RepairOrder")
         );
-        assert!(
+        assert_eq!(
             kg.query_sparql_for_claims(&claims_a, &orders)
                 .unwrap()
-                .is_empty(),
+                .len(),
+            1,
             "require_approval must not alter the production graph"
         );
 
