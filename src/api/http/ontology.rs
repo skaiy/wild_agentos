@@ -2141,7 +2141,10 @@ mod ontology_action_tests {
         )
         .unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(err.2.iter().any(|violation| violation.starts_with("predicate_whitelist:")));
+        assert!(err
+            .2
+            .iter()
+            .any(|violation| violation.starts_with("predicate_whitelist:")));
     }
 
     #[test]

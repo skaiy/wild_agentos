@@ -127,15 +127,20 @@ pub fn violations(
         ));
     }
 
-    let filters = policy
-        .allowed_predicate_prefixes
-        .iter()
-        .map(|prefix| format!("STRSTARTS(STR(?p), \"{}\")", sparql_literal(prefix)))
-        .collect::<Vec<_>>();
-    let foreign_q = format!(
-        "SELECT ?p WHERE {{ ?s ?p ?o . FILTER(!({})) }} LIMIT 1",
-        filters.join(" || ")
-    );
+    let foreign_q = if policy.allowed_predicate_prefixes.is_empty() {
+        // An explicit empty allowlist is the strictest policy: no predicate may be written.
+        "SELECT ?p WHERE { ?s ?p ?o } LIMIT 1".to_string()
+    } else {
+        let filters = policy
+            .allowed_predicate_prefixes
+            .iter()
+            .map(|prefix| format!("STRSTARTS(STR(?p), \"{}\")", sparql_literal(prefix)))
+            .collect::<Vec<_>>();
+        format!(
+            "SELECT ?p WHERE {{ ?s ?p ?o . FILTER(!({})) }} LIMIT 1",
+            filters.join(" || ")
+        )
+    };
     if !kg
         .query_staging_for_claims(claims, staging_id, &foreign_q)?
         .is_empty()
