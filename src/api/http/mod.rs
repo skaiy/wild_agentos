@@ -65,7 +65,8 @@ use kb::{
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
 use ontology::{
     approve_action_approval_handler, delete_action_type_handler, delete_function_def_handler,
-    delete_object_type_handler, domain_guardrails_handler, invoke_action_handler,
+    delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
+    invoke_action_handler,
     list_action_approvals_handler, ontology_types_handler, reject_action_approval_handler,
     update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
     update_link_type_handler, update_object_type_handler, upsert_action_type_handler,
