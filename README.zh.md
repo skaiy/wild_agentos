@@ -24,13 +24,13 @@
 
 ## 🎉 版本发布历史与说明
 
-欢迎查阅 **Wild AgentOS** 的版本演进历史。平台提供生产级安全网关、部分租户范围的存储接线，以及先进的智能体认知操作系统内核。当前隔离边界和未迁移的历史键请参阅 [隔离契约](docs/17-isolation-contract.md)。
+欢迎查阅 **Wild AgentOS** 的版本演进历史。平台提供生产级安全网关、部分租户范围的存储接线，以及先进的智能体认知操作系统内核。当前隔离边界和未迁移的历史键请参阅 [隔离契约](docs/17-isolation-contract.zh.md)。
 
 | 版本 | 发布日期 | 核心升级与融合特性 |
 |------|----------|-------------------|
 | **v0.1.8** | **2026-09-04** | **本体 Action 人工审批闭环（HITL）**<br>• 新增可配置 `commit_strategy`：Action 可自动提交或保留待审批，并提供 merge/discard API 与 TTL 到期处理。<br>• 新增可配置护栏、SPARQL `ASK` 断言和用于审批敏感操作的 `high_risk` hook。<br>• 通过事件总线发布 committed、pending、approved、rejected、violated 等结果的 `ACTION_AUDIT` 事件；详见[本体 Action 数据沙箱](docs/15-ontology-action-sandbox.md)。 |
 | **v0.1.7** | **2026-09-04** | **隔离证明与评测**<br>• 新增只读 `isolation-diagnose` CLI、面向客户的[隔离矩阵](docs/17-isolation-matrix.md)，以及 fail-closed `isolation_contract` CI 覆盖。<br>• 新增可选且显式的 `isolation-migrate`；绝不静默使用 `UNION`，也不宣称历史键已迁移。 |
-| **v0.1.6** | **2026-09-04** | **隔离与加固**<br>• 经验证 JWT 租户/项目声明现在负责铸造图、Blob、向量和 L0 目标；HTTP KG、本体、知识库、chat RAG 以及运行时图/向量工具均按声明隔离，缺少声明时拒绝访问。<br>• 新建用户 Agent 会写入经验证范围；公共 API Key chat 明确不使用租户 RAG。<br>• 新增可选 `AGENTOS_TENANT_TOOL_CALL_CAP`、MCP 行为披露、bash 子进程环境清理、工具 schema 强制校验和 PDCA L0 envelope。<br>• 详见[隔离契约](docs/17-isolation-contract.md)；历史键未迁移。 |
+| **v0.1.6** | **2026-09-04** | **隔离与加固**<br>• 经验证 JWT 租户/项目声明现在负责铸造图、Blob、向量和 L0 目标；HTTP KG、本体、知识库、chat RAG 以及运行时图/向量工具均按声明隔离，缺少声明时拒绝访问。<br>• 新建用户 Agent 会写入经验证范围；公共 API Key chat 明确不使用租户 RAG。<br>• 新增可选 `AGENTOS_TENANT_TOOL_CALL_CAP`、MCP 行为披露、bash 子进程环境清理、工具 schema 强制校验和 PDCA L0 envelope。<br>• 详见[隔离契约](docs/17-isolation-contract.zh.md)；历史键未迁移。 |
 | **v0.1.5** | **2026-08-18** | **认知因果引擎与图治理升级**<br>• **Causal Engine 因果引擎**：新增独立因果分析子系统 `CausalEngine`、`FusionEngine`、`CausalStore` 和类型化的 `CausalFactor`。支持智能体运行的因果推理与多因素融合分析，用于根因识别、故障链传播以及决策因果图谱构建。<br>• **统一图存储后端 (Unified Graph)**：将原零散图读写接口收敛为单一、高性能的 `GraphBackend`。<br>• **图特征计算与相似度**：支持对认知快照进行度中心性、PageRank 等图特征向量计算，并比对计算认知相似度。<br>• **快照时间线 (Snapshot Timeline)**：会话级定点历史恢复与基于 diff 的版本差异回滚。<br>• **技能中心 CRUD 与系统守卫**：支持应用级（`skill://`）技能的新建、详情解析（含 Input/Output Schema）、编辑与删除；对系统级（`iri://`）内置技能执行严格的 **403 只读保护**。 |
 | **v0.1.4** | **2026-07-06** | **统一模型注册中心与向量热桥接**<br>• **三合一收敛**：原「大模型网关」「向量/Embedding」「模型资源」Tab 合并收敛为单一的**模型注册中心**，实现统一管理。<br>• **自动拉取型号**：支持调用外部 `/v1/models` 并根据名称关键词自动对文本、VL、向量等型号进行模态预判。<br>• **向量服务热桥接**：在模型页面直接将型号「设为生效向量」，实现免重启热切换向量库并自动后台重建索引。 |
 | **v0.1.3** | **2026-07-06** | **多模态 (VL) 支持与 Agent 多模型能力挂载**<br>• **多模态智能网关**：支持对 `ChatContent` 中包含的文本与图片（Base64/URL）进行解析，自动路由至多模态大模型。<br>• **能力槽多模型挂载**：支持在 Agent 中挂载不同的型号到对应的功能槽（例如 chat 槽挂载 DeepSeek，vision 槽挂载 Gemini）。 |
@@ -202,7 +202,7 @@ cargo build -p wild-code-cli --release
 
 ## 🗺️ 路线图
 
-Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，结合 Oxigraph RDF/SPARQL、Hyperspace、`IsolationClaims` 命名契约和本体 Action 的**数据**沙箱。它不是裸机微内核 OS，也不是完整 Palantir 克隆；不以 Nebula/Cypher 替换 Oxigraph，不混合 AIDVP 产品仓库，且 mint 名称不等于迁移历史数据。详见[演进路线图](docs/18-evolution-roadmap.md)和[隔离契约](docs/17-isolation-contract.md)。
+Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，结合 Oxigraph RDF/SPARQL、Hyperspace、`IsolationClaims` 命名契约和本体 Action 的**数据**沙箱。它不是裸机微内核 OS，也不是完整 Palantir 克隆；不以 Nebula/Cypher 替换 Oxigraph，不混合其他业务/产品仓库或产品边界到本开源树，且 mint 名称不等于迁移历史数据。详见[演进路线图](docs/18-evolution-roadmap.zh.md)和[隔离契约](docs/17-isolation-contract.zh.md)。
 
 - **v0.1.6 — 已完成：** JWT `IsolationClaims` 为 graph/blob/vector/L0 mint 目标；相关 HTTP 路径 fail closed；历史键尚未迁移。
 - **v0.1.7 — 已完成：** 区分 minted 与历史键的只读诊断 CLI、客户可读隔离矩阵、fail-closed 黄金 CI，以及禁止静默 `UNION` 的可选显式迁移。
@@ -231,11 +231,11 @@ Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，�
 ## 📚 文档
 
 - **记忆系统** → [`docs/03-memory-system.md`](docs/03-memory-system.md)（L0 redb · HyperspaceEngine · Oxigraph SPARQL）
-- **知识摄取与 import-graph** → [`docs/16-knowledge-ingest-import-graph.md`](docs/16-knowledge-ingest-import-graph.md)（upload / ingest / 命名图隔离 · embedding 可换 · Oxigraph/hyperspace 固定）
-- **隔离契约** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md)（可信 claims、命名与未迁移历史键）
-- **隔离矩阵** → [`docs/17-isolation-matrix.md`](docs/17-isolation-matrix.md)（CI 验证的 fail-closed 行为；历史键尚未迁移）
-- **演进路线图** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md)（v0.1.6 后战略与明确非目标）
-- **本体 Action 数据沙箱** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md)（staging graph 护栏，不是计算沙箱）
+- **知识摄取与 import-graph** → [`docs/16-knowledge-ingest-import-graph.zh.md`](docs/16-knowledge-ingest-import-graph.zh.md)（upload / ingest / 命名图隔离 · embedding 可换 · Oxigraph/hyperspace 固定）
+- **隔离契约** → [`docs/17-isolation-contract.zh.md`](docs/17-isolation-contract.zh.md)（可信 claims、命名与未迁移历史键）
+- **隔离矩阵** → [`docs/17-isolation-matrix.zh.md`](docs/17-isolation-matrix.zh.md)（CI 验证的 fail-closed 行为；历史键尚未迁移）
+- **演进路线图** → [`docs/18-evolution-roadmap.zh.md`](docs/18-evolution-roadmap.zh.md)（v0.1.6 后战略与明确非目标）
+- **本体 Action 数据沙箱** → [`docs/15-ontology-action-sandbox.zh.md`](docs/15-ontology-action-sandbox.zh.md)（staging graph 护栏，不是计算沙箱）
 - **设计细节** → [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) · [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) (English)
 - **核心设计理念** → [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) · [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) (English)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
