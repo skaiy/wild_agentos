@@ -118,6 +118,12 @@ inventory for a future migration issue (such as #84), **not** a migration
 tool: a positive minted result does not prove migration or complete
 multi-tenant isolation.
 
+The filesystem diagnostic does not make an HTTP request. API-key chat's
+no-tenant-RAG invariant is instead covered by
+`public_api_key_chat_context_performs_no_tenant_rag` in
+`src/api/http/chat.rs`: public API-key requests have no claims and must
+retrieve neither tenant graph nor tenant vectors.
+
 ## Current wiring
 
 ### Spend gate
