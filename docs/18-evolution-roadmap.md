@@ -18,23 +18,23 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 经验证的 JWT `IsolationClaims` 已为 graph、blob、vector 与 L0 mint 目标；HTTP 路径在缺少 claims 时 fail closed。历史键没有迁移。详见 [17. Isolation Contract](17-isolation-contract.md)。
 
-### [v0.1.7 Isolation Proof & Eval](https://github.com/skaiy/wild_agentos/milestone/1)
+### v0.1.7 — 已完成：Isolation Proof & Eval
 
-建立可审计的隔离证明包：
+已交付可审计的隔离证明包：
 
-- Isolation diagnose CLI，区分 claims-minted 目标与历史键；
-- 面向客户的隔离矩阵，以及 fail-closed golden case 纳入 CI；
-- 可选的历史键迁移工具；默认只诊断，绝不静默 `UNION` 或把 mint 表述为迁移。
+- 只读 `isolation-diagnose` CLI，区分 claims-minted 目标与历史键；
+- 面向客户的[隔离矩阵](17-isolation-matrix.md)，以及纳入 CI 的 fail-closed `isolation_contract` golden case；
+- 可选、显式的 `isolation-migrate` 历史键迁移工具；默认只诊断，绝不静默 `UNION` 或把 mint 表述为迁移。
 
 对应工作项：[R17 诊断 CLI](https://github.com/skaiy/wild_agentos/issues/82)、[CI 与隔离矩阵](https://github.com/skaiy/wild_agentos/issues/83)、[可选迁移](https://github.com/skaiy/wild_agentos/issues/84)。
 
-### [v0.1.8 Ontology Action HITL](https://github.com/skaiy/wild_agentos/milestone/2)
+### v0.1.8 — 已完成：Ontology Action HITL
 
-把已有本体 Action 数据沙箱扩展为人工审批闭环：
+已把本体 Action 数据沙箱扩展为人工审批闭环：
 
-- 保留 staging graph，供审批后 merge 或 discard；
-- 护栏可配置，并支持 SPARQL 断言集；
-- 审批和提交通过事件总线审计。
+- 可通过 `commit_strategy` 保留 staging graph，供审批后 merge 或 discard，并支持 TTL 到期；
+- 可配置护栏，并支持 SPARQL `ASK` 断言集与 `high_risk` hook；
+- 通过 EventBus 发布 committed、pending、approved、rejected、violated 结果的 `ACTION_AUDIT` 审计事件。
 
 这仍是数据沙箱，不承诺任意代码执行沙箱；当前实现边界见 [15. 本体动作执行沙箱](15-ontology-action-sandbox.md)。对应工作项：[HITL](https://github.com/skaiy/wild_agentos/issues/85)、[护栏与断言](https://github.com/skaiy/wild_agentos/issues/86)、[事件审计](https://github.com/skaiy/wild_agentos/issues/87)。
 
