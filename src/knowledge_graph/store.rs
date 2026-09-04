@@ -663,18 +663,21 @@ impl KnowledgeGraphStore {
     /// 等尾部求解修饰符保留在 GRAPH 包装之外，避免拼出非法语法。
     fn wrap_in_named_graph(sparql: &str, g: &str) -> String {
         let upper = sparql.to_uppercase();
-        let where_pos = match upper.find("WHERE") {
-            Some(p) => p,
-            None => return format!("SELECT * WHERE {{ GRAPH {} {{ {} }} }}", g, sparql),
+        // SELECT normally has WHERE; ASK may omit it (`ASK { ... }`). Preserve the
+        // query form in both cases instead of turning an ASK into invalid SELECT text.
+        let open_abs = match upper.find("WHERE") {
+            Some(where_pos) => {
+                let after_where = &sparql[where_pos + 5..];
+                match after_where.find('{') {
+                    Some(open_rel) => where_pos + 5 + open_rel,
+                    None => return sparql.to_string(),
+                }
+            }
+            None => match sparql.find('{') {
+                Some(open_pos) => open_pos,
+                None => return sparql.to_string(),
+            },
         };
-
-        // 定位 WHERE 后的第一个 '{'
-        let after_where = &sparql[where_pos + 5..];
-        let open_rel = match after_where.find('{') {
-            Some(p) => p,
-            None => return sparql.to_string(),
-        };
-        let open_abs = where_pos + 5 + open_rel;
 
         // 大括号配对，找到与之匹配的 '}'
         let bytes = sparql.as_bytes();
@@ -1410,6 +1413,18 @@ mod tests {
             legacy_results.count(),
             1,
             "legacy graph:world remains intact"
+        );
+    }
+
+    #[test]
+    fn claims_scoped_ask_query_keeps_ask_form() {
+        let query = KnowledgeGraphStore::wrap_in_named_graph(
+            "ASK { ?s ?p ?o }",
+            "<graph://tenant-a/project-a/staging/test>",
+        );
+        assert_eq!(
+            query,
+            "ASK { GRAPH <graph://tenant-a/project-a/staging/test> { ?s ?p ?o } }"
         );
     }
 }
