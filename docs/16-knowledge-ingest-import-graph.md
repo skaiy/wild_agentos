@@ -224,7 +224,7 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/import-graph" \
 | `nodes` | array | 必填；`id` / `node_type` / `label`，可选 `description` / `properties` |
 | `edges` | array | 默认 `[]`；`source` / `target` / `relation`，可选 `properties` |
 | `graph` | string | 可兼容传入但被忽略；服务端使用 claims-minted 图 |
-| `clear_before` | bool | 默认 **true**：写入前清空该图 |
+| `clear_before` | bool | 默认 **true**：写入前清空 claims-minted 图 |
 
 节点映射要点（与 `07-knowledge-graph.md` 一致）：
 
