@@ -63,8 +63,9 @@ use kb::{
 };
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
 use ontology::{
-    delete_action_type_handler, delete_function_def_handler, delete_link_type_handler,
-    delete_object_type_handler, invoke_action_handler, ontology_types_handler,
+    approve_action_approval_handler, delete_action_type_handler, delete_function_def_handler,
+    delete_link_type_handler, delete_object_type_handler, invoke_action_handler,
+    list_action_approvals_handler, ontology_types_handler, reject_action_approval_handler,
     update_action_type_handler, update_function_def_handler, update_link_type_handler,
     update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
     upsert_link_type_handler, upsert_object_type_handler,
@@ -355,6 +356,22 @@ pub fn build_router(
         .route(
             "/api/v1/ontology/actions/:id/invoke",
             post(invoke_action_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals",
+            get(list_action_approvals_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals/:approval_id/approve",
+            post(approve_action_approval_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals/:approval_id/reject",
+            post(reject_action_approval_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals/:approval_id/discard",
+            post(reject_action_approval_handler),
         )
         // ── 知识库分类管理 CRUD ──
         .route(

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::{
     isolation::IsolationClaims,
-    knowledge_graph::store::{ClaimsGraphUpdate, KnowledgeGraphStore},
+    knowledge_graph::store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval},
 };
 
 use super::{iam::UserIdentity, AppState};
@@ -497,6 +497,18 @@ pub(crate) struct ActionInvokeRequest {
     /// 仅校验并返回将执行的 SPARQL，不真正写回。
     #[serde(default)]
     pub dry_run: bool,
+    /// `auto` commits immediately unless a future guardrail marks the action
+    /// high-risk. `require_approval` preserves the staging graph for HITL.
+    #[serde(default)]
+    pub commit_strategy: ActionCommitStrategy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActionCommitStrategy {
+    #[default]
+    Auto,
+    RequireApproval,
 }
 
 /// POST /api/v1/ontology/actions/:id/invoke — 动力层执行器
@@ -526,12 +538,20 @@ const SANDBOX_ALLOWED_PRED_PREFIXES: &[&str] = &[
 ];
 
 /// 护栏后校验：对影子图跑 ASK，返回违规项列表（空=通过）。
+#[derive(Debug, Default)]
+struct SandboxGuardrailReport {
+    violations: Vec<String>,
+    /// Extension point for configurable guardrails (#86): a rule may require
+    /// HITL without making the staged data invalid.
+    high_risk: bool,
+}
+
 fn sandbox_guardrail_violations(
     kg: &KnowledgeGraphStore,
     claims: &IsolationClaims,
     staging_id: &str,
-) -> Result<Vec<String>, String> {
-    let mut violations = Vec::new();
+) -> Result<SandboxGuardrailReport, String> {
+    let mut report = SandboxGuardrailReport::default();
 
     // 护栏1：三元组数上限。
     let count_q = format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s ?p ?o }}");
@@ -543,7 +563,7 @@ fn sandbox_guardrail_violations(
         .and_then(|s| s.parse::<usize>().ok())
         .ok_or_else(|| "护栏三元组计数查询返回无效结果".to_string())?;
     if n > SANDBOX_MAX_TRIPLES {
-        violations.push(format!(
+        report.violations.push(format!(
             "写回三元组数 {} 超过上限 {}",
             n, SANDBOX_MAX_TRIPLES
         ));
@@ -562,19 +582,31 @@ fn sandbox_guardrail_violations(
         .query_staging_for_claims(claims, staging_id, &foreign_q)?
         .is_empty();
     if has_foreign {
-        violations.push("存在越权谓词（不在允许的命名空间白名单内）".to_string());
+        report
+            .violations
+            .push("存在越权谓词（不在允许的命名空间白名单内）".to_string());
     }
 
-    Ok(violations)
+    Ok(report)
 }
 
-/// 经影子图提交一批写回语句：写影子图 → 护栏 → 提交/回滚。
-/// 返回 Ok(护栏报告 JSON) 表示已提交；Err((状态码, 消息, 违规列表)) 表示回滚。
+const ACTION_APPROVAL_TTL_HOURS: i64 = 24;
+
+#[derive(Debug)]
+enum StagingCommitOutcome {
+    Committed(Value),
+    Pending(PendingActionApproval),
+}
+
+/// 经影子图提交一批写回语句。默认自动合并；HITL 策略或未来高风险规则会保留影子图。
 fn commit_via_staging(
     kg: &KnowledgeGraphStore,
     claims: &IsolationClaims,
     statements: &[ClaimsGraphUpdate],
-) -> Result<Value, (StatusCode, String, Vec<String>)> {
+    strategy: ActionCommitStrategy,
+    action_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<StagingCommitOutcome, (StatusCode, String, Vec<String>)> {
     let staging_id = uuid::Uuid::new_v4().simple().to_string();
     let staging = kg
         .staging_graph_iri_for_claims(claims, &staging_id)
@@ -593,8 +625,8 @@ fn commit_via_staging(
     }
 
     // 2. 护栏后校验。违规即回滚（DROP 影子图），生产图不受影响。
-    let violations = match sandbox_guardrail_violations(kg, claims, &staging_id) {
-        Ok(violations) => violations,
+    let guardrails = match sandbox_guardrail_violations(kg, claims, &staging_id) {
+        Ok(report) => report,
         Err(e) => {
             let _ = kg.drop_staging_for_claims(claims, &staging_id);
             return Err((
@@ -604,16 +636,36 @@ fn commit_via_staging(
             ));
         }
     };
-    if !violations.is_empty() {
+    if !guardrails.violations.is_empty() {
         let _ = kg.drop_staging_for_claims(claims, &staging_id);
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "护栏校验未通过，已回滚（生产图未改动）".to_string(),
-            violations,
+            guardrails.violations,
         ));
     }
 
-    // 3. 提交：合并影子图到生产图，再删除影子图。
+    if strategy == ActionCommitStrategy::RequireApproval || guardrails.high_risk {
+        let approval = PendingActionApproval {
+            approval_id: staging_id.clone(),
+            staging_id,
+            staging_graph: staging,
+            action_id: action_id.to_string(),
+            created_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS)).to_rfc3339(),
+        };
+        if let Err(e) = kg.create_action_approval_for_claims(claims, &approval) {
+            let _ = kg.drop_staging_for_claims(claims, &approval.staging_id);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("审批记录创建失败，已回滚: {e}"),
+                vec![],
+            ));
+        }
+        return Ok(StagingCommitOutcome::Pending(approval));
+    }
+
+    // 自动提交：合并影子图到生产图，再删除影子图。
     if let Err(e) = kg.commit_staging_for_claims(claims, &staging_id) {
         let _ = kg.drop_staging_for_claims(claims, &staging_id);
         return Err((
@@ -624,11 +676,172 @@ fn commit_via_staging(
     }
     let _ = kg.drop_staging_for_claims(claims, &staging_id);
 
-    Ok(json!({
+    Ok(StagingCommitOutcome::Committed(json!({
         "sandbox": "staging_graph",
         "staging_graph": staging,
         "guardrails_passed": true,
-    }))
+    })))
+}
+
+fn approval_is_expired(approval: &PendingActionApproval) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&approval.expires_at)
+        .map(|expires_at| expires_at <= chrono::Utc::now())
+        .unwrap_or(true)
+}
+
+fn cleanup_action_approval(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    approval: &PendingActionApproval,
+) {
+    let _ = kg.drop_staging_for_claims(claims, &approval.staging_id);
+    let _ = kg.delete_action_approval_for_claims(claims, &approval.approval_id);
+}
+
+/// GET /api/v1/ontology/action-approvals — pending approvals in the caller's
+/// verified tenant/project scope. Expired approvals are lazily discarded.
+pub(crate) async fn list_action_approvals_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let approvals = match kg.list_action_approvals_for_claims(claims) {
+        Ok(approvals) => approvals,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let active: Vec<_> = approvals
+        .into_iter()
+        .filter(|approval| {
+            if approval_is_expired(approval) {
+                cleanup_action_approval(&kg, claims, approval);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let _ = state.kg_store.flush();
+    (StatusCode::OK, Json(json!({ "approvals": active }))).into_response()
+}
+
+/// POST /api/v1/ontology/action-approvals/:approval_id/approve
+pub(crate) async fn approve_action_approval_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(approval_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    resolve_action_approval(&state, identity, approval_id, true).await
+}
+
+/// POST /api/v1/ontology/action-approvals/:approval_id/reject
+pub(crate) async fn reject_action_approval_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(approval_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    resolve_action_approval(&state, identity, approval_id, false).await
+}
+
+async fn resolve_action_approval(
+    state: &Arc<AppState>,
+    identity: UserIdentity,
+    approval_id: String,
+    approve: bool,
+) -> axum::response::Response {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let approval = match kg.list_action_approvals_for_claims(claims) {
+        Ok(approvals) => approvals
+            .into_iter()
+            .find(|approval| approval.approval_id == approval_id),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let Some(approval) = approval else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "approval not found", "approval_id": approval_id })),
+        )
+            .into_response();
+    };
+    if approval_is_expired(&approval) {
+        cleanup_action_approval(&kg, claims, &approval);
+        let _ = state.kg_store.flush();
+        return (
+            StatusCode::GONE,
+            Json(json!({ "error": "approval expired", "approval_id": approval_id })),
+        )
+            .into_response();
+    }
+    if approve {
+        if let Err(e) = kg.commit_staging_for_claims(claims, &approval.staging_id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("approval merge failed: {e}") })),
+            )
+                .into_response();
+        }
+    }
+    if let Err(e) = kg.drop_staging_for_claims(claims, &approval.staging_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("approval staging cleanup failed: {e}") })),
+        )
+            .into_response();
+    }
+    if let Err(e) = kg.delete_action_approval_for_claims(claims, &approval.approval_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("approval metadata cleanup failed: {e}") })),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": if approve { "approved" } else { "rejected" },
+            "approval_id": approval.approval_id,
+            "staging_graph": approval.staging_graph,
+        })),
+    )
+        .into_response()
 }
 
 pub(crate) async fn invoke_action_handler(
@@ -696,12 +909,12 @@ pub(crate) async fn invoke_action_handler(
     };
 
     // 2. 前置条件 + 3. 组装 side-effect 写回 SPARQL（按动作分派）。
-    let now = chrono::Utc::now().to_rfc3339();
-    let (statements, result_meta) = match build_action_effects(&action_id, &req, &kg, claims, &now)
-    {
-        Ok(v) => v,
-        Err((code, msg)) => return (code, Json(json!({ "error": msg }))),
-    };
+    let now = chrono::Utc::now();
+    let (statements, result_meta) =
+        match build_action_effects(&action_id, &req, &kg, claims, &now.to_rfc3339()) {
+            Ok(v) => v,
+            Err((code, msg)) => return (code, Json(json!({ "error": msg }))),
+        };
 
     if req.dry_run {
         return (
@@ -717,8 +930,15 @@ pub(crate) async fn invoke_action_handler(
     }
 
     // 4. 数据沙箱写回：先写影子图 → 护栏后校验 → 通过才合并到生产图，失败即回滚。
-    let sandbox = match commit_via_staging(&kg, claims, &statements) {
-        Ok(report) => report,
+    let outcome = match commit_via_staging(
+        &kg,
+        claims,
+        &statements,
+        req.commit_strategy,
+        &action_id,
+        now,
+    ) {
+        Ok(outcome) => outcome,
         Err((code, msg, violations)) => {
             return (
                 code,
@@ -726,12 +946,25 @@ pub(crate) async fn invoke_action_handler(
             )
         }
     };
+    let (status, sandbox) = match outcome {
+        StagingCommitOutcome::Committed(report) => ("ok", report),
+        StagingCommitOutcome::Pending(approval) => (
+            "pending_approval",
+            json!({
+                "sandbox": "staging_graph",
+                "staging_graph": approval.staging_graph,
+                "guardrails_passed": true,
+                "approval_id": approval.approval_id,
+                "expires_at": approval.expires_at,
+            }),
+        ),
+    };
     let _ = state.kg_store.flush();
 
     (
         StatusCode::OK,
         Json(json!({
-            "status": "ok",
+            "status": status,
             "action": action_id,
             "graph": claims.graph_iri().expect("verified claims were validated"),
             "applied": statements.len(),
@@ -1456,6 +1689,178 @@ mod ontology_crud_tests {
 
         let _ = std::fs::remove_dir_all(tmp);
     }
+
+    #[tokio::test]
+    async fn action_approval_keeps_staging_until_same_scope_approves() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_approval_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state = make_state(&tmp);
+        let claims_a =
+            crate::isolation::IsolationClaims::from_verified("tenant-a", "repair", "tester")
+                .unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let seed = format!(
+            "<{}> a <{}> . <{}> a <{}> .",
+            ev_instance_iri("Vehicle", "LVIN123"),
+            ev_term_iri("Vehicle"),
+            ev_instance_iri("FaultCode", "P0A80"),
+            ev_term_iri("FaultCode"),
+        );
+        kg.update_for_claims(&claims_a, &ClaimsGraphUpdate::insert_data(seed))
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/actions/:id/invoke",
+                post(invoke_action_handler),
+            )
+            .route(
+                "/api/v1/ontology/action-approvals",
+                get(list_action_approvals_handler),
+            )
+            .route(
+                "/api/v1/ontology/action-approvals/:approval_id/approve",
+                post(approve_action_approval_handler),
+            )
+            .route(
+                "/api/v1/ontology/action-approvals/:approval_id/reject",
+                post(reject_action_approval_handler),
+            )
+            .with_state(state);
+        let post = |uri: String, token: &str, body: Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let unauthenticated = axum::http::Request::builder()
+            .uri("/api/v1/ontology/action-approvals")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let invoke = post(
+            "/api/v1/ontology/actions/GenerateRepairOrder/invoke".to_string(),
+            &test_jwt("tenant-a"),
+            json!({
+                "target": "P0A80",
+                "params": {"vehicle_vin": "LVIN123"},
+                "commit_strategy": "require_approval"
+            }),
+        );
+        let response = app.clone().oneshot(invoke).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], "pending_approval");
+        let approval_id = body["sandbox"]["approval_id"].as_str().unwrap().to_string();
+
+        let orders = format!(
+            "SELECT ?o WHERE {{ ?o a <{}> }}",
+            ev_term_iri("RepairOrder")
+        );
+        assert!(
+            kg.query_sparql_for_claims(&claims_a, &orders)
+                .unwrap()
+                .is_empty(),
+            "require_approval must not alter the production graph"
+        );
+
+        let list = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/action-approvals")
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list_body["approvals"].as_array().unwrap().len(), 1);
+
+        let cross_tenant = app
+            .clone()
+            .oneshot(post(
+                format!("/api/v1/ontology/action-approvals/{approval_id}/approve"),
+                &test_jwt("tenant-b"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+        let approved = app
+            .clone()
+            .oneshot(post(
+                format!("/api/v1/ontology/action-approvals/{approval_id}/approve"),
+                &test_jwt("tenant-a"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        assert!(
+            !kg.query_sparql_for_claims(&claims_a, &orders)
+                .unwrap()
+                .is_empty(),
+            "approval must merge the retained staging graph"
+        );
+
+        let reject_invoke = post(
+            "/api/v1/ontology/actions/GenerateRepairOrder/invoke".to_string(),
+            &test_jwt("tenant-a"),
+            json!({
+                "target": "P0A80",
+                "params": {"vehicle_vin": "LVIN123"},
+                "commit_strategy": "require_approval"
+            }),
+        );
+        let response = app.clone().oneshot(reject_invoke).await.unwrap();
+        let reject_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let reject_id = reject_body["sandbox"]["approval_id"].as_str().unwrap();
+        let rejected = app
+            .clone()
+            .oneshot(post(
+                format!("/api/v1/ontology/action-approvals/{reject_id}/reject"),
+                &test_jwt("tenant-a"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims_a, &orders)
+                .unwrap()
+                .len(),
+            1,
+            "reject must discard staged writes"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 }
 
 /// 动力层执行器（ActionType invoke）单测：参数/前置条件校验 + SPARQL 组装。
@@ -1500,6 +1905,7 @@ mod ontology_action_tests {
             target: target.map(|s| s.to_string()),
             params: params.as_object().cloned().unwrap_or_default(),
             dry_run,
+            commit_strategy: ActionCommitStrategy::Auto,
         }
     }
 
@@ -1583,7 +1989,18 @@ mod ontology_action_tests {
         )
         .unwrap();
 
-        let report = commit_via_staging(&kg, &claims, &stmts).expect("护栏应通过并提交");
+        let report = commit_via_staging(
+            &kg,
+            &claims,
+            &stmts,
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+        )
+        .expect("护栏应通过并提交");
+        let StagingCommitOutcome::Committed(report) = report else {
+            panic!("auto 策略必须直接提交");
+        };
         assert_eq!(report["guardrails_passed"], json!(true));
 
         // claims 图应能查到新建的维修工单类型三元组。
@@ -1633,7 +2050,15 @@ mod ontology_action_tests {
         let foreign = ClaimsGraphUpdate::insert_data(
             "<https://agentos.ontology/ev/X/1> <http://evil.example/pwn> \"x\"",
         );
-        let err = commit_via_staging(&kg, &claims, &[foreign]).unwrap_err();
+        let err = commit_via_staging(
+            &kg,
+            &claims,
+            &[foreign],
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(err.2.iter().any(|v| v.contains("越权谓词")));
 
