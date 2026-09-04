@@ -144,6 +144,10 @@ tonic-build = "0.10"
 name = "isolation-diagnose"
 path = "src/bin/isolation_diagnose.rs"
 
+[[bin]]
+name = "isolation-migrate"
+path = "src/bin/isolation_migrate.rs"
+
 [[bench]]
 name = "bench_graph_backend"
 harness = false

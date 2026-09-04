@@ -124,6 +124,65 @@ no-tenant-RAG invariant is instead covered by
 `src/api/http/chat.rs`: public API-key requests have no claims and must
 retrieve neither tenant graph nor tenant vectors.
 
+## 历史键迁移工具
+
+`scripts/isolation-migrate` is an explicit **offline** migration tool. It is
+not an HTTP endpoint and no request hot path can invoke it. It currently
+implements only Oxigraph named-graph migration; vector (`tenant:<id>`), L0,
+and blob historical keys remain unimplemented and must not be represented as
+migrated or isolated by production queries.
+
+The plan is JSON with schema version `1`. It maps each historical source graph
+to one claims-minted tenant/project target:
+
+```json
+{
+  "schema_version": 1,
+  "named_graphs": [{
+    "source_graph": "graph:world",
+    "target": { "tenant": "acme", "project": "research" }
+  }]
+}
+```
+
+Run a default, read-only plan first. It opens `<data-root>/kg` read-only and
+writes neither a graph, a RocksDB/WAL artifact, nor an audit file:
+
+```bash
+scripts/isolation-migrate --data-root data --plan migration.json
+```
+
+After reviewing its source and target quad counts, execute the fixed sequence
+`plan → copy → verify`:
+
+```bash
+scripts/isolation-migrate --data-root data --plan migration.json --execute
+```
+
+The tool rejects unsafe targets, duplicate targets, a target that already has
+quads, and invalid plans before it copies anything. It copies via Oxigraph
+SPARQL only and verifies that every target count equals its recorded source
+count. A successful real run writes a local
+`<data-root>/isolation-migrate-audit-<timestamp>.json`; the audit records the
+plan/verify result but no secret. Source graphs are retained by default.
+
+Deleting a verified source is a separate, destructive action requiring both
+flags, and should only occur after a backup and an independent production
+query check:
+
+```bash
+scripts/isolation-migrate --data-root data --plan migration.json --execute \
+  --delete-source --confirm-delete-source
+```
+
+Rollback for a normal copy is to stop using the new target graph and clear it
+with an operator-reviewed Oxigraph maintenance action; the original source
+remains available. Deletion is not automatically reversible, which is why it
+requires the two confirmations. There is deliberately no `UNION`, fallback,
+or read-through from `graph:world` (and no equivalent behavior for vector,
+L0, or blob keys). Until each historical backend is explicitly migrated and
+verified, production queries must not claim that isolation is complete.
+
 ## Current wiring
 
 ### Spend gate
