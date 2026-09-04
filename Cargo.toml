@@ -140,6 +140,10 @@ tempfile = "3.10"
 [build-dependencies]
 tonic-build = "0.10"
 
+[[bin]]
+name = "isolation-diagnose"
+path = "src/bin/isolation_diagnose.rs"
+
 [[bench]]
 name = "bench_graph_backend"
 harness = false
