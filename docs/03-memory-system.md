@@ -60,6 +60,13 @@ graph TB
 
 L0 是系统的永久 KV 层，将完整 JSON-LD 图数据写入 `l0.redb`，支持实体对齐和 MESI 一致性状态。向量检索不走 L0，而由 `hyperspace-engine` 提供；图查询走 Oxigraph SPARQL 1.1。
 
+对于带 JWT-verified `IsolationClaims` 的 HTTP 任务执行，L0 通过
+`L0Store::open_for_claims` 在提供的 L0 root 下打开 claims-minted tenant 目录，
+即 `/data/l0/{tenant}` 合同。没有 claims 时，启动时由 `L0Store::new` 打开的
+历史共享存储保持只读，写入会 fail closed。历史
+`./data/l0_store/l0.redb` 尚未迁移；它不是 claims-scoped 路径。完整作用域和
+迁移边界请参阅 [17-isolation-contract.md](17-isolation-contract.md)。
+
 **核心结构体**:
 
 ```rust

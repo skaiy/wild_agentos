@@ -2,7 +2,7 @@
 
 > 关联 Issue：[#7 知识摄取与 /import-graph](https://github.com/skaiy/wild_agentos/issues/7)  
 > 关联代码：`src/api/http/mod.rs`（KB CRUD / upload / ingest / import-graph / kg import+query）、`src/knowledge_graph/`、`src/memory/hyperspace_store.rs`、`src/blob/`  
-> 关联文档：`07-knowledge-graph.md`（图谱内核与命名图）、`03-memory-system.md`（Oxigraph + hyperspace 存储栈）  
+> 关联文档：`07-knowledge-graph.md`（图谱内核与命名图）、`03-memory-system.md`（Oxigraph + hyperspace 存储栈）、[17-isolation-contract.md](17-isolation-contract.md)（可信 claims 边界、命名与历史键）
 > **范围外**：不涉及 iDME 图内核替换；本文只讲当前 Wild AgentOS 已落地的 HTTP 摄取/导入路径。
 
 按本文走完「建库 → 导入样例 → SPARQL 查询」即可验收。
@@ -13,10 +13,10 @@
 
 | 场景 | 知识库类型 | 主路径 | 落库位置 |
 |------|------------|--------|----------|
-| 非结构化文本 / 文件语义检索 | `kb_type=vector` | `POST /api/v1/kb/bases/:id/upload`、`.../ingest`、`.../search` | Hyperspace 向量库（按 `vector_namespace` 过滤） |
-| 结构化三元组 / 实体关系图 | `kb_type=graph` | `POST /api/v1/kb/bases/:id/import-graph` | Oxigraph 命名图（KB 的 `graph` 字段） |
-| 程序化节点/边 JSON 写入 | 任意命名图（不必经 KB） | `POST /api/v1/kg/import` | Oxigraph（请求体 `graph`） |
-| SPARQL SELECT | 任意命名图 | `POST /api/v1/kg/query` | Oxigraph |
+| 非结构化文本 / 文件语义检索 | `kb_type=vector` | `POST /api/v1/kb/bases/:id/upload`、`.../ingest`、`.../search` | Hyperspace 向量库（目标由 claims-minted `vector://{tenant}/{project}` 决定） |
+| 结构化三元组 / 实体关系图 | `kb_type=graph` | `POST /api/v1/kb/bases/:id/import-graph` | Oxigraph（目标由 claims-minted `graph://{tenant}/{project}` 决定） |
+| 程序化节点/边 JSON 写入 | claims 作用域内 | `POST /api/v1/kg/import` | Oxigraph（忽略请求体 `graph`） |
+| SPARQL SELECT | claims 作用域内 | `POST /api/v1/kg/query` | Oxigraph（忽略客户端 `named_graph`） |
 
 向量路径只认向量库；`import-graph` 只认图谱库。调错类型会直接 `400`（例如「仅向量知识库支持文件上传」「仅图谱知识库支持三元组导入」）。
 
@@ -51,25 +51,27 @@ flowchart LR
 
 ## 3. 命名图 / 命名空间隔离
 
-创建知识库时按 `kb_type` 自动分配隔离键（见 `create_knowledge_base_handler`）：
+当前 HTTP KG/KB/import/query/RAG 路径只接受认证边界验证后产生的
+`IsolationClaims`。服务器从 claims mint 目标；客户端提交的 `graph`、
+`named_graph`、`namespace`（以及等价的 KB 目标字段）均不选择存储位置。
+知识库 catalog 元数据也经 claims-scoped store API 写入，不由请求字段拼接隔离键。
 
-| 类型 | 字段 | 格式 | 用途 |
+| 类型 | claims-minted 目标 | 用途 |
 |------|------|------|------|
-| graph | `graph` | `tenant:{tenant_id}/kb/{kb_id}` | Oxigraph 命名图 IRI |
-| vector | `vector_namespace` | `vec:tenant/{tenant_id}/kb/{kb_id}` | Hyperspace 检索过滤（`HybridSearchFilter.named_graph`） |
+| graph | `graph://{tenant}/{project}` | Oxigraph 命名图 IRI |
+| vector | `vector://{tenant}/{project}` | Hyperspace 向量命名空间与 JSON-LD named-graph 元数据 |
 
-系统内置命名图（见 `07-knowledge-graph.md`）仍有效，例如 `graph:world` / `graph:code` / `graph:skill` / `graph:bridge`。**业务 KB 图与系统图不要混写同一 IRI。**
+Minting 只验证和构造名称，不迁移数据。历史 `tenant:` 图或命名空间不会被迁移、重写或由这条新路径读穿。完整命名和历史键状态见 [Isolation Contract](17-isolation-contract.md)。
 
-开发身份用请求头 `X-Identity: base64({"user_id","tenant_id","roles"})`（见 `src/api/http/iam.rs`）；生产用 `Authorization: Bearer <JWT>`。`tenant_id` 参与命名图/向量命名空间拼装，决定隔离边界。
+`X-Identity` 仅用于开发模拟，**绝不**产生 `IsolationClaims`，也不是生产租户身份来源。当前 HTTP 边界使用已验证 JWT 产生 claims；缺少或无效的 JWT claims 会 fail closed，返回认证/授权错误（401/403），不会返回空的成功结果。
 
 ---
 
 ## 4. 鉴权与公共约定
 
 ```bash
-# 开发模拟身份（roles 按环境需要填写）
-export IDENTITY=$(printf '%s' '{"user_id":"dev","tenant_id":"demo","roles":["DA"]}' | base64)
-# 后续 curl 统一加：-H "X-Identity: $IDENTITY"
+# 使用认证边界验证、且含 tenant/project scope 的 JWT
+export AUTHORIZATION='Authorization: Bearer <verified-jwt>'
 ```
 
 默认服务根路径以本机部署为准（下文用 `http://127.0.0.1:8080` 占位）。单文件上传/导入体积极限 **60MB**（`KB_UPLOAD_MAX_BYTES`）。
@@ -83,7 +85,7 @@ export IDENTITY=$(printf '%s' '{"user_id":"dev","tenant_id":"demo","roles":["DA"
 ```http
 POST /api/v1/kb/bases
 Content-Type: application/json
-X-Identity: <base64>
+Authorization: Bearer <verified-jwt>
 
 {
   "name": "故障码样例图",
@@ -103,15 +105,14 @@ X-Identity: <base64>
     "id": "<kb_uuid>",
     "name": "故障码样例图",
     "kb_type": "graph",
-    "graph": "tenant:demo/kb/<kb_uuid>",
+    "graph": "graph://<tenant>/<project>",
     "vector_namespace": "",
-    "tenant_id": "demo",
     ...
   }
 }
 ```
 
-记下 `id` 与 `base.graph`（后面 SPARQL 的 `GRAPH <...>` 用这个 IRI）。
+记下 `id`。本路径的图目标由验证后的 claims 确定；不要把响应中的存储字段或客户端值作为下一请求的路由参数。
 
 ### 5.2 创建向量库（可选，走 upload/ingest）
 
@@ -123,7 +124,7 @@ X-Identity: <base64>
 }
 ```
 
-响应中会有 `vector_namespace`，形如 `vec:tenant/demo/kb/<kb_uuid>`。
+向量数据写入由 claims mint 的 `vector://<tenant>/<project>` 命名空间。
 
 相关只读接口：
 
@@ -144,7 +145,7 @@ X-Identity: <base64>
 | `file` | 有文件时必填 | 导入文件；也可只传 `schema` |
 | `format` | 否 | `csv` \| `jsonl` \| `triples`（亦接受 `nt`/`ttl` 别名）；缺省按扩展名推断，再缺省 `csv` |
 | `schema` | 否 | 任意文本，写入命名图元三元组 `kbSchema` |
-| `clear_before` | 否 | `true`/`1`/`yes` 时先 `DELETE WHERE { GRAPH <kb.graph> { ?s ?p ?o } }` |
+| `clear_before` | 否 | `true`/`1`/`yes` 时先清空 claims-minted 图中的现有三元组 |
 
 扩展名推断：`.jsonl`/`.json` → jsonl；`.nt`/`.ttl`/`.triples` → triples；其余 → csv。`format=cypher` 会明确拒绝（Oxigraph 走 SPARQL）。
 
@@ -171,7 +172,7 @@ pack1,hasFault,BMS_a067,iri
 ```bash
 KB_ID=<图谱库 uuid>
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/import-graph" \
-  -H "X-Identity: $IDENTITY" \
+  -H "$AUTHORIZATION" \
   -F "file=@fault_sample.csv;type=text/csv" \
   -F "format=csv" \
   -F "clear_before=true"
@@ -182,7 +183,7 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/import-graph" \
 ```json
 {
   "status": "imported",
-  "graph": "tenant:demo/kb/<kb_uuid>",
+  "graph": "graph://<tenant>/<project>",
   "format": "csv",
   "triples_written": 6,
   "entities": 3,
@@ -222,7 +223,7 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/import-graph" \
 |------|------|------|
 | `nodes` | array | 必填；`id` / `node_type` / `label`，可选 `description` / `properties` |
 | `edges` | array | 默认 `[]`；`source` / `target` / `relation`，可选 `properties` |
-| `graph` | string | 命名图（可写短前缀，服务端 `expand_iri`） |
+| `graph` | string | 可兼容传入但被忽略；服务端使用 claims-minted 图 |
 | `clear_before` | bool | 默认 **true**：写入前清空该图 |
 
 节点映射要点（与 `07-knowledge-graph.md` 一致）：
@@ -233,12 +234,11 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/import-graph" \
 - 属性 key 非完整 IRI 时加前缀 `https://agentos.ontology/meta/`
 
 ```bash
-GRAPH="tenant:demo/kb/${KB_ID}"
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/kg/import" \
   -H "Content-Type: application/json" \
-  -H "X-Identity: $IDENTITY" \
+  -H "$AUTHORIZATION" \
   -d "{
-    \"graph\": \"${GRAPH}\",
+    \"graph\": \"client-selected-graph-is-ignored\",
     \"clear_before\": true,
     \"nodes\": [
       {
@@ -260,7 +260,7 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kg/import" \
   "entity_count": 1,
   "relation_count": 0,
   "quad_count": 3,
-  "graph": "tenant:demo/kb/<kb_uuid>"
+  "graph": "graph://<tenant>/<project>"
 }
 ```
 
@@ -278,27 +278,26 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kg/import" \
 ```json
 {
   "sparql": "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 20",
-  "named_graph": "tenant:demo/kb/<kb_uuid>"
+  "named_graph": "client-selected-graph-is-ignored"
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
 | `sparql` | SPARQL SELECT（必填） |
-| `named_graph` | 可选；有则服务端把查询包进该命名图（并 `expand_iri`） |
+| `named_graph` | 可兼容传入但被忽略；服务端使用 claims-minted 图 |
 
-也可在 SPARQL 内手写 `GRAPH <...>`，此时可省略 `named_graph`。
+请求中的图选择不会覆盖 claims 作用域；查询在服务器选定的命名图中执行。
 
 **验收查询（按 §6 CSV 样例）：**
 
 ```bash
-GRAPH="tenant:demo/kb/${KB_ID}"
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/kg/query" \
   -H "Content-Type: application/json" \
-  -H "X-Identity: $IDENTITY" \
+  -H "$AUTHORIZATION" \
   -d "{
     \"sparql\": \"SELECT ?label WHERE { ?s a <http://aps.local/ontology/FaultCode> ; <http://www.w3.org/2000/01/rdf-schema#label> ?label }\",
-    \"named_graph\": \"${GRAPH}\"
+    \"named_graph\": \"client-selected-graph-is-ignored\"
   }"
 ```
 
@@ -326,7 +325,7 @@ Content-Type: application/json
 
 - 仅向量库；`texts`/`text` 至少有一段非空
 - 按约 **500 字符**切块（UTF-8 友好），再 embedding 写入
-- 成功：`{ "status": "ingested", "chunks": N, "namespace": "vec:tenant/.../kb/..." }`
+- 成功：`{ "status": "ingested", "chunks": N, "namespace": "vector://<tenant>/<project>" }`
 - embedding 未就绪：`503`「向量库未启用（embedding 初始化失败）」
 
 ### 9.2 文件上传
@@ -357,13 +356,13 @@ Content-Type: multipart/form-data
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/upload" \
-  -H "X-Identity: $IDENTITY" \
+  -H "$AUTHORIZATION" \
   -F "file=@manual.txt;type=text/plain" \
   -F "chunk_size=500"
 
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/search" \
   -H "Content-Type: application/json" \
-  -H "X-Identity: $IDENTITY" \
+  -H "$AUTHORIZATION" \
   -d '{"query":"高压电池维修","limit":5}'
 ```
 
@@ -384,7 +383,7 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/search" \
 
 1. `POST /api/v1/kb/bases` 创建 `kb_type=graph`，拿到 `id` 与 `graph`
 2. `POST .../import-graph` 上传 §6.1 CSV（`clear_before=true`），确认 `status=imported` 且 `triples_written>0`
-3. `POST /api/v1/kg/query` 带 `named_graph=<graph>`，SELECT 故障码 label，`count>=1`
+3. `POST /api/v1/kg/query` 使用已验证 JWT；服务端在 claims-minted 图中执行 SELECT 故障码 label，`count>=1`
 4. （可选）再建 `kb_type=vector`，`upload` 一段 TXT，再 `search` 能召回
 5. 确认文档/设计未引入「替换 Oxigraph / hyperspace / iDME 图内核」的假设
 
