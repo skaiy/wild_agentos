@@ -46,6 +46,8 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 对应工作项：[Skill CI 与发布](https://github.com/skaiy/wild_agentos/issues/88)、[黄金评测](https://github.com/skaiy/wild_agentos/issues/89)。
 
+Admin 配套跟踪在独立仓库：[五屏控制台](https://github.com/skaiy/wild_agentos_admin/issues/16) 与 [docs-site](https://github.com/skaiy/wild_agentos_admin/issues/17)；本路线图不改变该仓库的范围或实现。
+
 ### [v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4)
 
 - 半自动生成 ObjectType / LinkType 草稿，必须由人审批；
