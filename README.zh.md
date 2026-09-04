@@ -200,23 +200,15 @@ cargo build -p wild-code-cli --release
 
 ## 🗺️ 路线图
 
-**v0.1.x 发布系列**（稳定化）：
-- Linux/macOS/Windows 多平台二进制分发
-- Linux musl 全静态编译（零依赖）
-- MCP 工具生态扩展与文档完善
-- 检查点恢复功能的测试与打磨
+Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，结合 Oxigraph RDF/SPARQL、Hyperspace、`IsolationClaims` 命名契约和本体 Action 的**数据**沙箱。它不是裸机微内核 OS，也不是完整 Palantir 克隆；不以 Nebula/Cypher 替换 Oxigraph，不混合 AIDVP 产品仓库，且 mint 名称不等于迁移历史数据。详见[演进路线图](docs/18-evolution-roadmap.md)和[隔离契约](docs/17-isolation-contract.md)。
 
-**v0.2.x 发布系列**（规划中）：
-- 原生 Web 仪表盘（智能体监控与任务管理）
-- Python/TypeScript SDK 简化集成
-- 技能市场原型与社区插件注册表
-- 多模型路由与成本感知调度
-
-**v0.3.x+ 发布系列**（未来）：
-- Kubernetes 部署算子，生产级弹性伸缩
-- 跨 Edge 节点的分布式智能体网格
-- 多模态智能体支持（视觉、音频）
-- 多轮对话记忆压缩
+- **v0.1.6 — 已完成：** JWT `IsolationClaims` 为 graph/blob/vector/L0 mint 目标；相关 HTTP 路径 fail closed；历史键尚未迁移。
+- **[v0.1.7 Isolation Proof & Eval](https://github.com/skaiy/wild_agentos/milestone/1)：** 区分 minted 与历史键的诊断 CLI、客户可读隔离矩阵、fail-closed 黄金 CI，以及禁止静默 `UNION` 的可选迁移工具。
+- **[v0.1.8 Ontology Action HITL](https://github.com/skaiy/wild_agentos/milestone/2)：** 保留待审批 staging graph、merge/discard API、可配置护栏与 SPARQL 断言、事件总线审计。
+- **[v0.2.0 Control Plane + Skill CI](https://github.com/skaiy/wild_agentos/milestone/3)：** 按 claims 过滤的五屏 Admin control plane；Skill package test+Judge CI 与发布；Agent/Skill/Action 黄金评测。
+- **[v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4)：** 人工审批的 ObjectType/LinkType 草稿、MCP 入站租户目录、Skill-as-MCP 与薄型出站 A2A adapter。
+- **[v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5)：** claims 作用域 coding artifacts、外挂计算沙箱适配器，以及不编造速度提升的弱算力可复现基准。
+- **[v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6)：** 版本化 Function/Skill market、在认证边界 mint claims 的 OIDC/IdP、带 gate 的 emergent tools，以及默认关闭的有限 OWL/rules。
 
 ---
 
@@ -238,6 +230,9 @@ cargo build -p wild-code-cli --release
 
 - **记忆系统** → [`docs/03-memory-system.md`](docs/03-memory-system.md)（L0 redb · HyperspaceEngine · Oxigraph SPARQL）
 - **知识摄取与 import-graph** → [`docs/16-knowledge-ingest-import-graph.md`](docs/16-knowledge-ingest-import-graph.md)（upload / ingest / 命名图隔离 · embedding 可换 · Oxigraph/hyperspace 固定）
+- **隔离契约** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md)（可信 claims、命名与未迁移历史键）
+- **演进路线图** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md)（v0.1.6 后战略与明确非目标）
+- **本体 Action 数据沙箱** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md)（staging graph 护栏，不是计算沙箱）
 - **设计细节** → [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) · [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) (English)
 - **核心设计理念** → [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) · [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) (English)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
