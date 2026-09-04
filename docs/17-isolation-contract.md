@@ -61,6 +61,69 @@ remain in place and have not been remapped or rewritten:
 Do not change, delete, or assume ownership of these historical paths as part of
 new isolation work. Each migration requires a separately scoped change.
 
+## 诊断工具
+
+`scripts/isolation-diagnose` is a read-only, local filesystem diagnostic. It
+does not require a JWT, HTTP endpoint, or secret, and it never opens, creates,
+writes, merges, deletes, or migrates a graph, vector store, blob store, or L0
+database.
+
+```bash
+# `data` is AGENTOS_DATA_DIR's default.
+scripts/isolation-diagnose --data-root data
+
+# Stable schema for a future migration inventory; Markdown remains the default.
+scripts/isolation-diagnose --data-root data --json
+```
+
+The default output is an isolation-matrix Markdown snippet with `路径 | 身份 |
+期望 | 实测` columns. It reports durable `graph://{tenant}/{project}` and
+`vector://{tenant}/{project}` marker presence per tenant/project, local blob
+object counts under `blobs/{tenant}/`, tenant L0 directory existence, and the
+historical `graph:world`, `tenant:<id>`, `l0_store/l0.redb`, and
+`tenant:<id>/kb/...` indicators.
+
+The JSON output has schema version `1`:
+
+```text
+{
+  "schema_version": 1,
+  "data_root": "<path>",
+  "read_only": true,
+  "minted_namespaces": [{
+    "tenant": "<safe tenant>", "project": "<safe project>",
+    "graph_iri": "graph://<tenant>/<project>",
+    "graph_artifact_count": 0,
+    "vector_namespace": "vector://<tenant>/<project>",
+    "vector_artifact_count": 0,
+    "blob_prefix": "<tenant>/", "blob_object_count": 0,
+    "l0_path": "l0/<tenant>", "l0_exists": false
+  }],
+  "historical": {
+    "graph_world_present": false,
+    "tenant_vector_tags": [],
+    "shared_l0_redb_present": false,
+    "legacy_blob_prefixes": []
+  },
+  "scan_warnings": []
+}
+```
+
+`*_artifact_count` is a count of regular storage files that contain a durable
+namespace marker, not a backend object count. This distinction makes the tool
+safe even for backends whose open operation may initialize a WAL or take a
+writer lock. Files larger than 32 MiB are not marker-scanned and appear in
+`scan_warnings`; blob object counting still uses paths only. This is an
+inventory for a future migration issue (such as #84), **not** a migration
+tool: a positive minted result does not prove migration or complete
+multi-tenant isolation.
+
+The filesystem diagnostic does not make an HTTP request. API-key chat's
+no-tenant-RAG invariant is instead covered by
+`public_api_key_chat_context_performs_no_tenant_rag` in
+`src/api/http/chat.rs`: public API-key requests have no claims and must
+retrieve neither tenant graph nor tenant vectors.
+
 ## Current wiring
 
 ### Spend gate
