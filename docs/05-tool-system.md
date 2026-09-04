@@ -93,6 +93,18 @@ graph TB
 
 统一工具执行入口，负责工具查找、参数校验和执行。
 
+### Isolation and hardening (v0.1.6)
+
+运行时 graph/vector builtins 需要认证边界传入的 `IsolationClaims`。它们忽略
+工具参数中的 `graph`、`named_graph` 与 `namespace`，只使用 claims mint 的图和
+向量命名空间；没有 claims 时显式失败，不回退到历史图或空结果。
+
+当 `AGENTOS_TENANT_TOOL_CALL_CAP` 配置为有效值时，按租户的 metered tool call
+会受该进程内上限约束，并要求 verified claims。第三方 MCP 调用会披露其行为；
+bash 调用会清理传给子进程的环境；工具 schema 按当前轮次强制执行。可信边界、
+命名规则及历史路径请参阅 [17-isolation-contract.md](17-isolation-contract.md)；
+变更摘要参阅 [CHANGELOG.md](../CHANGELOG.md#016--2026-09-04)。
+
 **核心类型**:
 
 ```rust

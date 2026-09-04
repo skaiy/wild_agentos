@@ -4,6 +4,14 @@
 
 Agent 管理与调度是系统的核心，负责动态决定 Agent 组合与流转。SA 根据任务类型动态调度 PA/DA/CA/AA，并集成了感知引擎、干预机制和用户补充输入处理。
 
+### 租户作用域与 chat RAG
+
+新建的用户 Agent 会写入认证边界已验证 claims 中的 `tenant_id` 与
+`project_id`。内部/有作用域的 chat RAG 只接受与这些 verified claims 完全匹配
+的 Agent；缺少作用域或 tenant/project 不匹配的记录会被拒绝。因此历史未作用域
+Agent 不再被隐式共享。具体可信边界和 public API-key chat 的行为见
+[17-isolation-contract.md](17-isolation-contract.md)。
+
 ```mermaid
 graph TB
     subgraph Agent管理

@@ -2,6 +2,8 @@
 
 > 基于 Oxigraph RDF 存储的知识图谱引擎，支持 LLM 知识抽取、代码 AST 提取、SPARQL 查询和知识桥接
 
+> 租户数据的可信作用域、命名与历史键状态以 [17-isolation-contract.md](17-isolation-contract.md) 为准。
+
 ## 模块架构
 
 ```mermaid
@@ -62,7 +64,7 @@ graph TB
 ```rust
 pub struct KnowledgeGraphStore {
     store: Store,              // Oxigraph 内存存储
-    default_graph: String,     // 默认命名图 "graph:world"
+    default_graph: String,     // 历史/系统默认命名图 "graph:world"
 }
 ```
 
@@ -181,9 +183,14 @@ pub enum IncrementalResult {
 
 ## 命名图隔离策略
 
+`graph:world` 是历史/系统默认图，不是生产租户写入目标。生产租户数据的读写
+从已验证 `IsolationClaims` mint 为 `graph://{tenant}/{project}`；兼容性 API
+没有对 `graph:world` 的静默双写、读穿或迁移。客户端选择的图不会覆盖该目标。
+历史键的迁移须另行设计，详见 [Isolation Contract](17-isolation-contract.md)。
+
 | 命名图 | 用途 | 写入来源 |
 |--------|------|----------|
-| `graph:world` | 通用知识（LLM 抽取） | `knowledge_extract` |
+| `graph:world` | 历史/系统默认通用知识 | `knowledge_extract`（历史路径） |
 | `graph:code` | 代码结构知识 | `knowledge_extract_code` |
 | `graph:skill` | 技能图谱 | `SkillGraphStore` |
 | `graph:ontology` | 本体定义 | `ontology_register` |
