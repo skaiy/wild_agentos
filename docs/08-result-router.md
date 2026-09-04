@@ -1,39 +1,41 @@
-# 8. 工具结果智能路由
+# 8. Intelligent Tool Result Routing
 
-> 当工具返回大结果时，自动选择最优处理策略，避免 Token 浪费
+> *For the Chinese version, see [08-result-router.zh.md](08-result-router.zh.md).*
 
-## 问题背景
+> When a tool returns a large result, automatically selects the optimal handling strategy to avoid wasting tokens.
 
-LLM Agent 执行工具调用时，工具可能返回大量数据（如目录列表、搜索结果、代码文件内容）。直接将大结果塞入 LLM 上下文会导致：
-- Token 消耗剧增
-- 关键信息被淹没
-- API 调用可能超限
+## Background
 
-## 路由决策流程
+When an LLM Agent executes a tool call, the tool may return a large amount of data (such as directory listings, search results, or code-file contents). Putting a large result directly into the LLM context causes:
+- Rapidly increasing token consumption
+- Important information to be overwhelmed
+- API calls to potentially exceed their limits
+
+## Routing Decision Flow
 
 ```mermaid
 flowchart TD
-    INPUT["工具返回结果"] --> META["分析结果元数据<br/>ToolResultMeta"]
+    INPUT["Tool result"] --> META["Analyze result metadata<br/>ToolResultMeta"]
     META --> ROUTER["ResultRouter.route()"]
-    ROUTER --> SIZE{"结果大小?"}
+    ROUTER --> SIZE{"Result size?"}
 
-    SIZE -->|"< 4KB"| PASS["PassThrough<br/>直接透传"]
-    SIZE -->|"4KB-50KB"| STRUCT{"是否 JSON?"}
+    SIZE -->|"< 4KB"| PASS["PassThrough<br/>Pass through directly"]
+    SIZE -->|"4KB-50KB"| STRUCT{"Is it JSON?"}
 
-    STRUCT -->|"是 JSON"| TRUNC_J["Truncate<br/>JSON 智能截断<br/>保留前N个+标记"]
-    STRUCT -->|"非 JSON"| TRUNC_T["Truncate<br/>文本智能截断<br/>按行截断+统计"]
+    STRUCT -->|"JSON"| TRUNC_J["Truncate<br/>Smart JSON truncation<br/>Keep first N + marker"]
+    STRUCT -->|"Not JSON"| TRUNC_T["Truncate<br/>Smart text truncation<br/>Truncate by line + statistics"]
 
-    SIZE -->|"> 50KB"| LARGE_STRUCT{"是否结构化 JSON?"}
-    LARGE_STRUCT -->|"是"| GRAPHIFY["Graphify<br/>图谱化存储<br/>+ 微工具注入"]
-    LARGE_STRUCT -->|"否"| SUMMARIZE["Summarize<br/>预览+末尾预览<br/>+ read_full_result"]
+    SIZE -->|"> 50KB"| LARGE_STRUCT{"Is it structured JSON?"}
+    LARGE_STRUCT -->|"Yes"| GRAPHIFY["Graphify<br/>Store as a graph<br/>+ inject micro-tools"]
+    LARGE_STRUCT -->|"No"| SUMMARIZE["Summarize<br/>Head and tail previews<br/>+ read_full_result"]
 
-    GRAPHIFY --> MT["生成微工具<br/>query_{EntityType}<br/>get_entity_details<br/>expand_relation"]
-    SUMMARIZE --> STORE["完整结果存储<br/>注入 read_full_result"]
+    GRAPHIFY --> MT["Generate micro-tools<br/>query_{EntityType}<br/>get_entity_details<br/>expand_relation"]
+    SUMMARIZE --> STORE["Store complete result<br/>Inject read_full_result"]
 ```
 
-## 核心组件
+## Core Components
 
-### ResultRouter — 路由决策引擎
+### ResultRouter — Routing Decision Engine
 
 ```rust
 pub struct ResultRouter {
@@ -50,74 +52,74 @@ pub enum RouteDecision {
 
 ### ToolResultRouterSettings
 
-**配置文件**: `config.yaml` 中 `tool_result_router` 段
+**Configuration file**: the `tool_result_router` section in `config.yaml`
 
 ```yaml
 tool_result_router:
   enabled: true
-  threshold_small: 2048          # 小结果阈值（字节），小于此值直接透传
-  threshold_large: 8192          # 大结果阈值（字节），超过此值考虑图谱化
-  preview_size: 2000             # 摘要预览大小
-  max_graph_entities: 500        # 图谱化最大实体数
-  max_micro_tools: 5             # 最大微工具数
-  sparql_query_timeout_ms: 100   # SPARQL 查询超时
-  auto_cleanup: true             # 自动清理过期图谱
+  threshold_small: 2048          # Small-result threshold (bytes); pass through below this value
+  threshold_large: 8192          # Large-result threshold; consider graphification above this value
+  preview_size: 2000             # Summary preview size
+  max_graph_entities: 500        # Maximum entities for graphification
+  max_micro_tools: 5             # Maximum micro-tools
+  sparql_query_timeout_ms: 100   # SPARQL query timeout
+  auto_cleanup: true             # Automatically clean up expired graphs
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `threshold_small` | 2048 | 透传阈值（字节） |
-| `threshold_large` | 8192 | 截断/图谱化阈值（字节） |
-| `preview_size` | 2000 | 摘要预览大小 |
-| `max_graph_entities` | 500 | 图谱化最大实体数 |
-| `max_micro_tools` | 5 | 最大微工具数 |
+| Parameter | Default | Description |
+|------|--------:|------|
+| `threshold_small` | 2048 | Pass-through threshold (bytes) |
+| `threshold_large` | 8192 | Truncation/graphification threshold (bytes) |
+| `preview_size` | 2000 | Summary preview size |
+| `max_graph_entities` | 500 | Maximum number of graphified entities |
+| `max_micro_tools` | 5 | Maximum number of micro-tools |
 
-### 智能截断策略
+### Smart Truncation Strategies
 
-**JSON 截断**（`smart_truncate_json`）：
-- 识别 JSON 数组 → 保留前 N 个元素 + `[截断: 共 M 个, 保留 N 个]`
-- 识别 JSON 对象 → 保留前 N 个 key + 截断标记
-- 非 JSON → 退回文本截断
+**JSON truncation** (`smart_truncate_json`):
+- Detects JSON arrays → retains the first N elements + `[Truncated: M total, N retained]`
+- Detects JSON objects → retains the first N keys + a truncation marker
+- Non-JSON → falls back to text truncation
 
-**文本截断**（`smart_truncate_text`）：
-- 按行截断，保留完整行
-- 统计总行数和保留行数
-- UTF-8 字符边界安全处理
+**Text truncation** (`smart_truncate_text`):
+- Truncates by line, retaining complete lines
+- Counts total and retained lines
+- Safely handles UTF-8 character boundaries
 
-### GraphifyEngine — 图谱化引擎
+### GraphifyEngine — Graphification Engine
 
-将 JSON 工具结果递归解析为知识图谱节点：
+Recursively parses JSON tool results into knowledge-graph nodes:
 
 ```mermaid
 graph TD
-    JSON["JSON 工具结果"] --> PARSE["递归解析"]
-    PARSE --> OBJ["对象 → NodeDef<br/>id=路径, type=对象类型"]
-    PARSE --> ARR["数组 → 批量 NodeDef<br/>id=路径[i]"]
-    PARSE --> PRIM["基本类型 → 对象属性"]
+    JSON["JSON tool result"] --> PARSE["Recursive parsing"]
+    PARSE --> OBJ["Object → NodeDef<br/>id=path, type=object type"]
+    PARSE --> ARR["Array → batch NodeDef<br/>id=path[i]"]
+    PARSE --> PRIM["Primitive → object property"]
 
-    OBJ --> EDGE["父→子 EdgeDef<br/>relation=字段名"]
+    OBJ --> EDGE["Parent→child EdgeDef<br/>relation=field name"]
     ARR --> EDGE
 
-    OBJ --> ANALYSIS["SchemaAnalysis<br/>实体类型分布<br/>关系类型统计"]
-    ANALYSIS --> SUMMARY["数据摘要<br/>实体数/关系数/类型分布"]
-    ANALYSIS --> MICRO["微工具生成"]
+    OBJ --> ANALYSIS["SchemaAnalysis<br/>Entity-type distribution<br/>Relation-type statistics"]
+    ANALYSIS --> SUMMARY["Data summary<br/>Entity/relation counts/type distribution"]
+    ANALYSIS --> MICRO["Micro-tool generation"]
 ```
 
-**SchemaAnalysis** 输出：
-- `entity_types: Vec<(String, usize)>` — 实体类型及计数
-- `relation_types: Vec<String>` — 关系类型列表
-- `total_entities / total_relations` — 总计
+`SchemaAnalysis` output:
+- `entity_types: Vec<(String, usize)>` — entity types and counts
+- `relation_types: Vec<String>` — relation-type list
+- `total_entities / total_relations` — totals
 
-### MicroToolGenerator — 微工具生成
+### MicroToolGenerator — Micro-tool Generation
 
-根据图谱化结果动态生成查询工具，注入 LLM 上下文：
+Dynamically generates query tools from graphification results and injects them into the LLM context:
 
-| 微工具类型 | 名称模式 | 说明 |
+| Micro-tool type | Naming pattern | Description |
 |-----------|---------|------|
-| EntityTypeQuery | `query_{EntityType}` | 按实体类型查询 |
-| EntityDetails | `get_entity_details` | 获取实体详情 |
-| RelationTraversal | `expand_relation` | 遍历关系 |
-| FullTextRead | `read_full_result` | 读取完整存储结果 |
+| EntityTypeQuery | `query_{EntityType}` | Query by entity type |
+| EntityDetails | `get_entity_details` | Get entity details |
+| RelationTraversal | `expand_relation` | Traverse a relation |
+| FullTextRead | `read_full_result` | Read the complete stored result |
 
 ```rust
 pub enum MicroToolType {
@@ -128,9 +130,9 @@ pub enum MicroToolType {
 }
 ```
 
-## 集成到 AgentRunner
+## AgentRunner Integration
 
-工具结果路由在 `AgentRunner.route_tool_result()` 中自动执行：
+Tool-result routing runs automatically in `AgentRunner.route_tool_result()`:
 
 ```mermaid
 sequenceDiagram
@@ -141,26 +143,26 @@ sequenceDiagram
     participant LLM as LLM API
 
     AR->>TE: execute_tool(name, input)
-    TE-->>AR: tool_result (可能很大)
+    TE-->>AR: tool_result (potentially large)
     AR->>RR: route(result, tool_name, call_id)
     RR-->>AR: RouteDecision
 
     alt PassThrough
-        AR->>LLM: 直接透传结果
+        AR->>LLM: Pass result through directly
     else Truncate
         AR->>AR: smart_truncate(result)
-        AR->>LLM: 截断后的结果
+        AR->>LLM: Truncated result
     else Graphify
         AR->>KGS: write_quads(graphified)
-        AR->>LLM: 摘要 + 微工具定义
+        AR->>LLM: Summary + micro-tool definitions
     else Summarize
-        AR->>LLM: 预览 + read_full_result 工具
+        AR->>LLM: Preview + read_full_result tool
     end
 ```
 
-## UTF-8 安全处理
+## UTF-8 Safe Handling
 
-所有截断操作都确保在字符边界进行：
+All truncation operations ensure that slices end on a character boundary:
 
 ```rust
 fn safe_slice(s: &str, max_len: usize) -> &str {
