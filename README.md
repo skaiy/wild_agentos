@@ -210,7 +210,7 @@ cargo build -p wild-code-cli --release
 
 ## 🗺️ Roadmap
 
-Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a full Palantir clone; it does not replace Oxigraph with Nebula/Cypher, mix AIDVP product repositories, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
+Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a full Palantir clone; it does not replace Oxigraph with Nebula/Cypher, mix separate product/business repositories or product boundaries into this open-source tree, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
 
 - **v0.1.6 — done:** JWT `IsolationClaims` mint graph/blob/vector/L0 targets; relevant HTTP paths fail closed; historical keys are not migrated.
 - **v0.1.7 — done:** read-only minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and optional explicit migration with no silent `UNION`.
