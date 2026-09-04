@@ -1,67 +1,67 @@
-# 6. 感知系统
+# 6. Perception System
 
-> 基于 ProactiveEngine 的主动感知引擎，监控任务执行过程并在异常时触发干预
+> A proactive perception engine based on ProactiveEngine, monitoring task execution and triggering intervention when anomalies occur.
 
-## 6.1 模块概览
+## 6.1 Module Overview
 
-感知系统是 Agent OS 的"神经系统"，在任务执行的各个关键节点主动感知状态，发现异常时生成干预计划供 SA 决策执行。系统集成了 10 种感知触发器、缓存去重、5W2H 约束检查和经验提取功能。
+The perception system is Agent OS's “nervous system.” It proactively observes state at key points in task execution, generating intervention plans for SA to decide and execute when it finds anomalies. The system integrates ten perception triggers, cache deduplication, 5W2H constraint checks, and experience extraction.
 
 ```mermaid
 graph TB
-    subgraph 感知触发器
-        T1["TaskStart<br/>任务开始分析"]
-        T2["PlanCompleted<br/>计划完成评估"]
-        T3["ProgressAnomaly<br/>进度异常检测"]
-        T4["CheckCompleted<br/>审查结果评估"]
-        T5["TaskEnd<br/>经验提取"]
-        T6["CycleTimeout<br/>周期超时"]
-        T7["AgentBlocked<br/>Agent阻塞"]
-        T8["ResourceConflict<br/>资源冲突"]
-        T9["QualityDegradation<br/>质量下降"]
-        T10["UserFeedback<br/>用户反馈"]
+    subgraph Perception Triggers
+        T1["TaskStart<br/>Task-start analysis"]
+        T2["PlanCompleted<br/>Plan-completion assessment"]
+        T3["ProgressAnomaly<br/>Progress-anomaly detection"]
+        T4["CheckCompleted<br/>Review-result assessment"]
+        T5["TaskEnd<br/>Experience extraction"]
+        T6["CycleTimeout<br/>Cycle timeout"]
+        T7["AgentBlocked<br/>Agent blocked"]
+        T8["ResourceConflict<br/>Resource conflict"]
+        T9["QualityDegradation<br/>Quality degradation"]
+        T10["UserFeedback<br/>User feedback"]
     end
 
-    subgraph 分析能力
-        A1["难度分析<br/>输入长度阈值"]
-        A2["复杂度警告<br/>子任务数"]
-        A3["异常去重<br/>时间窗口"]
-        A4["5W2H 约束检查<br/>截止时间/预算"]
-        A5["经验检索<br/>L0 标签查询"]
+    subgraph Analysis Capabilities
+        A1["Difficulty analysis<br/>Input-length thresholds"]
+        A2["Complexity warning<br/>Subtask count"]
+        A3["Anomaly deduplication<br/>Time window"]
+        A4["5W2H constraint checks<br/>Deadline/budget"]
+        A5["Experience retrieval<br/>L0 tag query"]
     end
 
-    subgraph 输出产物
-        O1["TaskAnalysis<br/>任务分析结果"]
-        O2["AdvisoryNode<br/>建议节点"]
-        O3["InterventionPlan<br/>干预计划"]
-        O4["Experience<br/>经验记录"]
+    subgraph Outputs
+        O1["TaskAnalysis<br/>Task-analysis result"]
+        O2["AdvisoryNode<br/>Advisory node"]
+        O3["InterventionPlan<br/>Intervention plan"]
+        O4["Experience<br/>Experience record"]
     end
 
     T1 & T2 & T3 & T4 & T5 & T6 & T7 & T8 & T9 & T10 --> A1 & A2 & A3 & A4 & A5
     A1 & A2 & A3 & A4 & A5 --> O1 & O2 & O3 & O4
 ```
 
-## 6.2 核心组件
+## 6.2 Core Components
 
 ### 6.2.1 ProactiveEngine
 
-**文件**: `src/perception/proactive_engine.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/perception/proactive_engine.rs`
+**Implementation status**: ✅ Complete
 
-主动感知引擎，负责在任务执行关键节点进行感知分析。
+The proactive perception engine performs perception analysis at key task-execution points.
 
-**核心结构体**:
+**Core struct**:
 
 ```rust
 pub struct ProactiveEngine {
-    cache: HashMap<String, (DateTime<Utc>, Value)>,  // 分析结果缓存
-    config: PerceptionConfig,                          // 感知配置
-    anomaly_history: Vec<(String, DateTime<Utc>)>,     // 异常历史（去重）
-    l0: Arc<L0Store>,                                  // 永久存储（经验查询）
-    event_bus: Arc<EventBus>,                          // 事件总线
+    cache: HashMap<String, (DateTime<Utc>, Value)>,  // Analysis-result cache
+    config: PerceptionConfig,                          // Perception configuration
+    anomaly_history: Vec<(String, DateTime<Utc>)>,     // Anomaly history (deduplication)
+    l0: Arc<L0Store>,                                  // Persistent storage (experience queries)
+    event_bus: Arc<EventBus>,                          // Event bus
 }
 ```
 
-**数据类型的层次关系**:
+**Data-type hierarchy**:
 
 ```mermaid
 classDiagram
@@ -129,19 +129,19 @@ classDiagram
 
 ```rust
 pub struct PerceptionConfig {
-    pub cache_ttl_seconds: i64,           // 缓存 TTL（默认 300s）
-    pub cache_max_entries: usize,         // 最大缓存条目（默认 1000）
-    pub anomaly_dedup_window_seconds: i64, // 异常去重窗口（默认 60s）
-    pub simple_input_threshold: usize,    // 简单任务输入阈值（默认 50）
-    pub medium_input_threshold: usize,    // 中等任务输入阈值（默认 200）
-    pub simple_steps: u32,                // 简单任务步骤数（默认 1）
-    pub medium_steps: u32,                // 中等任务步骤数（默认 3）
-    pub complex_steps: u32,               // 复杂任务步骤数（默认 5）
-    pub complex_subtask_threshold: usize, // 复杂子任务告警阈值（默认 5）
+    pub cache_ttl_seconds: i64,           // Cache TTL (default: 300s)
+    pub cache_max_entries: usize,         // Maximum cache entries (default: 1000)
+    pub anomaly_dedup_window_seconds: i64, // Anomaly-deduplication window (default: 60s)
+    pub simple_input_threshold: usize,    // Simple-task input threshold (default: 50)
+    pub medium_input_threshold: usize,    // Medium-task input threshold (default: 200)
+    pub simple_steps: u32,                // Simple-task step count (default: 1)
+    pub medium_steps: u32,                // Medium-task step count (default: 3)
+    pub complex_steps: u32,               // Complex-task step count (default: 5)
+    pub complex_subtask_threshold: usize, // Complex-subtask warning threshold (default: 5)
 }
 ```
 
-**配置来源**: 通过 `PerceptionConfig::from_settings()` 从 `config.yaml` 加载：
+**Configuration source**: loaded from `config.yaml` through `PerceptionConfig::from_settings()`:
 
 ```yaml
 perception:
@@ -162,39 +162,39 @@ perception:
   error_rate_threshold: 0.5
 ```
 
-## 6.3 感知触发器详解
+## 6.3 Perception Trigger Details
 
-### 6.3.1 PerceptionTrigger 枚举
+### 6.3.1 `PerceptionTrigger` Enum
 
 ```rust
 pub enum PerceptionTrigger {
-    TaskStart,          // 任务开始 — 复杂度分析 + 经验检索
-    PlanCompleted,      // 计划完成 — 子任务数检查
-    ProgressAnomaly,    // 进度异常 — 去重窗口内检测重复异常
-    CheckCompleted,     // 审查完成 — 审查失败告警
-    TaskEnd,            // 任务结束 — 经验提取
-    CycleTimeout,       // 周期超时 — 执行超时干预
-    AgentBlocked,       // Agent 阻塞 — 健康检测
-    ResourceConflict,   // 资源冲突 — 队列/延迟分析
-    QualityDegradation, // 质量下降 — 回滚信号
-    UserFeedback,       // 用户反馈 — 反馈日志
+    TaskStart,          // Task start — complexity analysis + experience retrieval
+    PlanCompleted,      // Plan completed — subtask-count check
+    ProgressAnomaly,    // Progress anomaly — detect duplicate anomalies within the deduplication window
+    CheckCompleted,     // Review completed — review-failure warning
+    TaskEnd,            // Task end — experience extraction
+    CycleTimeout,       // Cycle timeout — execution-timeout intervention
+    AgentBlocked,       // Agent blocked — health check
+    ResourceConflict,   // Resource conflict — queue/latency analysis
+    QualityDegradation, // Quality degradation — rollback signal
+    UserFeedback,       // User feedback — feedback log
 }
 ```
 
-### 6.3.2 TaskStart — 任务开始分析
+### 6.3.2 TaskStart — Task-Start Analysis
 
-**方法**: `on_task_start(user_input, task_iri) -> Result<TaskAnalysis>`
+**Method**: `on_task_start(user_input, task_iri) -> Result<TaskAnalysis>`
 
-在 SA 启动新任务周期时调用，执行：
+Called when SA starts a new task cycle. It performs:
 
-1. **复杂度分析**：根据输入长度判断复杂度
-   - 输入 < `simple_input_threshold`（50）→ `simple`
-   - 输入 < `medium_input_threshold`（200）→ `medium`
-   - 输入 ≥ `medium_input_threshold` → `complex`
+1. **Complexity analysis**: determines complexity from input length
+   - Input < `simple_input_threshold` (50) → `simple`
+   - Input < `medium_input_threshold` (200) → `medium`
+   - Input ≥ `medium_input_threshold` → `complex`
 
-2. **经验检索**：从 L0 查询标签为 `experience` 的历史记录，筛选与当前任务相关的前 5 条，注入 `relevant_experience_hints`
+2. **Experience retrieval**: queries L0 for historical records tagged `experience`, selects the five most relevant to the current task, and injects them into `relevant_experience_hints`.
 
-3. **缓存**：分析结果缓存在 `cache` 中，TTL 内重复请求直接返回缓存
+3. **Caching**: stores the analysis result in `cache`; repeated requests within the TTL return the cached result directly.
 
 ```rust
 fn analyze_task(&self, user_input: &str) -> TaskAnalysis {
@@ -211,7 +211,7 @@ fn analyze_task(&self, user_input: &str) -> TaskAnalysis {
         summary: user_input.chars().take(100).collect(),
         complexity,
         estimated_steps: steps,
-        risks: /* complex 时提示大范围风险 */,
+        risks: /* identify broad-scope risks for complex tasks */,
         recommended_approach: /* simple→direct_da, medium→standard_pdca, complex→recursive_pdca */,
         agent_assignments: {plan: "PA", execute: "DA", check: "CA", act: "AA"},
         relevant_experience_hints: Vec::new(),
@@ -219,185 +219,185 @@ fn analyze_task(&self, user_input: &str) -> TaskAnalysis {
 }
 ```
 
-### 6.3.3 PlanCompleted — 计划完成评估
+### 6.3.3 PlanCompleted — Plan-Completion Assessment
 
-**方法**: `on_plan_completed(plan, task_iri) -> Vec<AdvisoryNode>`
+**Method**: `on_plan_completed(plan, task_iri) -> Vec<AdvisoryNode>`
 
-在 PA 完成计划制定后调用，检查：
+Called after PA completes plan creation. It checks:
 
-- 子任务数是否超过 `complex_subtask_threshold`（5）
-- 超过时生成 `complexity_warning` 类型的 AdvisoryNode（severity: medium），建议并行化
+- Whether the subtask count exceeds `complex_subtask_threshold` (5).
+- If it does, creates an `AdvisoryNode` of type `complexity_warning` (severity: medium) that recommends parallelization.
 
-### 6.3.4 ProgressAnomaly — 进度异常检测
+### 6.3.4 ProgressAnomaly — Progress-Anomaly Detection
 
-**方法**: `on_progress_anomaly(anomaly, task_iri) -> InterventionPlan`
+**Method**: `on_progress_anomaly(anomaly, task_iri) -> InterventionPlan`
 
-在 SA 执行过程中检测到进度异常时调用：
+Called when a progress anomaly is detected during SA execution:
 
-1. **去重检查**：在 `anomaly_dedup_window_seconds`（60s）内相同描述的异常只处理一次
-2. 返回 `InterventionPlan`，建议 "重新评估计划" 和 "考虑额外资源"
-3. 标记 `should_interrupt: true`
+1. **Deduplication check**: handles an anomaly with the same description only once within `anomaly_dedup_window_seconds` (60s).
+2. Returns an `InterventionPlan` recommending “reassess the plan” and “consider additional resources.”
+3. Sets `should_interrupt: true`.
 
-### 6.3.5 CheckCompleted — 审查结果评估
+### 6.3.5 CheckCompleted — Review-Result Assessment
 
-**方法**: `on_check_completed(check_result, task_iri) -> Option<AdvisoryNode>`
+**Method**: `on_check_completed(check_result, task_iri) -> Option<AdvisoryNode>`
 
-在 CA 完成审查后调用：
+Called after CA completes a review:
 
-- 检查 `verdict` 字段是否为 `"fail"`
-- 审查失败时生成 severity: `high` 的 AdvisoryNode，包含详细审查结果
+- Checks whether the `verdict` field is `"fail"`.
+- When the review fails, creates an `AdvisoryNode` with severity `high` that contains the detailed review result.
 
-### 6.3.6 TaskEnd — 经验提取
+### 6.3.6 TaskEnd — Experience Extraction
 
-**方法**: `on_task_end(task_result, task_iri) -> Option<Experience>`
+**Method**: `on_task_end(task_result, task_iri) -> Option<Experience>`
 
-在 Agent 执行完成（success 或 failed）后调用：
+Called after Agent execution completes (`success` or `failed`):
 
-1. 从 task_result 的 `summary` 字段提取场景描述
-2. 创建 Experience 对象，`success_rating` 为 0.9（成功）或 0.1（失败）
-3. 将经验存储到 L0，标签包含 `["experience", "task:{iri}", "status:{status}"]`
+1. Extracts the scenario description from the `summary` field of `task_result`.
+2. Creates an `Experience` object with `success_rating` of 0.9 (success) or 0.1 (failure).
+3. Stores the experience in L0 with tags including `["experience", "task:{iri}", "status:{status}"]`.
 
-### 6.3.7 CycleTimeout — 周期超时
+### 6.3.7 CycleTimeout — Cycle Timeout
 
-**方法**: `on_cycle_timeout(cycle_id, task_iri, elapsed_secs) -> InterventionPlan`
+**Method**: `on_cycle_timeout(cycle_id, task_iri, elapsed_secs) -> InterventionPlan`
 
-在任务周期超过超时阈值时调用：
+Called when a task cycle exceeds its timeout threshold:
 
-- 返回 `InterventionPlan`（priority: critical, should_interrupt: true）
-- 建议 "延长超时" 和 "检查 Agent 健康"
+- Returns an `InterventionPlan` (`priority: critical`, `should_interrupt: true`).
+- Recommends “extend the timeout” and “check Agent health.”
 
-### 6.3.8 AgentBlocked — Agent 阻塞
+### 6.3.8 AgentBlocked — Agent Blocked
 
-**方法**: `on_agent_blocked(agent_id, task_iri) -> InterventionPlan`
+**Method**: `on_agent_blocked(agent_id, task_iri) -> InterventionPlan`
 
-在 Agent 健康检测发现阻塞时调用：
+Called when Agent health checks detect a block:
 
-- 返回 `InterventionPlan`（priority: high, should_interrupt: true）
-- 建议 "重启 Agent" 和 "注入辅助消息"
+- Returns an `InterventionPlan` (`priority: high`, `should_interrupt: true`).
+- Recommends “restart the Agent” and “inject an assistive message.”
 
-### 6.3.9 ResourceConflict — 资源冲突
+### 6.3.9 ResourceConflict — Resource Conflict
 
-**方法**: `on_resource_conflict(conflict, task_iri) -> InterventionPlan`
+**Method**: `on_resource_conflict(conflict, task_iri) -> InterventionPlan`
 
-在检测到资源竞争时调用：
+Called when resource contention is detected:
 
-- 返回 `InterventionPlan`（priority: medium, should_interrupt: false）
-- 建议 "排队冲突请求" 和 "通知 SA"
+- Returns an `InterventionPlan` (`priority: medium`, `should_interrupt: false`).
+- Recommends “queue the conflicting requests” and “notify SA.”
 
-### 6.3.10 QualityDegradation — 质量下降
+### 6.3.10 QualityDegradation — Quality Degradation
 
-**方法**: `on_quality_degradation(degradation, task_iri) -> InterventionPlan`
+**Method**: `on_quality_degradation(degradation, task_iri) -> InterventionPlan`
 
-在输出质量下降时调用：
+Called when output quality degrades:
 
-- 返回 `InterventionPlan`（priority: high, should_interrupt: true）
-- 建议 "回滚到上一个检查点" 和 "使用不同方法重试"
+- Returns an `InterventionPlan` (`priority: high`, `should_interrupt: true`).
+- Recommends “roll back to the previous checkpoint” and “retry using a different approach.”
 
-### 6.3.11 UserFeedback — 用户反馈
+### 6.3.11 UserFeedback — User Feedback
 
-**方法**: `on_user_feedback(feedback, task_iri) -> AdvisoryNode`
+**Method**: `on_user_feedback(feedback, task_iri) -> AdvisoryNode`
 
-在收到用户明确反馈时调用：
+Called when explicit user feedback is received:
 
-- 返回 AdvisoryNode（type: user_feedback, severity: medium）
-- 完整保留用户反馈内容
+- Returns an `AdvisoryNode` (`type: user_feedback`, `severity: medium`).
+- Preserves the full user-feedback content.
 
-## 6.4 5W2H 约束检查
+## 6.4 5W2H Constraint Checks
 
-**方法**: `check_5w2h_constraints(five_w2h_iri) -> Option<String>`
+**Method**: `check_5w2h_constraints(five_w2h_iri) -> Option<String>`
 
-从 L0 加载 5W2H 节点，检查约束条件：
+Loads the 5W2H node from L0 and checks its constraints:
 
-**截止时间检查**：
-- 从 `task:when/task:deadline` 读取截止时间
-- 从 `task:when/task:reminderBefore` 读取提醒提前量（ISO8601 时长格式，如 `"PT1H"`）
-- 当前时间距截止时间小于提醒提前量 → `"DEADLINE_APPROACHING"`
-- 当前时间超过截止时间 → `"DEADLINE_EXCEEDED"`
+**Deadline check**:
+- Reads the deadline from `task:when/task:deadline`.
+- Reads the reminder lead time from `task:when/task:reminderBefore` (an ISO8601 duration, such as `"PT1H"`).
+- If the time until the deadline is less than the reminder lead time → `"DEADLINE_APPROACHING"`.
+- If the current time is past the deadline → `"DEADLINE_EXCEEDED"`.
 
-**预算检查**：
-- 从 `task:howMuch/task:tokenBudget` 读取 Token 预算
-- 从 `task:howMuch/task:actualCost/tokensUsed` 读取实际使用量
-- 使用量 > 预算的 80% → `"BUDGET_EXCEEDED"`
+**Budget check**:
+- Reads the token budget from `task:howMuch/task:tokenBudget`.
+- Reads actual usage from `task:howMuch/task:actualCost/tokensUsed`.
+- If usage exceeds 80% of the budget → `"BUDGET_EXCEEDED"`.
 
-**ISO8601 时长解析**：
+**ISO8601 duration parsing**:
 
 ```rust
 fn parse_iso8601_duration(s: &str) -> Option<chrono::Duration> {
-    // 解析 "PT1H30M" 格式
-    // 支持 H（小时）、M（分钟）、S（秒）
+    // Parses the "PT1H30M" format
+    // Supports H (hours), M (minutes), and S (seconds)
 }
 ```
 
-## 6.5 缓存与去重机制
+## 6.5 Cache and Deduplication
 
-### 结果缓存
+### Result Cache
 
 - `cache`: `HashMap<String, (DateTime<Utc>, Value)>`
-- 缓存 Key 格式：`"{trigger}:{context}"`（如 `"task_start:iri://task/001"`）
-- TTL：`cache_ttl_seconds`（默认 300 秒）
-- 达到 `cache_max_entries`（默认 1000）时执行 LRU 淘汰
+- Cache-key format: `"{trigger}:{context}"` (for example, `"task_start:iri://task/001"`).
+- TTL: `cache_ttl_seconds` (default: 300 seconds).
+- Performs LRU eviction when `cache_max_entries` (default: 1000) is reached.
 
 ```rust
 fn is_cached(&self, key: &str) -> bool {
-    // 检查缓存有效性（TTL 内）
+    // Checks cache validity (within the TTL)
 }
 
 fn evict_cache(&mut self) {
-    // 超出 max_entries 时淘汰过期和最早的缓存
+    // Evicts expired and oldest cache entries when max_entries is exceeded
 }
 ```
 
-### 异常去重
+### Anomaly Deduplication
 
 - `anomaly_history`: `Vec<(String, DateTime<Utc>)>`
-- 去重窗口：`anomaly_dedup_window_seconds`（默认 60 秒）
-- 相同描述的异常在窗口内重复出现时返回 `already_handled`（不执行干预）
-- 历史记录保留 `anomaly_dedup_window_seconds × 2` 后清理
+- Deduplication window: `anomaly_dedup_window_seconds` (default: 60 seconds).
+- Returns `already_handled` (with no intervention) if an anomaly with the same description recurs within the window.
+- Cleans up history after retaining it for `anomaly_dedup_window_seconds × 2`.
 
 ```rust
 fn on_progress_anomaly(&mut self, anomaly: &Value, task_iri: &str) -> InterventionPlan {
-    // 去重检查
+    // Deduplication check
     if self.anomaly_history.iter().any(|(d, t)| {
         d == desc && now.signed_duration_since(*t).num_seconds() < self.config.anomaly_dedup_window_seconds
     }) {
         return InterventionPlan { /* already_handled */ };
     }
-    // 记录新异常
+    // Record the new anomaly
     self.anomaly_history.push((desc.to_string(), Utc::now()));
-    // 返回真实干预计划
+    // Return the actual intervention plan
 }
 ```
 
-## 6.6 经验提取流程
+## 6.6 Experience-Extraction Flow
 
 ```mermaid
 flowchart TD
-    TASK_DONE["Agent 执行完成<br/>success / failed"] --> EXTRACT["提取场景摘要<br/>summary"]
-    EXTRACT --> CREATE_EXP["创建 Experience<br/>success_rating: 0.9/0.1"]
-    CREATE_EXP --> STORE_L0["存储到 L0<br/>标签: experience, status"]
-    STORE_L0 --> RETURN["返回 Option~Experience~"]
+    TASK_DONE["Agent execution complete<br/>success / failed"] --> EXTRACT["Extract scenario summary<br/>summary"]
+    EXTRACT --> CREATE_EXP["Create Experience<br/>success_rating: 0.9/0.1"]
+    CREATE_EXP --> STORE_L0["Store in L0<br/>Tags: experience, status"]
+    STORE_L0 --> RETURN["Return Option~Experience~"]
 
-    TASK_DONE -->|其他状态| SKIP["跳过经验提取"]
+    TASK_DONE -->|Other statuses| SKIP["Skip experience extraction"]
 ```
 
-经验在 L0 中的存储格式：
+Experience storage format in L0:
 
 ```json
 {
   "@id": "iri://experience/{id}",
   "@type": "Experience",
-  "scenario": "任务摘要内容",
+  "scenario": "task summary content",
   "pattern": "task_{status}",
   "success_rating": 0.9,
   "tags": ["experience", "task:{task_iri}", "status:{status}"]
 }
 ```
 
-后续任务开始时，`on_task_start()` 通过 `search_by_tags(["experience"])` 查询相关经验，利用内容关键词匹配筛选 Top-5。
+When subsequent tasks begin, `on_task_start()` queries relevant experience using `search_by_tags(["experience"])` and selects the top five through content-keyword matching.
 
-## 6.7 与 SA 的集成
+## 6.7 Integration with SA
 
-感知系统与 SA 的集成发生在以下环节：
+The perception system integrates with SA at the following points:
 
 ```mermaid
 sequenceDiagram
@@ -419,21 +419,21 @@ sequenceDiagram
     SA->>PE: on_task_end(result, iri)
     PE-->>SA: Option<Experience>
 
-    Note over PE: 经验存储到 L0
+    Note over PE: Store experience in L0
 
-    loop 步骤执行中
+    loop While steps execute
         SA->>PE: check_5w2h_constraints(iri)
-        alt 有约束告警
+        alt Constraint warning exists
             PE-->>SA: "DEADLINE_APPROACHING/BUDGET_EXCEEDED"
-            SA->>EB: 发射约束告警事件
+            SA->>EB: Emit constraint-warning event
         end
     end
 
-    Note over SA,PE: 异常感知（事件驱动）
-    PE->>SA: InterventionPlan（通过 LLM 分类决策）
+    Note over SA,PE: Anomaly perception (event-driven)
+    PE->>SA: InterventionPlan (decision based on LLM classification)
     SA->>LLM: analyze_anomaly_with_llm()
-    LLM-->>SA: 选择预定义干预动作
-    SA->>SA: 执行干预动作
+    LLM-->>SA: Select a predefined intervention action
+    SA->>SA: Execute the intervention action
 ```
 
-SA 通过 `perception` 字段持有 `ProactiveEngine` 实例，在 `process_task()`、`execute_plan()` 和 `dispatch_agent()` 中适时调用感知方法。
+SA holds a `ProactiveEngine` instance through its `perception` field and invokes perception methods as appropriate in `process_task()`, `execute_plan()`, and `dispatch_agent()`.

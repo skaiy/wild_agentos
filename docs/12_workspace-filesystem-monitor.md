@@ -1,136 +1,138 @@
-# 12. 工作区文件系统监控与内容管理（Workspace FileSystem Monitor）
+# 12. Workspace File-System Monitoring and Content Management
 
-## 12.1 问题背景
+> *For the Chinese translation, see [12_workspace-filesystem-monitor.zh.md](12_workspace-filesystem-monitor.zh.md).*
 
-### 现状痛点
+## 12.1 Background
 
-当前 wildcode 在文件系统操作上存在以下问题：
+### Current pain points
 
-1. **重复读取**：Agent 反复 `file_read` 同一个文件，不知道哪些已读过
-2. **盲目 ls**：Agent 反复 `file_list` 探索目录结构，没有工作区快照
-3. **变更无知**：Agent 不知道文件在两次读取之间是否被修改（上次读取 vs 当前状态）
-4. **全量重读**：即使文件只改了几行，也必须全量重读，没有差分能力
-5. **盲区文件**：Agent 不知道工作区存在哪些尚未发现/未读取的文件
-6. **无状态上下文**：LLM 上下文窗口内关于文件状态的信息完全依赖自身记忆
+wildcode currently has the following problems with file-system operations:
 
-### 现有可复用基础设施
+1. **Repeated reads**: Agents repeatedly `file_read` the same file without knowing which files they have already read.
+2. **Blind ls**: Agents repeatedly use `file_list` to explore the directory structure because there is no workspace snapshot.
+3. **Change unawareness**: Agents do not know whether a file was modified between two reads (the previous read versus its current state).
+4. **Full rereads**: Even when only a few lines change, the entire file must be reread; no diff capability exists.
+5. **Undiscovered files**: Agents do not know which files in the workspace have not yet been discovered or read.
+6. **Stateless context**: All file-state knowledge in the LLM context window relies entirely on the LLM's own memory.
 
-| 系统 | 文件 | 可复用能力 |
+### Existing reusable infrastructure
+
+| System | File | Reusable capability |
 |------|------|-----------|
-| **redb** | 已依赖 `redb = "4.1"` | 嵌入式 KV 数据库，ACID 事务，用于文件元数据持久化和版本索引 |
-| **walkdir** | 已依赖 `walkdir = "2.4"` | 高效递归目录遍历 |
-| **sha2** | 已依赖 `sha2 = "0.10"` | SHA-256 内容哈希 |
-| **Oxigraph / L2** | `src/memory/l2_blackboard.rs` | RDF Triple Store + SPARQL 1.1 + Named Graph 隔离 |
-| **L3 Projection** | `src/memory/l3_projection.rs` | SPARQL 投影 + Materialized View + Token 预算控制 |
-| **EventBus** | `src/core/event_bus.rs` | O(1) bitmap 路由 + broadcast channel + spawn_consumer |
-| **HookManager** | `src/tools/hooks.rs` | 18 个 HookPoint，SkillBefore/After 工具拦截 |
-| **ToolGuard** | `src/tools/tool_guard.rs` | FileCoverage 行范围追踪 + Pre/Post validation hooks |
-| **ImportScanner** | `src/tools/import_scanner.rs` | 6 语言 import 解析（Rust/TS/JS/Py/Go/Java/C） |
-| **CodeAst** | `src/knowledge_graph/code_ast.rs` | tree-sitter AST + 内容哈希缓存 + `file:` IRI 映射 |
-| **PerceptionEngine** | `src/perception/proactive_engine.rs` | 10 触发器 + 异常去重 + EventBus 消费 |
-| **Batch Agent** | `src/batch/manager.rs` | 后台知识提取 + 实体/关系检测 + 自进化 |
-| **L0Store** | `src/memory/l0_store.rs` | 持久化存储 + MESI 状态 + prefix scan |
-| **MCP Client** | `src/tools/mcp_client.rs` | 外部工具发现（可透传文件状态到 MCP 工具） |
+| **redb** | Already depends on `redb = "4.1"` | Embedded KV database and ACID transactions for persistent file metadata and version indexes |
+| **walkdir** | Already depends on `walkdir = "2.4"` | Efficient recursive directory traversal |
+| **sha2** | Already depends on `sha2 = "0.10"` | SHA-256 content hashing |
+| **Oxigraph / L2** | `src/memory/l2_blackboard.rs` | RDF Triple Store + SPARQL 1.1 + Named Graph isolation |
+| **L3 Projection** | `src/memory/l3_projection.rs` | SPARQL projection + Materialized View + token-budget control |
+| **EventBus** | `src/core/event_bus.rs` | O(1) bitmap routing + broadcast channel + spawn_consumer |
+| **HookManager** | `src/tools/hooks.rs` | 18 HookPoints and SkillBefore/After tool interception |
+| **ToolGuard** | `src/tools/tool_guard.rs` | FileCoverage line-range tracking + Pre/Post validation hooks |
+| **ImportScanner** | `src/tools/import_scanner.rs` | Import parsing for 6 languages (Rust/TS/JS/Py/Go/Java/C) |
+| **CodeAst** | `src/knowledge_graph/code_ast.rs` | tree-sitter AST + content-hash cache + `file:` IRI mapping |
+| **PerceptionEngine** | `src/perception/proactive_engine.rs` | 10 triggers + anomaly deduplication + EventBus consumption |
+| **Batch Agent** | `src/batch/manager.rs` | Background knowledge extraction + entity/relation detection + self-evolution |
+| **L0Store** | `src/memory/l0_store.rs` | Persistent storage + MESI state + prefix scan |
+| **MCP Client** | `src/tools/mcp_client.rs` | External tool discovery (can pass file state through to MCP tools) |
 
-**现有依赖中已包含**: `redb`, `walkdir`, `sha2`。  
-**需要新增**: `notify`, `notify-debouncer-mini`, `similar`, `lru`。  
-**不需要 gix**：见下文 12.3.4 分析。
+**Already included among existing dependencies**: `redb`, `walkdir`, `sha2`.
+**Must be added**: `notify`, `notify-debouncer-mini`, `similar`, `lru`.
+**gix is not needed**: see the analysis in section 12.3.4 below.
 
 ---
 
-## 12.2 带来的提升（对现有系统的增强）
+## 12.2 Improvements to Existing Systems
 
-### 12.2.1 感知能力的质变
+### 12.2.1 Qualitative change in perception
 
-当前系统依赖 Agent **主动查询**（`glob_search`、`grep_search`、`file_list`）。文件监控系统可以**被动推送**：
+The current system depends on Agents **actively querying** (`glob_search`, `grep_search`, `file_list`). The file-monitoring system can **push passively**:
 
-| 维度 | 当前（主动轮询） | 新系统（被动推送） |
+| Dimension | Current (active polling) | New system (passive push) |
 |------|-----------------|-------------------|
-| 实时性 | Agent 需要反复 file_list 巡检 | notify 事件驱动，毫秒级感知 |
-| 完整性 | 只知已列出的文件，存在盲区 | `full_scan()` 建立完整清单，所有文件有状态 |
-| 上下文刷新 | Agent 需自行判断是否重读 | 变更事件 → L2 标记 stale → L3 投影自动反映最新状态 |
-| 盲区消除 | 文件存在于磁盘但 Agent 不知道 | FileInventory 记录所有文件，`discovered_unread` 状态 |
+| Timeliness | Agent must repeatedly inspect with file_list | notify event-driven, millisecond-level awareness |
+| Completeness | Only knows listed files; blind spots remain | `full_scan()` builds a complete inventory; every file has state |
+| Context refresh | Agent must decide whether to reread | Change event → L2 marks stale → L3 projection automatically reflects the latest state |
+| Blind-spot elimination | Files exist on disk but are unknown to the Agent | FileInventory records every file with `discovered_unread` state |
 
-### 12.2.2 上下文管理的精准度提升
+### 12.2.2 More precise context management
 
-| 能力 | 机制 |
+| Capability | Mechanism |
 |------|------|
-| **已读/未读状态** | L2 Node 的 `ws:state` 属性：`read_fresh` / `read_stale` / `discovered_unread` / `written_unread` |
-| **过期检测** | `ws:lastReadVersion < ws:currentVersion` → 提示 Agent "文件 X 已更新，是否重新读取" |
-| **差分读取** | ContentStore 缓存旧版本 + DiffEngine 生成 unified diff → 只返回变更行 |
-| **版本绑定** | 每次读取记录版本号，上下文引用可追溯到特定版本 |
+| **Read/unread state** | `ws:state` on the L2 Node: `read_fresh` / `read_stale` / `discovered_unread` / `written_unread` |
+| **Staleness detection** | `ws:lastReadVersion < ws:currentVersion` → prompts the Agent: “File X has changed; reread it?” |
+| **Diff reads** | ContentStore caches the old version + DiffEngine generates a unified diff → returns only changed lines |
+| **Version binding** | Each read records a version number; context references can be traced to a specific version |
 
-### 12.2.3 工具执行的效率与安全性
+### 12.2.3 Tool-execution efficiency and safety
 
-| 增强 | 实现 |
+| Enhancement | Implementation |
 |------|------|
-| **ToolGuard 硬阻断** | Agent 试图 `file_edit` 一个 `read_stale` 文件 → HookManager SkillBefore 返回 Abort |
-| **ImportScanner 自动刷新** | 文件变更 → 自动 re-scan imports → 更新 L2 中的 `ws:dependsOn` 关系 |
-| **依赖图感知** | L2 中文件间的 `ws:importedBy` / `ws:dependsOn` 关系 → 变更一个文件时提示相关文件也需要检查 |
-| **file_read 智能模式** | `ReadMode::Diff` — 文件变化时返回增量；`ReadMode::Full` — 首次读取或缓存失效 |
+| **ToolGuard hard block** | Agent attempts to `file_edit` a `read_stale` file → HookManager SkillBefore returns Abort |
+| **ImportScanner automatic refresh** | File change → automatically re-scan imports → update `ws:dependsOn` relations in L2 |
+| **Dependency-graph awareness** | `ws:importedBy` / `ws:dependsOn` relations between files in L2 → changing one file prompts review of related files |
+| **file_read intelligent modes** | `ReadMode::Diff` returns an increment when a file changes; `ReadMode::Full` is for initial reads or invalid caches |
 
-### 12.2.4 后台整理与自进化
+### 12.2.4 Background organization and self-evolution
 
-| 增强 | 实现 |
+| Enhancement | Implementation |
 |------|------|
-| **Batch Agent 触发** | `WORKSPACE_FILE_MODIFIED` 事件 → 触发知识抽取 / 记忆压缩 |
-| **经验学习** | 高频读取/修改文件统计 → 反馈到 Prompt 模板 / Skill Graph |
-| **自动 AST 重提取** | 文件变更 → CodeAst 重解析 → 更新 Knowledge Graph 中的代码实体 |
+| **Batch Agent trigger** | `WORKSPACE_FILE_MODIFIED` event → triggers knowledge extraction / memory compression |
+| **Experience learning** | Statistics for frequently read/modified files → feedback to Prompt templates / Skill Graph |
+| **Automatic AST re-extraction** | File change → CodeAst re-parses → updates code entities in the Knowledge Graph |
 
 ---
 
-## 12.3 总体架构
+## 12.3 Overall architecture
 
 ```mermaid
 flowchart TB
-    subgraph FS["文件系统事件"]
+    subgraph FS["File-system events"]
         NOTIFY["notify crate<br/>inotify / FSEvents / ReadDirectoryChanges"]
     end
 
     subgraph CORE["Workspace Monitor Core"]
-        WE["WatchEngine<br/>━━━━━━━━━━━<br/>notify 封装<br/>事件去抖 500ms"]
-        FI["FileInventory<br/>━━━━━━━━━━━<br/>L2/L3 facade<br/>redb 元数据缓存"]
-        CS["ContentStore<br/>━━━━━━━━━━━<br/>LRU 内容缓存<br/>SHA-256 索引"]
+        WE["WatchEngine<br/>━━━━━━━━━━━<br/>notify wrapper<br/>500ms event debounce"]
+        FI["FileInventory<br/>━━━━━━━━━━━<br/>L2/L3 facade<br/>redb metadata cache"]
+        CS["ContentStore<br/>━━━━━━━━━━━<br/>LRU content cache<br/>SHA-256 index"]
         DE["DiffEngine<br/>━━━━━━━━━━━<br/>similar crate<br/>Myers diff"]
     end
 
-    subgraph EXISTING["复用现有基础设施"]
+    subgraph EXISTING["Reuse existing infrastructure"]
         EB["EventBus<br/>WORKSPACE_FILE_*"]
         L2["L2 Blackboard<br/>Named Graph: iri://workspace<br/>RDF Triple Store"]
-        L3["L3 ProjectionEngine<br/>SPARQL 投影<br/>Materialized View"]
-        L0["L0Store (redb)<br/>版本索引持久化<br/>crash 恢复"]
+        L3["L3 ProjectionEngine<br/>SPARQL projection<br/>Materialized View"]
+        L0["L0Store (redb)<br/>persistent version index<br/>crash recovery"]
         HM["HookManager<br/>SkillBefore/After"]
-        TG["ToolGuard<br/>FileCoverage 增强"]
-        IS["ImportScanner<br/>依赖重扫描"]
-        BA["Batch Agent<br/>后台知识提取"]
-        PE["PerceptionEngine<br/>异常告警"]
-        CA["CodeAst<br/>AST 重提取"]
+        TG["ToolGuard<br/>FileCoverage enhancement"]
+        IS["ImportScanner<br/>dependency re-scan"]
+        BA["Batch Agent<br/>background knowledge extraction"]
+        PE["PerceptionEngine<br/>anomaly alerting"]
+        CA["CodeAst<br/>AST re-extraction"]
     end
 
-    subgraph AGENT["Agent 工具层"]
-        FR["file_read<br/>Diff/Cache 模式"]
-        FL["file_list<br/>快照模式"]
-        FW["file_write/edit<br/>自动标记"]
+    subgraph AGENT["Agent tool layer"]
+        FR["file_read<br/>Diff/Cache modes"]
+        FL["file_list<br/>snapshot mode"]
+        FW["file_write/edit<br/>automatic marking"]
     end
 
-    NOTIFY -->|原始事件| WE
-    WE -->|去抖后| EB
+    NOTIFY -->|raw events| WE
+    WE -->|after debounce| EB
     EB -->|WORKSPACE_FILE_*| FI
-    EB -.->|触发| BA
-    EB -.->|异常检测| PE
+    EB -.->|trigger| BA
+    EB -.->|anomaly detection| PE
 
     FI <-->|SPARQL R/W| L2
-    FI -->|查询投影| L3
-    FI <-->|元数据缓存| L0
+    FI -->|query projection| L3
+    FI <-->|metadata cache| L0
 
     HM --> FI
     HM --> TG
     HM --> CS
 
-    TG -->|检查 stale| FI
-    TG -.->|阻断写入| FW
-    IS -->|依赖更新| L2
-    CA -->|AST 存储| L2
+    TG -->|check stale| FI
+    TG -.->|block writes| FW
+    IS -->|dependency update| L2
+    CA -->|AST storage| L2
 
     FR --> CS --> DE
     FL --> FI
@@ -139,37 +141,37 @@ flowchart TB
 
 ---
 
-## 12.4 核心设计
+## 12.4 Core design
 
-### 12.4.1 存储架构 — 双层模型
+### 12.4.1 Storage architecture — two-layer model
 
-**设计原则**：文件**元数据**走 L2 + redb，文件**内容**走 ContentStore。不混用。
+**Design principle**: file **metadata** goes through L2 + redb; file **content** goes through ContentStore. Do not mix them.
 
 ```
-查询路径:
-  Agent file_list → FileInventory → redb (热缓存) → L2 SPARQL
-  Agent file_read  → ContentStore → LRU 内存缓存 → 磁盘
-  L3 投影查询     → L2 SPARQL → MaterializedView
+Query paths:
+  Agent file_list → FileInventory → redb (hot cache) → L2 SPARQL
+  Agent file_read → ContentStore → LRU in-memory cache → disk
+  L3 projection query → L2 SPARQL → MaterializedView
 
-写入路径:
-  notify 事件     → EventBus → FileInventory → redb + L2 SPARQL UPDATE
+Write paths:
+  notify event → EventBus → FileInventory → redb + L2 SPARQL UPDATE
   Agent file_write → HookManager → ContentStore.invalidate() + FileInventory.mark_written()
 ```
 
-#### 为什么不用 gix？—— 含回滚能力分析
+#### Why not gix? — rollback-capability analysis
 
-| 对比维度 | gix | redb + SnapshotManager | 评估 |
+| Comparison | gix | redb + SnapshotManager | Assessment |
 |----------|-----|----------------------|------|
-| 编译时间 | ~60s | 0s（已编译） | redb 胜 |
-| 二进制大小 | +~2MB | 0（已包含） | redb 胜 |
-| 单文件版本存储 | blob + tree | redb key: `version:{hash}` → content | 相当 |
-| **Workspace 快照** | commit（所有文件一致性快照） | `SnapshotRecord { path→hash map }` 存入 redb | 相当 |
-| **Workspace 回滚** | checkout commit | 遍历 snapshot → 写回每个文件 | 相当 |
-| Diff | git diff | similar crate（更轻量） | redb 更轻 |
-| 分支/合并 | ✅ | ❌ 不需要 | Agent 不需要 |
-| 增量提交 | ✅（自动） | ✅（仅变更文件更新 snapshot） | 相当 |
+| Compile time | ~60s | 0s (already compiled) | redb wins |
+| Binary size | +~2MB | 0 (already included) | redb wins |
+| Single-file version storage | blob + tree | redb key: `version:{hash}` → content | Equivalent |
+| **Workspace snapshot** | commit (consistent snapshot of all files) | Store `SnapshotRecord { path→hash map }` in redb | Equivalent |
+| **Workspace rollback** | checkout commit | Traverse snapshot → write back each file | Equivalent |
+| Diff | git diff | similar crate (lighter) | redb is lighter |
+| Branches/merges | ✅ | ❌ Not needed | Not needed by Agents |
+| Incremental commits | ✅ (automatic) | ✅ (only changed files update the snapshot) | Equivalent |
 
-**回滚实现**（redb 方案）：
+**Rollback implementation** (redb approach):
 
 ```rust
 /// 工作区快照管理器
@@ -219,7 +221,7 @@ pub struct RollbackResult {
 }
 ```
 
-**回滚流程**：
+**Rollback flow**:
 
 ```mermaid
 sequenceDiagram
@@ -247,13 +249,13 @@ sequenceDiagram
     SM->>SM: 更新 FileInventory 状态
 ```
 
-**结论**：redb + SnapshotManager 可以支持 workspace 级别的快照和回滚，不需要 git 的 DAG 模型。Agent 场景不需要分支/合并/标签/远程同步，简单的时间线快照已足够。关键实现 ~150 行代码。
+**Conclusion**: redb + SnapshotManager supports workspace-level snapshots and rollback without Git's DAG model. The Agent scenario does not need branches, merges, tags, or remote synchronization; a simple timeline of snapshots is sufficient. The key implementation is about 150 lines of code.
 
-### 12.4.2 FileInventory — L2/L3 门面
+### 12.4.2 FileInventory — L2/L3 facade
 
-**设计原则**：FileInventory 是薄门面，数据主存储在 L2（RDF Triple Store），热缓存用 redb。
+**Design principle**: FileInventory is a thin facade. The primary data store is L2 (RDF Triple Store), with redb as the hot cache.
 
-#### RDF 数据模型（L2 Named Graph: `iri://workspace`）
+#### RDF data model (L2 Named Graph: `iri://workspace`)
 
 ```jsonld
 {
@@ -280,25 +282,25 @@ sequenceDiagram
 }
 ```
 
-#### FileState 状态机
+#### FileState state machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> Undiscovered
     Undiscovered --> Discovered: full_scan()
     Discovered --> ReadFresh: file_read()
-    ReadFresh --> ReadStale: 外部修改 (notify/mtime)
-    ReadFresh --> ReadFresh: file_read() (未变化)
+    ReadFresh --> ReadStale: external modification (notify/mtime)
+    ReadFresh --> ReadFresh: file_read() (unchanged)
     ReadStale --> ReadFresh: file_read()
     ReadFresh --> WrittenUnread: Agent file_write()
     WrittenUnread --> ReadFresh: file_read()
     ReadStale --> WrittenUnread: Agent file_write()
 ```
 
-#### SPARQL 操作示例
+#### SPARQL operation examples
 
 ```sparql
--- 列出目录下所有文件及状态
+-- List all files and their state under a directory
 PREFIX ws: <https://wildagentos.org/ontology/workspace#>
 SELECT ?path ?size ?state ?lastRead ?lang
 WHERE {
@@ -313,7 +315,7 @@ WHERE {
   }
 } ORDER BY ?path
 
--- 查询文件的依赖关系
+-- Query a file's dependency relations
 PREFIX ws: <https://wildagentos.org/ontology/workspace#>
 SELECT ?importedBy ?importedByState
 WHERE {
@@ -323,7 +325,7 @@ WHERE {
   }
 }
 
--- 统计文件状态分布
+-- Count the distribution of file states
 PREFIX ws: <https://wildagentos.org/ontology/workspace#>
 SELECT ?state (COUNT(?file) as ?count) (SUM(?size) as ?totalBytes)
 WHERE {
@@ -333,7 +335,7 @@ WHERE {
 } GROUP BY ?state
 ```
 
-#### L3 预定义投影帧
+#### L3 predefined projection frames
 
 ```rust
 // 在 ProjectionEngine 中新增的帧
@@ -379,9 +381,9 @@ fn load_workspace_frames() -> Vec<ProjectionFrame> {
 }
 ```
 
-### 12.4.3 ContentStore — 内容缓存与差分
+### 12.4.3 ContentStore — content cache and diffs
 
-**设计原则**：独立于 L2（内容太大不适合 RDF），使用 LRU 内存缓存 + 磁盘 redb 持久化。
+**Design principle**: Independent from L2 (content is too large for RDF); use an LRU in-memory cache + persistent redb disk storage.
 
 ```rust
 pub struct ContentStore {
@@ -424,27 +426,27 @@ pub struct ReadResult {
 }
 ```
 
-**变更检测算法**：
+**Change-detection algorithm**:
 
 ```mermaid
 flowchart TD
-    Start["file_read(path, mode)"] --> InCache{"ContentStore<br/>有缓存?"}
-    InCache -->|无| ReadDisk["读盘 → 缓存"]
-    InCache -->|有| CheckMtime{"磁盘 mtime ==<br/>缓存 mtime?"}
-    CheckMtime -->|相同| Hit["返回缓存<br/>(from_cache=true)"]
-    CheckMtime -->|不同| ReadNew["读盘 → 计算 hash"]
-    ReadNew --> CheckHash{"hash ==<br/>缓存 hash?"}
-    CheckHash -->|相同| UpdateMtime["更新 mtime → 返回缓存"]
-    CheckHash -->|不同| BumpVer["版本号 +1"]
-    BumpVer --> CheckMode{"mode==Diff<br/>且有旧内容?"}
-    CheckMode -->|是| CalcDiff["similar 计算 unified diff"]
-    CheckMode -->|否| FullReturn["替换缓存 → 返回全量"]
-    CalcDiff --> DiffReturn["返回: changed=true<br/>+ changed_ranges<br/>+ unified_diff"]
+    Start["file_read(path, mode)"] --> InCache{"ContentStore<br/>has a cache?"}
+    InCache -->|no| ReadDisk["read disk → cache"]
+    InCache -->|yes| CheckMtime{"disk mtime ==<br/>cached mtime?"}
+    CheckMtime -->|same| Hit["return cache<br/>(from_cache=true)"]
+    CheckMtime -->|different| ReadNew["read disk → calculate hash"]
+    ReadNew --> CheckHash{"hash ==<br/>cached hash?"}
+    CheckHash -->|same| UpdateMtime["update mtime → return cache"]
+    CheckHash -->|different| BumpVer["version +1"]
+    BumpVer --> CheckMode{"mode==Diff<br/>and old content exists?"}
+    CheckMode -->|yes| CalcDiff["similar calculates unified diff"]
+    CheckMode -->|no| FullReturn["replace cache → return full content"]
+    CalcDiff --> DiffReturn["return: changed=true<br/>+ changed_ranges<br/>+ unified_diff"]
 ```
 
-### 12.4.4 DiffEngine — 差分引擎
+### 12.4.4 DiffEngine — diff engine
 
-基于 `similar` crate（纯 Rust Myers 算法，跨平台）：
+Based on the `similar` crate (a pure Rust Myers algorithm, cross-platform):
 
 ```rust
 pub struct DiffEngine;
@@ -467,9 +469,9 @@ impl DiffEngine {
 }
 ```
 
-### 12.4.5 WatchEngine — 文件系统监控
+### 12.4.5 WatchEngine — file-system monitoring
 
-薄封装 `notify`（Linux inotify / macOS FSEvents / Windows ReadDirectoryChangesW），事件通过 EventBus 广播：
+A thin wrapper around `notify` (Linux inotify / macOS FSEvents / Windows ReadDirectoryChangesW); events are broadcast through EventBus:
 
 ```rust
 pub struct WatchEngine {
@@ -487,28 +489,28 @@ impl WatchEngine {
 }
 ```
 
-**事件 → EventType 映射**：
+**Event → EventType mapping**:
 
 | notify EventKind | EventBus EventType |
 |-----------------|-------------------|
 | `Create(_)` | `WorkspaceFileCreated` |
 | `Modify(_)` | `WorkspaceFileModified` |
 | `Remove(_)` | `WorkspaceFileRemoved` |
-| 全量扫描完成 | `WorkspaceScanCompleted` |
-| 文件读取发现过期 | `WorkspaceFileStale` |
+| Full scan complete | `WorkspaceScanCompleted` |
+| A read discovers staleness | `WorkspaceFileStale` |
 
-**降级策略**：当 notify 不可用时（容器/受限环境），自动降级为轮询模式（默认每 5 秒扫描工作区 mtime）。
+**Fallback strategy**: When notify is unavailable (containers/restricted environments), automatically fall back to polling mode (scan workspace mtime every 5 seconds by default).
 
-**去抖配置**：
-- 时间窗口：500ms（快速连续写入合并）
-- 最大等待：5s（防止无限推迟）
-- 排除目录：`node_modules/`, `target/`, `.git/`, `dist/`, `build/`, `__pycache__/`
+**Debounce configuration**:
+- Time window: 500ms (coalesces rapid consecutive writes)
+- Maximum wait: 5s (prevents indefinite postponement)
+- Excluded directories: `node_modules/`, `target/`, `.git/`, `dist/`, `build/`, `__pycache__/`
 
 ---
 
-## 12.5 与现有系统的集成
+## 12.5 Integration with existing systems
 
-### 12.5.1 EventBus 集成
+### 12.5.1 EventBus integration
 
 ```rust
 // WatchEngine 启动时注册的消费者
@@ -545,17 +547,17 @@ event_bus.spawn_consumer(
 );
 ```
 
-### 12.5.2 HookManager 集成
+### 12.5.2 HookManager integration
 
-WorkspaceMonitor 注册 3 个 hooks 到 HookManager，与 ToolGuard 并列运行：
+WorkspaceMonitor registers three hooks with HookManager, running alongside ToolGuard:
 
-| Hook | HookPoint | 优先级 | 作用 |
+| Hook | HookPoint | Priority | Purpose |
 |------|-----------|--------|------|
-| `workspace::file_awareness` | SkillBefore | 85 | 注入工作区状态快照到 skill metadata |
-| `workspace::file_read_tracker` | SkillAfter | 85 | 更新 ContentStore 缓存 + FileInventory 标记已读 |
-| `workspace::file_write_invalidator` | SkillAfter | 85 | file_write/edit/bash 后标记文件为 written_unread |
+| `workspace::file_awareness` | SkillBefore | 85 | Inject a workspace-state snapshot into skill metadata |
+| `workspace::file_read_tracker` | SkillAfter | 85 | Update ContentStore cache + mark the FileInventory entry as read |
+| `workspace::file_write_invalidator` | SkillAfter | 85 | Mark files as `written_unread` after file_write/edit/bash |
 
-### 12.5.3 ToolGuard 增强 — 写入前置检查
+### 12.5.3 ToolGuard enhancement — pre-write check
 
 ```rust
 // 在 ToolGuard 的 SkillBefore hook 中新增
@@ -583,9 +585,9 @@ fn check_stale_write(ctx: &HookContext) -> HookResult {
 }
 ```
 
-### 12.5.4 ImportScanner 集成
+### 12.5.4 ImportScanner integration
 
-文件变更时自动触发依赖重扫描，更新 L2 中的 `ws:imports` / `ws:importedBy` 关系：
+Automatically trigger dependency re-scanning when files change, updating `ws:imports` / `ws:importedBy` relations in L2:
 
 ```rust
 async fn trigger_import_rescan(path: &str) {
@@ -597,9 +599,9 @@ async fn trigger_import_rescan(path: &str) {
 }
 ```
 
-### 12.5.5 Batch Agent 触发
+### 12.5.5 Batch Agent trigger
 
-文件变更事件可触发后台知识处理：
+File-change events can trigger background knowledge processing:
 
 ```rust
 // Batch Agent 订阅 WORKSPACE_FILE_MODIFIED 事件
@@ -615,9 +617,9 @@ event_bus.spawn_consumer(
 );
 ```
 
-### 12.5.6 PerceptionEngine 集成
+### 12.5.6 PerceptionEngine integration
 
-感知引擎可订阅文件变更事件进行异常检测：
+The perception engine can subscribe to file-change events for anomaly detection:
 
 ```rust
 // PerceptionEngine 订阅 WORKSPACE_FILE_MODIFIED
@@ -627,52 +629,52 @@ PerceptionTrigger::ResourceConflict → "检测到外部进程大量修改工作
 
 ---
 
-## 12.6 性能设计
+## 12.6 Performance design
 
-### 12.6.1 内存预算
+### 12.6.1 Memory budget
 
-| 项 | 预估 |
+| Item | Estimate |
 |----|------|
-| redb 热缓存（元数据） | ~5MB（10,000 文件 × 500 bytes/entry） |
-| ContentStore LRU 缓存 | 可配置，默认 64MB |
-| L2 Oxigraph 内存 | 约 50MB（已有，新增 workspace graph 很小） |
-| DiffEngine 临时缓冲 | 单次 < 4MB |
-| notify watcher 开销 | < 1MB |
-| **总计新增** | **< 75MB** |
+| redb hot cache (metadata) | ~5MB (10,000 files × 500 bytes/entry) |
+| ContentStore LRU cache | Configurable; 64MB by default |
+| L2 Oxigraph memory | About 50MB (already present; the new workspace graph is very small) |
+| DiffEngine temporary buffer | < 4MB per operation |
+| notify watcher overhead | < 1MB |
+| **Total additional memory** | **< 75MB** |
 
-### 12.6.2 性能关键路径
+### 12.6.2 Performance-critical paths
 
-| 操作 | 路径 | 预期延迟 |
+| Operation | Path | Expected latency |
 |------|------|---------|
-| file_read 缓存命中 | LRU 内存 → 直接返回 | < 0.1ms |
-| file_read 缓存失效 | 读盘 + 计算 hash + diff | 1-50ms（取决于文件大小） |
-| file_list | redb 热缓存 | < 1ms |
-| file_list 降级 | L2 SPARQL 查询 | 2-5ms |
-| notify 事件 → 状态更新 | EventBus → redb write + L2 SPARQL UPDATE | < 5ms |
-| 全量扫描（10,000 文件） | walkdir + redb 批量写入 | < 3s（后台异步） |
-| ImportScanner 重扫描 | 读缓存 + regex 解析 | < 10ms/文件 |
+| file_read cache hit | LRU memory → return directly | < 0.1ms |
+| file_read cache miss | Read disk + calculate hash + diff | 1–50ms (depends on file size) |
+| file_list | redb hot cache | < 1ms |
+| file_list fallback | L2 SPARQL query | 2–5ms |
+| notify event → state update | EventBus → redb write + L2 SPARQL UPDATE | < 5ms |
+| Full scan (10,000 files) | walkdir + redb batch write | < 3s (asynchronously in background) |
+| ImportScanner re-scan | Read cache + regex parsing | < 10ms/file |
 
-### 12.6.3 防事件风暴
+### 12.6.3 Preventing event storms
 
 ```
-1. notify-debouncer 500ms 窗口合并（核心防线）
-2. .gitignore 规则自动排除 node_modules、target、.git 等
-3. 相同文件连续 5 次 Modify 事件 → 降级为 2s 冷却窗口
-4. 事件速率超过 1000/s → 自动切换为轮询模式（5s 间隔）
+1. notify-debouncer coalesces in a 500ms window (primary defense)
+2. .gitignore rules automatically exclude node_modules, target, .git, and similar paths
+3. Five consecutive Modify events for the same file → fall back to a 2s cooldown window
+4. Event rate exceeds 1000/s → automatically switch to polling mode (5s interval)
 ```
 
-### 12.6.4 跨平台策略
+### 12.6.4 Cross-platform strategy
 
-| 平台 | 监控后端 | 降级 |
+| Platform | Monitoring backend | Fallback |
 |------|---------|------|
-| Linux | inotify（内核级，零开销） | 轮询（5s） |
-| macOS | FSEvents（系统级） | 轮询（5s） |
-| Windows | ReadDirectoryChangesW | 轮询（5s） |
-| 容器/受限 | 自动检测 → 轮询（5s） | —
+| Linux | inotify (kernel-level, zero overhead) | Polling (5s) |
+| macOS | FSEvents (system-level) | Polling (5s) |
+| Windows | ReadDirectoryChangesW | Polling (5s) |
+| Container/restricted | Automatic detection → polling (5s) | — |
 
 ---
 
-## 12.7 新增依赖
+## 12.7 New dependencies
 
 ```toml
 [dependencies]
@@ -687,15 +689,15 @@ lru = "0.12"
 similar = "2"
 ```
 
-**不需要新增：**
-- `redb = "4.1"` — 已依赖
-- `walkdir = "2.4"` — 已依赖  
-- `sha2 = "0.10"` — 已依赖
-- `gix` — 不需要（redb + L2 + similar 覆盖所有需求）
+**No additions needed:**
+- `redb = "4.1"` — already a dependency
+- `walkdir = "2.4"` — already a dependency
+- `sha2 = "0.10"` — already a dependency
+- `gix` — not needed (`redb` + L2 + `similar` cover every requirement)
 
 ---
 
-## 12.8 文件结构
+## 12.8 File structure
 
 ```
 src/
@@ -707,8 +709,8 @@ src/
 │   │   ├── inventory.rs          # FileInventory (L2/L3 facade + redb 热缓存)
 │   │   ├── content_store.rs      # ContentStore (LRU 缓存 + SHA-256 + redb 版本)
 │   │   ├── diff_engine.rs        # DiffEngine (similar crate 封装)
-    │   │   ├── snapshot.rs           # SnapshotManager (workspace 快照 + 回滚)
-    │   │   └── watch_engine.rs       # WatchEngine (notify → EventBus 封装)
+│   │   ├── snapshot.rs           # SnapshotManager (workspace 快照 + 回滚)
+│   │   └── watch_engine.rs       # WatchEngine (notify → EventBus 封装)
 │   ├── hooks.rs                  # 已存在，无需修改（通用框架）
 │   ├── tool_guard.rs             # 🆕 增强：写入前 stale 检查 + FileCoverage → FileState 演进
 │   ├── import_scanner.rs         # 🆕 增强：文件变更时自动重扫描
@@ -727,19 +729,19 @@ src/
 
 ---
 
-## 12.9 关键设计决策总结
+## 12.9 Summary of key design decisions
 
-| 决策 | 理由 |
+| Decision | Rationale |
 |------|------|
-| **不用 gix** | redb + sha2 + similar 覆盖版本存储和 diff，编译/二进制开销远小于 gix |
-| **元数据用 L2 + redb** | L2 提供 SPARQL 查询能力，redb 提供微秒级热缓存 |
-| **内容用独立 ContentStore** | 文件内容太大不适合 RDF 存储，LRU 内存缓存更高效 |
-| **不用 gix** | redb + sha2 + similar 覆盖所有版本化需求，避免引入重型依赖 |
-| **WatchEngine 不复用 mpsc** | 直接用 EventBus broadcast，PerceptionEngine/Batch Agent 可自由订阅 |
-| **Hooks 复用 HookManager** | 与 ToolGuard 统一生命周期，AgentRunner 统一管理 |
-| **FileInventory 是 facade** | 不维护独立数据结构，数据主存储 L2 + redb |
-| **redb + sha2 + similar 覆盖所有版本化需求，避免引入重型依赖** | — |  
-| **WatchEngine 不复用 mpsc** | 直接用 EventBus broadcast，PerceptionEngine/Batch Agent 可自由订阅 |
-| **Hooks 复用 HookManager** | 与 ToolGuard 统一生命周期，AgentRunner 统一管理 |
-| **FileInventory 是 facade** | 不维护独立数据结构，数据主存储 L2 + redb |
-| **redb 仅做热缓存** | L2 是权威数据源，redb 是加速层（crash 可从 L2 重建） |
+| **Do not use gix** | redb + sha2 + similar cover version storage and diffs, with far less compile-time/binary overhead than gix |
+| **Use L2 + redb for metadata** | L2 supplies SPARQL query capability; redb supplies a microsecond-scale hot cache |
+| **Use a separate ContentStore for content** | File content is too large for RDF storage; an LRU in-memory cache is more efficient |
+| **Do not use gix** | redb + sha2 + similar cover all versioning requirements and avoid a heavyweight dependency |
+| **WatchEngine does not reuse mpsc** | Use EventBus broadcast directly so PerceptionEngine/Batch Agent can subscribe freely |
+| **Hooks reuse HookManager** | Unified lifecycle with ToolGuard and unified AgentRunner management |
+| **FileInventory is a facade** | It does not maintain an independent data structure; L2 + redb are the primary stores |
+| **redb + sha2 + similar cover all versioning requirements and avoid a heavyweight dependency** | — |
+| **WatchEngine does not reuse mpsc** | Use EventBus broadcast directly so PerceptionEngine/Batch Agent can subscribe freely |
+| **Hooks reuse HookManager** | Unified lifecycle with ToolGuard and unified AgentRunner management |
+| **FileInventory is a facade** | It does not maintain an independent data structure; L2 + redb are the primary stores |
+| **redb only serves as a hot cache** | L2 is the authoritative source; redb is an acceleration layer (it can be rebuilt from L2 after a crash) |

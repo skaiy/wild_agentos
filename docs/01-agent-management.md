@@ -1,68 +1,61 @@
-# 1. Agent 管理与调度
+# 1. Agent Management and Scheduling
 
-## 1.1 模块概览
+## 1.1 Module Overview
 
-Agent 管理与调度是系统的核心，负责动态决定 Agent 组合与流转。SA 根据任务类型动态调度 PA/DA/CA/AA，并集成了感知引擎、干预机制和用户补充输入处理。
+Agent management and scheduling is the system core. It dynamically selects Agent combinations and transitions. SA schedules PA/DA/CA/AA by task type and integrates the perception engine, intervention mechanisms, and supplementary user input.
 
-### 租户作用域与 chat RAG
+### Tenant Scope and Chat RAG
 
-新建的用户 Agent 会写入认证边界已验证 claims 中的 `tenant_id` 与
-`project_id`。内部/有作用域的 chat RAG 只接受与这些 verified claims 完全匹配
-的 Agent；缺少作用域或 tenant/project 不匹配的记录会被拒绝。因此历史未作用域
-Agent 不再被隐式共享。具体可信边界和 public API-key chat 的行为见
-[17-isolation-contract.md](17-isolation-contract.md)。
+New user Agents are written with the `tenant_id` and `project_id` from authentication-boundary-verified claims. Internal/scoped chat RAG accepts only Agents that exactly match those verified claims; records without scope, or with mismatched tenant/project values, are rejected. Legacy unscoped Agents are therefore no longer implicitly shared. For the trust boundary and public API-key chat behavior, see [17-isolation-contract.md](17-isolation-contract.md).
 
 ```mermaid
 graph TB
-    subgraph Agent管理
-        SA["SA<br/>SupervisorAgent<br/>核心调度器"]
-        AR["AgentRunner<br/>统一执行器<br/>ReAct 模式"]
-        BA["BizAgent<br/>业务Agent实例"]
-        AI["AgentInstance<br/>Agent 元数据"]
+    subgraph Agent Management
+        SA["SA<br/>SupervisorAgent<br/>Core scheduler"]
+        AR["AgentRunner<br/>Unified executor<br/>ReAct mode"]
+        BA["BizAgent<br/>Business Agent instance"]
+        AI["AgentInstance<br/>Agent metadata"]
     end
-
-    subgraph Agent角色
+    subgraph Agent Roles
         PA["PA<br/>Plan Agent"]
         DA["DA<br/>Do Agent"]
         CA["CA<br/>Check Agent"]
         AA["AA<br/>Act Agent"]
     end
-
-    subgraph 扩展能力
-        PE["ProactiveEngine<br/>感知引擎"]
-        IV["InterventionAction<br/>16种预定义干预动作"]
-        SI["SupplementaryInput<br/>12种用户补充输入"]
+    subgraph Extension Capabilities
+        PE["ProactiveEngine<br/>Perception engine"]
+        IV["InterventionAction<br/>16 predefined interventions"]
+        SI["SupplementaryInput<br/>12 supplementary user inputs"]
     end
-
-    SA -->|动态调度| AR
-    AR -->|创建实例| BA
-    BA -->|角色类型| PA & DA & CA & AA
-    AI -->|元数据| BA
+    SA -->|Dynamic scheduling| AR
+    AR -->|Create instance| BA
+    BA -->|Role type| PA & DA & CA & AA
+    AI -->|Metadata| BA
     SA --> PE
     SA --> IV
     SA --> SI
 ```
 
-## 1.2 核心组件
+## 1.2 Core Components
 
 ### 1.2.1 SupervisorAgent (SA)
 
-**文件**: `src/core/sa.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/core/sa.rs`
+**Implementation status**: ✅ Complete
 
-SA 是系统的核心调度器，根据任务类型**动态决定** Agent 组合与流转：
+SA is the core scheduler and **dynamically determines** Agent composition and flow by task type:
 
-| 任务类型 | Agent 流转 | 说明 |
-|---------|-----------|------|
-| Instant | 仅 DA | 立即执行（极短输入） |
-| Simple | 仅 DA | 简单查询直接执行 |
-| Standard | PA → DA → CA → AA | 完整 PDCA |
-| Complex | PA → DA → CA → AA | 带完整验证的复杂任务 |
-| Exploratory | PA → [DA1, DA2, DA3] 并行 → CA → AA | 并行探索执行 |
-| Emergency | DA → CA → AA | 跳过 PA 直接修复 |
-| Recursive | PA → DA(微观 PDCA) → CA → AA | 递归分解子任务 |
+| Task type | Agent flow | Description |
+|---|---|---|
+| Instant | DA only | Immediate execution (very short input) |
+| Simple | DA only | Direct execution of simple queries |
+| Standard | PA → DA → CA → AA | Full PDCA |
+| Complex | PA → DA → CA → AA | Complex task with full validation |
+| Exploratory | PA → [DA1, DA2, DA3] in parallel → CA → AA | Parallel exploratory execution |
+| Emergency | DA → CA → AA | Direct repair without PA |
+| Recursive | PA → DA (micro PDCA) → CA → AA | Recursively decomposed subtasks |
 
-**核心结构体**:
+**Core structure**:
 
 ```rust
 pub struct SupervisorAgent {
@@ -84,20 +77,18 @@ pub struct SupervisorAgent {
 }
 ```
 
-**核心方法**:
+| Method | Purpose |
+|---|---|
+| `process_task(task_iri, user_input)` | Handles task entry (full flow) |
+| `start_cycle(user_input, task_iri)` | Starts a task cycle and invokes perception analysis |
+| `analyze_task(user_input)` | Uses rules to determine task type and complexity |
+| `analyze_task_with_llm(user_input, five_w2h, hints)` | Uses the LLM to produce a detailed execution plan |
+| `execute_plan(plan, task_iri, input, five_w2h, iri)` | Schedules Agents sequentially/in parallel according to the plan |
+| `dispatch_agent(role, ctx, cycle, plan_step)` | Schedules one Agent with BizAgent isolation |
+| `dispatch_agents_parallel(role, count, ...)` | Schedules multiple Agents in parallel |
+| `execute_intervention(plan, task_iri)` | Executes an intervention plan from the perception engine |
 
-| 方法 | 功能 |
-|------|------|
-| `process_task(task_iri, user_input)` | 处理用户任务入口（完整流程） |
-| `start_cycle(user_input, task_iri)` | 启动新任务周期，调用感知引擎分析 |
-| `analyze_task(user_input)` | 使用规则引擎分析任务类型和复杂度 |
-| `analyze_task_with_llm(user_input, five_w2h, hints)` | 使用 LLM 生成详细执行计划 |
-| `execute_plan(plan, task_iri, input, five_w2h, iri)` | 按计划调度 Agent 顺序/并行执行 |
-| `dispatch_agent(role, ctx, cycle, plan_step)` | 调度单个 Agent（带 BizAgent 隔离） |
-| `dispatch_agents_parallel(role, count, ...)` | 并行调度多个 Agent |
-| `execute_intervention(plan, task_iri)` | 执行感知引擎的干预计划 |
-
-**任务处理完整流程**:
+**Complete task-processing flow**:
 
 ```mermaid
 sequenceDiagram
@@ -108,87 +99,77 @@ sequenceDiagram
     participant L0 as L0 Store
     participant EB as EventBus
     participant AR as AgentRunner
-
-    User->>SA: 提交任务
-    SA->>PE: on_task_start() 感知分析
+    User->>SA: Submit task
+    SA->>PE: on_task_start() perception analysis
     PE-->>SA: TaskAnalysis {complexity, hints}
-    SA->>L0: 存储 5W2H 元数据
+    SA->>L0: Store 5W2H metadata
     SA->>LLM: analyze_task_with_llm()
     LLM-->>SA: ExecutionPlan
-    SA->>EB: CYCLE_STARTED 事件
-    
-    loop 每个步骤
+    SA->>EB: CYCLE_STARTED event
+    loop Each step
         SA->>AR: dispatch_agent(role, ctx)
-        alt 并行组
+        alt Parallel group
             SA->>AR: dispatch_agents_parallel()
         end
         AR-->>SA: TaskResult
         SA->>PE: on_task_end() / on_plan_completed()
-        SA->>EB: 步骤完成事件
+        SA->>EB: Step-completed event
     end
-    
-    SA-->>User: 最终结果
+    SA-->>User: Final result
 ```
 
-### 递归分解任务
+### Recursive Task Decomposition
 
-递归分解是 SA 调度模型的核心创新点，用于处理需要多步骤、多层次的复杂任务。
+Recursive decomposition is the central innovation of the SA scheduling model for complex, multi-step, multi-level tasks.
 
-**触发关键词**：`重构`、`refactor`、`重写`、`迁移`、`拆分`、`逐步实现`、`端到端`、`从零搭建` 等
+**Trigger keywords**: `重构`, `refactor`, `重写`, `迁移`, `拆分`, `逐步实现`, `端到端`, `从零搭建`, and similar terms.
 
-**递归深度限制**：
+| Task type | Maximum recursion depth |
+|---|---|
+| Recursive | 3 levels |
+| Complex | 2 levels |
+| Other | 0 (no recursion) |
 
-| 任务类型 | 最大递归深度 |
-|---------|------------|
-| Recursive | 3 层 |
-| Complex | 2 层 |
-| 其他 | 0（不递归） |
+**Core method**: `execute_recursive_sub_cycle()`
 
-**核心方法**：`execute_recursive_sub_cycle()`
-
-1. DA 执行成功后，将 DA 摘要发送给 LLM 进行子任务分解
-2. LLM 返回 `has_sub_tasks` 和 `sub_tasks` 列表
-3. 对每个子任务创建 `TaskContext` 并调度 DA 执行
-4. 子任务执行成功后，递归检查是否需要更深层分解
-5. 所有子任务结果合并后传递给 CA
+1. After DA succeeds, send its summary to the LLM to decompose subtasks.
+2. The LLM returns `has_sub_tasks` and the `sub_tasks` list.
+3. Create a `TaskContext` for every subtask and schedule DA execution.
+4. After success, recursively determine whether deeper decomposition is needed.
+5. Merge all subtask results and pass them to CA.
 
 ```mermaid
 flowchart TD
-    START["DA 执行完成"] --> DECOMPOSE{"LLM 分析结果<br/>has_sub_tasks?"}
-    DECOMPOSE -->|"true"| SUB1["子任务 1: DA"]
-    DECOMPOSE -->|"true"| SUB2["子任务 2: DA"]
-    DECOMPOSE -->|"true"| SUB3["子任务 3: DA"]
-
+    START["DA completed"] --> DECOMPOSE{"LLM result<br/>has_sub_tasks?"}
+    DECOMPOSE -->|"true"| SUB1["Subtask 1: DA"]
+    DECOMPOSE -->|"true"| SUB2["Subtask 2: DA"]
+    DECOMPOSE -->|"true"| SUB3["Subtask 3: DA"]
     SUB1 --> DEEP1{"depth < max?"}
-    DEEP1 -->|"是"| RECURSE1["递归子循环<br/>depth+1"]
-    DEEP1 -->|"否"| STOP1["停止递归"]
+    DEEP1 -->|Yes| RECURSE1["Recursive subcycle<br/>depth+1"]
+    DEEP1 -->|No| STOP1["Stop recursion"]
     SUB2 --> DEEP2{"depth < max?"}
-    DEEP2 -->|"是"| RECURSE2["递归子循环<br/>depth+1"]
-    DEEP2 -->|"否"| STOP2["停止递归"]
-
-    RECURSE1 --> MERGE["合并子任务结果"]
+    DEEP2 -->|Yes| RECURSE2["Recursive subcycle<br/>depth+1"]
+    DEEP2 -->|No| STOP2["Stop recursion"]
+    RECURSE1 --> MERGE["Merge subtask results"]
     STOP1 --> MERGE
     RECURSE2 --> MERGE
     STOP2 --> MERGE
     SUB3 --> MERGE
-
-    MERGE --> CA["CA 审查所有结果"]
+    MERGE --> CA["CA reviews all results"]
     DECOMPOSE -->|"false"| CA
 ```
 
-### 干预动作系统
+### Intervention Action System
 
-SA 集成了 5 类 16 个预定义干预动作，由 ProactiveEngine 触发后进行 LLM 分类决策执行：
+SA integrates 16 predefined intervention actions in five categories. After `ProactiveEngine` triggers them, an LLM classifies and decides what to execute.
 
-| 类别 | 动作 | 说明 |
-|------|------|------|
-| **正常继续** | Continue / ContinueWithMonitor | 不做干预或加强监控 |
-| **参数调整** | IncreaseRetry / IncreaseTimeout / ReduceComplexity / RestrictTools | 无需中断的参数调整 |
-| **执行流调整** | SkipStep / RetryStep / Parallelize / SplitStep / InsertExtraStep | 需要中断的流程调整 |
-| **资源与模式** | FallbackToShallow / EmergencyMode / IncreaseBudget / FreezeAndReport | 模式切换（IncreaseBudget 需人工确认） |
-| **终止与升级** | AbortTask / NotifyHuman | 最后手段 |
-
-**干预流程**：
+| Category | Actions | Description |
+|---|---|---|
+| **Continue normally** | Continue / ContinueWithMonitor | No intervention or increased monitoring |
+| **Parameter adjustment** | IncreaseRetry / IncreaseTimeout / ReduceComplexity / RestrictTools | Parameter changes without interruption |
+| **Execution-flow adjustment** | SkipStep / RetryStep / Parallelize / SplitStep / InsertExtraStep | Flow changes requiring interruption |
+| **Resources and mode** | FallbackToShallow / EmergencyMode / IncreaseBudget / FreezeAndReport | Mode changes (`IncreaseBudget` requires human approval) |
+| **Terminate and escalate** | AbortTask / NotifyHuman | Last resort |
 
 ```mermaid
 sequenceDiagram
@@ -196,42 +177,37 @@ sequenceDiagram
     participant SA
     participant LLM
     participant User
-
     PE->>SA: InterventionPlan
     SA->>LLM: analyze_anomaly_with_llm()
     LLM-->>SA: {action, params}
-    
     alt IncreaseBudget
         SA->>User: request_human_approval()
-        User-->>SA: 批准/拒绝
+        User-->>SA: Approve/reject
     end
-    
-    SA->>SA: get_action_handler() 注册表分发
-    SA->>SA: 执行动作 handler
-    SA->>EB: INTERVENTION_EXECUTED 事件
+    SA->>SA: get_action_handler() registry dispatch
+    SA->>SA: Execute action handler
+    SA->>EB: INTERVENTION_EXECUTED event
 ```
 
-### 用户补充输入处理
+### Supplementary User Input
 
-SA 支持在执行过程中接收用户补充输入，分为 4 类 12 个预定义动作：
+SA can receive supplementary input during execution in four categories with 12 predefined actions:
 
-| 类别 | 动作 | 说明 |
-|------|------|------|
-| **信息补充** | AddContext / RefineObjective / ProvideConstraint | 用户提供额外上下文 |
-| **方向引导** | GuideDirection / PrioritizeStep / SuggestApproach | 用户指示方向 |
-| **执行控制** | PauseExecution / ResumeExecution / SkipCurrentStep | 控制执行流 |
-| **反馈纠正** | ConfirmDirection / CorrectApproach / AbortCurrentStep | 纠正错误 |
+| Category | Actions | Description |
+|---|---|---|
+| **Information additions** | AddContext / RefineObjective / ProvideConstraint | User supplies additional context |
+| **Direction guidance** | GuideDirection / PrioritizeStep / SuggestApproach | User directs the approach |
+| **Execution control** | PauseExecution / ResumeExecution / SkipCurrentStep | Controls execution flow |
+| **Feedback correction** | ConfirmDirection / CorrectApproach / AbortCurrentStep | Corrects mistakes |
 
-补充输入通过 `EventBus.USER_SUPPLEMENTARY_INPUT` 事件接收，SA 在步骤间检查并处理。
+Supplementary input is received through `EventBus.USER_SUPPLEMENTARY_INPUT`; SA checks and processes it between steps.
 
 ### 1.2.2 AgentRunner
 
-**文件**: `src/core/agent_runner.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/core/agent_runner.rs`
+**Implementation status**: ✅ Complete
 
-统一 Agent 执行器，所有 PA/DA/CA/AA 共享同一个 `AgentRunner`，差异仅在于注入的提示词模板、工具白名单和最大轮次。采用 ReAct (Thought-Action-Observation) 执行模式。
-
-**核心结构体**:
+All PA/DA/CA/AA Agents share the unified `AgentRunner`; only injected prompt templates, tool allowlists, and maximum turns differ. It uses the ReAct (Thought-Action-Observation) execution pattern.
 
 ```rust
 pub struct AgentRunner {
@@ -257,69 +233,49 @@ pub struct AgentRunner {
 }
 ```
 
-**核心方法**:
-
-| 方法 | 功能 |
-|------|------|
-| `execute(agent, ctx)` | 执行 Agent 的 ReAct 循环 |
-| `execute_with_biz_agent(agent, ctx, plan_step)` | 使用 BizAgent 隔离执行 |
-| `build_system_prompt(agent, ctx)` | 构建 Agent 系统提示词 |
-| `parse_llm_response(response)` | 解析 LLM 响应为 thought/content/summary |
-| `route_tool_result(result, tool_name, call_id)` | 工具结果智能路由 |
-| `set_event_bus(event_bus)` | 注入 EventBus 用于细粒度事件发射 |
-
-**ReAct 执行循环**:
+| Method | Purpose |
+|---|---|
+| `execute(agent, ctx)` | Executes an Agent ReAct cycle |
+| `execute_with_biz_agent(agent, ctx, plan_step)` | Executes with BizAgent isolation |
+| `build_system_prompt(agent, ctx)` | Builds the Agent system prompt |
+| `parse_llm_response(response)` | Parses thought/content/summary from an LLM response |
+| `route_tool_result(result, tool_name, call_id)` | Intelligently routes tool results |
+| `set_event_bus(event_bus)` | Injects EventBus for granular event emission |
 
 ```mermaid
 flowchart TB
-    START[开始] --> THINK[Thought<br/>LLM 思考]
-    THINK --> DECIDE{action 决策}
-    DECIDE -->|tool_call| ACTION[Action<br/>调用工具]
-    DECIDE -->|finish| END[结束<br/>返回 TaskResult]
+    START[Start] --> THINK["Thought<br/>LLM reasoning"]
+    THINK --> DECIDE{action decision}
+    DECIDE -->|tool_call| ACTION["Action<br/>Call tool"]
+    DECIDE -->|finish| END["End<br/>Return TaskResult"]
     DECIDE -->|continue| THINK
-    ACTION --> OBSERVE[Observation<br/>获取工具结果]
+    ACTION --> OBSERVE["Observation<br/>Obtain tool result"]
     OBSERVE --> THINK
-
-    style THINK fill:#4CAF50,color:white
-    style ACTION fill:#2196F3,color:white
-    style OBSERVE fill:#FF9800,color:white
-    style DECIDE fill:#9C27B0,color:white
-    style END fill:#F44336,color:white
 ```
 
-**Agent 轮次限制**（按角色动态调整）：
-
-| 角色 | 最大轮次 | 说明 |
-|------|---------|------|
-| PA (Plan) | 8 | 调研类任务需要更多轮次 |
-| DA (Do) | max_iterations | 不额外限制 |
-| CA (Check) | 15 | 复杂任务审查需要足够轮次 |
-| AA (Act) | 8 | 决策类任务需要足够轮次 |
-
-**LLM 响应格式**：
+| Role | Maximum turns | Description |
+|---|---|---|
+| PA (Plan) | 8 | Research tasks need more turns |
+| DA (Do) | max_iterations | No additional limit |
+| CA (Check) | 15 | Complex-task review needs enough turns |
+| AA (Act) | 8 | Decision tasks need enough turns |
 
 ```json
 {
-  "thought": "思考过程",
-  "content": "正式回复内容",
-  "summary": "摘要（不超过50字）",
+  "thought": "Reasoning process",
+  "content": "Formal reply content",
+  "summary": "Summary (no more than 50 characters)",
   "action": "tool_call|finish|continue",
   "emphasis": []
 }
 ```
 
-**强调内容双重提取**：
-
-| 提取方式 | 说明 |
-|---------|------|
-| LLM 提取 | 从 LLM 响应的 JSON 中解析 emphasis 字段 |
-| 关键词匹配 | 扫描文本中的强调关键词（如 "必须"、"IMPORTANT" 等） |
-| 配置驱动 | 通过 config.yaml emphasis 段配置提取方式和阈值 |
+**Dual extraction of emphasized content**: LLM extraction parses the `emphasis` field from LLM JSON; keyword matching scans for emphasis keywords such as `必须` and `IMPORTANT`; configuration in the `emphasis` section of `config.yaml` controls extraction and thresholds.
 
 ### 1.2.3 TaskContext
 
-**文件**: `src/core/agent_runner.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/core/agent_runner.rs`
+**Implementation status**: ✅ Complete
 
 ```rust
 pub struct TaskContext {
@@ -338,7 +294,7 @@ pub struct TaskContext {
 }
 ```
 
-TaskContext 在 Agent 间传递时，可承载 5W2H 快照、历史摘要和步骤状态。
+When passed between Agents, `TaskContext` carries a 5W2H snapshot, historical summaries, and step state.
 
 ### 1.2.4 TaskResult
 
@@ -357,16 +313,14 @@ pub struct TaskResult {
 }
 ```
 
-`five_w2h_updates` 字段支持 Agent 在执行过程中更新 5W2H 元数据。
+`five_w2h_updates` lets an Agent update 5W2H metadata during execution.
 
-### 1.2.5 5W2H 任务分析器
+### 1.2.5 5W2H Task Analyzer
 
-**文件**: `src/core/five_w2h.rs`
-**实现状态**: ✅ 完整
+**File**: `src/core/five_w2h.rs`
+**Implementation status**: ✅ Complete
 
-使用 5W2H 方法论对任务进行结构化分析，支持渐进式填充和冻结归档。
-
-**核心结构体**:
+The analyzer uses 5W2H methodology for structured task analysis, supporting progressive completion and frozen archival.
 
 ```rust
 pub struct Task5W2H {
@@ -382,10 +336,8 @@ pub struct Task5W2H {
 }
 ```
 
-**维度明细结构**：
-
-| 类型 | 关键字段 |
-|------|---------|
+| Type | Key fields |
+|---|---|
 | WhyDetail | description, success_criteria, priority |
 | WhoDetail | requestor, assignees, stakeholders, required_role, access_level |
 | WhenDetail | deadline, start_after, estimated_duration, timezone, reminder_before |
@@ -394,38 +346,34 @@ pub struct Task5W2H {
 | HowMuchDetail | token_budget, max_sub_agents, max_pdca_cycles, expected_quality, actual_cost |
 | ActualCost | tokens_used, cycles_used, duration_secs |
 
-**渐进式填充生命周期**：
-
-| 阶段 | 填充维度 | 填充者 |
-|------|---------|--------|
-| Create | what, why | SA (LLM 提取) |
+| Stage | Filled dimensions | Populated by |
+|---|---|---|
+| Create | what, why | SA (LLM extraction) |
 | Plan | who, when, how | PA |
-| Do | where, how_much(partial) | DA |
-| Check | how_much(actual) | CA |
-| Act | freeze 归档 | SA |
-
-**任务复杂度分类**：
+| Do | where, how_much (partial) | DA |
+| Check | how_much (actual) | CA |
+| Act | freeze archive | SA |
 
 ```rust
 pub enum TaskComplexity {
-    Instant,      // 极短输入（<15字符无空格）
-    Simple,       // 简单事实查询
-    Standard,     // 标准任务（默认）
-    Complex,      // 复杂任务
-    Exploratory,  // 探索性任务（多并行DA）
-    Emergency,    // 紧急修复（跳过PA）
-    Recursive,    // 递归分解
+    Instant,      // Very short input (<15 characters without spaces)
+    Simple,       // Simple factual query
+    Standard,     // Standard task (default)
+    Complex,      // Complex task
+    Exploratory,  // Exploratory task (multiple parallel DAs)
+    Emergency,    // Emergency repair (skip PA)
+    Recursive,    // Recursive decomposition
 }
 ```
 
-复杂度通过关键词匹配规则自动分类，也支持 LLM 辅助分类。
+Complexity is automatically categorized with keyword-matching rules and can also use LLM-assisted classification.
 
 ### 1.2.6 BizAgent
 
-**文件**: `src/core/biz_agent.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/core/biz_agent.rs`
+**Implementation status**: ✅ Complete
 
-业务 Agent 实例，每个 PA/DA/CA/AA 都是 BizAgent 的实例，支持创建子 Agent 进行并行处理。
+A business Agent instance. Every PA/DA/CA/AA is a `BizAgent` instance and can create child Agents for parallel processing.
 
 ```rust
 pub struct BizAgent {
@@ -442,10 +390,10 @@ pub struct BizAgent {
 
 ### 1.2.7 AgentInstance
 
-**文件**: `src/core/agent_instance.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/core/agent_instance.rs`
+**Implementation status**: ✅ Complete
 
-Agent 元数据定义。
+Defines Agent metadata.
 
 ```rust
 pub struct AgentInstance {
@@ -456,12 +404,11 @@ pub struct AgentInstance {
     pub created_at: DateTime<Utc>,
     pub parent_id: Option<String>,
 }
-
 pub enum AgentRole { Plan, Do, Check, Act }
 pub enum AgentStatus { Idle, Running, Completed, Failed }
 ```
 
-## 1.3 模块依赖关系
+## 1.3 Module Dependencies
 
 ```mermaid
 graph LR
@@ -484,20 +431,20 @@ graph LR
     BA --> AR
 ```
 
-## 1.4 执行事件系统
+## 1.4 Execution Event System
 
-**文件**: `src/core/execution_event.rs`
+**File**: `src/core/execution_event.rs`
 
-SA 和 AgentRunner 通过 ExecutionEvent 系统向 EventBus 发射细粒度事件，支持 UI/监控实时展示：
+SA and AgentRunner emit granular events to EventBus through `ExecutionEvent`, enabling real-time UI and monitoring views.
 
-| 事件类型 | 触发时机 | 用途 |
-|---------|---------|------|
-| PhaseChange | Agent 阶段切换 | 显示执行进度 |
-| AgentStatus | Agent 状态变更 | 监控 Agent 健康 |
-| LlmContent | LLM 流式响应 | 实时显示思考过程 |
-| ToolCall | 工具调用开始 | 展示工具使用 |
-| ToolResult | 工具调用结束 | 显示执行结果 |
-| Thought | SA/Agent 思考 | TUI 推理展示 |
-| TokenUsage | Token 消耗更新 | 预算监控 |
-| Error | 错误发生 | 异常告警 |
-| Completion | 任务完成 | 结果展示 |
+| Event type | Trigger | Purpose |
+|---|---|---|
+| PhaseChange | Agent phase transition | Show execution progress |
+| AgentStatus | Agent state change | Monitor Agent health |
+| LlmContent | Streaming LLM response | Show reasoning in real time |
+| ToolCall | Tool invocation begins | Show tool use |
+| ToolResult | Tool invocation ends | Show execution result |
+| Thought | SA/Agent thought | TUI reasoning display |
+| TokenUsage | Token-use update | Budget monitoring |
+| Error | Error occurs | Anomaly alert |
+| Completion | Task completes | Result display |

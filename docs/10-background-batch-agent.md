@@ -1,73 +1,75 @@
-# 10. Batch Agent 后台智能整理系统设计
+# 10. Batch Agent Background Intelligent Curation System Design
 
-> 利用 LLM 能力对技能图谱、知识记忆、执行痕迹进行后台批量整理，持续提升系统智能性
+> *For the Chinese version, see [10-background-batch-agent.zh.md](10-background-batch-agent.zh.md).*
 
-## 1. 设计目标与核心理念
+> Uses LLM capabilities to batch-curate the skill graph, knowledge memories, and execution traces in the background, continuously improving system intelligence.
 
-### 现状
+## 1. Design Goals and Core Principles
 
-Wild AgentOS 已有：
+### Current State
 
-- **技能图谱**：7,500+ LOC 动态语义网络，6 类链接类型，Learn/Reduce 自举学习，冲突检测
-- **五层记忆**：MESI 一致性协议的 L0→L3 层次化存储
-- **执行引擎**：PDCA 循环 + 10 类感知触发器
-- **Batch Agent 框架**：滑动窗口 + 模板引擎 + 抽取管道 + 知识持久化（Phase 1-5 已完成）
+Wild AgentOS already provides:
 
-### 缺口
+- **Skill graph**: a 7,500+ LOC dynamic semantic network with 6 link types, Learn/Reduce bootstrapping, and conflict detection
+- **Five-layer memory**: L0→L3 hierarchical storage using the MESI consistency protocol
+- **Execution engine**: a PDCA cycle plus 10 types of perception triggers
+- **Batch Agent framework**: sliding windows, template engine, extraction pipeline, and knowledge persistence (Phases 1–5 complete)
 
-LLM 的后台整理能力未被充分利用。技能合并/拆分/质量评估、知识碎片提炼、跨会话记忆整合、失败模式挖掘等场景仍依赖简单规则或人工确认。
+### Gap
 
-### 核心理念：模板即角色
+The LLM's background curation capabilities have not been fully used. Skill merging/splitting/quality evaluation, knowledge-fragment refinement, cross-session memory consolidation, and failure-pattern mining still rely on simple rules or manual confirmation.
 
-**不同"角色"不是不同的代码实现。** 8 个整理角色全部是同一个 `BatchAgentManager` 的配置实例。角色间的唯一差异是：
+### Core Principle: Templates Are Roles
+
+**Different “roles” are not separate code implementations.** All eight curation roles are configuration instances of the same `BatchAgentManager`. The only differences between roles are:
 
 ```
-角色 = 1 个配置文件条目 + 1 个模板文件 + 1 个结果处理器函数
-         ↑ 框架配置          ↑ 行为定义(LLM)     ↑ 结果写入逻辑
+Role = 1 configuration-file entry + 1 template file + 1 result-handler function
+       ↑ framework configuration    ↑ behavior definition (LLM) ↑ result-write logic
 ```
 
-框架复用关系：
+Framework reuse:
 
-| 组件 | 复用方式 |
+| Component | Reuse approach |
 |------|----------|
-| `BatchAgentManager` | 全复用 — 管理所有角色的注册/启动/停止 |
-| `SlidingWindow` | 全复用 — 每个角色独立实例，参数不同 |
-| `TriggerSystem` | 全复用 — Cron/EventCount/Manual，配置不同 |
-| `DynamicPromptEngine` | 全复用 — 根据 template_name 加载对应模板 |
-| `ExtractorPipeline` | 全复用 — LLM 调用 + JSON 解析 |
-| `OutputValidator` | 全复用 — 词汇表校验 |
-| `ContextCollector` | 全复用 — 记忆注入 |
-| **模板文件 (Template)** | **角色差异点 #1** — 定义 LLM 在什么角色下分析什么 |
-| **结果处理器 (Handler)** | **角色差异点 #2** — 抽取结果如何写入图谱/知识库 |
+| `BatchAgentManager` | Fully reused — manages registration/start/stop for every role |
+| `SlidingWindow` | Fully reused — each role has an independent instance with different parameters |
+| `TriggerSystem` | Fully reused — Cron/EventCount/Manual, with different configuration |
+| `DynamicPromptEngine` | Fully reused — loads the corresponding template by template_name |
+| `ExtractorPipeline` | Fully reused — LLM invocation plus JSON parsing |
+| `OutputValidator` | Fully reused — vocabulary validation |
+| `ContextCollector` | Fully reused — memory injection |
+| **Template file (Template)** | **Role difference #1** — defines what the LLM analyzes in its role |
+| **Result handler (Handler)** | **Role difference #2** — defines how extracted results are written to the graph/knowledge base |
 
-### 扩展一个新角色：只需 3 步
+### Add a New Role in Only Three Steps
 
 ```mermaid
 flowchart LR
-    STEP1[Step 1: 写模板<br/>告诉 LLM 该分析什么] --> STEP2
-    STEP2[Step 2: 加配置<br/>yaml 注册一个 agent 条目] --> STEP3
-    STEP3[Step 3: 写 handler<br/>处理抽取后的结构化结果]
-    STEP3 --> DONE[新角色上线]
+    STEP1[Step 1: Write the template<br/>Tell the LLM what to analyze] --> STEP2
+    STEP2[Step 2: Add configuration<br/>Register an agent entry in YAML] --> STEP3
+    STEP3[Step 3: Write the handler<br/>Process the extracted structured result]
+    STEP3 --> DONE[New role goes live]
 ```
 
-无需改框架代码、无需加模块、无需重新编译。
+No framework code changes, no new modules, and no recompilation are required.
 
 ---
 
-## 2. 整体架构
+## 2. Overall Architecture
 
 ```mermaid
 graph TB
-    subgraph "数据源 (Data Sources)"
-        SG[SkillGraphStore<br/>技能图谱]
-        L0[L0 持久记忆<br/>redb]
-        L2[L2 知识图谱<br/>Oxigraph]
-        EVENT[EventBus<br/>执行事件]
+    subgraph "Data Sources"
+        SG[SkillGraphStore<br/>Skill graph]
+        L0[L0 persistent memory<br/>redb]
+        L2[L2 knowledge graph<br/>Oxigraph]
+        EVENT[EventBus<br/>Execution events]
     end
 
-    subgraph "统一调度层 (BatchAgentManager)"
-        MGR[BatchAgentManager<br/>生命周期/触发/窗口]
-        subgraph "角色配置表"
+    subgraph "Unified scheduling layer (BatchAgentManager)"
+        MGR[BatchAgentManager<br/>Lifecycle/triggers/windows]
+        subgraph "Role configuration table"
             C1[skill_merge<br/>cron:2h]
             C2[fragment_refine<br/>cron:2h]
             C3[entity_resolution<br/>event:5min]
@@ -79,70 +81,70 @@ graph TB
         end
     end
 
-    subgraph "框架管道 (Framework Pipeline)"
-        WIN[SlidingWindow<br/>聚合上下文] --> PROMPT[DynamicPromptEngine<br/>模板加载 + 记忆注入]
-        PROMPT --> LLM_CALL[LLM 调用]
-        LLM_CALL --> EXTRACT[ExtractorPipeline<br/>JSON 解析 + 校验]
+    subgraph "Framework Pipeline"
+        WIN[SlidingWindow<br/>Aggregate context] --> PROMPT[DynamicPromptEngine<br/>Load templates + inject memory]
+        PROMPT --> LLM_CALL[LLM invocation]
+        LLM_CALL --> EXTRACT[ExtractorPipeline<br/>JSON parsing + validation]
     end
 
-    subgraph "角色差异点 (Per-Role)"
-        TPL[模板文件<br/>*.md<br/>定义 LLM 行为]
-        HDL[结果处理器<br/>dispatch → handler_fn<br/>写入策略]
+    subgraph "Per-Role Differences"
+        TPL[Template files<br/>*.md<br/>Define LLM behavior]
+        HDL[Result handler<br/>dispatch → handler_fn<br/>Write strategy]
     end
 
     MGR --> WIN
-    TPL -.->|差异点1| PROMPT
-    EXTRACT -.->|差异点2| HDL
+    TPL -.->|Difference 1| PROMPT
+    EXTRACT -.->|Difference 2| HDL
 
-    subgraph "输出目标 (Outputs)"
-        SG_UPD[SkillGraph 更新]
-        L0_UPD[记忆更新]
-        SUGGEST[建议队列<br/>待人工确认]
-        AUDIT[EventBus 审计事件]
+    subgraph "Outputs"
+        SG_UPD[SkillGraph update]
+        L0_UPD[Memory update]
+        SUGGEST[Suggestion queue<br/>Awaiting human confirmation]
+        AUDIT[EventBus audit events]
     end
 
     HDL --> SG_UPD & L0_UPD & SUGGEST & AUDIT
 ```
 
-### 2.1 调度策略
+### 2.1 Scheduling Strategy
 
-| 周期 | 角色 | 触发方式 | 数据量级 |
+| Period | Role | Trigger | Data scale |
 |------|------|----------|----------|
-| 5min | SkillHealthAgent | Cron | O(50) 技能 |
-| 5min | EntityResolutionAgent | Cron | O(100) 实体 |
-| 30min | FailureMineAgent | EventCount | O(50) 失败记录 |
-| 30min | LinkRecommendAgent | Cron | O(200) 技能对 |
-| 2h | SkillMergeAgent | Conflict 事件 | O(10) 冲突对 |
-| 2h | FragmentRefineAgent | Cron | O(20) 碎片 |
-| 24h | MemoryCompactAgent | Cron | O(1000) L0 条目 |
-| 24h | TemplateAnalyzeAgent | Cron | O(100) 模板调用 |
+| 5min | SkillHealthAgent | Cron | O(50) skills |
+| 5min | EntityResolutionAgent | Cron | O(100) entities |
+| 30min | FailureMineAgent | EventCount | O(50) failure records |
+| 30min | LinkRecommendAgent | Cron | O(200) skill pairs |
+| 2h | SkillMergeAgent | Conflict event | O(10) conflict pairs |
+| 2h | FragmentRefineAgent | Cron | O(20) fragments |
+| 24h | MemoryCompactAgent | Cron | O(1000) L0 entries |
+| 24h | TemplateAnalyzeAgent | Cron | O(100) template invocations |
 
 ```mermaid
 gantt
-    title Batch Agent 整理周期调度
+    title Batch Agent curation schedule
     dateFormat  HH:mm
     axisFormat  %H:%M
     
-    section 高频 (每 5 分钟)
-    技能健康巡检           :active, a1, 00:00, 5min
-    实体解析               :a2, 00:05, 5min
+    section High frequency (every 5 minutes)
+    Skill health inspection       :active, a1, 00:00, 5min
+    Entity resolution             :a2, 00:05, 5min
     
-    section 中频 (每 30 分钟)
-    失败模式挖掘           :b1, 00:00, 30min
-    链路推荐               :b2, 00:30, 30min
+    section Medium frequency (every 30 minutes)
+    Failure-pattern mining        :b1, 00:00, 30min
+    Link recommendations          :b2, 00:30, 30min
     
-    section 低频 (每 2 小时)
-    技能合并评估           :c1, 00:00, 120min
-    知识碎片提炼           :c2, 00:00, 120min
+    section Low frequency (every 2 hours)
+    Skill merge evaluation        :c1, 00:00, 120min
+    Knowledge-fragment refinement :c2, 00:00, 120min
     
-    section 每日 (每 24 小时)
-    记忆整合压缩           :d1, 00:00, 24h
-    模板效果分析           :d2, 00:00, 24h
+    section Daily (every 24 hours)
+    Memory consolidation/compression :d1, 00:00, 24h
+    Template effectiveness analysis  :d2, 00:00, 24h
 ```
 
-### 2.2 统一的配置模板
+### 2.2 Unified Configuration Template
 
-所有 8 个角色共用相同的配置结构——**仅字段值不同**：
+All eight roles share the same configuration structure—**only field values differ**:
 
 ```yaml
 batch_agents:
@@ -182,9 +184,9 @@ batch_agents:
 
 ---
 
-## 3. 统一执行流程
+## 3. Unified Execution Flow
 
-每个角色无论是什么"身份"，触发时都走完全相同的管道：
+Regardless of its “identity,” every role follows the same complete pipeline when triggered:
 
 ```mermaid
 sequenceDiagram
@@ -194,36 +196,36 @@ sequenceDiagram
     participant L as LLM
     participant E as ExtractorPipeline
     participant H as ResultHandler
-    participant S as 存储层
+    participant S as Storage layer
 
-    T->>W: 触发 (Cron/Event/Manual)
-    W->>P: 窗口就绪 -> 获取上下文
-    P->>P: 加载模板文件 + 注入记忆
-    P->>L: prompt -> LLM 调用
-    L->>E: raw text -> JSON 解析
-    E->>E: 词汇校验 + 结构校验
-    E->>H: 结构化结果
-    H->>S: 写入图谱/知识库/建议队列
+    T->>W: Trigger (Cron/Event/Manual)
+    W->>P: Window ready -> obtain context
+    P->>P: Load template file + inject memory
+    P->>L: prompt -> LLM invocation
+    L->>E: raw text -> JSON parsing
+    E->>E: Vocabulary validation + structure validation
+    E->>H: Structured result
+    H->>S: Write to graph/knowledge base/suggestion queue
 
-    Note over H: 角色差异点 #2 ↓<br/>SkillMergeHandler:<br/>  create_composite / deprecate<br/>FailureMineHandler:<br/>  create_fragment / advisory_node<br/>EntityResolutionHandler:<br/>  owl:sameAs / merge
+    Note over H: Role difference #2 ↓<br/>SkillMergeHandler:<br/>  create_composite / deprecate<br/>FailureMineHandler:<br/>  create_fragment / advisory_node<br/>EntityResolutionHandler:<br/>  owl:sameAs / merge
 ```
 
 ---
 
-## 4. 八大角色
+## 4. Eight Core Roles
 
-每个角色以下面的结构描述：
+Each role is described with the following structure:
 
 ```
-模板：    定义 LLM 行为（差异点 #1）
-预过滤：  交给 LLM 前，代码先行过滤（减少 token 消耗）
-输出：    模板要求 LLM 输出的 JSON 结构
-结果处理器：解析 JSON 后执行的操作（差异点 #2）
+Template:       Defines LLM behavior (difference #1)
+Pre-filtering:  Code filters first before sending to the LLM (reduces token usage)
+Output:         The JSON structure the template requires the LLM to return
+Result handler: Operations performed after parsing JSON (difference #2)
 ```
 
-### 4.1 技能合并专家 (SkillMergeAgent)
+### 4.1 Skill Merge Specialist (SkillMergeAgent)
 
-**模板**—定义 LLM 要分析的内容和输出格式：
+**Template**—defines what the LLM analyzes and its output format:
 
 ```markdown
 你是一个技能合并分析专家。分析以下两个技能的相似度并给出合并建议。
@@ -250,9 +252,9 @@ sequenceDiagram
 }
 ```
 
-**预过滤**：只处理 `ConflictDetectionEngine` 标记为 `SemanticDuplicate` 且相似度 > 0.7 的技能对。
+**Pre-filtering**: Process only skill pairs marked `SemanticDuplicate` by `ConflictDetectionEngine` with similarity > 0.7.
 
-**结果处理器**（差异点 #2）：
+**Result handler** (difference #2):
 
 ```
 confidence > 0.85:
@@ -261,13 +263,13 @@ confidence > 0.85:
   merge_strategy == "deprecate_b"      → SkillGraphStore::deprecate_skill()
   → emit(BATCH_SKILL_MERGE_APPLIED)
 
-0.6 ~ 0.85: 写入建议队列（待人工确认）
-< 0.6:      丢弃
+0.6 ~ 0.85: Write to the suggestion queue (awaiting human confirmation)
+< 0.6:      Discard
 ```
 
-### 4.2 知识碎片提炼 (FragmentRefineAgent)
+### 4.2 Knowledge Fragment Refinement (FragmentRefineAgent)
 
-**模板**—目标：将原始失败模式提炼为结构化解决方案：
+**Template**—goal: refine raw failure patterns into structured, reusable knowledge:
 
 ```markdown
 你是一个知识提炼专家。将以下原始失败模式提炼为可重用的知识。
@@ -289,20 +291,20 @@ confidence > 0.85:
 }
 ```
 
-**预过滤**：只处理最近 24h 内的新碎片，排除已有 generalized_pattern 的。
+**Pre-filtering**: Process only fragments created in the last 24 hours, excluding those that already have a `generalized_pattern`.
 
-**结果处理器**：
+**Result handler**:
 
 ```
 confidence > 0.85 && !requires_human_review:
-  → 写入 L2 知识图谱 + 建立 Related 链接
+  → Write to the L2 knowledge graph + create Related links
 otherwise:
-  → 写入建议队列
+  → Write to the suggestion queue
 ```
 
-### 4.3 实体解析/合并 (EntityResolutionAgent)
+### 4.3 Entity Resolution/Merging (EntityResolutionAgent)
 
-**预过滤**（纯代码，减少 LLM 调用）：
+**Pre-filtering** (code only, to reduce LLM calls):
 
 ```rust
 fn get_candidates(new: &ExtractedEntity) -> Vec<Entity> {
@@ -312,7 +314,7 @@ fn get_candidates(new: &ExtractedEntity) -> Vec<Entity> {
 }
 ```
 
-**模板**—判断两个实体是否同一真实世界对象：
+**Template**—determines whether two entities represent the same real-world object:
 
 ```markdown
 实体 A: {{entity_a.label}} ({{entity_a.description}})
@@ -328,19 +330,19 @@ fn get_candidates(new: &ExtractedEntity) -> Vec<Entity> {
 }
 ```
 
-**结果处理器**：
+**Result handler**:
 
 ```
-same_entity && confidence > 0.85: 写入 owl:sameAs → L2，emit 审计事件
-same_entity && confidence ≤ 0.85: 写入 conflict 队列
-!same_entity:                     跳过
+same_entity && confidence > 0.85: Write owl:sameAs → L2; emit an audit event
+same_entity && confidence ≤ 0.85: Write to the conflict queue
+!same_entity:                     Skip
 ```
 
-### 4.4 失败模式挖掘 (FailureMineAgent)
+### 4.4 Failure Pattern Mining (FailureMineAgent)
 
-**预过滤**：EventBus 拉取最近 24h 的 `TASK_FAILED` / `CYCLE_FAILED` 事件，按 error_code 分组统计。
+**Pre-filtering**: Pull `TASK_FAILED` / `CYCLE_FAILED` events from EventBus for the last 24 hours and group/count them by error_code.
 
-**模板**—批量分析失败模式：
+**Template**—batch analysis of failure patterns:
 
 ```markdown
 过去 24 小时共检测到 {{total_failures}} 次失败，分组如下：
@@ -365,19 +367,19 @@ same_entity && confidence ≤ 0.85: 写入 conflict 队列
 }
 ```
 
-**结果处理器**：
+**Result handler**:
 
 ```
-每个 pattern:
-  → 不存在相同签名碎片且 confidence > 0.7 → create_fragment()
-  → 高频模式（top 20%）→ 同时生成 AdvisoryNode
+For each pattern:
+  → If no fragment with the same signature exists and confidence > 0.7 → create_fragment()
+  → High-frequency patterns (top 20%) → also generate an AdvisoryNode
 ```
 
-### 4.5 技能健康巡检 (SkillHealthAgent)
+### 4.5 Skill Health Inspection (SkillHealthAgent)
 
-**预过滤**：`SkillEvolutionEngine::analyze_skill_health()` 筛选健康度 < 0.6 的技能，再送 LLM。
+**Pre-filtering**: `SkillEvolutionEngine::analyze_skill_health()` filters skills with health < 0.6 before sending them to the LLM.
 
-**模板**：
+**Template**:
 
 ```markdown
 技能名称: {{skill.name}}
@@ -395,38 +397,38 @@ same_entity && confidence ≤ 0.85: 写入 conflict 队列
 }
 ```
 
-**结果处理器**：
+**Result handler**:
 
 ```
-health_grade == "D": 写入建议队列（优先处理）
-health_grade == "C" && priority == "high": 写入建议队列
-otherwise: 记录审计日志
+health_grade == "D": Write to the suggestion queue (priority handling)
+health_grade == "C" && priority == "high": Write to the suggestion queue
+otherwise: Record an audit log
 ```
 
-### 4.6 记忆整合压缩 (MemoryCompactAgent)
+### 4.6 Memory Consolidation and Compression (MemoryCompactAgent)
 
-**分层策略**（大多数不需要 LLM）：
+**Layered strategy** (most cases do not require an LLM):
 
-| 类型 | 处理方式 | LLM? |
+| Type | Handling | LLM? |
 |------|----------|------|
-| `emphasis` 标签 | 保留高 importance | 否 |
-| 过期会话 (>7天) | 摘要后删除 | 是 |
-| `skill_graph` 条目 | 跳过（SkillGraph 管理） | 否 |
-| 重复内容 (hash 相同) | 直接去重 | 否 |
-| 低访问条目 | 评估是否保留 | 是 |
+| `emphasis` tag | Retain high-importance items | No |
+| Expired sessions (>7 days) | Summarize, then delete | Yes |
+| `skill_graph` entries | Skip (managed by SkillGraph) | No |
+| Duplicate content (same hash) | Deduplicate directly | No |
+| Low-access entries | Evaluate whether to retain | Yes |
 
-### 4.7 链路推荐 (LinkRecommendAgent)
+### 4.7 Link Recommendations (LinkRecommendAgent)
 
-**两阶段预过滤**：
+**Two-stage pre-filtering**:
 
 ```
-阶段 1 (代码): suggest_links() 标签相似度 + UsageRecord 共现分析 → top-10 候选
-阶段 2 (LLM):  评估阶段 1 候选的语义相关性
+Stage 1 (code): suggest_links() tag similarity + UsageRecord co-occurrence analysis → top-10 candidates
+Stage 2 (LLM):  Evaluate the semantic relevance of the stage-1 candidates
 ```
 
-### 4.8 模板效果分析 (TemplateAnalyzeAgent)
+### 4.8 Template Effectiveness Analysis (TemplateAnalyzeAgent)
 
-**纯统计分析**，监听 `BATCH_EXTRACTION_COMPLETED` 事件聚合 KPI：
+**Statistical analysis only**: listens for `BATCH_EXTRACTION_COMPLETED` events and aggregates KPIs:
 
 ```yaml
 template_name: batch/skill_merge
@@ -435,15 +437,15 @@ avg_parse_success: 0.92
 failure_reasons: {"JSON parse error": 8, "Missing fields": 3}
 ```
 
-结果 → 报告写入建议队列，供开发者参考优化模板。
+The result → report is written to the suggestion queue, for developers to use when optimizing templates.
 
 ---
 
-## 5. 扩展一个新角色：3 步完整示例
+## 5. Adding a New Role: Complete Three-Step Example
 
-> 假设需求：每周检查一次技能描述是否过时，自动建议更新。
+> Assume the requirement is to check once a week whether skill descriptions are stale and automatically suggest updates.
 
-### Step 1: 写模板文件
+### Step 1: Write the Template File
 
 ```markdown
 # templates/prompts/batch/description_stale_check.md
@@ -463,7 +465,7 @@ failure_reasons: {"JSON parse error": 8, "Missing fields": 3}
 }
 ```
 
-### Step 2: 加配置条目
+### Step 2: Add a Configuration Entry
 
 ```yaml
 batch_agents:
@@ -477,7 +479,7 @@ batch_agents:
     business_domain: "skill_graph_maintenance"
 ```
 
-### Step 3: 写结果处理器
+### Step 3: Write the Result Handler
 
 ```rust
 // src/batch/handlers/mod.rs
@@ -500,13 +502,13 @@ fn dispatch_handler(agent_name: &str, result: Value) -> Result<(), BatchError> {
 }
 ```
 
-**完成。无需加模块、无需改编译、无需重启框架。**
+**Done. No modules need to be added, no recompilation is needed, and the framework does not need to restart.**
 
 ---
 
-## 6. 与现有系统的集成
+## 6. Integration with Existing Systems
 
-### 6.1 EventBus 新事件类型
+### 6.1 New EventBus Event Types
 
 ```rust
 pub enum EventType {
@@ -525,7 +527,7 @@ pub enum EventType {
 }
 ```
 
-### 6.2 配置扩展
+### 6.2 Configuration Extensions
 
 ```yaml
 batch:
@@ -564,7 +566,7 @@ batch:
       lookback_hours: 168
 ```
 
-### 6.3 SkillGraphStore 新增接口
+### 6.3 New SkillGraphStore Interface
 
 ```rust
 // 所有角色共享的扩展接口
@@ -578,12 +580,12 @@ impl SkillGraphStore {
 
 ---
 
-## 7. 风险与缓解
+## 7. Risks and Mitigations
 
-| 风险 | 缓解 |
+| Risk | Mitigation |
 |------|------|
-| LLM 调用延迟导致后台堆积 | 所有调用设 30s 超时 + 重试队列，单次最多 50 次 LLM 调用 |
-| 自动合并误引入错误 | 仅 confidence > 0.85 自动应用，其余进建议队列 |
-| L0 压缩误删记忆 | 先标记删除，观察 7 天后再物理删除 |
-| 角色间重复处理 | 基于 content_hash + 60s 窗口去重 |
-| LLM token 费用激增 | 预过滤（代码先筛掉 80% 不需要 LLM 的场景）+ 调度频控 |
+| LLM invocation latency causes background backlog | Set a 30-second timeout plus a retry queue for all calls; at most 50 LLM calls per run |
+| Automated merging introduces errors | Automatically apply only when confidence > 0.85; send all others to the suggestion queue |
+| L0 compression incorrectly deletes memories | Mark for deletion first; physically delete only after observing for 7 days |
+| Duplicate processing between roles | Deduplicate using content_hash plus a 60-second window |
+| Surging LLM token costs | Pre-filtering (code first filters 80% of cases that do not need an LLM) plus scheduling rate limits |
