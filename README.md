@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.6-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.8-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,8 @@ Welcome to the release timeline of **Wild AgentOS**, featuring production-grade 
 
 | Version | Release Date | Key Upgrades & Fused Features |
 |---------|--------------|------------------------------|
+| **v0.1.8** | **2026-09-04** | **Ontology Action HITL**<br>• Adds configurable `commit_strategy` for automatic or approval-held Action staging, with merge/discard APIs and TTL expiry.<br>• Adds configurable guardrails, SPARQL `ASK` assertions, and a `high_risk` approval hook.<br>• Publishes `ACTION_AUDIT` EventBus events for committed, pending, approved, rejected, and violated outcomes; see the [Ontology Action Data Sandbox](docs/15-ontology-action-sandbox.md). |
+| **v0.1.7** | **2026-09-04** | **Isolation Proof & Eval**<br>• Adds the read-only `isolation-diagnose` CLI, customer-readable [Isolation Matrix](docs/17-isolation-matrix.md), and fail-closed `isolation_contract` CI coverage.<br>• Adds optional explicit `isolation-migrate`; it never uses a silent `UNION` and does not claim historical keys were migrated. |
 | **v0.1.6** | **2026-09-04** | **Isolation & Hardening**<br>• Verified JWT tenant/project claims now mint graph, blob, vector, and L0 targets; HTTP KG, ontology, KB, chat RAG, and runtime graph/vector tools are claims-scoped and fail closed when claims are absent.<br>• New user agents receive verified scope; public API-key chat is non-tenant-RAG.<br>• Adds optional `AGENTOS_TENANT_TOOL_CALL_CAP`, MCP disclosure, bash environment sanitization, tool-schema enforcement, and PDCA L0 envelopes.<br>• See the [Isolation Contract](docs/17-isolation-contract.md); historical keys are not migrated. |
 | **v0.1.5** | **2026-08-18** | **Cognitive Causal Engine & Advanced Graph Governance**<br>• **Causal Engine**: Standalone causal reasoning subsystem (`CausalEngine`, `FusionEngine`, `CausalStore`) to trace root causes and compute causal graphs of agent decisions.<br>• **Unified Graph Backend**: Consolidated fragmented graph operations into a single high-performance `GraphBackend`.<br>• **Graph Features**: Structural feature computation (PageRank, PageRank vector, centrality) and similarity scoring between cognitive snapshots.<br>• **Snapshot Timeline**: Temporal snapshot versioning with diff-based rollback and point-in-time state restoration.<br>• **Skill Center CRUD & Guard**: New client-side skill editing/deletion support, detail schema rendering, and strict **403 Forbidden** guards protecting system-level (`iri://`) builtins. |
 | **v0.1.4** | **2026-07-06** | **Model Registry Center (3-in-1 Consolidation) & Dynamic Ingestion**<br>• **Consolidated Model Registry**: Merged gateway, embedding, and resource mapping settings into a unified "Model Registry Center".<br>• **Auto Model Discovery**: Automatic endpoint model schema discovery (`/v1/models`) and keyword-matching modaly pre-evaluation.<br>• **Vector Service Bridge**: Dynamic hot-swapping embedding models, triggering zero-downtime database rebuilds and background indexing. |
@@ -211,8 +213,8 @@ cargo build -p wild-code-cli --release
 Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a full Palantir clone; it does not replace Oxigraph with Nebula/Cypher, mix AIDVP product repositories, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
 
 - **v0.1.6 — done:** JWT `IsolationClaims` mint graph/blob/vector/L0 targets; relevant HTTP paths fail closed; historical keys are not migrated.
-- **[v0.1.7 Isolation Proof & Eval](https://github.com/skaiy/wild_agentos/milestone/1):** minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and an optional migration tool with no silent `UNION`.
-- **[v0.1.8 Ontology Action HITL](https://github.com/skaiy/wild_agentos/milestone/2):** approval-held staging graphs, merge/discard APIs, configurable guardrails plus SPARQL assertions, and event-bus audit.
+- **v0.1.7 — done:** read-only minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and optional explicit migration with no silent `UNION`.
+- **v0.1.8 — done:** approval-held Action staging with merge/discard APIs and TTL, configurable guardrails plus SPARQL assertions, and `ACTION_AUDIT` event-bus audit.
 - **[v0.2.0 Control Plane + Skill CI](https://github.com/skaiy/wild_agentos/milestone/3):** claims-filtered five-screen Admin control plane; Skill package test+Judge CI and publishing; Agent/Skill/Action golden evals.
 - **[v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4):** human-approved ObjectType/LinkType drafts, MCP inbound tenant catalog, Skill-as-MCP, and a thin outbound A2A adapter.
 - **[v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5):** claims-scoped coding artifacts, an external compute-sandbox adapter, and reproducible weak-compute benchmarks without fabricated speedups.

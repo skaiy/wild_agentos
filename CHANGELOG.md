@@ -1,6 +1,34 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.1.6`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.1.8`。
+
+## [0.1.8] — 2026-09-04
+
+### Ontology Action HITL
+
+- Added Action staging with configurable `commit_strategy`: actions can commit
+  automatically or remain pending explicit approval, with merge, discard, and
+  TTL-expiry handling.
+- Added configurable ontology guardrails, including SPARQL `ASK` assertions,
+  and a `high_risk` hook for approval-sensitive actions.
+- Published `ACTION_AUDIT` EventBus events for committed, pending, approved,
+  rejected, and violated Action outcomes. See the
+  [Ontology Action Data Sandbox](docs/15-ontology-action-sandbox.md) for the
+  current data-sandbox boundary.
+
+## [0.1.7] — 2026-09-04
+
+### Isolation proof and operations
+
+- Added the read-only `isolation-diagnose` CLI to distinguish
+  claims-minted targets from historical keys.
+- Added a customer-readable isolation matrix and fail-closed
+  `isolation_contract` golden test coverage in CI. See the
+  [Isolation Contract](docs/17-isolation-contract.md) and
+  [Isolation Matrix](docs/17-isolation-matrix.md).
+- Added the optional, explicit `isolation-migrate` CLI for named-graph
+  migration. It never performs a silent `UNION`; diagnosis remains the default
+  operational path.
 
 ## [0.1.6] — 2026-09-04
 
