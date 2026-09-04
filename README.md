@@ -208,23 +208,15 @@ cargo build -p wild-code-cli --release
 
 ## 🗺️ Roadmap
 
-**v0.1.x Release Series** (stabilization):
-- Binary distribution for Linux/macOS/Windows via GitHub Releases
-- Pre-built musl static builds for Linux (zero-dependency)
-- MCP tool ecosystem expansion and documentation
-- Checkpoint/resume polish and testing
+Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a full Palantir clone; it does not replace Oxigraph with Nebula/Cypher, mix AIDVP product repositories, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
 
-**v0.2.x Release Series** (planned):
-- Native web dashboard for agent monitoring and task management
-- Python/TypeScript SDK for easier integration
-- Skill marketplace prototype with community plugin registry
-- Multi-model routing with cost-aware scheduling
-
-**v0.3.x+ Release Series** (future):
-- Kubernetes deployment operator for production scaling
-- Distributed agent mesh across Edge nodes
-- Multi-modal agent support (vision, audio)
-- Multi-turn conversation memory compression
+- **v0.1.6 — done:** JWT `IsolationClaims` mint graph/blob/vector/L0 targets; relevant HTTP paths fail closed; historical keys are not migrated.
+- **[v0.1.7 Isolation Proof & Eval](https://github.com/skaiy/wild_agentos/milestone/1):** minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and an optional migration tool with no silent `UNION`.
+- **[v0.1.8 Ontology Action HITL](https://github.com/skaiy/wild_agentos/milestone/2):** approval-held staging graphs, merge/discard APIs, configurable guardrails plus SPARQL assertions, and event-bus audit.
+- **[v0.2.0 Control Plane + Skill CI](https://github.com/skaiy/wild_agentos/milestone/3):** claims-filtered five-screen Admin control plane; Skill package test+Judge CI and publishing; Agent/Skill/Action golden evals.
+- **[v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4):** human-approved ObjectType/LinkType drafts, MCP inbound tenant catalog, Skill-as-MCP, and a thin outbound A2A adapter.
+- **[v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5):** claims-scoped coding artifacts, an external compute-sandbox adapter, and reproducible weak-compute benchmarks without fabricated speedups.
+- **[v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6):** versioned Function/Skill market, OIDC/IdP with claims minted at the auth boundary, gated emergent tools, and optional default-off limited OWL/rules.
 
 ---
 
@@ -246,6 +238,8 @@ cargo build -p wild-code-cli --release
 
 - **Memory System** → [`docs/03-memory-system.md`](docs/03-memory-system.md) (L0 redb · HyperspaceEngine · Oxigraph SPARQL)
 - **Isolation Contract** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md) (verified claims and future naming; no storage migration)
+- **Evolution Roadmap** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md) (post-v0.1.6 strategy and explicit non-goals)
+- **Ontology Action Data Sandbox** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md) (staging graph guardrails; not a compute sandbox)
 - **Design Detail** → [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) · [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
