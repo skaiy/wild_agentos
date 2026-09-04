@@ -1,5 +1,6 @@
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::isolation::IsolationClaims;
@@ -19,6 +20,25 @@ pub enum ClaimsGraphUpdate {
     InsertData(String),
     DeleteWhere(String),
 }
+
+/// A human approval that owns one claims-scoped staging graph.
+///
+/// Approval records live in a graph separate from the production data graph,
+/// so queuing an action never makes its domain triples queryable as production
+/// data. The staging graph remains claims-derived and cannot be selected by a
+/// caller.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PendingActionApproval {
+    pub approval_id: String,
+    pub staging_id: String,
+    pub staging_graph: String,
+    pub action_id: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+const APPROVAL_BASE_IRI: &str = "https://agentos.ontology/action-approval/";
+const APPROVAL_VOCAB_IRI: &str = "https://agentos.ontology/action-approval/";
 
 impl ClaimsGraphUpdate {
     pub fn insert_data(triples: impl Into<String>) -> Self {
@@ -297,6 +317,130 @@ impl KnowledgeGraphStore {
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {}", e))?;
         Ok(format!("{production}/staging/{staging_id}"))
+    }
+
+    /// Creates a pending approval record in a dedicated graph derived only
+    /// from verified tenant/project claims.
+    pub fn create_action_approval_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        approval: &PendingActionApproval,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(&approval.approval_id, "approval identifier")?;
+        Self::validate_opaque_id(&approval.staging_id, "staging identifier")?;
+        let expected_staging = self.staging_graph_iri_for_claims(claims, &approval.staging_id)?;
+        if approval.staging_graph != expected_staging {
+            return Err("approval staging graph is not claims-derived".to_string());
+        }
+        let graph = self.approvals_graph_iri_for_claims(claims)?;
+        let subject = format!("{APPROVAL_BASE_IRI}{}", approval.approval_id);
+        let lit = |value: &str| Self::sparql_literal(value);
+        let update = format!(
+            "INSERT DATA {{ GRAPH <{graph}> {{ \
+             <{subject}> <{vocab}approvalId> {id} ; \
+             <{vocab}stagingId> {staging_id} ; \
+             <{vocab}stagingGraph> {staging_graph} ; \
+             <{vocab}actionId> {action_id} ; \
+             <{vocab}createdAt> {created_at} ; \
+             <{vocab}expiresAt> {expires_at} . \
+             }} }}",
+            vocab = APPROVAL_VOCAB_IRI,
+            id = lit(&approval.approval_id),
+            staging_id = lit(&approval.staging_id),
+            staging_graph = lit(&approval.staging_graph),
+            action_id = lit(&approval.action_id),
+            created_at = lit(&approval.created_at),
+            expires_at = lit(&approval.expires_at),
+        );
+        self.store
+            .update(&update)
+            .map_err(|e| format!("claims-scoped approval create failed: {e}"))
+    }
+
+    /// Lists pending approvals visible only in the verified claims scope.
+    pub fn list_action_approvals_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<Vec<PendingActionApproval>, String> {
+        let graph = self.approvals_graph_iri_for_claims(claims)?;
+        let query = format!(
+            "SELECT ?id ?staging_id ?staging_graph ?action_id ?created_at ?expires_at WHERE {{ \
+             GRAPH <{graph}> {{ \
+             ?approval <{vocab}approvalId> ?id ; \
+                 <{vocab}stagingId> ?staging_id ; \
+                 <{vocab}stagingGraph> ?staging_graph ; \
+                 <{vocab}actionId> ?action_id ; \
+                 <{vocab}createdAt> ?created_at ; \
+                 <{vocab}expiresAt> ?expires_at . \
+             }} }} ORDER BY ?created_at",
+            vocab = APPROVAL_VOCAB_IRI,
+        );
+        self.query_sparql_in_graph(&query, None)?
+            .into_iter()
+            .map(|row| {
+                let get = |name: &str| {
+                    row.get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("approval query missing {name}"))
+                };
+                Ok(PendingActionApproval {
+                    approval_id: get("?id")?,
+                    staging_id: get("?staging_id")?,
+                    staging_graph: get("?staging_graph")?,
+                    action_id: get("?action_id")?,
+                    created_at: get("?created_at")?,
+                    expires_at: get("?expires_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Removes the approval metadata after an approve, reject, or TTL expiry.
+    pub fn delete_action_approval_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        approval_id: &str,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(approval_id, "approval identifier")?;
+        let graph = self.approvals_graph_iri_for_claims(claims)?;
+        let subject = format!("{APPROVAL_BASE_IRI}{approval_id}");
+        self.store
+            .update(&format!(
+                "DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> ?p ?o }} }}"
+            ))
+            .map_err(|e| format!("claims-scoped approval cleanup failed: {e}"))
+    }
+
+    fn approvals_graph_iri_for_claims(&self, claims: &IsolationClaims) -> Result<String, String> {
+        let production = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {e}"))?;
+        Ok(format!("{production}/action-approvals"))
+    }
+
+    fn validate_opaque_id(value: &str, kind: &str) -> Result<(), String> {
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(format!(
+                "{kind} must contain only ASCII letters, digits, '-' or '_'"
+            ));
+        }
+        Ok(())
+    }
+
+    fn sparql_literal(value: &str) -> String {
+        format!(
+            "\"{}\"",
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+        )
     }
 
     fn update_in_claims_graph(
