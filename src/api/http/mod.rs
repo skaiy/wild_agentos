@@ -369,6 +369,10 @@ pub fn build_router(
             "/api/v1/ontology/action-approvals/:approval_id/reject",
             post(reject_action_approval_handler),
         )
+        .route(
+            "/api/v1/ontology/action-approvals/:approval_id/discard",
+            post(reject_action_approval_handler),
+        )
         // ── 知识库分类管理 CRUD ──
         .route(
             "/api/v1/kb/categories",

@@ -51,7 +51,7 @@
 |---|---|
 | `GET /api/v1/ontology/action-approvals` | 列出本 tenant/project 的待审批记录。 |
 | `POST /api/v1/ontology/action-approvals/:approval_id/approve` | 合并对应 staging 图，再清理 staging 和审批记录。 |
-| `POST /api/v1/ontology/action-approvals/:approval_id/reject` | 丢弃对应 staging 图和审批记录。 |
+| `POST /api/v1/ontology/action-approvals/:approval_id/reject`（或 `/discard`） | 丢弃对应 staging 图和审批记录。 |
 
 审批对象 schema 为 `approval_id`、`staging_id`、`staging_graph`、`action_id`、`created_at` 和
 `expires_at`。默认 TTL 为 24 小时；读取或决议时发现过期记录会惰性清理 staging 图和元数据，
