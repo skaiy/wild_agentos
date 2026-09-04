@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tracing::error;
 
 use crate::{
     isolation::IsolationClaims,
@@ -453,6 +454,70 @@ pub(crate) async fn delete_function_def_handler(
 // 让知识图谱从"只读"变为"可写可执行"：依据 ActionType 做参数校验 + 前置条件检查，
 // 再把 side-effect 以 SPARQL 写回 JWT claims 铸造的命名图。
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
+const ACTION_AUDIT_EVENT: &str = "ACTION_AUDIT";
+const ACTION_AUDIT_SOURCE: &str = "ontology-action-api";
+
+/// A tenant-scoped audit record emitted after an action reaches a durable
+/// decision. Values are sourced exclusively from verified isolation claims.
+#[derive(Debug, Serialize)]
+struct ActionAuditEvent<'a> {
+    tenant_id: &'a str,
+    project_id: &'a str,
+    actor_id: &'a str,
+    action_id: &'a str,
+    staging_id: &'a str,
+    decision: &'a str,
+    violations: &'a [String],
+    timestamp: String,
+}
+
+async fn emit_action_audit(
+    state: &AppState,
+    claims: &IsolationClaims,
+    action_id: &str,
+    staging_id: &str,
+    decision: &str,
+    violations: &[String],
+) {
+    let event = ActionAuditEvent {
+        tenant_id: claims.tenant_id(),
+        project_id: claims.project_id(),
+        actor_id: claims.actor_id(),
+        action_id,
+        staging_id,
+        decision,
+        violations,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let payload = match serde_json::to_string(&event) {
+        Ok(payload) => payload,
+        Err(error) => {
+            error!(
+                action_id,
+                staging_id,
+                decision,
+                %error,
+                "failed to serialize action audit event"
+            );
+            return;
+        }
+    };
+    // EventBus emission is intentionally best-effort: its API does not expose
+    // delivery failures, and audit publication must never change an action's
+    // already-determined HTTP outcome.
+    state
+        .core
+        .events
+        .emit(
+            &claims
+                .graph_iri()
+                .unwrap_or_else(|_| "graph://invalid".to_string()),
+            ACTION_AUDIT_EVENT,
+            ACTION_AUDIT_SOURCE,
+            &payload,
+        )
+        .await;
+}
 
 fn unauthorized_isolation_claims() -> (StatusCode, Json<Value>) {
     (
@@ -628,11 +693,11 @@ fn commit_via_staging(
     action_id: &str,
     now: chrono::DateTime<chrono::Utc>,
     guardrails: &ontology_guardrails::EffectiveGuardrails,
-) -> Result<StagingCommitOutcome, (StatusCode, String, Vec<String>)> {
+) -> Result<StagingCommitOutcome, (StatusCode, String, Vec<String>, Option<String>)> {
     let staging_id = uuid::Uuid::new_v4().simple().to_string();
     let staging = kg
         .staging_graph_iri_for_claims(claims, &staging_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e, vec![]))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e, vec![], None))?;
 
     // 1. 写入影子图（生产图零改动）。任一失败即清理并报错。
     for stmt in statements {
@@ -642,6 +707,7 @@ fn commit_via_staging(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("影子图写入失败: {e}"),
                 vec![],
+                Some(staging_id),
             ));
         }
     }
@@ -655,6 +721,7 @@ fn commit_via_staging(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("护栏校验失败，已回滚: {e}"),
                 vec![],
+                Some(staging_id),
             ));
         }
     };
@@ -664,6 +731,7 @@ fn commit_via_staging(
             StatusCode::UNPROCESSABLE_ENTITY,
             "护栏校验未通过，已回滚（生产图未改动）".to_string(),
             guardrails.violations,
+            Some(staging_id),
         ));
     }
 
@@ -682,6 +750,7 @@ fn commit_via_staging(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("审批记录创建失败，已回滚: {e}"),
                 vec![],
+                Some(approval.staging_id.clone()),
             ));
         }
         return Ok(StagingCommitOutcome::Pending(approval));
@@ -694,6 +763,7 @@ fn commit_via_staging(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("影子图合并到生产图失败: {e}"),
             vec![],
+            Some(staging_id),
         ));
     }
     let _ = kg.drop_staging_for_claims(claims, &staging_id);
@@ -855,6 +925,15 @@ async fn resolve_action_approval(
             .into_response();
     }
     let _ = state.kg_store.flush();
+    emit_action_audit(
+        state,
+        claims,
+        &approval.action_id,
+        &approval.staging_id,
+        if approve { "approved" } else { "rejected" },
+        &[],
+    )
+    .await;
     (
         StatusCode::OK,
         Json(json!({
@@ -939,6 +1018,8 @@ pub(crate) async fn invoke_action_handler(
         };
 
     if req.dry_run {
+        // dry runs deliberately have no staging graph and therefore no audit
+        // event; they do not produce a state-changing decision to retain.
         return (
             StatusCode::OK,
             Json(json!({
@@ -966,15 +1047,35 @@ pub(crate) async fn invoke_action_handler(
         &guardrails,
     ) {
         Ok(outcome) => outcome,
-        Err((code, msg, violations)) => {
+        Err((code, msg, violations, staging_id)) => {
+            if code == StatusCode::UNPROCESSABLE_ENTITY {
+                if let Some(staging_id) = staging_id.as_deref() {
+                    emit_action_audit(
+                        &state,
+                        claims,
+                        &action_id,
+                        staging_id,
+                        "violated",
+                        &violations,
+                    )
+                    .await;
+                }
+            }
             return (
                 code,
                 Json(json!({ "error": msg, "violations": violations })),
-            )
+            );
         }
     };
-    let (status, sandbox) = match outcome {
-        StagingCommitOutcome::Committed(report) => ("ok", report),
+    let (status, sandbox, decision, staging_id) = match outcome {
+        StagingCommitOutcome::Committed(report) => {
+            let staging_id = report["staging_graph"]
+                .as_str()
+                .and_then(|graph| graph.rsplit('/').next())
+                .unwrap_or_default()
+                .to_string();
+            ("ok", report, "committed", staging_id)
+        }
         StagingCommitOutcome::Pending(approval) => (
             "pending_approval",
             json!({
@@ -984,9 +1085,12 @@ pub(crate) async fn invoke_action_handler(
                 "approval_id": approval.approval_id,
                 "expires_at": approval.expires_at,
             }),
+            "pending",
+            approval.staging_id,
         ),
     };
     let _ = state.kg_store.flush();
+    emit_action_audit(&state, claims, &action_id, &staging_id, decision, &[]).await;
 
     (
         StatusCode::OK,
@@ -1683,6 +1787,7 @@ mod ontology_crud_tests {
         kg.update_for_claims(&claims_a, &ClaimsGraphUpdate::insert_data(seed))
             .unwrap();
 
+        let mut audit_events = state.core.events.subscribe();
         let app = Router::new()
             .route(
                 "/api/v1/ontology/actions/:id/invoke",
@@ -1773,6 +1878,60 @@ mod ontology_crud_tests {
             app.clone().oneshot(unauthenticated).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
+        let unauthenticated_invoke = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/actions/GenerateRepairOrder/invoke")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "target": "P0A80",
+                    "params": {"vehicle_vin": "LVIN123"}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(unauthenticated_invoke)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            matches!(
+                audit_events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "requests without verified claims must not forge an audit tenant"
+        );
+
+        let auto_commit = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/actions/GenerateRepairOrder/invoke".to_string(),
+                &test_jwt("tenant-a"),
+                json!({
+                    "target": "P0A80",
+                    "params": {"vehicle_vin": "LVIN123"}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(auto_commit.status(), StatusCode::OK);
+        let committed = audit_events.recv().await.unwrap();
+        assert_eq!(committed.event_type, ACTION_AUDIT_EVENT);
+        let committed: Value = serde_json::from_str(&committed.payload).unwrap();
+        assert_eq!(committed["tenant_id"], "tenant-a");
+        assert_eq!(committed["project_id"], "repair");
+        assert_eq!(committed["actor_id"], "ontology-tester");
+        assert_eq!(committed["action_id"], "GenerateRepairOrder");
+        assert_eq!(committed["decision"], "committed");
+        assert!(committed["staging_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(committed["violations"], json!([]));
+        assert!(committed["timestamp"].as_str().is_some());
 
         let invoke = post(
             "/api/v1/ontology/actions/GenerateRepairOrder/invoke".to_string(),
@@ -1793,6 +1952,10 @@ mod ontology_crud_tests {
         .unwrap();
         assert_eq!(body["status"], "pending_approval");
         let approval_id = body["sandbox"]["approval_id"].as_str().unwrap().to_string();
+        let pending: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(pending["decision"], "pending");
+        assert_eq!(pending["staging_id"], approval_id);
 
         let orders = format!(
             "SELECT ?o WHERE {{ ?o a <{}> }}",
@@ -1845,6 +2008,10 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(approved.status(), StatusCode::OK);
+        let approved: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(approved["decision"], "approved");
+        assert_eq!(approved["staging_id"], approval_id);
         assert!(
             !kg.query_sparql_for_claims(&claims_a, &orders)
                 .unwrap()
@@ -1869,6 +2036,10 @@ mod ontology_crud_tests {
         )
         .unwrap();
         let reject_id = reject_body["sandbox"]["approval_id"].as_str().unwrap();
+        let pending_reject: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(pending_reject["decision"], "pending");
+        assert_eq!(pending_reject["staging_id"], reject_id);
         let rejected = app
             .clone()
             .oneshot(post(
@@ -1879,11 +2050,15 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::OK);
+        let rejected: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(rejected["decision"], "rejected");
+        assert_eq!(rejected["staging_id"], reject_id);
         assert_eq!(
             kg.query_sparql_for_claims(&claims_a, &orders)
                 .unwrap()
                 .len(),
-            1,
+            2,
             "reject must discard staged writes"
         );
         let _ = std::fs::remove_dir_all(tmp);

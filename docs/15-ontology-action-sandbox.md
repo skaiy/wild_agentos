@@ -41,6 +41,19 @@
 - `dry_run=true`：只返回将执行的 SPARQL，不落任何图（预演）。
 - `dry_run=false`：走上面的影子图提交或待审批流程（真写，但可回滚 + 有护栏）。
 
+### 审计事件
+动作作出持久化决策后，会以 `ACTION_AUDIT` 发布到既有 `EventBus`。事件 payload 是结构化 JSON；
+租户、项目和操作者均只来自已验证的 JWT isolation claims，未通过 claims 认证的请求不会产生事件。
+事件采用尽力而为发布，发布问题不会改变动作的 HTTP 结果。
+
+| Event name | 触发条件 | Fields |
+|---|---|---|
+| `ACTION_AUDIT` (`decision=committed`) | `auto` 影子图已合并 | `tenant_id`, `project_id`, `actor_id`, `action_id`, `staging_id`, `decision`, `violations`, `timestamp` |
+| `ACTION_AUDIT` (`decision=pending`) | `require_approval` 或高风险策略保留影子图 | 同上 |
+| `ACTION_AUDIT` (`decision=approved`) | 审批通过且 staging 已合并、清理 | 同上 |
+| `ACTION_AUDIT` (`decision=rejected`) | 审批拒绝且 staging 已丢弃、清理 | 同上 |
+| `ACTION_AUDIT` (`decision=violated`) | 护栏违规并回滚影子图 | 同上；`violations` 包含触发的护栏代码 |
+
 ### 人工审批 API（JWT claims 必需）
 
 所有 API 从已验证 JWT 铸造租户/项目作用域；请求不能选择图、租户或项目。审批记录放在专用
