@@ -2162,8 +2162,9 @@ mod kb_ingest_tests {
     }
 }
 
+/// CI golden cases selected with `cargo test isolation_contract`.
 #[cfg(test)]
-mod kb_isolation_http_tests {
+mod isolation_contract {
     use super::*;
     use crate::api::http::{api_gov::ApiUsageState, AppState, TEST_ENV_LOCK};
     use crate::core::core_types::{CoreConfig, SemanticCore};
@@ -2264,7 +2265,8 @@ mod kb_isolation_http_tests {
     }
 
     #[tokio::test]
-    async fn kb_catalog_requires_claims_and_isolates_tenants() {
+    async fn isolation_contract_kb_catalog_requires_claims_mints_targets_and_blocks_cross_tenant_writes(
+    ) {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
@@ -2343,7 +2345,7 @@ mod kb_isolation_http_tests {
     }
 
     #[tokio::test]
-    async fn graph_import_and_stats_require_claims_and_isolate_tenants() {
+    async fn isolation_contract_graph_read_write_requires_claims_and_uses_minted_graph() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
@@ -2421,7 +2423,7 @@ mod kb_isolation_http_tests {
     }
 
     #[tokio::test]
-    async fn vector_ingest_and_search_require_claims_and_isolate_tenants() {
+    async fn isolation_contract_vector_read_write_requires_claims_and_uses_minted_namespace() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());

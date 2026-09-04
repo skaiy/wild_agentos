@@ -231,6 +231,7 @@ Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，�
 - **记忆系统** → [`docs/03-memory-system.md`](docs/03-memory-system.md)（L0 redb · HyperspaceEngine · Oxigraph SPARQL）
 - **知识摄取与 import-graph** → [`docs/16-knowledge-ingest-import-graph.md`](docs/16-knowledge-ingest-import-graph.md)（upload / ingest / 命名图隔离 · embedding 可换 · Oxigraph/hyperspace 固定）
 - **隔离契约** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md)（可信 claims、命名与未迁移历史键）
+- **隔离矩阵** → [`docs/17-isolation-matrix.md`](docs/17-isolation-matrix.md)（CI 验证的 fail-closed 行为；历史键尚未迁移）
 - **演进路线图** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md)（v0.1.6 后战略与明确非目标）
 - **本体 Action 数据沙箱** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md)（staging graph 护栏，不是计算沙箱）
 - **设计细节** → [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) · [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) (English)

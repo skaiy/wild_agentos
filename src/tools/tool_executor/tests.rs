@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_tools_use_claims_scope_and_ignore_tool_supplied_graphs() {
+    fn isolation_contract_graph_tools_use_claims_scope_and_ignore_tool_supplied_graphs() {
         rt().block_on(async {
             let executor = ToolExecutor::new();
             let tenant_a = claims("tenant-a");
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_and_vector_tools_fail_closed_without_claims() {
+    fn isolation_contract_graph_and_vector_tools_fail_closed_without_claims() {
         rt().block_on(async {
             let executor = ToolExecutor::new();
             for (tool, input) in [
