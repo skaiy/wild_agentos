@@ -1787,7 +1787,6 @@ mod ontology_crud_tests {
         kg.update_for_claims(&claims_a, &ClaimsGraphUpdate::insert_data(seed))
             .unwrap();
 
-        let mut audit_events = state.core.events.subscribe();
         let app = Router::new()
             .route(
                 "/api/v1/ontology/actions/:id/invoke",
@@ -1842,6 +1841,7 @@ mod ontology_crud_tests {
         kg.update_for_claims(&claims_a, &ClaimsGraphUpdate::insert_data(seed))
             .unwrap();
 
+        let mut audit_events = state.core.events.subscribe();
         let app = Router::new()
             .route(
                 "/api/v1/ontology/actions/:id/invoke",
