@@ -36,6 +36,7 @@ pub mod kb;
 pub mod mcp;
 pub mod models;
 pub mod ontology;
+pub mod ontology_guardrails;
 pub mod prompts;
 pub mod runtime;
 pub mod skills;
@@ -64,11 +65,11 @@ use kb::{
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
 use ontology::{
     approve_action_approval_handler, delete_action_type_handler, delete_function_def_handler,
-    delete_link_type_handler, delete_object_type_handler, invoke_action_handler,
+    delete_object_type_handler, domain_guardrails_handler, invoke_action_handler,
     list_action_approvals_handler, ontology_types_handler, reject_action_approval_handler,
-    update_action_type_handler, update_function_def_handler, update_link_type_handler,
-    update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
-    upsert_link_type_handler, upsert_object_type_handler,
+    update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
+    update_link_type_handler, update_object_type_handler, upsert_action_type_handler,
+    upsert_function_def_handler, upsert_link_type_handler, upsert_object_type_handler,
 };
 use runtime::{health_handler, metrics_handler, unified_stats_handler};
 use skills::{
@@ -335,6 +336,10 @@ pub fn build_router(
         .route(
             "/api/v1/ontology/link-types/:id",
             put(update_link_type_handler).delete(delete_link_type_handler),
+        )
+        .route(
+            "/api/v1/ontology/guardrails",
+            get(domain_guardrails_handler).put(update_domain_guardrails_handler),
         )
         // ── 本体元模型在线 CRUD（动作/函数）──
         .route(
