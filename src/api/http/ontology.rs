@@ -10,10 +10,13 @@ use serde_json::{json, Value};
 
 use crate::{
     isolation::IsolationClaims,
-    knowledge_graph::store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval},
+    knowledge_graph::{
+        ontology_layer::ActionGuardrailConfig,
+        store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval},
+    },
 };
 
-use super::{iam::UserIdentity, AppState};
+use super::{iam::UserIdentity, ontology_guardrails, AppState};
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 
@@ -54,6 +57,60 @@ pub(crate) async fn ontology_types_handler(
         "action_types": ont.action_types,
         "functions": ont.functions,
     }))
+}
+
+/// GET /api/v1/ontology/guardrails — 返回当前 claims 已认证调用方可读取的域默认护栏。
+pub(crate) async fn domain_guardrails_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
+    let store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    match store.load_domain_guardrails(ONT_DOMAIN) {
+        Ok(guardrails) => {
+            Json(json!({ "domain": ONT_DOMAIN, "guardrails": guardrails })).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/v1/ontology/guardrails — 更新域默认护栏。
+///
+/// This endpoint is claims-authenticated. Invoke payloads cannot carry this configuration;
+/// their graph scope and policy are selected server-side from the stored ActionType/domain.
+pub(crate) async fn update_domain_guardrails_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(guardrails): Json<ActionGuardrailConfig>,
+) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
+    if let Err(error) = ontology_guardrails::validate_config(&guardrails) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
+    }
+    let store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    match store.upsert_domain_guardrails(ONT_DOMAIN, &guardrails) {
+        Ok(()) => Json(json!({ "status": "ok", "domain": ONT_DOMAIN, "guardrails": guardrails }))
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
 }
 
 // ─── 阶段1：ObjectType + LinkType 在线 CRUD（存储驱动，写前备份 meta 图）───────
@@ -252,6 +309,9 @@ pub(crate) async fn upsert_action_type_handler(
     if identity.isolation_claims().is_none() {
         return unauthorized_isolation_claims().into_response();
     }
+    if let Err(e) = ontology_guardrails::validate_config(&action.guardrails) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -277,6 +337,9 @@ pub(crate) async fn update_action_type_handler(
         return unauthorized_isolation_claims().into_response();
     }
     action.id = id;
+    if let Err(e) = ontology_guardrails::validate_config(&action.guardrails) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -487,6 +550,7 @@ fn p_num(params: &serde_json::Map<String, Value>, name: &str) -> Option<f64> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActionInvokeRequest {
     /// applies_to 对象实例的主键值（动作作用的目标对象）。
     #[serde(default)]
@@ -528,66 +592,23 @@ const BUILTIN_EXECUTABLE_ACTIONS: &[&str] = &["GenerateRepairOrder"];
 //   3. 对影子图跑 ASK 护栏（三元组数上限 / 谓词命名空间白名单），任一命中即视为违规
 //   4. 通过 → ADD 影子图到生产图 + DROP 影子图（提交）；违规 → DROP 影子图（回滚）
 
-/// 影子图三元组数上限（防单次写回爆量）。
-const SANDBOX_MAX_TRIPLES: usize = 5000;
-/// 允许写回的谓词命名空间前缀白名单（防越权写入无关命名空间）。
-const SANDBOX_ALLOWED_PRED_PREFIXES: &[&str] = &[
-    "https://agentos.ontology/ev/",
-    "http://www.w3.org/2000/01/rdf-schema#",
-    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-];
-
-/// 护栏后校验：对影子图跑 ASK，返回违规项列表（空=通过）。
 #[derive(Debug, Default)]
 struct SandboxGuardrailReport {
     violations: Vec<String>,
-    /// Extension point for configurable guardrails (#86): a rule may require
-    /// HITL without making the staged data invalid.
+    /// A relaxed policy is held for approval even when its hard checks pass.
     high_risk: bool,
 }
 
-fn sandbox_guardrail_violations(
+fn sandbox_guardrail_report(
     kg: &KnowledgeGraphStore,
     claims: &IsolationClaims,
     staging_id: &str,
+    policy: &ontology_guardrails::EffectiveGuardrails,
 ) -> Result<SandboxGuardrailReport, String> {
-    let mut report = SandboxGuardrailReport::default();
-
-    // 护栏1：三元组数上限。
-    let count_q = format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s ?p ?o }}");
-    let n = kg
-        .query_staging_for_claims(claims, staging_id, &count_q)?
-        .into_iter()
-        .next()
-        .and_then(|row| row.get("?c").and_then(|v| v.as_str().map(String::from)))
-        .and_then(|s| s.parse::<usize>().ok())
-        .ok_or_else(|| "护栏三元组计数查询返回无效结果".to_string())?;
-    if n > SANDBOX_MAX_TRIPLES {
-        report.violations.push(format!(
-            "写回三元组数 {} 超过上限 {}",
-            n, SANDBOX_MAX_TRIPLES
-        ));
-    }
-
-    // 护栏2：谓词命名空间白名单——存在任一不在白名单前缀内的谓词即违规。
-    let filters: Vec<String> = SANDBOX_ALLOWED_PRED_PREFIXES
-        .iter()
-        .map(|p| format!("STRSTARTS(STR(?p), \"{}\")", p))
-        .collect();
-    let foreign_q = format!(
-        "SELECT ?p WHERE {{ ?s ?p ?o . FILTER(!({allow})) }} LIMIT 1",
-        allow = filters.join(" || ")
-    );
-    let has_foreign = !kg
-        .query_staging_for_claims(claims, staging_id, &foreign_q)?
-        .is_empty();
-    if has_foreign {
-        report
-            .violations
-            .push("存在越权谓词（不在允许的命名空间白名单内）".to_string());
-    }
-
-    Ok(report)
+    Ok(SandboxGuardrailReport {
+        violations: ontology_guardrails::violations(kg, claims, staging_id, policy)?,
+        high_risk: ontology_guardrails::is_high_risk(policy),
+    })
 }
 
 const ACTION_APPROVAL_TTL_HOURS: i64 = 24;
@@ -598,7 +619,7 @@ enum StagingCommitOutcome {
     Pending(PendingActionApproval),
 }
 
-/// 经影子图提交一批写回语句。默认自动合并；HITL 策略或未来高风险规则会保留影子图。
+/// 经影子图提交一批写回语句。默认自动合并；HITL 策略或高风险护栏策略会保留影子图。
 fn commit_via_staging(
     kg: &KnowledgeGraphStore,
     claims: &IsolationClaims,
@@ -606,6 +627,7 @@ fn commit_via_staging(
     strategy: ActionCommitStrategy,
     action_id: &str,
     now: chrono::DateTime<chrono::Utc>,
+    guardrails: &ontology_guardrails::EffectiveGuardrails,
 ) -> Result<StagingCommitOutcome, (StatusCode, String, Vec<String>)> {
     let staging_id = uuid::Uuid::new_v4().simple().to_string();
     let staging = kg
@@ -625,7 +647,7 @@ fn commit_via_staging(
     }
 
     // 2. 护栏后校验。违规即回滚（DROP 影子图），生产图不受影响。
-    let guardrails = match sandbox_guardrail_violations(kg, claims, &staging_id) {
+    let guardrails = match sandbox_guardrail_report(kg, claims, &staging_id, guardrails) {
         Ok(report) => report,
         Err(e) => {
             let _ = kg.drop_staging_for_claims(claims, &staging_id);
@@ -930,6 +952,10 @@ pub(crate) async fn invoke_action_handler(
     }
 
     // 4. 数据沙箱写回：先写影子图 → 护栏后校验 → 通过才合并到生产图，失败即回滚。
+    let guardrails = match ontology_guardrails::effective_config(&ont, &action) {
+        Ok(guardrails) => guardrails,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    };
     let outcome = match commit_via_staging(
         &kg,
         claims,
@@ -937,6 +963,7 @@ pub(crate) async fn invoke_action_handler(
         req.commit_strategy,
         &action_id,
         now,
+        &guardrails,
     ) {
         Ok(outcome) => outcome,
         Err((code, msg, violations)) => {
@@ -1989,16 +2016,24 @@ mod ontology_action_tests {
         )
         .unwrap();
 
-        let report = commit_via_staging(
+        let ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        let guardrails = ontology_guardrails::effective_config(&ont, action).unwrap();
+        let outcome = commit_via_staging(
             &kg,
             &claims,
             &stmts,
             ActionCommitStrategy::Auto,
             "GenerateRepairOrder",
             chrono::Utc::now(),
+            &guardrails,
         )
         .expect("护栏应通过并提交");
-        let StagingCommitOutcome::Committed(report) = report else {
+        let StagingCommitOutcome::Committed(report) = outcome else {
             panic!("auto 策略必须直接提交");
         };
         assert_eq!(report["guardrails_passed"], json!(true));
@@ -2050,6 +2085,13 @@ mod ontology_action_tests {
         let foreign = ClaimsGraphUpdate::insert_data(
             "<https://agentos.ontology/ev/X/1> <http://evil.example/pwn> \"x\"",
         );
+        let ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        let guardrails = ontology_guardrails::effective_config(&ont, action).unwrap();
         let err = commit_via_staging(
             &kg,
             &claims,
@@ -2057,6 +2099,7 @@ mod ontology_action_tests {
             ActionCommitStrategy::Auto,
             "GenerateRepairOrder",
             chrono::Utc::now(),
+            &guardrails,
         )
         .unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
@@ -2068,6 +2111,96 @@ mod ontology_action_tests {
             .unwrap()
             .to_string();
         assert_eq!(before, after, "回滚后生产图不应有任何改动");
+    }
+
+    #[test]
+    fn test_action_whitelist_override_rejects_otherwise_allowed_predicate() {
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
+        let mut ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter_mut()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        action.guardrails.allowed_predicate_prefixes =
+            Some(vec!["https://agentos.ontology/ev/prop/".into()]);
+        let action = action.clone();
+        let guardrails = ontology_guardrails::effective_config(&ont, &action).unwrap();
+        let permitted_by_default = ClaimsGraphUpdate::insert_data(
+            "<https://agentos.ontology/ev/X/1> <https://agentos.ontology/ev/custom> \"x\"",
+        );
+        let err = commit_via_staging(
+            &kg,
+            &claims,
+            &[permitted_by_default],
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+            &guardrails,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err
+            .2
+            .iter()
+            .any(|violation| violation.starts_with("predicate_whitelist:")));
+    }
+
+    #[test]
+    fn test_assertion_failure_rolls_back_staging_graph() {
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
+        let before = kg
+            .query_sparql_for_claims(&claims, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+            .unwrap()[0]["?c"]
+            .clone();
+        let mut ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter_mut()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        action.guardrails.assertions.push(
+            crate::knowledge_graph::ontology_layer::SparqlAskAssertion {
+                code: "no_staging_writes".into(),
+                query: "ASK { ?s ?p ?o }".into(),
+            },
+        );
+        let action = action.clone();
+        let guardrails = ontology_guardrails::effective_config(&ont, &action).unwrap();
+        let write = ClaimsGraphUpdate::insert_data(
+            "<https://agentos.ontology/ev/X/1> <https://agentos.ontology/ev/prop/value> \"x\"",
+        );
+        let err = commit_via_staging(
+            &kg,
+            &claims,
+            &[write],
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+            &guardrails,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err
+            .2
+            .iter()
+            .any(|violation| violation.starts_with("assertion:no_staging_writes:")));
+        let after = kg
+            .query_sparql_for_claims(&claims, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+            .unwrap()[0]["?c"]
+            .clone();
+        assert_eq!(before, after, "断言失败后生产图不应有任何改动");
+    }
+
+    #[test]
+    fn test_invoke_payload_cannot_override_guardrails() {
+        assert!(serde_json::from_value::<ActionInvokeRequest>(json!({
+            "dry_run": true,
+            "guardrails": { "max_triples": 0 }
+        }))
+        .is_err());
     }
 
     #[test]

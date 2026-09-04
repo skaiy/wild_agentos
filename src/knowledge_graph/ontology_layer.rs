@@ -169,6 +169,28 @@ pub struct SideEffect {
     pub description: String,
 }
 
+/// 一条轻量级 SPARQL ASK 护栏断言。查询返回 true 时表示违反该约束。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SparqlAskAssertion {
+    /// 稳定、可读的违规代码，供 API 调用方和审计系统识别。
+    pub code: String,
+    /// 仅允许 ASK 查询；执行时由服务端绑定到 JWT claims 派生的影子图。
+    pub query: String,
+}
+
+/// 动作写回数据沙箱的可选配置。
+///
+/// `None` 不代表关闭护栏，而是继承域配置；域配置也缺失时使用安全的内置默认值。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionGuardrailConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_triples: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_predicate_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    pub assertions: Vec<SparqlAskAssertion>,
+}
+
 /// ActionType — 动力层操作类型（让图谱从"只读"变"可写可执行"）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionType {
@@ -181,6 +203,9 @@ pub struct ActionType {
     pub preconditions: Vec<String>,
     pub side_effects: Vec<SideEffect>,
     pub icon: String,
+    /// 动作级护栏覆盖；未配置的项继承域默认值，不能用空值关闭内置护栏。
+    #[serde(default)]
+    pub guardrails: ActionGuardrailConfig,
 }
 
 /// FunctionDef — 动力层函数（派生属性 / AI 计算）。
@@ -198,6 +223,9 @@ pub struct FunctionDef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OntologyDefinition {
     pub domain: String,
+    /// 此业务域的护栏默认值；动作级设置可逐项覆盖。
+    #[serde(default)]
+    pub guardrails: ActionGuardrailConfig,
     pub object_types: Vec<ObjectType>,
     pub link_types: Vec<LinkType>,
     pub action_types: Vec<ActionType>,
@@ -739,6 +767,7 @@ pub fn ev_repair_ontology() -> OntologyDefinition {
                 },
             ],
             icon: "ClipboardList".into(),
+            guardrails: ActionGuardrailConfig::default(),
         },
         ActionType {
             id: "UpdateBatterySoh".into(),
@@ -757,6 +786,7 @@ pub fn ev_repair_ontology() -> OntologyDefinition {
                 description: "更新 Battery.soh 属性".into(),
             }],
             icon: "BatteryCharging".into(),
+            guardrails: ActionGuardrailConfig::default(),
         },
         ActionType {
             id: "MarkRecall".into(),
@@ -775,6 +805,7 @@ pub fn ev_repair_ontology() -> OntologyDefinition {
                 description: "写入召回标记与原因".into(),
             }],
             icon: "Megaphone".into(),
+            guardrails: ActionGuardrailConfig::default(),
         },
         ActionType {
             id: "AppendFaq".into(),
@@ -801,6 +832,7 @@ pub fn ev_repair_ontology() -> OntologyDefinition {
                 },
             ],
             icon: "MessageCirclePlus".into(),
+            guardrails: ActionGuardrailConfig::default(),
         },
     ];
 
@@ -833,6 +865,7 @@ pub fn ev_repair_ontology() -> OntologyDefinition {
 
     OntologyDefinition {
         domain: "ev-repair".into(),
+        guardrails: ActionGuardrailConfig::default(),
         object_types,
         link_types,
         action_types,
