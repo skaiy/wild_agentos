@@ -2000,9 +2000,16 @@ mod ontology_crud_tests {
             .header("authorization", format!("Bearer {token}"))
             .body(axum::body::Body::from(r#"{"confirm":true}"#))
             .unwrap();
+        let promoted = app.clone().oneshot(promote).await.unwrap();
+        let promoted_status = promoted.status();
+        let promoted_body = axum::body::to_bytes(promoted.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
-            app.clone().oneshot(promote).await.unwrap().status(),
-            StatusCode::OK
+            promoted_status,
+            StatusCode::OK,
+            "promotion response: {}",
+            String::from_utf8_lossy(&promoted_body)
         );
 
         let types = app

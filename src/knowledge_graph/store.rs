@@ -485,7 +485,13 @@ impl KnowledgeGraphStore {
                         .map(str::to_owned)
                         .ok_or_else(|| format!("type draft query missing {name}"))
                 };
-                let bundle: TypeDraftBundle = serde_json::from_str(&get("?bundle")?)
+                // Query results have RDF literal delimiters removed but retain
+                // their escapes. Decode that literal layer before parsing the
+                // canonical JSON draft snapshot.
+                let stored_bundle = get("?bundle")?;
+                let bundle_json = serde_json::from_str::<String>(&format!("\"{stored_bundle}\""))
+                    .unwrap_or(stored_bundle);
+                let bundle: TypeDraftBundle = serde_json::from_str(&bundle_json)
                     .map_err(|e| format!("stored type draft is invalid: {e}"))?;
                 Ok(PendingTypeDraft {
                     draft_id: get("?id")?,
