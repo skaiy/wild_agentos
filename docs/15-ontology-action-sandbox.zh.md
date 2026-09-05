@@ -104,30 +104,47 @@
 
 ---
 
-## 二、计算沙箱（待实现 — 记录，不落地）
+## 二、计算沙箱：外接 Provider 挂载
 
 ### 何时才需要
 仅当自定义动作/函数要执行**真正的代码或任意表达式**（而非占位符白名单替换的 SPARQL 模板）
 时才需要进程级隔离。当前阶段自定义动作 `executable=false`（invoke 返回 422），不触发此需求。
 
-### 已有可复用基础（无需从零造）
+### 外接重计算路径
+内核提供 `tools::sandbox_provider::SandboxProvider` 挂载契约，对接
+OpenHands/E2B 一类的外部网关；内核只提交结构化描述、查询状态并接收结构化结果，
+不在进程内执行用户工作：
+
+1. `submit(SandboxSubmitRequest)` 接收调用方指定的 `task_id`、已验证的
+   `tenant_id`/`project_id`/`actor_id` claims，以及 JSON 工作描述。
+2. `status(task_id)` 返回 `queued`、`running`、`succeeded`、`failed` 或
+   `cancelled`。
+3. `fetch_result(task_id)` 只接收终态 `SandboxResult` JSON：
+   `task_id`、`status`、`exit_code`、结构化 `output`、以及有界
+   `stdout`/`stderr`；task ID 不匹配或非终态结果会被拒绝。
+
+默认构建包含 `MockSandboxProvider`，不执行任何代码，测试不依赖外部服务。
+通用 HTTP 网关适配器（`POST /tasks`、`GET /tasks/{id}`、
+`GET /tasks/{id}/result`）仅在 `--features external-sandbox` 时编译。
+凭据不属于该契约，必须由部署层在传输边界注入。
+
+`AuditedSandboxProvider` 在读取终态结果后尽力发布 `SANDBOX_AUDIT` 事件；
+payload 含 provider、task ID、已验证 claims、终态和 exit code，不含结果内容。
+
+### 已有可复用的本地轻量基础
 - `src/tools/tool_executor/builtins.rs` (`execute_bash`) plus `src/tools/builtin/sandbox.rs`：已具备 `FilesystemIsolationMode`、`isolateNetwork`、
   `namespaceRestrictions`、`dangerouslyDisableSandbox` 等 namespace/网络隔离能力。
 - `src/core/syscall_gate.rs`：`WhitelistManager` / `SyscallGate` 提供能力白名单 + 签名校验骨架。
 
-### 拟采用形态（待需求触发再定稿）
-1. **表达式层**：优先把自定义函数限制为「受限 DSL / SPARQL 模板 + 占位符白名单替换」，
-   能不引入代码执行就不引入。
-2. **确需执行代码**：复用 bash.rs 的 namespace 隔离（只读文件系统 + 禁网 + 资源限额），
-   经 `SyscallGate` 能力白名单收敛可用系统调用，输入输出走结构化通道。
-3. **审计**：执行事件入事件总线留痕（与现有事件流一致）。
-
 ### 明确不做（本次范围外）
 - 不引入容器/gVisor/WASM 运行时等新依赖。
+- 不新造「第四个」进程内 OS；重计算交给外部 Provider，本地 bash 隔离仍是显式轻量 opt-in。
 - 不放开 `BUILTIN_EXECUTABLE_ACTIONS` 白名单去执行任意自定义动作代码。
 
 ---
 
 ## 决策小结
 - **现在**：声明式动作 → 数据沙箱（影子图 + 护栏 + 命名图限定），纯 SPARQL 能力、零新依赖、可回滚。
-- **将来（按需）**：任意代码执行 → 计算沙箱（复用 bash.rs namespace 隔离 + syscall_gate 白名单）。
+- **重计算**：挂载外部 Provider，只收结构化结果；HTTP 适配器受 feature flag 控制。
+- **本地轻量路径**：继续使用显式 bash namespace 隔离 + syscall_gate 白名单；任意 executable action
+  保持禁用。
