@@ -19,13 +19,15 @@ IsolationClaims::from_verified(tenant_id, project_id, actor_id)
 
 调用者在认证边界验证这些值；隔离模块不读取 HTTP 请求、不解析 JSON body、不检查
 headers，也不校验 credentials。`X-Identity` 仅为开发模拟，不创建
-`IsolationClaims`，不是生产租户身份来源。生产部署应使用 OIDC/JWKS 模式
-（`AGENTOS_AUTH_MODE=oidc`），并配置 `AGENTOS_OIDC_JWKS_URL`、
+`IsolationClaims`，不是生产租户身份来源。`AGENTOS_ENV=production` 强制要求
+OIDC/JWKS 模式（`AGENTOS_AUTH_MODE=oidc`）；选择 HS256 时服务会拒绝启动。
+OIDC 模式必须配置 `AGENTOS_OIDC_JWKS_URL`、
 `AGENTOS_OIDC_ISSUER` 和 `AGENTOS_OIDC_AUDIENCE`；issuer 与 audience 是必填，
 且只接受非对称 OIDC 算法。JWKS 从配置 endpoint 获取，短时缓存，遇到未知 key ID
 会刷新一次。默认 `hs256` 模式用 `AGENTOS_JWT_SECRET` 验证，保留给本地开发。
-OIDC/JWKS 配置错误、缺少 key、签名无效、issuer/audience 不匹配都会 fail closed。
-JWKS URL 必须使用 HTTPS；仅本地开发与测试 fixture 可以使用 loopback HTTP。
+启动时会拒绝不完整的 OIDC 配置；OIDC/JWKS 配置错误、缺少 key、签名无效、
+issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS URL；
+仅本地开发与测试 fixture 可以使用 loopback HTTP，生产环境绝不允许。
 
 无 claims 的请求不能使用 claims-scoped graph/blob 路径。`JwtClaims.project_id` 是
 带 serde default 的 `Option<String>`；缺失或为空时 mint `default` project。非空值
