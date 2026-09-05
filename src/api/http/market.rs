@@ -161,14 +161,8 @@ fn valid_semver_suffix(value: &str) -> bool {
 }
 
 fn compare_semver(left: &str, right: &str) -> std::cmp::Ordering {
-    let split = |value: &str| {
-        let value = value.split('+').next().unwrap_or(value);
-        value
-            .split_once('-')
-            .map_or((value, None), |(core, pre)| (core, Some(pre)))
-    };
-    let (left_core, left_pre) = split(left);
-    let (right_core, right_pre) = split(right);
+    let (left_core, left_pre) = split_semver_core(left);
+    let (right_core, right_pre) = split_semver_core(right);
     for (left, right) in left_core.split('.').zip(right_core.split('.')) {
         match left
             .parse::<u64>()
@@ -185,6 +179,13 @@ fn compare_semver(left: &str, right: &str) -> std::cmp::Ordering {
         (Some(left), Some(right)) => left.cmp(right),
         (None, None) => std::cmp::Ordering::Equal,
     }
+}
+
+fn split_semver_core(value: &str) -> (&str, Option<&str>) {
+    let value = value.split('+').next().unwrap_or(value);
+    value
+        .split_once('-')
+        .map_or((value, None), |(core, pre)| (core, Some(pre)))
 }
 
 fn claims_or_unauthorized(
