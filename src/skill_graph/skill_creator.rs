@@ -688,6 +688,21 @@ pub struct InputProperty {
 mod tests {
     use super::*;
 
+    #[derive(Deserialize)]
+    struct GoldenSkillCase {
+        input: String,
+        expected: GoldenSkillExpectation,
+    }
+
+    #[derive(Deserialize)]
+    struct GoldenSkillExpectation {
+        name: String,
+        required_parameters: Vec<String>,
+        optional_parameters: Vec<String>,
+        step_count: usize,
+        tags: Vec<String>,
+    }
+
     #[test]
     fn test_convert_markdown_static() {
         let markdown = r#"# Web Search
@@ -720,6 +735,34 @@ Search the internet for information
         assert!(!def.input_properties[1].required);
         assert_eq!(def.steps.len(), 4);
         assert!(def.tags.contains(&"search".to_string()));
+    }
+
+    #[test]
+    fn golden_skill_markdown_static_parse() {
+        let case: GoldenSkillCase =
+            serde_json::from_str(include_str!("../../evals/golden/skill-markdown.json"))
+                .expect("golden skill fixture must be valid JSON");
+        let def = SkillCreator::convert_markdown_static(&case.input).unwrap();
+
+        assert_eq!(def.name, case.expected.name);
+        assert_eq!(def.steps.len(), case.expected.step_count);
+        assert_eq!(def.tags, case.expected.tags);
+        for name in case.expected.required_parameters {
+            assert!(
+                def.input_properties
+                    .iter()
+                    .any(|property| property.name == name && property.required),
+                "required parameter {name} was not parsed"
+            );
+        }
+        for name in case.expected.optional_parameters {
+            assert!(
+                def.input_properties
+                    .iter()
+                    .any(|property| property.name == name && !property.required),
+                "optional parameter {name} was not parsed"
+            );
+        }
     }
 
     #[test]
