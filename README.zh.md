@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.2.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.2.1-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,7 @@
 
 | 版本 | 发布日期 | 核心升级与融合特性 |
 |------|----------|-------------------|
+| **v0.2.1** | **2026-09-05** | **本体数据 + 协议**<br>• 新增从 CSV 或 JSON Schema 生成、按 claims 隔离的 ObjectType/LinkType 草稿；必须经获授权人员审批后才能提升。<br>• 新增由 `IsolationClaims` 过滤的入站 MCP 工具目录，以及可显式发布为 MCP 工具的受 gate 租户 Skill；内核 Skill 仍被排除。<br>• 新增默认关闭 feature flag 保护的薄型出站 A2A adapter；它以尽力而为方式工作，不提供入站服务器，也不改变本地任务生命周期。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。 |
 | **v0.2.0** | **2026-09-05** | **控制平面 + Skill CI**<br>• 新增 Skill package 格式与 CI gate：包含 package 验证和 golden input/output 检查，Judge hook 默认关闭。<br>• 通过的 package 可经受控 tenant 发布通道发布；失败 fixture 会被拦截。<br>• 通过 `scripts/test_golden.sh` 在 Rust CI 中新增 Agent 计划、Skill Markdown 和 Action 调用的 golden evals。<br>• 配套 Admin #16 已在独立仓库交付五屏控制平面骨架；本次发布不改变该仓库的范围。 |
 | **v0.1.8** | **2026-09-04** | **本体 Action 人工审批闭环（HITL）**<br>• 新增可配置 `commit_strategy`：Action 可自动提交或保留待审批，并提供 merge/discard API 与 TTL 到期处理。<br>• 新增可配置护栏、SPARQL `ASK` 断言和用于审批敏感操作的 `high_risk` hook。<br>• 通过事件总线发布 committed、pending、approved、rejected、violated 等结果的 `ACTION_AUDIT` 事件；详见[本体 Action 数据沙箱](docs/15-ontology-action-sandbox.md)。 |
 | **v0.1.7** | **2026-09-04** | **隔离证明与评测**<br>• 新增只读 `isolation-diagnose` CLI、面向客户的[隔离矩阵](docs/17-isolation-matrix.md)，以及 fail-closed `isolation_contract` CI 覆盖。<br>• 新增可选且显式的 `isolation-migrate`；绝不静默使用 `UNION`，也不宣称历史键已迁移。 |
@@ -203,13 +204,13 @@ cargo build -p wild-code-cli --release
 
 ## 🗺️ 路线图
 
-Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，结合 Oxigraph RDF/SPARQL、Hyperspace、`IsolationClaims` 命名契约和本体 Action 的**数据**沙箱。它不是裸机微内核 OS，也不是完整 Palantir 克隆；不以 Nebula/Cypher 替换 Oxigraph，不混合其他业务/产品仓库或产品边界到本开源树，且 mint 名称不等于迁移历史数据。详见[演进路线图](docs/18-evolution-roadmap.zh.md)和[隔离契约](docs/17-isolation-contract.zh.md)。
+Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，结合 Oxigraph RDF/SPARQL、Hyperspace、`IsolationClaims` 命名契约和本体 Action 的**数据**沙箱。它不是裸机微内核 OS，也不追求完整复刻某个专有平台；不以 Nebula/Cypher 替换 Oxigraph，不混合其他业务/产品仓库或产品边界到本开源树，且 mint 名称不等于迁移历史数据。详见[演进路线图](docs/18-evolution-roadmap.zh.md)和[隔离契约](docs/17-isolation-contract.zh.md)。
 
 - **v0.1.6 — 已完成：** JWT `IsolationClaims` 为 graph/blob/vector/L0 mint 目标；相关 HTTP 路径 fail closed；历史键尚未迁移。
 - **v0.1.7 — 已完成：** 区分 minted 与历史键的只读诊断 CLI、客户可读隔离矩阵、fail-closed 黄金 CI，以及禁止静默 `UNION` 的可选显式迁移。
 - **v0.1.8 — 已完成：** 可保留待审批的 Action staging、merge/discard API 与 TTL、可配置护栏和 SPARQL 断言，以及 `ACTION_AUDIT` 事件总线审计。
 - **v0.2.0 — 已完成：** Skill package 验证、golden 检查、默认关闭的 Judge hook 和受控 tenant 发布；Rust CI 中的 Agent/Skill/Action golden evals；配套 Admin #16 已在独立仓库交付五屏控制平面骨架。
-- **[v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4)：** 人工审批的 ObjectType/LinkType 草稿、MCP 入站租户目录、Skill-as-MCP 与薄型出站 A2A adapter。
+- **v0.2.1 — 已完成：** 从 CSV 或 JSON Schema 生成、按 claims 隔离并需获授权人员审批后才能提升的 ObjectType/LinkType 草稿；由 `IsolationClaims` 过滤的入站 MCP 目录；受 gate 租户 Skill 的 MCP 工具发布；以及默认关闭、尽力而为的薄型出站 A2A adapter。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。
 - **[v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5)：** claims 作用域 coding artifacts、外挂计算沙箱适配器，以及不编造速度提升的弱算力可复现基准。
 - **[v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6)：** 版本化 Function/Skill market、在认证边界 mint claims 的 OIDC/IdP、带 gate 的 emergent tools，以及默认关闭的有限 OWL/rules。
 

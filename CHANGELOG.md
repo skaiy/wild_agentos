@@ -1,6 +1,21 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.2.0`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.2.1`。
+
+## [0.2.1] — 2026-09-05
+
+### Ontology Data + Protocols
+
+- Added ObjectType and LinkType drafts generated from CSV or JSON Schema.
+  Drafts are tenant/project claims-scoped and promote only after an authorized
+  human approval.
+- Added an inbound MCP tool catalog filtered by verified `IsolationClaims`, so
+  discovery exposes only tools authorized for the requesting tenant/project.
+- Added Skills as MCP publication units: gated tenant Skills can be explicitly
+  exposed as claims-authorized MCP tools, while kernel Skills remain excluded.
+- Added a thin outbound A2A adapter behind a default-off feature flag. It sends
+  best-effort outbound updates without adding an inbound A2A server or changing
+  the local task lifecycle. See [Outbound A2A adapter](docs/19-a2a-outbound.md).
 
 ## [0.2.0] — 2026-09-05
 
