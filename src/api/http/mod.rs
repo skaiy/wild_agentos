@@ -64,13 +64,14 @@ use kb::{
 };
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
 use ontology::{
-    approve_action_approval_handler, delete_action_type_handler, delete_function_def_handler,
+    approve_action_approval_handler, create_csv_type_draft_handler,
+    create_json_schema_type_draft_handler, delete_action_type_handler, delete_function_def_handler,
     delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
-    invoke_action_handler, list_action_approvals_handler, ontology_types_handler,
-    reject_action_approval_handler, update_action_type_handler, update_domain_guardrails_handler,
-    update_function_def_handler, update_link_type_handler, update_object_type_handler,
-    upsert_action_type_handler, upsert_function_def_handler, upsert_link_type_handler,
-    upsert_object_type_handler,
+    invoke_action_handler, list_action_approvals_handler, list_type_drafts_handler,
+    ontology_types_handler, promote_type_draft_handler, reject_action_approval_handler,
+    update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
+    update_link_type_handler, update_object_type_handler, upsert_action_type_handler,
+    upsert_function_def_handler, upsert_link_type_handler, upsert_object_type_handler,
 };
 use runtime::{health_handler, metrics_handler, unified_stats_handler};
 use skills::{

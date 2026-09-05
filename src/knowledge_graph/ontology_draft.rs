@@ -183,7 +183,7 @@ pub fn from_json_schema(
 }
 
 fn property_from_schema(name: &str, definition: &Value, required: &[&str]) -> PropertySpec {
-    let enum_values = definition
+    let enum_values: Vec<String> = definition
         .get("enum")
         .and_then(Value::as_array)
         .map(|values| {
