@@ -27,12 +27,14 @@ cargo test --workspace isolation_contract --verbose
 | Development `X-Identity` | `X-Identity` can simulate a development identity but never creates `IsolationClaims`. Strict authentication rejects it. | `api::http::iam::tests::isolation_contract_x_identity_never_creates_isolation_claims` |
 | Tool-call spend gate | When `AGENTOS_TENANT_TOOL_CALL_CAP` is unset, the gate does not require claims. When it is set to a valid cap, a metered call without verified claims is rejected. | `spend::tests::isolation_contract_spend_gate_allows_missing_claims_when_cap_is_unset`; `spend::tests::isolation_contract_spend_gate_requires_claims_when_cap_is_configured` |
 
-## Historical data is not migrated
+## Historical data requires offline migration
 
 Claims mint safe names for new graph, vector, blob, and L0 operations. They do
-not move, rewrite, or read through historical data. In particular,
-`graph:world`, `tenant:<id>` vector tags, `./data/l0_store/l0.redb`, and
-`tenant:default/kb/...` blob keys remain historical live key spaces. This
-matrix does not claim that those keys are isolated or migrated. See the
-[Isolation Contract](17-isolation-contract.md) for the full naming and
+not move, rewrite, or read through historical data. `scripts/isolation-migrate`
+v2 performs an operator-reviewed offline copy and verification for named
+graphs, checkpointed local Hyperspace `tenant:<id>` vectors, shared local L0,
+and local filesystem `tenant:<id>/kb/...` blobs. Remote object-store blobs
+remain historical and are not handled by this tool. This matrix does not claim
+production isolation until an operator has verified each applicable migration.
+See the [Isolation Contract](17-isolation-contract.md) for the full plan and
 compatibility boundary.

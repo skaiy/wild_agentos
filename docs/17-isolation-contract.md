@@ -59,13 +59,13 @@ Minting validates the tenant and project as safe identifier segments and fails
 closed for empty values, `.` / `..`, path separators, and other unsafe
 characters. It does not create a directory or access a backend.
 
-Minting is **not** a data migration. The following historical live key spaces
-remain in place and have not been remapped or rewritten:
+Minting is **not** a data migration. Historical keys remain live until an
+operator completes the explicit offline migration below:
 
-- named graph: `graph:world` (not migrated)
-- vector tag: `tenant:<id>` (not migrated)
-- L0 storage: `./data/l0_store/l0.redb` (not migrated)
-- blob key: `tenant:default/kb/...` (not migrated)
+- named graph: `graph:world`
+- vector tag: `tenant:<id>`
+- L0 storage: `./data/l0_store/l0.redb`
+- local blob key: `tenant:default/kb/...`
 
 Do not change, delete, or assume ownership of these historical paths as part of
 new isolation work. Each migration requires a separately scoped change.
@@ -136,26 +136,27 @@ retrieve neither tenant graph nor tenant vectors.
 ## 历史键迁移工具
 
 `scripts/isolation-migrate` is an explicit **offline** migration tool. It is
-not an HTTP endpoint and no request hot path can invoke it. It currently
-implements only Oxigraph named-graph migration; vector (`tenant:<id>`), L0,
-and blob historical keys remain unimplemented and must not be represented as
-migrated or isolated by production queries.
-
-The plan is JSON with schema version `1`. It maps each historical source graph
-to one claims-minted tenant/project target:
+not an HTTP endpoint and no request hot path can invoke it. Schema version `1`
+plans containing only `named_graphs` remain supported. New plans use version
+`2`, which can migrate named graphs, checkpointed local Hyperspace vectors,
+the shared local L0 database, and local filesystem blobs:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "named_graphs": [{
     "source_graph": "graph:world",
     "target": { "tenant": "acme", "project": "research" }
-  }]
+  }],
+  "vectors": [{"source_tag": "tenant:acme", "target": {"tenant": "acme", "project": "research"}}],
+  "l0": [{"source_path": "l0_store/l0.redb", "target": {"tenant": "acme", "project": "research"}}],
+  "blobs": [{"source_prefix": "tenant:default/kb", "target": {"tenant": "acme", "project": "research"}}]
 }
 ```
 
-Run a default, read-only plan first. It opens `<data-root>/kg` read-only and
-writes neither a graph, a RocksDB/WAL artifact, nor an audit file:
+Run a default, read-only plan first. When named graphs are planned it opens
+`<data-root>/kg` read-only; it writes neither a graph, a RocksDB/WAL artifact,
+nor an audit file:
 
 ```bash
 scripts/isolation-migrate --data-root data --plan migration.json
@@ -168,10 +169,15 @@ After reviewing its source and target quad counts, execute the fixed sequence
 scripts/isolation-migrate --data-root data --plan migration.json --execute
 ```
 
-The tool rejects unsafe targets, duplicate targets, a target that already has
-quads, and invalid plans before it copies anything. It copies via Oxigraph
-SPARQL only and verifies that every target count equals its recorded source
-count. A successful real run writes a local
+The tool rejects unsafe targets, duplicate targets, non-empty targets, and
+invalid plans before it copies anything. Vectors require an existing,
+checkpointed `vector_store/index.snapshot`; matching historical `tenant:<id>`
+vectors are copied to `vector://{tenant}/{project}` and verified by count. L0
+copies the declared shared `l0_store/l0.redb` to `l0/{tenant}/l0.redb`; local
+blobs copy the declared `blobs/tenant:<id>/kb` tree to `blobs/{tenant}/kb`;
+each verifies file counts. Remote object backends are intentionally not
+migrated by this local filesystem tool. Graphs copy via Oxigraph SPARQL and
+verify quad counts. A successful real run writes a local
 `<data-root>/isolation-migrate-audit-<timestamp>.json`; the audit records the
 plan/verify result but no secret. Source graphs are retained by default.
 

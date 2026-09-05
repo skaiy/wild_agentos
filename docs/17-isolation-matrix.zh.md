@@ -30,9 +30,11 @@ cargo test --workspace isolation_contract --verbose
 | 开发 `X-Identity` | `X-Identity` 只能模拟开发身份，绝不创建 `IsolationClaims`；严格认证拒绝它。 | `api::http::iam::tests::isolation_contract_x_identity_never_creates_isolation_claims` |
 | 工具调用额度门 | `AGENTOS_TENANT_TOOL_CALL_CAP` 未设置时不要求 claims；设置有效 cap 后，没有 verified claims 的计量调用被拒绝。 | `spend::tests::isolation_contract_spend_gate_allows_missing_claims_when_cap_is_unset`; `spend::tests::isolation_contract_spend_gate_requires_claims_when_cap_is_configured` |
 
-## 历史数据未迁移
+## 历史数据需要离线迁移
 
 Claims 为新图、向量、blob 和 L0 操作 mint 安全名称，但不移动、改写或读穿历史数据。
-`graph:world`、`tenant:<id>` 向量标签、`./data/l0_store/l0.redb` 和
-`tenant:default/kb/...` blob key 仍是历史在用键空间。本矩阵不宣称它们已隔离或
-迁移。完整命名和兼容性边界见[隔离契约](17-isolation-contract.zh.md)。
+`scripts/isolation-migrate` v2 提供 operator-reviewed 的离线 copy 与 verify，覆盖
+named graph、checkpoint 的本地 Hyperspace `tenant:<id>` vector、共享本地 L0，以及
+本地文件系统 `tenant:<id>/kb/...` blob。远程对象存储 blob 仍为历史键，本工具不处理。
+在 operator 验证每个适用迁移前，本矩阵不宣称生产隔离完成。完整 plan 和兼容性边界见
+[隔离契约](17-isolation-contract.zh.md)。
