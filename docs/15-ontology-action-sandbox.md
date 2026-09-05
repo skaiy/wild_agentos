@@ -122,14 +122,37 @@ the claims-derived staging graph, preventing cross-tenant reads.
 foreign predicate, same-scope approval and cross-tenant/JWT rejection,
 whitelist overrides, and failed ASK assertions.
 
-## Compute sandbox (planned; not implemented)
+## Compute sandbox: external provider mount
 
 Process isolation is needed only when custom actions/functions execute real
 code or arbitrary expressions, rather than SPARQL templates with placeholder
 allow-list replacement. Today custom actions have `executable=false` and
 invoke returns **422**.
 
-Reusable foundations already exist:
+The kernel now provides `tools::sandbox_provider::SandboxProvider`, a mount
+contract for external services such as OpenHands- or E2B-style gateways:
+
+1. `submit(SandboxSubmitRequest)` accepts a caller-assigned `task_id`, verified
+   `tenant_id`/`project_id`/`actor_id` claims, and JSON work descriptor.
+2. `status(task_id)` reports `queued`, `running`, `succeeded`, `failed`, or
+   `cancelled`.
+3. `fetch_result(task_id)` returns a terminal `SandboxResult` JSON envelope:
+   `task_id`, `status`, `exit_code`, structured `output`, and bounded
+   `stdout`/`stderr`. A mismatched task ID or non-terminal result is rejected.
+
+The default build includes `MockSandboxProvider`; it performs no code
+execution and makes tests independent of external services. The generic
+OpenHands/E2B-style HTTP gateway adapter (`POST /tasks`, `GET /tasks/{id}`,
+`GET /tasks/{id}/result`) is only compiled with
+`--features external-sandbox`. Credentials are intentionally not part of the
+contract; deployment code must inject them at its transport boundary.
+
+`AuditedSandboxProvider` emits best-effort `SANDBOX_AUDIT` events when a
+terminal result is fetched. Payloads include the provider, task ID, verified
+claims, final status, and exit code; result output is deliberately excluded
+from audit events.
+
+Reusable local-light-path foundations remain:
 
 - `src/tools/tool_executor/builtins.rs` (`execute_bash`) and
   `src/tools/builtin/sandbox.rs` provide `FilesystemIsolationMode`,
@@ -138,16 +161,18 @@ Reusable foundations already exist:
 - `src/core/syscall_gate.rs` provides `WhitelistManager` / `SyscallGate` for
   a capability allow-list and signature-validation skeleton.
 
-When requirements justify it, the intended design is a restricted DSL/SPARQL
-template layer first; actual code would reuse bash namespace isolation (read-only
-filesystem, no network, resource limits) and the `SyscallGate` allow-list, with
-structured I/O and EventBus auditing. This scope does not add container,
-gVisor, or WASM dependencies and does not expand `BUILTIN_EXECUTABLE_ACTIONS`
-to arbitrary custom-action code.
+When requirements justify it, use a restricted DSL/SPARQL template layer
+first. The external mount handles heavy execution; local bash namespace
+isolation remains an explicit light-path opt-in. This scope does not add
+container, gVisor, or WASM dependencies, does not create a fourth in-process
+OS, and does not expand `BUILTIN_EXECUTABLE_ACTIONS` to arbitrary custom-action
+code.
 
 ## Decision summary
 
 - **Now:** declarative actions use a data sandbox—shadow graph, guardrails, and
   named-graph scope—with pure SPARQL, no new dependency, and rollback.
-- **Later, when needed:** arbitrary code execution uses a compute sandbox that
-  reuses bash namespace isolation and the `syscall_gate` allow-list.
+- **Heavy compute:** mount an external provider and accept only a structured
+  result envelope; the HTTP adapter is feature-gated.
+- **Local light path:** remains opt-in bash namespace isolation with the
+  `syscall_gate` allow-list; arbitrary executable actions remain disabled.
