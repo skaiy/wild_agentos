@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.2.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.2.1-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,7 @@ Welcome to the release timeline of **Wild AgentOS**, featuring production-grade 
 
 | Version | Release Date | Key Upgrades & Fused Features |
 |---------|--------------|------------------------------|
+| **v0.2.1** | **2026-09-05** | **Ontology Data + Protocols**<br>• Adds claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema; promotion requires authorized human approval.<br>• Adds an inbound MCP tool catalog filtered by `IsolationClaims`, plus explicitly published, gated tenant Skills as MCP tools; kernel Skills remain excluded.<br>• Adds a thin outbound A2A adapter behind a default-off feature flag; it is best-effort and does not add an inbound server or alter the local task lifecycle. See [Outbound A2A adapter](docs/19-a2a-outbound.md). |
 | **v0.2.0** | **2026-09-05** | **Control Plane + Skill CI**<br>• Adds the Skill package format and CI gate: verification plus golden input/output checks, with the Judge hook disabled by default.<br>• Passing packages publish through the gated tenant channel; failing fixtures are blocked.<br>• Adds Rust-CI golden evaluations for Agent plans, Skill Markdown, and Action invocation via `scripts/test_golden.sh`.<br>• Companion Admin #16 delivered the separate-repository five-screen control-plane skeleton; this release does not change that repository's scope. |
 | **v0.1.8** | **2026-09-04** | **Ontology Action HITL**<br>• Adds configurable `commit_strategy` for automatic or approval-held Action staging, with merge/discard APIs and TTL expiry.<br>• Adds configurable guardrails, SPARQL `ASK` assertions, and a `high_risk` approval hook.<br>• Publishes `ACTION_AUDIT` EventBus events for committed, pending, approved, rejected, and violated outcomes; see the [Ontology Action Data Sandbox](docs/15-ontology-action-sandbox.md). |
 | **v0.1.7** | **2026-09-04** | **Isolation Proof & Eval**<br>• Adds the read-only `isolation-diagnose` CLI, customer-readable [Isolation Matrix](docs/17-isolation-matrix.md), and fail-closed `isolation_contract` CI coverage.<br>• Adds optional explicit `isolation-migrate`; it never uses a silent `UNION` and does not claim historical keys were migrated. |
@@ -220,13 +221,13 @@ cargo build -p wild-code-cli --release
 
 ## 🗺️ Roadmap
 
-Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a full Palantir clone; it does not replace Oxigraph with Nebula/Cypher, mix separate product/business repositories or product boundaries into this open-source tree, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
+Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a comprehensive proprietary-platform recreation; it does not replace Oxigraph with Nebula/Cypher, mix separate product/business repositories or product boundaries into this open-source tree, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
 
 - **v0.1.6 — done:** JWT `IsolationClaims` mint graph/blob/vector/L0 targets; relevant HTTP paths fail closed; historical keys are not migrated.
 - **v0.1.7 — done:** read-only minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and optional explicit migration with no silent `UNION`.
 - **v0.1.8 — done:** approval-held Action staging with merge/discard APIs and TTL, configurable guardrails plus SPARQL assertions, and `ACTION_AUDIT` event-bus audit.
 - **v0.2.0 — done:** Skill package verification, golden checks, default-off Judge hook, and gated tenant publishing; Rust-CI Agent/Skill/Action golden evaluations; companion Admin #16 delivered the separate-repository five-screen control-plane skeleton.
-- **[v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4):** human-approved ObjectType/LinkType drafts, MCP inbound tenant catalog, Skill-as-MCP, and a thin outbound A2A adapter.
+- **v0.2.1 — done:** claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema with authorized approval before promotion; an `IsolationClaims`-filtered inbound MCP catalog; gated tenant Skill publishing as MCP tools; and a default-off, best-effort outbound A2A adapter. See [Outbound A2A adapter](docs/19-a2a-outbound.md).
 - **[v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5):** claims-scoped coding artifacts, an external compute-sandbox adapter, and reproducible weak-compute benchmarks without fabricated speedups.
 - **[v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6):** versioned Function/Skill market, OIDC/IdP with claims minted at the auth boundary, gated emergent tools, and optional default-off limited OWL/rules.
 
