@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod conflict;
 pub mod discovery;
 pub mod embedding;
+pub mod emergent_tools;
 pub mod evolution;
 pub mod graph_algorithms;
 pub mod graph_store;
@@ -19,6 +20,10 @@ pub use bootstrap::{
 pub use conflict::{ConflictDetectionEngine, ConflictReport, ConflictRule, ConflictRuleType};
 pub use discovery::{SkillDiscoveryEngine, SkillMatch, Task5W2H};
 pub use embedding::SkillGraphEmbedder;
+pub use emergent_tools::{
+    EmergentToolCandidate, EmergentToolGate, EmergentToolGateScope, EmergentToolGateVerdict,
+    EmergentToolPromotion, EmergentToolRecord, EmergentToolState, EmergentToolStore,
+};
 pub use evolution::{
     is_methodology_iri, EvolutionApproval, EvolutionPatch, EvolutionProposal,
     EvolutionProposalRecovery, EvolutionProposalStatus, EvolutionProposalStore,
