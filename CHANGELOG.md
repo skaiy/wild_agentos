@@ -1,6 +1,36 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.2.1`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.3.0`。
+
+## [0.3.0] — 2026-09-05
+
+### Markets + IdP + Emergent
+
+- Added a versioned Logic and Skill package market. Package versions are
+  immutable, tenant access is claims-scoped, and install, upgrade, and
+  rollback select explicit versions.
+- Added an OIDC/JWKS authentication mode alongside local-development HS256.
+  It verifies asymmetric JWTs using configured issuer, audience, and HTTPS
+  JWKS settings before minting `IsolationClaims`, and fails closed on
+  verification or configuration errors.
+- Added a gated emergent-tool promotion pipeline. Generated tools remain
+  untrusted until each sandbox/judge gate and required human approval passes;
+  no direct publish path is provided.
+- Added optional, default-off limited RDFS inference for claims-scoped graph
+  reads. It provides query-time subclass and type expansion only and does not
+  persist inferred triples.
+
+## [0.2.2] — 2026-09-05
+
+### Artifacts + Sandbox + Bench
+
+- Added a claims-scoped coding artifact store. Immutable artifact metadata is
+  written to the caller's `IsolationClaims` graph, while artifact bytes use a
+  server-minted tenant blob prefix.
+- Added an external `SandboxProvider` adapter behind a default-off feature
+  flag. Its async path does not hold `MutexGuard` across an `await`.
+- Added reproducible private-deployment benchmarks for Oxigraph, redb, and
+  Hyperspace that record measured results without fabricating speedups.
 
 ## [0.2.1] — 2026-09-05
 

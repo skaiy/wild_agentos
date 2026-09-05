@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.2.1-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.3.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,8 @@
 
 | 版本 | 发布日期 | 核心升级与融合特性 |
 |------|----------|-------------------|
+| **v0.3.0** | **2026-09-05** | **市场 + IdP + Emergent**<br>• 新增版本化的 Logic 与 Skill package market，package 版本不可变，访问按 claims 隔离，并支持显式 install、upgrade 与 rollback。<br>• 新增与本地开发 HS256 并行的 OIDC/JWKS 身份验证，通过非对称 JWT 验证以及 fail-closed 的 issuer、audience 与 JWKS 校验保护访问。<br>• 新增带 gate 的 emergent-tool promotion pipeline：生成的工具在通过 sandbox/judge gate 和所需人工审批前始终不受信任。<br>• 新增可选且默认关闭的有限 RDFS 推理，用于 claims 作用域 graph read；仅在 query-time 扩展 subclass 和 type，绝不持久化推理三元组。 |
+| **v0.2.2** | **2026-09-05** | **制品 + 沙箱 + 基准**<br>• 新增 claims 作用域的 coding artifact store：不可变元数据写入调用者的 `IsolationClaims` graph，制品字节使用服务端 mint 的 tenant blob 前缀。<br>• 新增默认关闭 feature flag 保护的外部 `SandboxProvider` adapter；其异步路径不会跨 `await` 持有 `MutexGuard`。<br>• 新增面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，记录实测结果且不编造速度提升。 |
 | **v0.2.1** | **2026-09-05** | **本体数据 + 协议**<br>• 新增从 CSV 或 JSON Schema 生成、按 claims 隔离的 ObjectType/LinkType 草稿；必须经获授权人员审批后才能提升。<br>• 新增由 `IsolationClaims` 过滤的入站 MCP 工具目录，以及可显式发布为 MCP 工具的受 gate 租户 Skill；内核 Skill 仍被排除。<br>• 新增默认关闭 feature flag 保护的薄型出站 A2A adapter；它以尽力而为方式工作，不提供入站服务器，也不改变本地任务生命周期。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。 |
 | **v0.2.0** | **2026-09-05** | **控制平面 + Skill CI**<br>• 新增 Skill package 格式与 CI gate：包含 package 验证和 golden input/output 检查，Judge hook 默认关闭。<br>• 通过的 package 可经受控 tenant 发布通道发布；失败 fixture 会被拦截。<br>• 通过 `scripts/test_golden.sh` 在 Rust CI 中新增 Agent 计划、Skill Markdown 和 Action 调用的 golden evals。<br>• 配套 Admin #16 已在独立仓库交付五屏控制平面骨架；本次发布不改变该仓库的范围。 |
 | **v0.1.8** | **2026-09-04** | **本体 Action 人工审批闭环（HITL）**<br>• 新增可配置 `commit_strategy`：Action 可自动提交或保留待审批，并提供 merge/discard API 与 TTL 到期处理。<br>• 新增可配置护栏、SPARQL `ASK` 断言和用于审批敏感操作的 `high_risk` hook。<br>• 通过事件总线发布 committed、pending、approved、rejected、violated 等结果的 `ACTION_AUDIT` 事件；详见[本体 Action 数据沙箱](docs/15-ontology-action-sandbox.md)。 |
@@ -211,8 +213,8 @@ Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，�
 - **v0.1.8 — 已完成：** 可保留待审批的 Action staging、merge/discard API 与 TTL、可配置护栏和 SPARQL 断言，以及 `ACTION_AUDIT` 事件总线审计。
 - **v0.2.0 — 已完成：** Skill package 验证、golden 检查、默认关闭的 Judge hook 和受控 tenant 发布；Rust CI 中的 Agent/Skill/Action golden evals；配套 Admin #16 已在独立仓库交付五屏控制平面骨架。
 - **v0.2.1 — 已完成：** 从 CSV 或 JSON Schema 生成、按 claims 隔离并需获授权人员审批后才能提升的 ObjectType/LinkType 草稿；由 `IsolationClaims` 过滤的入站 MCP 目录；受 gate 租户 Skill 的 MCP 工具发布；以及默认关闭、尽力而为的薄型出站 A2A adapter。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。
-- **[v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5)：** claims 作用域 coding artifacts、外挂计算沙箱适配器，以及不编造速度提升的弱算力可复现基准。
-- **[v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6)：** 版本化 Function/Skill market、在认证边界 mint claims 的 OIDC/IdP、带 gate 的 emergent tools，以及默认关闭的有限 OWL/rules。
+- **v0.2.2 — 已完成：** claims 作用域 coding artifact store（`IsolationClaims` graph 元数据与服务端 mint 的 tenant blob 前缀）；默认关闭的外部 `SandboxProvider` adapter（不会跨 `await` 持有 `MutexGuard`）；以及面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，不编造速度提升。
+- **v0.3.0 — 已完成：** 具有不可变版本和显式 install/upgrade/rollback 的版本化 Logic 与 Skill package market；与本地开发 HS256 并行、且 fail-closed 的 OIDC/JWKS 身份验证；带 gate 和人工审批的 emergent-tool promotion pipeline；以及默认关闭、仅在 query-time 扩展且绝不持久化推理三元组的有限 RDFS 推理。
 
 ---
 

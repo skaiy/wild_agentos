@@ -67,20 +67,27 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 对应工作项：[对象模型草稿](https://github.com/skaiy/wild_agentos/issues/90)、[MCP 目录](https://github.com/skaiy/wild_agentos/issues/91)、[Skill-as-MCP](https://github.com/skaiy/wild_agentos/issues/92)、[A2A adapter](https://github.com/skaiy/wild_agentos/issues/93)。
 
-### [v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5)
+### v0.2.2 — 已完成：制品 + 沙箱 + 基准
 
-- claims 作用域的 coding artifacts store；
-- 外部计算沙箱适配器（OpenHands/E2B 风格挂载），内核只接收结构化结果；
-- 弱算力环境可复现基准，不编造速度提升。
+- claims 作用域 coding artifact store 将不可变元数据写入调用者的
+  `IsolationClaims` graph，并将制品字节写入服务端 mint 的 tenant blob 前缀；
+- 外部 `SandboxProvider` adapter 默认由 feature flag 关闭；其异步路径不会跨
+  `await` 持有 `MutexGuard`；
+- private-deployment benchmarks 可复现地测量 Oxigraph、redb 与 Hyperspace，
+  不编造速度提升。
 
 对应工作项：[制品库](https://github.com/skaiy/wild_agentos/issues/94)、[外挂计算沙箱](https://github.com/skaiy/wild_agentos/issues/95)、[可复现基准](https://github.com/skaiy/wild_agentos/issues/96)。
 
-### [v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6)
+### v0.3.0 — 已完成：市场 + IdP + Emergent
 
-- 版本化 Function / Skill market；
-- OIDC / IdP；claims 仍在认证边界 mint；
-- 具备 gate 的 emergent tool pipeline；
-- 有限 OWL / rules，作为可选功能且默认关闭。
+- 版本化 Logic 与 Skill package market 提供不可变的 package 版本、按 claims
+  隔离的 tenant access，以及显式的 install、upgrade 与 rollback；
+- OIDC/JWKS 身份验证与本地开发 HS256 并行。它按配置的 issuer、audience 和 JWKS
+  endpoint 验证非对称 JWT，配置或验证无效时 fail closed；
+- emergent-tool promotion pipeline 让生成的工具在逐项通过所需 sandbox/judge gate
+  与人工审批前保持不受信任；
+- 有限 RDFS 推理是可选功能且默认关闭。它为 claims 作用域 graph read 执行
+  query-time 的 subclass 和 type 扩展，不持久化推理三元组。
 
 对应工作项：[市场](https://github.com/skaiy/wild_agentos/issues/97)、[OIDC/IdP](https://github.com/skaiy/wild_agentos/issues/98)、[emergent tools](https://github.com/skaiy/wild_agentos/issues/99)、[有限 OWL/rules](https://github.com/skaiy/wild_agentos/issues/100)。
 
