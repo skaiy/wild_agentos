@@ -564,7 +564,7 @@ fn preflight_blobs(
 }
 
 fn preflight_file(source: &Path, target: &Path) -> Result<FileMigrationReport, MigrationError> {
-    if target.exists() {
+    if target.exists() || target.parent().is_some_and(|parent| parent.exists()) {
         return Err(MigrationError::TargetPathNotEmpty {
             path: target.display().to_string(),
         });
@@ -722,6 +722,7 @@ fn execute_vectors(
                 hit.payload
                     .as_ref()
                     .is_some_and(|payload| has_tag(payload, &mapping.source_tag))
+                    && !hit.iri.starts_with("vector://")
             }) {
                 let vector = engine
                     .get_vector(&hit.iri)
@@ -863,6 +864,7 @@ fn delete_vector_sources(
                 hit.payload
                     .as_ref()
                     .is_some_and(|payload| has_tag(payload, &mapping.source_tag))
+                    && !hit.iri.starts_with("vector://")
             }) {
                 engine
                     .delete(&hit.iri)
