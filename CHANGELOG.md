@@ -11,9 +11,11 @@
   rollback select explicit versions.
 - Added an OIDC/JWKS authentication mode alongside local-development HS256.
   It verifies asymmetric JWTs using configured issuer, audience, and HTTPS
-  JWKS settings, and fails closed on verification or configuration errors.
+  JWKS settings before minting `IsolationClaims`, and fails closed on
+  verification or configuration errors.
 - Added a gated emergent-tool promotion pipeline. Generated tools remain
-  untrusted until each sandbox/judge gate and required human approval passes.
+  untrusted until each sandbox/judge gate and required human approval passes;
+  no direct publish path is provided.
 - Added optional, default-off limited RDFS inference for claims-scoped graph
   reads. It provides query-time subclass and type expansion only and does not
   persist inferred triples.
