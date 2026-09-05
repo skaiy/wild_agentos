@@ -110,6 +110,15 @@ For `--mcp-server-stdio`, Wild AgentOS starts the server as a child process. Tha
 
 MCP failures are fail-loud: a failed connection is reported as `status=error:...`, clears any discovered tools, and returns an error to the caller. Failed tool calls are also returned as errors—they are not skipped and never replaced with a `simulated` result.
 
+#### Published Skill MCP tools
+
+Tenant Skills that pass the publication gate can be explicitly exposed at
+`POST /mcp` as MCP tools. Exposure is default-deny, scoped to a tenant, and
+managed by DA users through `/api/v1/mcp/skill-exposures`; built-in `iri://`
+Skills are never exposed. A verified Bearer JWT is required for discovery and
+calls, and `allowed_roles` plus the Skill input schema are enforced. See
+[#92](https://github.com/skaiy/wild_agentos/issues/92).
+
 ### 13. Checkpoint & Recovery — Crash-Proof Long-Running Tasks
 Session state snapshots at critical points with full restoration on crash. Enables hour/day-long agent tasks and post-mortem replay debugging. `--resume <task_iri>` and `--list-checkpoints` commands for explicit session management.
 

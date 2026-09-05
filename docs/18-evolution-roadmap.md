@@ -84,7 +84,8 @@ that repository's scope or implementation.
 
 - Semi-automatic ObjectType / LinkType drafts, with human approval required.
 - MCP inbound tenant catalog.
-- Skill-as-MCP publishing.
+- Skill-as-MCP publishing: gated tenant Skills can be explicitly exposed as
+  JWT/claims-authorized MCP tools (default deny; kernel Skills excluded).
 - A thin outbound A2A adapter without a kernel rewrite.
 
 Related work: [object-model drafts](https://github.com/skaiy/wild_agentos/issues/90),
