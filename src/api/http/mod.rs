@@ -34,6 +34,7 @@ pub mod config;
 pub mod core_ops;
 pub mod guard;
 pub mod kb;
+pub mod market;
 pub mod mcp;
 pub mod mcp_skills;
 pub mod models;
@@ -67,6 +68,10 @@ use kb::{
     save_knowledge_packs, search_knowledge_base_handler, update_kb_category_handler,
     update_knowledge_base_handler, update_knowledge_pack_handler, upload_knowledge_base_handler,
     KB_UPLOAD_MAX_BYTES,
+};
+use market::{
+    install_package_handler, list_packages_handler, publish_package_handler,
+    rollback_package_handler, upgrade_package_handler,
 };
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
 use mcp_skills::{
@@ -327,6 +332,23 @@ pub fn build_router(
         .route(
             "/api/v1/skills/pipeline-rerun",
             post(pipeline_rerun_handler),
+        )
+        // ── Logic / Skill package market (immutable versions, claims-scoped) ──
+        .route(
+            "/api/v1/market/packages",
+            get(list_packages_handler).post(publish_package_handler),
+        )
+        .route(
+            "/api/v1/market/packages/:name/install",
+            post(install_package_handler),
+        )
+        .route(
+            "/api/v1/market/packages/:name/rollback",
+            post(rollback_package_handler),
+        )
+        .route(
+            "/api/v1/market/packages/:name/upgrade",
+            post(upgrade_package_handler),
         )
         .route("/api/v1/guard/audit", get(guard_audit_handler))
         .route("/api/v1/guard/stats", get(guard_stats_handler))
