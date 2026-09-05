@@ -663,7 +663,9 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
             }),
         );
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(axum::serve(listener, app));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
         let saved: Vec<_> = [
             "AGENTOS_AUTH_MODE",
