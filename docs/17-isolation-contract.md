@@ -231,7 +231,7 @@ Coding artifact upload, listing, and download also require JWT-verified claims.
 Artifact bytes use the minted `{tenant}/artifacts/` blob prefix and their
 replay metadata is stored in the minted claims graph. A task IRI links each
 patch, run transcript, or reproduction script to its checkpoint execution.
-See [Claims-Scoped Coding Artifacts](18-coding-artifacts.md).
+See [Claims-Scoped Coding Artifacts](20-coding-artifacts.md).
 
 ### Vector
 

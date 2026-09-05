@@ -161,7 +161,7 @@ legacy unscoped Agent 不再隐式共享。新 user Agent 创建时写入 verifi
 Coding 制品的上传、列出与下载同样要求 JWT-verified claims。制品字节使用 mint 的
 `{tenant}/artifacts/` blob 前缀；用于重放的元数据写入 mint 的 claims graph。每个
 patch、运行轨迹或复现脚本以 task IRI 关联 checkpoint 执行。参见
-[Claims 作用域 Coding 制品](18-coding-artifacts.zh.md)。
+[Claims 作用域 Coding 制品](20-coding-artifacts.zh.md)。
 
 ## 图接口
 

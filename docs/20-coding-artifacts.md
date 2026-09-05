@@ -1,4 +1,4 @@
-# 18. Claims-Scoped Coding Artifacts
+# 20. Claims-Scoped Coding Artifacts
 
 Replayable outputs from coding agents are stored through the claims-scoped
 artifact API. It supports `patch`, `run_transcript`, and `reproduce_script`.

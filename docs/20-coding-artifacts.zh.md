@@ -1,6 +1,6 @@
-> *本文是 [18-coding-artifacts.md](18-coding-artifacts.md) 的中文翻译。*
+> *本文是 [20-coding-artifacts.md](20-coding-artifacts.md) 的中文翻译。*
 
-# 18. Claims 作用域 Coding 制品
+# 20. Claims 作用域 Coding 制品
 
 Coding agent 的可重放产物经 claims-scoped artifact API 存储，支持 `patch`、
 `run_transcript` 与 `reproduce_script`。每次上传必须具有 JWT 验证的

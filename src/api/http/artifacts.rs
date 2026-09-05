@@ -137,19 +137,22 @@ fn save_metadata(
     claims: &IsolationClaims,
     metadata: &ArtifactMetadata,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let metadata_json = serde_json::to_string(metadata).map_err(|_| {
+    let metadata_json = serde_json::to_vec(metadata).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "artifact metadata serialization failed" })),
         )
     })?;
+    // Query helpers return lexical RDF literals rather than decoded literal
+    // values. Base64 therefore preserves JSON quotes and escapes exactly.
+    let metadata_index = STANDARD.encode(metadata_json);
     artifact_store(state)?
         .write_quads_for_claims(
             claims,
             &[RdfQuad {
                 subject: artifact_subject(&metadata.id),
                 predicate: ARTIFACT_METADATA_PREDICATE.to_string(),
-                object: RdfValue::Literal(metadata_json),
+                object: RdfValue::Literal(metadata_index),
                 graph: None,
             }],
         )
@@ -188,7 +191,8 @@ fn load_metadata(
     Ok(rows
         .iter()
         .filter_map(|row| row.get("metadata").and_then(Value::as_str))
-        .filter_map(|raw| serde_json::from_str(raw).ok())
+        .filter_map(|encoded| STANDARD.decode(encoded).ok())
+        .filter_map(|raw| serde_json::from_slice(&raw).ok())
         .collect())
 }
 
