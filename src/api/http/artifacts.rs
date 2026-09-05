@@ -190,7 +190,13 @@ fn load_metadata(
         })?;
     Ok(rows
         .iter()
-        .filter_map(|row| row.get("metadata").and_then(Value::as_str))
+        // KnowledgeGraphStore preserves SPARQL variable spelling, including
+        // its leading `?` (for example, `?metadata`).
+        .filter_map(|row| {
+            row.get("?metadata")
+                .or_else(|| row.get("metadata"))
+                .and_then(Value::as_str)
+        })
         .filter_map(|encoded| STANDARD.decode(encoded).ok())
         .filter_map(|raw| serde_json::from_slice(&raw).ok())
         .collect())
