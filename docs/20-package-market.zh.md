@@ -29,5 +29,6 @@ Foundry 级 Workshop：不执行上传包中的代码、不创建工作流，也
 - `system`：内核可读包，内容只读。
 
 `POST /api/v1/market/packages/:name/install` 为当前租户/project 选择一个可见版本。
-`POST /api/v1/market/packages/:name/rollback` 使用相同版本请求体选择先前的可见版本。
-安装记录按 tenant/project 隔离；同一范围再次选择版本会替换该范围的当前选择。
+`POST /api/v1/market/packages/:name/upgrade` 显式选择较新版本，服务端绝不隐式选择
+“latest”。`POST /api/v1/market/packages/:name/rollback` 使用相同版本请求体选择先前的
+可见版本。安装记录按 tenant/project 隔离；同一范围再次选择版本会替换该范围的当前选择。

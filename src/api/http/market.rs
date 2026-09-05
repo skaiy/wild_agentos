@@ -406,6 +406,18 @@ pub(crate) async fn rollback_package_handler(
     .await
 }
 
+/// POST /api/v1/market/packages/:name/upgrade — select a newer visible version.
+/// Version ordering is deliberately caller-explicit; the server never chooses a
+/// "latest" version because that would make upgrades non-deterministic.
+pub(crate) async fn upgrade_package_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(name): Path<String>,
+    Json(request): Json<InstallPackageRequest>,
+) -> impl IntoResponse {
+    install_package_handler(State(state), identity, Path(name), Json(request)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

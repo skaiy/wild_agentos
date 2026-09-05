@@ -66,7 +66,7 @@ use kb::{
 };
 use market::{
     install_package_handler, list_packages_handler, publish_package_handler,
-    rollback_package_handler,
+    rollback_package_handler, upgrade_package_handler,
 };
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
 use mcp_skills::{
@@ -330,6 +330,10 @@ pub fn build_router(
         .route(
             "/api/v1/market/packages/:name/rollback",
             post(rollback_package_handler),
+        )
+        .route(
+            "/api/v1/market/packages/:name/upgrade",
+            post(upgrade_package_handler),
         )
         .route("/api/v1/guard/audit", get(guard_audit_handler))
         .route("/api/v1/guard/stats", get(guard_stats_handler))

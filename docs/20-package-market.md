@@ -35,7 +35,8 @@ mutations. Client-provided tenant fields are never accepted.
 - `system`: readable kernel package; its content is read-only.
 
 `POST /api/v1/market/packages/:name/install` selects a visible version for the
-caller’s tenant/project. `POST /api/v1/market/packages/:name/rollback` selects
-an earlier visible version using the same version request body. Installation
-records are scoped by tenant and project; a second version replaces that
-scope's active selection.
+caller’s tenant/project. `POST /api/v1/market/packages/:name/upgrade` selects
+an explicitly requested newer version; it never implicitly chooses "latest".
+`POST /api/v1/market/packages/:name/rollback` selects an earlier visible
+version using the same version request body. Installation records are scoped by
+tenant and project; a second version replaces that scope's active selection.
