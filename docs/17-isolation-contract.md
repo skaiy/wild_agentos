@@ -236,6 +236,12 @@ Existing `tenant:default/kb/...` objects are still historical objects. No
 read-through compatibility mapping or migration has moved them to the new
 prefix.
 
+Coding artifact upload, listing, and download also require JWT-verified claims.
+Artifact bytes use the minted `{tenant}/artifacts/` blob prefix and their
+replay metadata is stored in the minted claims graph. A task IRI links each
+patch, run transcript, or reproduction script to its checkpoint execution.
+See [Claims-Scoped Coding Artifacts](20-coding-artifacts.md).
+
 ### Vector
 
 Claims-scoped vector upsert, search, and delete use the namespace minted by

@@ -163,6 +163,11 @@ legacy unscoped Agent 不再隐式共享。新 user Agent 创建时写入 verifi
 `L0Store::new` read-only 打开的 startup L0 store；写历史共享数据库会 fail closed。
 `./data/l0_store/l0.redb` 尚未迁移。
 
+Coding 制品的上传、列出与下载同样要求 JWT-verified claims。制品字节使用 mint 的
+`{tenant}/artifacts/` blob 前缀；用于重放的元数据写入 mint 的 claims graph。每个
+patch、运行轨迹或复现脚本以 task IRI 关联 checkpoint 执行。参见
+[Claims 作用域 Coding 制品](20-coding-artifacts.zh.md)。
+
 ## 图接口
 
 Wild AgentOS 图查询仍是 Oxigraph 上的 **SPARQL 1.1**。本契约不引入 Cypher、不替换
