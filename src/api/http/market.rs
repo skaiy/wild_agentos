@@ -407,7 +407,7 @@ pub(crate) async fn install_package_handler(
     });
     installations.push(Installation {
         name,
-        version: package.version,
+        version: package.version.clone(),
         previous_version: None,
         tenant_id: claims.tenant_id().into(),
         project_id: claims.project_id().into(),
