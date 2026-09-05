@@ -774,15 +774,17 @@ mod tests {
         let listed_for_a = server
             .handle_message_with_claims(MCPMessage::request("tools/list", None), Some(&tenant_a))
             .await;
-        let names_for_a: Vec<&str> = listed_for_a.result.unwrap()["tools"]
+        let listed_tools = listed_for_a.result.unwrap();
+        let names_for_a: Vec<String> = listed_tools["tools"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|tool| tool["name"].as_str())
+            .map(str::to_string)
             .collect();
-        assert!(names_for_a.contains(&"tenant-a-tool"));
-        assert!(names_for_a.contains(&"shared-read"));
-        assert!(!names_for_a.contains(&"tenant-b-tool"));
+        assert!(names_for_a.contains(&"tenant-a-tool".to_string()));
+        assert!(names_for_a.contains(&"shared-read".to_string()));
+        assert!(!names_for_a.contains(&"tenant-b-tool".to_string()));
 
         let cross_tenant_call = server
             .handle_message_with_claims(
