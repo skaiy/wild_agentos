@@ -16,6 +16,9 @@ ontology = []
 ontology-embeddings = ["ontology"]
 # Causal layer (python3 + dowhy needed at runtime)
 ontology-causal = ["ontology"]
+# Mount a remote OpenHands/E2B-style HTTP sandbox gateway. Disabled by default:
+# the kernel's default build has no external sandbox-service requirement.
+external-sandbox = []
 
 [dependencies]
 # 异步运行时
@@ -147,6 +150,10 @@ path = "src/bin/isolation_diagnose.rs"
 [[bin]]
 name = "isolation-migrate"
 path = "src/bin/isolation_migrate.rs"
+
+[[bin]]
+name = "private-deploy-bench"
+path = "src/bin/private_deploy_bench.rs"
 
 [[bench]]
 name = "bench_graph_backend"
