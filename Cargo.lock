@@ -6111,7 +6111,7 @@ dependencies = [
 
 [[package]]
 name = "wild-agent-os-core"
-version = "0.1.6"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6189,7 +6189,7 @@ dependencies = [
 
 [[package]]
 name = "wild-code-cli"
-version = "0.1.6"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",

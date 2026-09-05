@@ -22,9 +22,18 @@ parse JSON bodies, inspect headers, or validate credentials.
 
 `X-Identity` is a development simulation only. It never creates
 `IsolationClaims` and is not a production tenant identity source. JWT identities
-verified by the current HTTP boundary do create claims; that boundary currently
-validates HS256 JWTs using `AGENTOS_JWT_SECRET`, not OIDC or Keycloak. Unverified
-requests have no claims and cannot use the claims-scoped graph or blob paths.
+verified by the HTTP boundary do create claims. Production deployments should use
+OIDC/JWKS mode (`AGENTOS_AUTH_MODE=oidc`) with
+`AGENTOS_OIDC_JWKS_URL`, `AGENTOS_OIDC_ISSUER`, and
+`AGENTOS_OIDC_AUDIENCE`; issuer and audience are required and verification
+accepts only asymmetric OIDC algorithms. JWKS are retrieved from the configured
+endpoint, cached briefly, and refreshed once for an unknown key ID. The default
+`hs256` mode validates with `AGENTOS_JWT_SECRET` and is retained for local
+development only. OIDC/JWKS configuration errors, missing keys, invalid
+signatures, and invalid issuer/audience all fail closed. Unverified requests
+have no claims and cannot use the claims-scoped graph or blob paths.
+The JWKS URL must use HTTPS; loopback HTTP is accepted only for local
+development and test fixtures.
 `JwtClaims.project_id` is an optional `Option<String>` field with a serde
 default. A verified JWT without `project_id`, or with an empty `project_id`,
 mints the `default` project. A non-empty value is passed to
