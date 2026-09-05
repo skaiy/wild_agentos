@@ -85,6 +85,20 @@ fn load_pipeline_runs() -> Vec<crate::tools::skill_pipeline::PipelineRun> {
     }
 }
 
+/// A Skill is externally publishable only when its most recent admission run
+/// succeeded with tenant visibility. This makes an MCP exposure fail closed if
+/// the Skill is later replaced by session-scoped authoring or a failed rerun.
+pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
+    load_pipeline_runs()
+        .into_iter()
+        .find(|run| run.skill_iri == skill_iri)
+        .is_some_and(|run| {
+            run.published
+                && run.gate_passed
+                && run.visibility == crate::tools::skill_pipeline::SkillVisibility::Tenant
+        })
+}
+
 /// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。best-effort。
 fn append_pipeline_run(run: &crate::tools::skill_pipeline::PipelineRun) -> std::io::Result<()> {
     let mut runs = load_pipeline_runs();
@@ -949,6 +963,46 @@ mod tests {
             output_mapping: Default::default(),
             skill_types: vec![],
         }
+    }
+
+    #[test]
+    fn tenant_publish_status_requires_latest_passing_tenant_run() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("tenant_publish_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+
+        let registry = crate::tools::skill_registry::SkillRegistry::new();
+        let skill = sample_skill();
+        let mut ctx = crate::tools::skill_pipeline::PipelineContext::local(
+            crate::tools::skill_pipeline::PipelineSource::Manual,
+            "tester",
+        );
+        ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Tenant;
+        let published = crate::tools::skill_pipeline::run_pipeline(
+            &registry,
+            &skill,
+            &ctx,
+            Box::new(|_| Ok("published".into())),
+        );
+        append_pipeline_run(&published).unwrap();
+        assert!(is_tenant_published_skill(&skill.skill_iri));
+
+        ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Session;
+        let session_update = crate::tools::skill_pipeline::run_pipeline(
+            &registry,
+            &skill,
+            &ctx,
+            Box::new(|_| Ok("session update".into())),
+        );
+        append_pipeline_run(&session_update).unwrap();
+        assert!(
+            !is_tenant_published_skill(&skill.skill_iri),
+            "a later session update must revoke external publication"
+        );
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
     }
     // ── 纯函数单元测试 ────────────────────────────────────────────────────────
 

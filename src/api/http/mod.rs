@@ -34,6 +34,7 @@ pub mod core_ops;
 pub mod guard;
 pub mod kb;
 pub mod mcp;
+pub mod mcp_skills;
 pub mod models;
 pub mod ontology;
 pub mod ontology_guardrails;
@@ -63,6 +64,10 @@ use kb::{
     KB_UPLOAD_MAX_BYTES,
 };
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
+use mcp_skills::{
+    delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
+    upsert_skill_exposure_handler,
+};
 use ontology::{
     approve_action_approval_handler, create_csv_type_draft_handler,
     create_json_schema_type_draft_handler, delete_action_type_handler, delete_function_def_handler,
@@ -503,6 +508,15 @@ pub fn build_router(
         .route(
             "/api/v1/mcp/servers",
             get(list_mcp_servers_handler).post(register_mcp_server_handler),
+        )
+        // Published tenant Skills are explicitly opt-in MCP tools. `/mcp`
+        // is the external JSON-RPC endpoint; the management route is DA-only.
+        .route("/mcp", post(skill_mcp_handler))
+        .route(
+            "/api/v1/mcp/skill-exposures",
+            get(list_skill_exposures_handler)
+                .post(upsert_skill_exposure_handler)
+                .delete(delete_skill_exposure_handler),
         )
         // ── G6' Prompt/模型灰度版本管理 ──
         .route(

@@ -775,10 +775,52 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             spec.include_tool_calls,
         );
         emitter.emit_phase_change("idle", "plan", "PA", "Task started");
+        // Outbound A2A is intentionally best-effort: remote delivery must not
+        // change the local supervisor lifecycle or make an external agent a
+        // dependency of the kernel.
+        let a2a_client =
+            crate::a2a::outbound::A2aOutboundClient::from_settings(&self.settings.a2a.outbound)
+                .ok();
+        let remote_task_id = match &a2a_client {
+            Some(client) if self.settings.a2a.outbound.enabled => match client
+                .send_task_request(&spec.task_iri, &spec.prompt, spec.isolation_claims.as_ref())
+                .await
+            {
+                Ok(remote_task_id) => remote_task_id,
+                Err(_) => {
+                    tracing::warn!(
+                        task_iri = %spec.task_iri,
+                        "Outbound A2A request delivery failed; continuing local task"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
 
         match sa.process_task(&spec.prompt, &spec.task_iri).await {
             Ok(result) => {
                 emitter.emit_completion(&result.status, &result.summary, result.output.clone());
+                if let Some(client) = &a2a_client {
+                    if self.settings.a2a.outbound.enabled
+                        && client
+                            .send_task_result(
+                                &spec.task_iri,
+                                remote_task_id.as_deref(),
+                                &result.status,
+                                &result.summary,
+                                result.output.as_ref(),
+                                spec.isolation_claims.as_ref(),
+                            )
+                            .await
+                            .is_err()
+                    {
+                        tracing::warn!(
+                            task_iri = %spec.task_iri,
+                            "Outbound A2A result delivery failed; local task remains completed"
+                        );
+                    }
+                }
                 // 显式在共享总线上推送终态，供 SSE 循环终止并转发 completion 给前端。
                 let event_type = if result.status == "failed" {
                     "TASK_FAILED"
