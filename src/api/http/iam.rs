@@ -6,8 +6,9 @@
  *   2. X-Identity: base64(JSON)            —— 开发/测试模拟身份
  *   3. 匿名（user_id="anonymous"）         —— 无凭据回退
  *
- * AGENTOS_AUTH_MODE=hs256（默认）使用 AGENTOS_JWT_SECRET；生产环境应使用
- * AGENTOS_AUTH_MODE=oidc 和 OIDC issuer/audience/JWKS 配置。
+ * AGENTOS_AUTH_MODE=hs256（默认）使用 AGENTOS_JWT_SECRET，仅限本地开发；
+ * AGENTOS_ENV=production 强制要求 AGENTOS_AUTH_MODE=oidc 和完整的
+ * OIDC issuer/audience/JWKS 配置。
  * AGENTOS_AUTH_STRICT=true 强制执行角色校验，并拒绝 X-Identity（默认 false，
  * 适合本地开发）。严格模式中，JWT 是唯一可用的 HTTP 身份来源。
  */
@@ -177,6 +178,27 @@ fn auth_mode() -> Result<AuthMode, String> {
     }
 }
 
+fn production_environment() -> bool {
+    std::env::var("AGENTOS_ENV").is_ok_and(|value| value.eq_ignore_ascii_case("production"))
+}
+
+/// Validates the authentication profile before the service starts listening.
+///
+/// Production may only use OIDC and OIDC mode always requires a complete,
+/// safe configuration. This deliberately does not fetch JWKS at boot: an
+/// unavailable identity provider must not make a previously valid process
+/// restart-dependent, while individual token verification still fails closed.
+pub fn validate_startup_auth_configuration() -> Result<(), String> {
+    match auth_mode()? {
+        AuthMode::Hs256 if production_environment() => Err(
+            "AGENTOS_AUTH_MODE=oidc is required when AGENTOS_ENV=production; HS256 is limited to local development"
+                .to_string(),
+        ),
+        AuthMode::Hs256 => Ok(()),
+        AuthMode::Oidc => oidc_config().map(|_| ()),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OidcConfig {
     jwks_url: String,
@@ -193,12 +215,16 @@ fn required_env(name: &str) -> Result<String, String> {
 
 fn oidc_config() -> Result<OidcConfig, String> {
     let jwks_url = required_env("AGENTOS_OIDC_JWKS_URL")?;
-    let loopback_http = jwks_url.starts_with("http://127.0.0.1")
-        || jwks_url.starts_with("http://localhost")
-        || jwks_url.starts_with("http://[::1]");
-    if !jwks_url.starts_with("https://") && !loopback_http {
+    let url = reqwest::Url::parse(&jwks_url)
+        .map_err(|_| "AGENTOS_OIDC_JWKS_URL must be a valid HTTPS URL".to_string())?;
+    let loopback_http = !production_environment()
+        && url.scheme() == "http"
+        && url
+            .host_str()
+            .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"));
+    if url.scheme() != "https" && !loopback_http {
         return Err(
-            "AGENTOS_OIDC_JWKS_URL must use HTTPS (HTTP is limited to loopback development)"
+            "AGENTOS_OIDC_JWKS_URL must use HTTPS (HTTP is limited to loopback development and test fixtures)"
                 .to_string(),
         );
     }
@@ -374,7 +400,9 @@ mod tests {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde::Serialize;
 
-    use super::{verify_jwt, AuthMethod, JwtClaims, UserIdentity};
+    use super::{
+        validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims, UserIdentity,
+    };
     use crate::api::http::TEST_ENV_LOCK;
 
     #[tokio::test]
@@ -602,6 +630,61 @@ mod tests {
             );
         }
         restore_env("AGENTOS_AUTH_MODE", previous_mode);
+    }
+
+    #[test]
+    fn production_profile_rejects_hs256_before_startup() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = ["AGENTOS_ENV", "AGENTOS_AUTH_MODE"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("AGENTOS_ENV", "production");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        let error = validate_startup_auth_configuration().unwrap_err();
+        assert!(error.contains("AGENTOS_AUTH_MODE=oidc"));
+        assert!(error.contains("HS256"));
+
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+    }
+
+    #[test]
+    fn oidc_startup_requires_complete_https_configuration() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = [
+            "AGENTOS_ENV",
+            "AGENTOS_AUTH_MODE",
+            "AGENTOS_OIDC_JWKS_URL",
+            "AGENTOS_OIDC_ISSUER",
+            "AGENTOS_OIDC_AUDIENCE",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        std::env::set_var("AGENTOS_ENV", "production");
+        std::env::set_var("AGENTOS_AUTH_MODE", "oidc");
+        std::env::set_var("AGENTOS_OIDC_JWKS_URL", "https://issuer.example.test/jwks");
+        std::env::set_var("AGENTOS_OIDC_ISSUER", "https://issuer.example.test");
+        std::env::set_var("AGENTOS_OIDC_AUDIENCE", "wild-agent-os");
+        assert!(validate_startup_auth_configuration().is_ok());
+
+        std::env::remove_var("AGENTOS_OIDC_AUDIENCE");
+        assert!(validate_startup_auth_configuration()
+            .unwrap_err()
+            .contains("AGENTOS_OIDC_AUDIENCE"));
+
+        std::env::set_var("AGENTOS_OIDC_AUDIENCE", "wild-agent-os");
+        std::env::set_var("AGENTOS_OIDC_JWKS_URL", "http://localhost/jwks");
+        assert!(validate_startup_auth_configuration()
+            .unwrap_err()
+            .contains("must use HTTPS"));
+
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
     }
 
     #[derive(Serialize)]

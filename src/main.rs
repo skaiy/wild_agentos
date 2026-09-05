@@ -6,6 +6,11 @@ use wild_agent_os_core::utils::init_logging;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(error) = wild_agent_os_core::api::http::iam::validate_startup_auth_configuration() {
+        eprintln!("Authentication configuration error: {}", error);
+        std::process::exit(1);
+    }
+
     if let Err(e) = migrate_legacy_home_data() {
         eprintln!("Warning: legacy data directory migration skipped: {}", e);
     }
