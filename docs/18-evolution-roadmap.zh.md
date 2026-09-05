@@ -67,11 +67,14 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 对应工作项：[对象模型草稿](https://github.com/skaiy/wild_agentos/issues/90)、[MCP 目录](https://github.com/skaiy/wild_agentos/issues/91)、[Skill-as-MCP](https://github.com/skaiy/wild_agentos/issues/92)、[A2A adapter](https://github.com/skaiy/wild_agentos/issues/93)。
 
-### [v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5)
+### v0.2.2 — 已完成：制品 + 沙箱 + 基准
 
-- claims 作用域的 coding artifacts store；
-- 外部计算沙箱适配器（OpenHands/E2B 风格挂载），内核只接收结构化结果；
-- 弱算力环境可复现基准，不编造速度提升。
+- claims 作用域 coding artifact store 将不可变元数据写入调用者的
+  `IsolationClaims` graph，并将制品字节写入服务端 mint 的 tenant blob 前缀；
+- 外部 `SandboxProvider` adapter 默认由 feature flag 关闭；其异步路径不会跨
+  `await` 持有 `MutexGuard`；
+- private-deployment benchmarks 可复现地测量 Oxigraph、redb 与 Hyperspace，
+  不编造速度提升。
 
 对应工作项：[制品库](https://github.com/skaiy/wild_agentos/issues/94)、[外挂计算沙箱](https://github.com/skaiy/wild_agentos/issues/95)、[可复现基准](https://github.com/skaiy/wild_agentos/issues/96)。
 

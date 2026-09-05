@@ -96,12 +96,15 @@ Related work: [object-model drafts](https://github.com/skaiy/wild_agentos/issues
 [Skill-as-MCP](https://github.com/skaiy/wild_agentos/issues/92), and
 [A2A adapter](https://github.com/skaiy/wild_agentos/issues/93).
 
-### [v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5)
+### v0.2.2 — complete: Artifacts + Sandbox + Bench
 
-- Claims-scoped coding-artifact storage.
-- An external compute-sandbox adapter (OpenHands/E2B-style mounting); the
-  kernel receives structured results only.
-- Reproducible benchmarks on modest compute, without invented speed claims.
+- The claims-scoped coding artifact store writes immutable metadata to the
+  caller's `IsolationClaims` graph and artifact bytes under a server-minted
+  tenant blob prefix.
+- The external `SandboxProvider` adapter is feature-flagged off by default;
+  its async path does not hold `MutexGuard` across an `await`.
+- Private-deployment benchmarks reproducibly measure Oxigraph, redb, and
+  Hyperspace without inventing speed claims.
 
 Related work: [artifact store](https://github.com/skaiy/wild_agentos/issues/94),
 [external compute sandbox](https://github.com/skaiy/wild_agentos/issues/95), and

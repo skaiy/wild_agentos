@@ -1,6 +1,18 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.2.1`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.2.2`。
+
+## [0.2.2] — 2026-09-05
+
+### Artifacts + Sandbox + Bench
+
+- Added a claims-scoped coding artifact store. Immutable artifact metadata is
+  written to the caller's `IsolationClaims` graph, while artifact bytes use a
+  server-minted tenant blob prefix.
+- Added an external `SandboxProvider` adapter behind a default-off feature
+  flag. Its async path does not hold `MutexGuard` across an `await`.
+- Added reproducible private-deployment benchmarks for Oxigraph, redb, and
+  Hyperspace that record measured results without fabricating speedups.
 
 ## [0.2.1] — 2026-09-05
 
