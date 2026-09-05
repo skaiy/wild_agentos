@@ -56,6 +56,8 @@ pub(crate) struct MarketPackage {
 struct Installation {
     name: String,
     version: String,
+    #[serde(default)]
+    previous_version: Option<String>,
     tenant_id: String,
     project_id: String,
     installed_at: String,
@@ -84,9 +86,7 @@ pub(crate) struct InstallPackageRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct RollbackPackageRequest {
-    pub version: String,
-}
+pub(crate) struct RollbackPackageRequest {}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CatalogQuery {
@@ -158,6 +158,33 @@ fn valid_semver_suffix(value: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
+}
+
+fn compare_semver(left: &str, right: &str) -> std::cmp::Ordering {
+    let split = |value: &str| {
+        let value = value.split('+').next().unwrap_or(value);
+        value
+            .split_once('-')
+            .map_or((value, None), |(core, pre)| (core, Some(pre)))
+    };
+    let (left_core, left_pre) = split(left);
+    let (right_core, right_pre) = split(right);
+    for (left, right) in left_core.split('.').zip(right_core.split('.')) {
+        match left
+            .parse::<u64>()
+            .unwrap_or(0)
+            .cmp(&right.parse::<u64>().unwrap_or(0))
+        {
+            std::cmp::Ordering::Equal => {}
+            order => return order,
+        }
+    }
+    match (left_pre, right_pre) {
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(left), Some(right)) => left.cmp(right),
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 fn claims_or_unauthorized(
@@ -362,6 +389,17 @@ pub(crate) async fn install_package_handler(
     // package to other callers. The scoped installation record is the source
     // of truth for a future claims-aware package resolver.
     let mut installations = load_installations();
+    if installations.iter().any(|entry| {
+        entry.name == name
+            && entry.tenant_id == claims.tenant_id()
+            && entry.project_id == claims.project_id()
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "package is already installed; use upgrade or rollback"})),
+        )
+            .into_response();
+    }
     installations.retain(|entry| {
         !(entry.name == name
             && entry.tenant_id == claims.tenant_id()
@@ -370,6 +408,7 @@ pub(crate) async fn install_package_handler(
     installations.push(Installation {
         name,
         version: package.version,
+        previous_version: None,
         tenant_id: claims.tenant_id().into(),
         project_id: claims.project_id().into(),
         installed_at: chrono::Utc::now().to_rfc3339(),
@@ -390,32 +429,116 @@ pub(crate) async fn install_package_handler(
 
 /// POST /api/v1/market/packages/:name/rollback — switch to a previously published visible version.
 pub(crate) async fn rollback_package_handler(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     identity: UserIdentity,
     Path(name): Path<String>,
-    Json(request): Json<RollbackPackageRequest>,
+    Json(_request): Json<RollbackPackageRequest>,
 ) -> impl IntoResponse {
-    install_package_handler(
-        State(state),
-        identity,
-        Path(name),
-        Json(InstallPackageRequest {
-            version: request.version,
-        }),
-    )
-    .await
+    let claims = match claims_or_unauthorized(&identity) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
+    let mut installations = load_installations();
+    let Some(installation) = installations.iter_mut().find(|entry| {
+        entry.name == name
+            && entry.tenant_id == claims.tenant_id()
+            && entry.project_id == claims.project_id()
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "package is not installed"})),
+        )
+            .into_response();
+    };
+    let Some(previous_version) = installation.previous_version.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "no previous package version available for rollback"})),
+        )
+            .into_response();
+    };
+    let package = match select_visible_package(&name, &previous_version, claims) {
+        Ok(package) => package,
+        Err(response) => return response,
+    };
+    let current = std::mem::replace(&mut installation.version, previous_version);
+    installation.previous_version = Some(current);
+    installation.installed_at = chrono::Utc::now().to_rfc3339();
+    match save(installations_path(), &installations) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "rolled_back": package})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /api/v1/market/packages/:name/upgrade — select a newer visible version.
 /// Version ordering is deliberately caller-explicit; the server never chooses a
 /// "latest" version because that would make upgrades non-deterministic.
 pub(crate) async fn upgrade_package_handler(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     identity: UserIdentity,
     Path(name): Path<String>,
     Json(request): Json<InstallPackageRequest>,
 ) -> impl IntoResponse {
-    install_package_handler(State(state), identity, Path(name), Json(request)).await
+    let claims = match claims_or_unauthorized(&identity) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
+    let package = match select_visible_package(&name, &request.version, claims) {
+        Ok(package) => package,
+        Err(response) => return response,
+    };
+    let mut installations = load_installations();
+    let Some(installation) = installations.iter_mut().find(|entry| {
+        entry.name == name
+            && entry.tenant_id == claims.tenant_id()
+            && entry.project_id == claims.project_id()
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "package is not installed; use install first"})),
+        )
+            .into_response();
+    };
+    if compare_semver(&package.version, &installation.version) != std::cmp::Ordering::Greater {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "version_conflict",
+                "installed": installation.version,
+                "requested": package.version,
+            })),
+        )
+            .into_response();
+    }
+    installation.previous_version = Some(installation.version.clone());
+    installation.version = package.version.clone();
+    installation.installed_at = chrono::Utc::now().to_rfc3339();
+    match save(installations_path(), &installations) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "upgraded": package})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +552,14 @@ mod tests {
         assert!(!valid_semver("1.2"));
         assert!(!valid_semver("v1.2.3"));
         assert!(!valid_semver("01.2.3"));
+        assert_eq!(
+            compare_semver("1.1.0", "1.0.9"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_semver("1.0.0-rc.1", "1.0.0"),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
