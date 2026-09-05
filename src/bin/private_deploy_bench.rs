@@ -16,7 +16,7 @@ use hyperspace_engine::wal::WalSyncMode;
 use oxigraph::model::{NamedNode, Quad};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -206,7 +206,7 @@ fn bench_hyperspace(dir: &Path, records: usize) -> Result<Vec<f64>, Box<dyn std:
     runtime.block_on(async {
         let engine = HyperspaceEngineImpl::open(
             dir,
-            WalSyncMode::Immediate,
+            WalSyncMode::Strict,
             DIMENSIONS,
             Box::new(CosineMetric),
             HnswConfig::default(),
@@ -306,11 +306,20 @@ fn proc_status_bytes(field: &str) -> Option<u64> {
 fn proc_status_bytes_from(path: &str, field: &str) -> Option<u64> {
     fs::read_to_string(path).ok()?.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
-        (key == field).then(|| value.split_whitespace().next()?.parse::<u64>().ok()? * 1024)
+        if key == field {
+            value
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+                .map(|kilobytes| kilobytes * 1024)
+        } else {
+            None
+        }
     })
 }
 
-fn arg_value(args: &[String], name: &str) -> Option<&str> {
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.windows(2)
         .find_map(|pair| (pair[0] == name).then_some(pair[1].as_str()))
 }
