@@ -19,7 +19,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use jsonwebtoken::{jwk::JwkSet, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -271,7 +271,6 @@ fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
 }
 
 async fn verify_jwt(token: &str) -> Option<UserIdentity> {
-    use jsonwebtoken::{decode, decode_header};
     match auth_mode() {
         Ok(AuthMode::Hs256) => verify_hs256_jwt(token),
         Ok(AuthMode::Oidc) => verify_oidc_jwt(token).await,
