@@ -72,19 +72,20 @@ tenant graph 或 vectors。
 ## 历史键迁移工具
 
 `scripts/isolation-migrate` 是显式**离线**迁移工具，不是 HTTP endpoint，任何请求
-hot path 都不能调用。它当前只实现 Oxigraph named-graph migration；vector
-(`tenant:<id>`)、L0 和 blob 历史键仍未实现，生产查询不得把它们表述为已迁移或隔离。
-
-其 JSON plan 的 schema version 为 `1`，把每个历史 source graph 映射到
-claims-minted tenant/project target：
+hot path 都不能调用。仅含 `named_graphs` 的 schema version `1` plan 仍受支持；新的
+schema version `2` 可迁移 named graph、已 checkpoint 的本地 Hyperspace vector、
+共享本地 L0 database 与本地文件系统 blob：
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "named_graphs": [{
     "source_graph": "graph:world",
     "target": { "tenant": "acme", "project": "research" }
-  }]
+  }],
+  "vectors": [{"source_tag": "tenant:acme", "target": {"tenant": "acme", "project": "research"}}],
+  "l0": [{"source_path": "l0_store/l0.redb", "target": {"tenant": "acme", "project": "research"}}],
+  "blobs": [{"source_prefix": "tenant:default/kb", "target": {"tenant": "acme", "project": "research"}}]
 }
 ```
 
@@ -100,9 +101,13 @@ scripts/isolation-migrate --data-root data --plan migration.json
 scripts/isolation-migrate --data-root data --plan migration.json --execute
 ```
 
-工具在复制前拒绝不安全 target、重复 target、已有 quads 的 target 和无效 plan。它只
-通过 Oxigraph SPARQL 复制，并验证每个 target count 等于记录的 source count。成功
-real run 写入本地 `<data-root>/isolation-migrate-audit-<timestamp>.json`，仅记录
+工具在复制前拒绝不安全 target、重复 target、非空 target 和无效 plan。Vector 要求已有
+checkpoint 的 `vector_store/index.snapshot`，把匹配的 `tenant:<id>` vector 复制到
+`vector://{tenant}/{project}` 并按 count 验证。L0 把声明的
+`l0_store/l0.redb` 复制到 `l0/{tenant}/l0.redb`；本地 blob 把声明的
+`blobs/tenant:<id>/kb` 树复制到 `blobs/{tenant}/kb`，均按文件数验证。此工具不迁移
+远程对象存储后端。Graph 继续通过 Oxigraph SPARQL 复制并验证 quad count。成功 real
+run 写入本地 `<data-root>/isolation-migrate-audit-<timestamp>.json`，仅记录
 plan/verify 结果，不含 secret；source graph 默认保留。
 
 删除已验证 source 是单独的破坏性操作，必须先备份和独立生产查询检查，并同时提供：
