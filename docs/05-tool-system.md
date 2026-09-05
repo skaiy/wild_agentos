@@ -217,6 +217,25 @@ The MCP (Model Context Protocol) client communicates with external tool services
 }
 ```
 
+#### Inbound catalog isolation (v0.2.1)
+
+The inbound `MCPServer` catalog (`tools/list`) and tool invocation
+(`tools/call`) require verified `IsolationClaims`. Requests without claims are
+rejected; there is no anonymous or unauthenticated public catalog.
+
+An inbound tool can be scoped to the tenant and project from verified claims.
+Scoped tools are disclosed and callable only by the same tenant/project.
+Unscoped tools are shared only among authenticated tenants. Catalog responses
+include `annotations.x-agentos-risk-level`; high and critical tools also set
+`annotations.destructiveHint: true`. The HTTP MCP server-registration catalog
+uses the same tenant/project boundary, and legacy registrations without scope
+remain hidden.
+
+Claims come from the authentication boundary, never from MCP arguments or
+client-supplied tenant fields. This catalog filtering is intentionally separate
+from publishing Skills as MCP tools, which can add registrations through the
+same scoped registry later.
+
 ### 5.2.4 HookManager — Hook System
 
 **File**: `src/tools/hooks.rs`
