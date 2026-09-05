@@ -245,7 +245,7 @@ mod tests {
         let previous = std::env::var_os("AGENTOS_AUTH_STRICT");
         std::env::set_var("AGENTOS_AUTH_STRICT", "true");
         let (mut parts, _) = Request::builder()
-            .body(r#"{"tenant_id":"evil","roles":["DA"]}"#)
+            .body(r#"{"tenant":"evil","tenant_id":"also-evil","roles":["DA"]}"#)
             .unwrap()
             .into_parts();
 
@@ -254,6 +254,10 @@ mod tests {
             .unwrap();
         assert_eq!(identity.auth_method, AuthMethod::Anonymous);
         assert_ne!(identity.tenant_id, "evil");
+        assert!(
+            identity.isolation_claims().is_none(),
+            "an unverified request body must not mint isolation claims"
+        );
         assert!(identity.require_role("DA").is_err());
 
         restore_strict_mode(previous);
