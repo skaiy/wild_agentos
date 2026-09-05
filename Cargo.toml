@@ -148,6 +148,10 @@ path = "src/bin/isolation_diagnose.rs"
 name = "isolation-migrate"
 path = "src/bin/isolation_migrate.rs"
 
+[[bin]]
+name = "private-deploy-bench"
+path = "src/bin/private_deploy_bench.rs"
+
 [[bench]]
 name = "bench_graph_backend"
 harness = false

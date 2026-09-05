@@ -234,6 +234,11 @@ Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxig
 
 ## 📊 Performance Targets
 
+This historical reference table is not a benchmark result. Do not change it or
+publish speedup ratios without a sourced measured run; use the
+[private deployment benchmark](docs/19-private-deploy-benchmark.md) to produce
+JSON and Markdown evidence on the target machine.
+
 | Operation | Latency | Throughput |
 |-----------|---------|-----------|
 | L2 Node Write (Oxigraph) | ~2ms | 500 ops/sec |
@@ -252,6 +257,7 @@ Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxig
 - **Isolation Contract** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md) (verified claims and future naming; no storage migration)
 - **Isolation Matrix** → [`docs/17-isolation-matrix.md`](docs/17-isolation-matrix.md) (CI-verified fail-closed behavior; historical keys are not migrated)
 - **Evolution Roadmap** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md) (post-v0.1.6 strategy and explicit non-goals)
+- **Private Deployment Benchmark** → [`docs/19-private-deploy-benchmark.md`](docs/19-private-deploy-benchmark.md) (reproducible measured Oxigraph/redb/Hyperspace profile)
 - **Ontology Action Data Sandbox** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md) (staging graph guardrails; not a compute sandbox)
 - **Design Detail** → [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) · [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
