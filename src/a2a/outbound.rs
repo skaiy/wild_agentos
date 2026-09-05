@@ -22,11 +22,8 @@ pub enum A2aOutboundError {
     MissingEndpoint,
     #[error("outbound A2A request failed: {0}")]
     Transport(#[from] reqwest::Error),
-    #[error("outbound A2A endpoint returned {status}: {body}")]
-    Http {
-        status: reqwest::StatusCode,
-        body: String,
-    },
+    #[error("outbound A2A endpoint returned {status}")]
+    Http { status: reqwest::StatusCode },
 }
 
 /// A narrowly scoped HTTP+JSON client for an already-configured remote A2A
@@ -159,10 +156,7 @@ impl A2aOutboundClient {
         let status = response.status();
         let response_body = response.text().await?;
         if !status.is_success() {
-            return Err(A2aOutboundError::Http {
-                status,
-                body: response_body.chars().take(512).collect(),
-            });
+            return Err(A2aOutboundError::Http { status });
         }
         let response_json: Value = serde_json::from_str(&response_body).unwrap_or(Value::Null);
         Ok(response_json
@@ -269,7 +263,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, A2aOutboundError::Http { status, .. } if status == StatusCode::BAD_GATEWAY)
+            matches!(error, A2aOutboundError::Http { status } if status == StatusCode::BAD_GATEWAY)
         );
     }
 }
