@@ -27,6 +27,7 @@ pub mod api_gov;
 pub mod iam;
 use api_gov::{ApiClient, ApiKey, ApiUsageState};
 pub mod agents;
+pub mod artifacts;
 pub mod api_clients;
 pub mod chat;
 pub mod config;
@@ -47,6 +48,10 @@ pub mod tasks;
 use agents::{
     create_agent_handler, delete_agent_handler, list_agents_handler, load_user_agents,
     migrate_legacy_agent_graphs, save_user_agents, update_agent_handler,
+};
+use artifacts::{
+    download_artifact_handler, list_artifacts_handler, upload_artifact_handler,
+    ARTIFACT_UPLOAD_MAX_BYTES,
 };
 use chat::{
     agent_chat_handler, openai_chat_completions_handler, openai_list_models_handler,
@@ -275,6 +280,16 @@ pub fn build_router(
         .route("/api/v1/tasks/:task_iri", get(get_task_handler))
         .route("/api/v1/tasks/stream", post(stream_task_handler))
         .route("/api/v1/tasks/trends", get(list_task_trends_handler))
+        .route(
+            "/api/v1/artifacts",
+            get(list_artifacts_handler)
+                .post(upload_artifact_handler)
+                .layer(DefaultBodyLimit::max(ARTIFACT_UPLOAD_MAX_BYTES)),
+        )
+        .route(
+            "/api/v1/artifacts/:id/download",
+            get(download_artifact_handler),
+        )
         .route(
             "/api/v1/tasks/:task_iri/status",
             get(get_realtime_status_handler),
