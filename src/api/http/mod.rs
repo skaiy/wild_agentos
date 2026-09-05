@@ -641,7 +641,12 @@ mod tests {
         let (st, _) = post_json(
             &router,
             "/api/v1/kg/import",
-            json!({"graph": "client:ignored", "nodes": [], "edges": []}),
+            json!({
+                "tenant": "attacker-controlled",
+                "graph": "client:ignored",
+                "nodes": [],
+                "edges": []
+            }),
             None,
         )
         .await;
