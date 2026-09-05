@@ -207,7 +207,10 @@ impl<P: SandboxProvider> SandboxProvider for AuditedSandboxProvider<P> {
         let result = self.provider.fetch_result(task_id).await?;
         result.validate(task_id)?;
 
-        if let Some(claims) = self.claims_by_task.lock().remove(task_id) {
+        // Keep the non-Send parking_lot guard confined to this synchronous
+        // expression; EventBus::emit below awaits.
+        let claims = { self.claims_by_task.lock().remove(task_id) };
+        if let Some(claims) = claims {
             let payload = serde_json::json!({
                 "task_id": task_id,
                 "provider": self.provider.provider_name(),
