@@ -1,3 +1,4 @@
+use oxigraph::model::{GraphNameRef, NamedNodeRef};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,34 @@ use crate::isolation::IsolationClaims;
 use super::ontology_draft::TypeDraftBundle;
 use super::rdf_mapper::RdfMapper;
 use super::types::RdfQuad;
+
+/// Environment switch for the deliberately small query-time RDFS segment.
+///
+/// This is opt-in and supports only `rdfs:subClassOf` transitivity and type
+/// propagation. It is intentionally not a general OWL or rules engine.
+pub const LIMITED_RDFS_INFERENCE_ENV: &str = "AGENTOS_LIMITED_RDFS_INFERENCE";
+
+/// Controls whether claims-scoped reads use the small RDFS expansion segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitedRdfsInference {
+    /// Preserve Oxigraph's normal SPARQL evaluation exactly.
+    Disabled,
+    /// Evaluate a query against an ephemeral graph with subclass closure.
+    QueryTime,
+}
+
+impl LimitedRdfsInference {
+    /// Only explicit `1` / `true` values enable the feature; unset and all
+    /// other values preserve the historic behavior.
+    pub fn from_environment() -> Self {
+        match std::env::var(LIMITED_RDFS_INFERENCE_ENV) {
+            Ok(value) if matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true") => {
+                Self::QueryTime
+            }
+            _ => Self::Disabled,
+        }
+    }
+}
 
 pub struct KnowledgeGraphStore {
     store: Arc<Store>,
@@ -229,6 +258,24 @@ impl KnowledgeGraphStore {
         claims: &IsolationClaims,
         sparql: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        self.query_sparql_for_claims_with_inference(
+            claims,
+            sparql,
+            LimitedRdfsInference::from_environment(),
+        )
+    }
+
+    /// Executes a claims-scoped SPARQL query with an explicit inference mode.
+    ///
+    /// `QueryTime` is useful to callers that need deterministic opt-in without
+    /// mutating process environment. It never writes inferred triples to the
+    /// durable Oxigraph store.
+    pub fn query_sparql_for_claims_with_inference(
+        &self,
+        claims: &IsolationClaims,
+        sparql: &str,
+        inference: LimitedRdfsInference,
+    ) -> Result<Vec<serde_json::Value>, String> {
         if sparql.to_uppercase().contains("GRAPH") {
             return Err(
                 "scoped SPARQL queries must not contain GRAPH; the claims graph is applied automatically"
@@ -238,7 +285,7 @@ impl KnowledgeGraphStore {
         let graph = claims
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {}", e))?;
-        self.query_sparql_in_graph(sparql, Some(&graph))
+        self.query_sparql_in_graph_with_inference(sparql, Some(&graph), inference)
     }
 
     /// Writes a graph-local mutation to a graph minted from verified claims.
@@ -709,6 +756,19 @@ impl KnowledgeGraphStore {
         sparql: &str,
         named_graph: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
+        self.query_sparql_in_graph_with_inference(
+            sparql,
+            named_graph,
+            LimitedRdfsInference::Disabled,
+        )
+    }
+
+    fn query_sparql_in_graph_with_inference(
+        &self,
+        sparql: &str,
+        named_graph: Option<&str>,
+        inference: LimitedRdfsInference,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let final_sparql = match named_graph {
             Some(graph) if !sparql.to_uppercase().contains("GRAPH") => {
                 let g = format!("<{}>", graph);
@@ -717,8 +777,15 @@ impl KnowledgeGraphStore {
             _ => sparql.to_string(),
         };
 
-        let results = self
-            .store
+        let query_store;
+        let store = match (inference, named_graph) {
+            (LimitedRdfsInference::QueryTime, Some(graph)) => {
+                query_store = self.rdfs_query_store(graph)?;
+                &query_store
+            }
+            _ => self.store.as_ref(),
+        };
+        let results = store
             .query(&final_sparql)
             .map_err(|e| format!("SPARQL query failed: {}", e))?;
 
@@ -763,6 +830,50 @@ impl KnowledgeGraphStore {
             }
         }
         Ok(values)
+    }
+
+    /// Copies only one claims graph into a temporary Oxigraph store and applies
+    /// the bounded RDFS segment there. The source store is never materialized
+    /// or changed.
+    fn rdfs_query_store(&self, graph: &str) -> Result<Store, String> {
+        let graph_name = NamedNodeRef::new(graph)
+            .map_err(|e| format!("invalid graph IRI for RDFS inference: {e}"))?;
+        let temporary = Store::new().map_err(|e| format!("create RDFS query store failed: {e}"))?;
+
+        for quad in self.store.iter() {
+            let quad = quad.map_err(|e| format!("read graph for RDFS inference failed: {e}"))?;
+            if quad.graph_name.as_ref() == GraphNameRef::NamedNode(graph_name) {
+                temporary
+                    .insert(&quad)
+                    .map_err(|e| format!("copy graph for RDFS inference failed: {e}"))?;
+            }
+        }
+
+        // Oxigraph evaluates the property path to a finite closure. Keep this
+        // rule set deliberately tiny: subclass hierarchy closure plus instance
+        // type propagation. No OWL axioms, property rules, or rule files run.
+        let closure = format!(
+            "INSERT {{ GRAPH <{graph}> {{ ?sub <http://www.w3.org/2000/01/rdf-schema#subClassOf> ?super }} }}
+             WHERE {{ GRAPH <{graph}> {{
+               ?sub <http://www.w3.org/2000/01/rdf-schema#subClassOf>+ ?super .
+               FILTER(?sub != ?super)
+             }} }}",
+        );
+        temporary
+            .update(&closure)
+            .map_err(|e| format!("RDFS subclass closure failed: {e}"))?;
+        let type_propagation = format!(
+            "INSERT {{ GRAPH <{graph}> {{ ?instance <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?super }} }}
+             WHERE {{ GRAPH <{graph}> {{
+               ?instance <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?sub .
+               ?sub <http://www.w3.org/2000/01/rdf-schema#subClassOf>+ ?super .
+               FILTER(?sub != ?super)
+             }} }}",
+        );
+        temporary
+            .update(&type_propagation)
+            .map_err(|e| format!("RDFS type propagation failed: {e}"))?;
+        Ok(temporary)
     }
 
     /// 将不含 GRAPH 子句的 SPARQL 查询包装到指定命名图中。
@@ -1428,6 +1539,76 @@ mod tests {
             .query_sparql_for_claims(&claims(), "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 2")
             .unwrap();
         assert_eq!(results.len(), 2, "LIMIT 应保留在 GRAPH 包装之外并生效");
+    }
+
+    #[test]
+    fn limited_rdfs_inference_is_opt_in_and_query_time_only() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let animal = "http://example.org/Animal";
+        let mammal = "http://example.org/Mammal";
+        let dog = "http://example.org/Dog";
+        let fido = "http://example.org/fido";
+        let subclass = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+        store
+            .write_quads_for_claims(
+                &claims(),
+                &[
+                    make_quad(dog, subclass, RdfValue::Iri(mammal.into())),
+                    make_quad(mammal, subclass, RdfValue::Iri(animal.into())),
+                    make_quad(fido, RDF_TYPE, RdfValue::Iri(dog.into())),
+                ],
+            )
+            .unwrap();
+
+        let query = format!("SELECT ?instance WHERE {{ ?instance a <{animal}> }}");
+        assert!(
+            store
+                .query_sparql_for_claims_with_inference(
+                    &claims(),
+                    &query,
+                    LimitedRdfsInference::Disabled,
+                )
+                .unwrap()
+                .is_empty(),
+            "default mode must not infer superclass membership"
+        );
+
+        let inferred = store
+            .query_sparql_for_claims_with_inference(
+                &claims(),
+                &query,
+                LimitedRdfsInference::QueryTime,
+            )
+            .unwrap();
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0]["?instance"], fido);
+
+        let subclass_query =
+            format!("SELECT ?super WHERE {{ <{dog}> <{subclass}> ?super }} ORDER BY ?super");
+        let closure = store
+            .query_sparql_for_claims_with_inference(
+                &claims(),
+                &subclass_query,
+                LimitedRdfsInference::QueryTime,
+            )
+            .unwrap();
+        assert_eq!(
+            closure.len(),
+            2,
+            "query-time mode exposes hierarchy closure"
+        );
+
+        assert!(
+            store
+                .query_sparql_for_claims_with_inference(
+                    &claims(),
+                    &query,
+                    LimitedRdfsInference::Disabled,
+                )
+                .unwrap()
+                .is_empty(),
+            "query-time inference must not materialize triples into the source graph"
+        );
     }
 
     #[test]
