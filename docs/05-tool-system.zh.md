@@ -225,6 +225,20 @@ MCP (Model Context Protocol) 客户端，通过 JSON-RPC 协议与外部工具�
 }
 ```
 
+#### 入站目录隔离（v0.2.1）
+
+入站 `MCPServer` 的目录（`tools/list`）和工具调用（`tools/call`）都要求经过验证的
+`IsolationClaims`。没有 claims 的请求会被拒绝；不存在匿名或未认证的公共目录。
+
+入站工具可绑定到 verified claims 中的租户与项目范围。带范围的工具仅对同一租户/项目
+披露和可调用；未带范围的工具仅在已认证租户之间共享。目录响应包含
+`annotations.x-agentos-risk-level`；高风险和严重风险工具还会设置
+`annotations.destructiveHint: true`。HTTP MCP 服务器注册目录遵循相同的租户/项目
+边界；没有范围的历史注册记录保持隐藏。
+
+claims 只能由认证边界提供，不能来自 MCP 参数或客户端提供的租户字段。这里的目录过滤
+特意与将 Skill 发布为 MCP 工具分离；后续可通过同一带范围的注册表添加该能力。
+
 ### 5.2.4 HookManager — 钩子系统
 
 **文件**: `src/tools/hooks.rs`
