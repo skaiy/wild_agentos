@@ -1,6 +1,20 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.1.8`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.2.0`。
+
+## [0.2.0] — 2026-09-05
+
+### Control Plane + Skill CI
+
+- Added the Skill package format and CI gate: package verification, golden
+  input/output checks, and an optional Judge hook that is disabled by default.
+  Passing packages publish through the gated tenant channel; failing fixtures
+  are blocked.
+- Added the Rust-CI golden evaluation suite for Agent plans, Skill Markdown,
+  and Action invocation via `scripts/test_golden.sh`.
+- Companion Admin #16 delivered the five-screen control-plane skeleton in its
+  separate repository. That companion change is noted here only; it does not
+  change this repository's scope.
 
 ## [0.1.8] — 2026-09-04
 

@@ -63,18 +63,22 @@ Related work: [HITL](https://github.com/skaiy/wild_agentos/issues/85),
 [guardrails and assertions](https://github.com/skaiy/wild_agentos/issues/86), and
 [event auditing](https://github.com/skaiy/wild_agentos/issues/87).
 
-### [v0.2.0 Control Plane + Skill CI](https://github.com/skaiy/wild_agentos/milestone/3)
+### v0.2.0 — complete: Control Plane + Skill CI
 
-- Five-screen Admin control plane: Runs, Skills, KB · Ontology, Keys · Models,
-  and Isolation; every view is filtered by claims.
-- Skill package CI (`test` + Judge) and a distribution channel.
-- Agent, Skill, and Action golden evaluations.
+- The Skill package format has a CI gate for package verification and golden
+  input/output checks. Its optional Judge hook is disabled by default.
+- Passing packages publish through the gated tenant channel; failing fixtures
+  are blocked.
+- Rust CI runs Agent-plan, Skill-Markdown, and Action-invocation golden
+  evaluations through `scripts/test_golden.sh`.
 
 Related work: [Skill CI and release](https://github.com/skaiy/wild_agentos/issues/88)
 and [golden evaluations](https://github.com/skaiy/wild_agentos/issues/89).
 
-Associated Admin tracking remains in a separate repository; this roadmap does
-not change that repository's scope or implementation.
+Companion Admin #16 delivered the five-screen control-plane skeleton (Runs,
+Skills, KB · Ontology, Keys · Models, and Isolation) in its separate
+repository. This roadmap notes that companion change only; it does not change
+that repository's scope or implementation.
 
 ### [v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4)
 
