@@ -116,6 +116,37 @@ graph TB
 ### Formal Invariant Validation (`InvariantVerifier`)
 `src/skill_graph/verification.rs` validates acyclicity, link existence (no dangling references), compositional reachability, absence of deprecated prerequisites, complete 5W2H metadata, and valid security levels (no unauthorized links). Operations that violate these checks are rejected before commit with a specific error.
 
+### Skill Packages, Gate, and Publication
+
+A distributable skill is a directory containing `skill.yaml`, a `SKILL.md` entrypoint, and
+`tests/golden-input.json` plus `tests/golden-output.json`. The `package` section of
+`skill.yaml` is versioned with `schema: agentos.dev/skill-package/v1` and must declare:
+
+```yaml
+package:
+  schema: agentos.dev/skill-package/v1
+  side_effect_level: none # none | read | write | execute
+  visibility: tenant      # system | tenant | session
+  entrypoint: SKILL.md
+  golden_input: tests/golden-input.json
+  golden_output: tests/golden-output.json
+  judge_rules: judge.rules # optional deterministic JSON-pointer rules
+```
+
+Git import is the tenant publication channel. It validates the package manifest, existing
+schema/signature/security checks, golden input/output contract, and optional deterministic
+Judge rules before it persists or registers the skill. A `system` package declaration is
+rejected; system skills are kernel-owned. Session authoring remains isolated and does not
+silently promote a skill to tenant scope. LLM Judge execution is off by default, and imported
+package scripts are never executed by the kernel gate.
+
+The CI `skill-package-gate` job executes both a passing and intentionally failing fixture.
+Run it locally with:
+
+```bash
+cargo test --lib skill_package_gate_ --verbose
+```
+
 ### Hypergraph Composition
 The skill graph supports first-class hypergraph composition through `Hyperedge` and `CompositionType`: `Sequential`, `Parallel`, `Conditional`, `Optional`, and `Fallback`.
 

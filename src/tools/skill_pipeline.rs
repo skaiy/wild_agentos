@@ -1,7 +1,7 @@
 //! Skill CI/CD Pipeline Engine —— 技能准入流水线引擎。
 //!
 //! 每次技能注册（手动 POST / Git 导入 / 手动重跑）都会真实执行以下四个阶段：
-//! 1. `Lint`     —— 清单/元数据规范校验 + input/output JSON Schema 可编译性校验。
+//! 1. `Lint`     —— 技能包清单/元数据规范校验 + input/output JSON Schema 可编译性校验。
 //! 2. `Security` —— Ed25519 签名核验 + 命名空间/权限-安全级一致性 + 克隆目录敏感模式扫描。
 //! 3. `Test`     —— Schema 自测（模板 JSON 解析 + 示例夹具校验）+ skill_iri 冲突检测 +
 //!    可选的仓库测试框架检测/执行（受 `AGENTOS_PIPELINE_RUN_REPO_TESTS` 门控）。
@@ -137,6 +137,10 @@ pub struct PipelineRun {
     pub skill_name: String,
     pub version: String,
     pub source: PipelineSource,
+    /// Package visibility requested for this run. Tenant publication is never
+    /// performed until every gate has passed.
+    #[serde(default = "default_visibility")]
+    pub visibility: SkillVisibility,
     /// 触发者 user_id。
     pub triggered_by: String,
     /// Git 来源时的仓库地址（脱敏无需，URL 非机密）。
@@ -156,6 +160,115 @@ pub struct PipelineRun {
     pub summary: String,
 }
 
+/// Publication scope encoded by a Skill package manifest.
+///
+/// `System` is reserved for kernel-bundled skills. A submitted package may
+/// only target `tenant` or `session`; it cannot promote itself to `system`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillVisibility {
+    System,
+    Tenant,
+    Session,
+}
+
+fn default_visibility() -> SkillVisibility {
+    SkillVisibility::Session
+}
+
+/// Declared side-effect level. This deliberately describes capability rather
+/// than trust: trust/signing is evaluated independently by the security gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffectLevel {
+    None,
+    Read,
+    Write,
+    Execute,
+}
+
+/// Parsed package metadata. Packages are directories with a `skill.yaml`,
+/// `SKILL.md` entrypoint, and golden JSON input/output fixtures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPackageManifest {
+    pub schema: String,
+    pub side_effect_level: SideEffectLevel,
+    pub visibility: SkillVisibility,
+    pub entrypoint: String,
+    pub golden_input: String,
+    pub golden_output: String,
+    pub judge_rules: Option<String>,
+}
+
+impl SkillPackageManifest {
+    /// Parse the intentionally small, flat package section of `skill.yaml`.
+    /// Full skill metadata remains parsed by the HTTP importer.
+    pub fn parse(yaml: &str) -> Result<Self, String> {
+        let mut values = std::collections::HashMap::new();
+        let mut section = String::new();
+        for line in yaml.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            if let Some((key, raw)) = trimmed.split_once(':') {
+                let key = key.trim();
+                let value = raw.trim().trim_matches('"').trim_matches('\'').to_string();
+                if indent == 0 && value.is_empty() {
+                    section = key.to_string();
+                } else if !value.is_empty() {
+                    let key = if section.is_empty() || indent == 0 {
+                        key.to_string()
+                    } else {
+                        format!("{section}.{key}")
+                    };
+                    values.insert(key, value);
+                }
+            }
+        }
+        let schema = values
+            .remove("package.schema")
+            .ok_or_else(|| "skill.yaml missing package.schema".to_string())?;
+        if schema != "agentos.dev/skill-package/v1" {
+            return Err(format!("unsupported package.schema: {schema}"));
+        }
+        let side_effect_level = match values.remove("package.side_effect_level").as_deref() {
+            Some("none") => SideEffectLevel::None,
+            Some("read") => SideEffectLevel::Read,
+            Some("write") => SideEffectLevel::Write,
+            Some("execute") => SideEffectLevel::Execute,
+            Some(other) => return Err(format!("invalid package.side_effect_level: {other}")),
+            None => return Err("skill.yaml missing package.side_effect_level".to_string()),
+        };
+        let visibility = match values.remove("package.visibility").as_deref() {
+            Some("system") => SkillVisibility::System,
+            Some("tenant") => SkillVisibility::Tenant,
+            Some("session") => SkillVisibility::Session,
+            Some(other) => return Err(format!("invalid package.visibility: {other}")),
+            None => return Err("skill.yaml missing package.visibility".to_string()),
+        };
+        let entrypoint = values
+            .remove("package.entrypoint")
+            .unwrap_or_else(|| "SKILL.md".to_string());
+        let golden_input = values
+            .remove("package.golden_input")
+            .unwrap_or_else(|| "tests/golden-input.json".to_string());
+        let golden_output = values
+            .remove("package.golden_output")
+            .unwrap_or_else(|| "tests/golden-output.json".to_string());
+        Ok(Self {
+            schema,
+            side_effect_level,
+            visibility,
+            entrypoint,
+            golden_input,
+            golden_output,
+            judge_rules: values.remove("package.judge_rules"),
+        })
+    }
+}
+
 /// 流水线执行上下文。
 pub struct PipelineContext {
     pub source: PipelineSource,
@@ -165,6 +278,10 @@ pub struct PipelineContext {
     pub clone_dir: Option<PathBuf>,
     /// 仓库内技能子目录（相对 clone_dir），缺省 "."。
     pub sub_path: String,
+    /// Git packages require the package format and golden checks. Existing
+    /// JSON API payloads remain supported for session-scoped authoring.
+    pub require_package: bool,
+    pub visibility: SkillVisibility,
 }
 
 impl PipelineContext {
@@ -176,6 +293,8 @@ impl PipelineContext {
             repo_url: None,
             clone_dir: None,
             sub_path: ".".into(),
+            require_package: false,
+            visibility: SkillVisibility::Session,
         }
     }
 
@@ -223,8 +342,31 @@ const MAX_SCAN_FILE_BYTES: u64 = 512 * 1024;
 // 阶段 1：Lint —— 清单/元数据规范 + Schema 可编译性
 // ────────────────────────────────────────────────────────────────────────────
 
-fn lint_stage(skill: &SkillMeta) -> StageResult {
+fn lint_stage(skill: &SkillMeta, ctx: &PipelineContext) -> StageResult {
     let mut b = StageResult::new("lint", "代码静态检查 (Lint)");
+
+    if ctx.require_package {
+        match load_package_manifest(ctx) {
+            Ok((_, manifest)) => {
+                if manifest.visibility == SkillVisibility::System {
+                    b.fail("package.visibility=system is reserved for kernel-bundled skills");
+                } else if manifest.visibility != ctx.visibility {
+                    b.fail(format!(
+                        "package.visibility={:?} does not match requested publication scope {:?}",
+                        manifest.visibility, ctx.visibility
+                    ));
+                } else {
+                    b.pass(format!(
+                        "Skill package manifest valid (schema={}, visibility={:?}, side_effect_level={:?})",
+                        manifest.schema, manifest.visibility, manifest.side_effect_level
+                    ));
+                }
+            }
+            Err(error) => b.fail(error),
+        }
+    } else {
+        b.pass("session authoring payload (no package manifest required)");
+    }
 
     // skill_iri 命名规范
     if skill.skill_iri.trim().is_empty() {
@@ -297,6 +439,31 @@ fn lint_stage(skill: &SkillMeta) -> StageResult {
         b.details.iter().filter(|d| d.starts_with('✓')).count()
     );
     b.finish(summary)
+}
+
+fn load_package_manifest(ctx: &PipelineContext) -> Result<(PathBuf, SkillPackageManifest), String> {
+    let dir = ctx
+        .skill_dir()
+        .ok_or_else(|| "package gate requires a package directory".to_string())?;
+    let yaml = std::fs::read_to_string(dir.join("skill.yaml"))
+        .map_err(|_| "package is missing readable skill.yaml".to_string())?;
+    let manifest = SkillPackageManifest::parse(&yaml)?;
+    for path in [
+        &manifest.entrypoint,
+        &manifest.golden_input,
+        &manifest.golden_output,
+    ] {
+        let joined = dir.join(path);
+        if !joined.is_file() {
+            return Err(format!("package required file is missing: {path}"));
+        }
+    }
+    if let Some(rules) = &manifest.judge_rules {
+        if !dir.join(rules).is_file() {
+            return Err(format!("package judge rules file is missing: {rules}"));
+        }
+    }
+    Ok((dir, manifest))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -457,7 +624,48 @@ fn test_stage(registry: &SkillRegistry, skill: &SkillMeta, ctx: &PipelineContext
         b.fail("output_schema 编译失败");
     }
 
-    // 3) 示例夹具校验：clone_dir/<sub>/examples/*.json 或 tests/*.json 逐一按 input_schema 校验
+    // 3) Package golden execution contract. Skills do not run arbitrary package
+    // code in the kernel gate. Instead their declared golden input and output
+    // must satisfy the schemas; executable hooks stay opt-in outside CI.
+    if ctx.require_package {
+        match load_package_manifest(ctx) {
+            Ok((dir, manifest)) => {
+                let input = read_json_fixture(&dir.join(&manifest.golden_input), "golden input");
+                let output = read_json_fixture(&dir.join(&manifest.golden_output), "golden output");
+                match (input, output, compiled_input.as_ref()) {
+                    (Ok(input), Ok(output), Some(input_schema)) => {
+                        if input_schema.is_valid(&input) {
+                            b.pass("golden input satisfies input_schema");
+                        } else {
+                            b.fail("golden input does not satisfy input_schema");
+                        }
+                        match jsonschema::JSONSchema::options().compile(&skill.output_schema) {
+                            Ok(output_schema) if output_schema.is_valid(&output) => {
+                                b.pass("golden output satisfies output_schema (minimal execute contract)");
+                            }
+                            Ok(_) => b.fail("golden output does not satisfy output_schema"),
+                            Err(_) => b.fail("output_schema cannot validate golden output"),
+                        }
+                        if let Some(rules) = manifest.judge_rules {
+                            match evaluate_judge_rules(&dir.join(rules), &input, &output) {
+                                Ok(()) => b.pass("deterministic Judge rules passed"),
+                                Err(error) => {
+                                    b.fail(format!("Judge rules rejected package: {error}"))
+                                }
+                            }
+                        } else {
+                            b.pass("Judge hook disabled (no package.judge_rules; LLM Judge is OFF by default)");
+                        }
+                    }
+                    (Err(error), _, _) | (_, Err(error), _) => b.fail(error),
+                    _ => b.fail("input_schema unavailable for golden test"),
+                }
+            }
+            Err(error) => b.fail(format!("package test setup failed: {error}")),
+        }
+    }
+
+    // 4) 示例夹具校验：clone_dir/<sub>/examples/*.json 或 tests/*.json 逐一按 input_schema 校验
     let mut example_total = 0usize;
     let mut example_ok = 0usize;
     if let (Some(dir), Some(schema)) = (ctx.skill_dir(), compiled_input.as_ref()) {
@@ -510,7 +718,7 @@ fn test_stage(registry: &SkillRegistry, skill: &SkillMeta, ctx: &PipelineContext
         b.pass("无示例夹具（examples/tests/fixtures），仅执行 Schema 自测");
     }
 
-    // 4) 可选：检测并执行仓库测试框架（默认关闭，由 AGENTOS_PIPELINE_RUN_REPO_TESTS=1 开启）
+    // 5) 可选：检测并执行仓库测试框架（默认关闭，由 AGENTOS_PIPELINE_RUN_REPO_TESTS=1 开启）
     if let Some(dir) = ctx.skill_dir() {
         let frameworks = detect_test_frameworks(&dir);
         if frameworks.is_empty() {
@@ -543,6 +751,40 @@ fn test_stage(registry: &SkillRegistry, skill: &SkillMeta, ctx: &PipelineContext
         "Schema 自测通过".to_string()
     };
     b.finish(summary)
+}
+
+fn read_json_fixture(path: &Path, label: &str) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{label} cannot be read: {e}"))?;
+    serde_json::from_str(&raw).map_err(|e| format!("{label} is invalid JSON: {e}"))
+}
+
+/// Rules are deliberately data-only: each non-comment line is `input.path`
+/// or `output.path` and must resolve to a non-null JSON value. This provides a
+/// deterministic Judge hook without granting imported packages code execution.
+fn evaluate_judge_rules(
+    path: &Path,
+    input: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Result<(), String> {
+    let rules = std::fs::read_to_string(path).map_err(|e| format!("cannot read rules: {e}"))?;
+    for line in rules
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let (scope, pointer) = line.split_once(':').ok_or_else(|| {
+            format!("invalid rule `{line}`; expected input:/pointer or output:/pointer")
+        })?;
+        let value = match scope {
+            "input" => input.pointer(pointer),
+            "output" => output.pointer(pointer),
+            _ => return Err(format!("unknown rule scope `{scope}`")),
+        };
+        if value.is_none() || value == Some(&serde_json::Value::Null) {
+            return Err(format!("required JSON pointer missing: {line}"));
+        }
+    }
+    Ok(())
 }
 
 /// 依据仓库中的清单文件推断测试框架（有序，取第一个执行）。
@@ -611,7 +853,7 @@ pub fn run_pipeline(
     let started_at = chrono::Utc::now().to_rfc3339();
 
     let mut stages = Vec::with_capacity(4);
-    stages.push(lint_stage(skill));
+    stages.push(lint_stage(skill, ctx));
     stages.push(security_stage(registry, skill, ctx));
     stages.push(test_stage(registry, skill, ctx));
 
@@ -655,6 +897,7 @@ pub fn run_pipeline(
         skill_name: skill.name.clone(),
         version: skill.version.clone(),
         source: ctx.source,
+        visibility: ctx.visibility,
         triggered_by: ctx.triggered_by.clone(),
         repo_url: ctx.repo_url.clone(),
         started_at,
@@ -729,6 +972,74 @@ mod tests {
         assert!(
             !published_flag.get(),
             "publish callback must not run when gate fails"
+        );
+    }
+
+    fn fixture_context(name: &str) -> PipelineContext {
+        PipelineContext {
+            source: PipelineSource::Git,
+            triggered_by: "ci".into(),
+            repo_url: None,
+            clone_dir: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/skills")
+                    .join(name),
+            ),
+            sub_path: ".".into(),
+            require_package: true,
+            visibility: SkillVisibility::Tenant,
+        }
+    }
+
+    #[test]
+    fn skill_package_gate_accepts_green_fixture_and_publishes() {
+        let registry = SkillRegistry::new();
+        let skill = sample_skill();
+        let run = run_pipeline(
+            &registry,
+            &skill,
+            &fixture_context("package-green"),
+            Box::new(|_| Ok("tenant skill published".into())),
+        );
+        assert!(
+            run.gate_passed,
+            "green fixture should pass: {:?}",
+            run.stages
+        );
+        assert!(run.published);
+        assert_eq!(run.visibility, SkillVisibility::Tenant);
+    }
+
+    #[test]
+    fn skill_package_gate_rejects_red_fixture_without_publishing() {
+        let registry = SkillRegistry::new();
+        let skill = sample_skill();
+        let published = std::cell::Cell::new(false);
+        let run = run_pipeline(
+            &registry,
+            &skill,
+            &fixture_context("package-red"),
+            Box::new(|_| {
+                published.set(true);
+                Ok("must not run".into())
+            }),
+        );
+        assert!(
+            !run.gate_passed,
+            "red fixture should fail: {:?}",
+            run.stages
+        );
+        assert!(!run.published);
+        assert!(!published.get(), "red fixture must never publish");
+        assert!(
+            run.stages.iter().any(|stage| {
+                stage.stage == "test"
+                    && stage
+                        .details
+                        .iter()
+                        .any(|detail| detail.contains("golden input does not satisfy"))
+            }),
+            "failure should identify the golden input gate"
         );
     }
 }

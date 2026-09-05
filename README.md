@@ -215,7 +215,7 @@ Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxig
 - **v0.1.6 — done:** JWT `IsolationClaims` mint graph/blob/vector/L0 targets; relevant HTTP paths fail closed; historical keys are not migrated.
 - **v0.1.7 — done:** read-only minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and optional explicit migration with no silent `UNION`.
 - **v0.1.8 — done:** approval-held Action staging with merge/discard APIs and TTL, configurable guardrails plus SPARQL assertions, and `ACTION_AUDIT` event-bus audit.
-- **[v0.2.0 Control Plane + Skill CI](https://github.com/skaiy/wild_agentos/milestone/3):** claims-filtered five-screen Admin control plane; Skill package test+Judge CI and publishing; Agent/Skill/Action golden evals.
+- **[v0.2.0 Control Plane + Skill CI](https://github.com/skaiy/wild_agentos/milestone/3):** claims-filtered five-screen Admin control plane; [x] Skill package test+Judge CI and gated tenant publishing; Agent/Skill/Action golden evals.
 - **[v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4):** human-approved ObjectType/LinkType drafts, MCP inbound tenant catalog, Skill-as-MCP, and a thin outbound A2A adapter.
 - **[v0.2.2 Artifacts + Sandbox + Bench](https://github.com/skaiy/wild_agentos/milestone/5):** claims-scoped coding artifacts, an external compute-sandbox adapter, and reproducible weak-compute benchmarks without fabricated speedups.
 - **[v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6):** versioned Function/Skill market, OIDC/IdP with claims minted at the auth boundary, gated emergent tools, and optional default-off limited OWL/rules.

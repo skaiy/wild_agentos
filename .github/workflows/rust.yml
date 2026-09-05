@@ -31,3 +31,17 @@ jobs:
       run: ./scripts/test_golden.sh
     - name: Run tests
       run: cargo test --workspace --verbose
+
+  skill-package-gate:
+    name: Skill package gate fixtures
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+    - name: Cache Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Verify passing package fixture
+      run: cargo test --lib skill_package_gate_accepts_green_fixture_and_publishes --verbose
+    - name: Verify failing package fixture is blocked
+      run: cargo test --lib skill_package_gate_rejects_red_fixture_without_publishing --verbose
