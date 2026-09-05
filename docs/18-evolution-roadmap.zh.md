@@ -42,15 +42,17 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 这仍是数据沙箱，不承诺任意代码执行沙箱；当前实现边界见 [15. 本体动作执行沙箱](15-ontology-action-sandbox.zh.md)。对应工作项：[HITL](https://github.com/skaiy/wild_agentos/issues/85)、[护栏与断言](https://github.com/skaiy/wild_agentos/issues/86)、[事件审计](https://github.com/skaiy/wild_agentos/issues/87)。
 
-### [v0.2.0 Control Plane + Skill CI](https://github.com/skaiy/wild_agentos/milestone/3)
+### v0.2.0 — 已完成：控制平面 + Skill CI
 
-- 五屏 Admin control plane：Runs、Skills、KB · Ontology、Keys · Models、Isolation；所有视图按 claims 过滤；
-- Skill package CI（test + Judge）与发布通道；
-- Agent、Skill、Action golden evals。
+- Skill package 格式已提供 CI gate，用于 package 验证和 golden input/output
+  检查；可选 Judge hook 默认关闭。
+- 通过的 package 可经受控 tenant 发布通道发布；失败 fixture 会被拦截。
+- Rust CI 通过 `scripts/test_golden.sh` 执行 Agent 计划、Skill Markdown 和
+  Action 调用的 golden evals。
 
 对应工作项：[Skill CI 与发布](https://github.com/skaiy/wild_agentos/issues/88)、[黄金评测](https://github.com/skaiy/wild_agentos/issues/89)。
 
-Admin 配套跟踪在独立仓库：[五屏控制台](https://github.com/skaiy/wild_agentos_admin/issues/16) 与 [docs-site](https://github.com/skaiy/wild_agentos_admin/issues/17)；本路线图不改变该仓库的范围或实现。
+配套 Admin #16 已在独立仓库交付五屏控制平面骨架（Runs、Skills、KB · Ontology、Keys · Models、Isolation）。本路线图仅记录该配套变更，不改变该仓库的范围或实现。
 
 ### [v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4)
 
