@@ -126,6 +126,8 @@ pub enum PipelineSource {
     Git,
     /// 对已注册技能手动重跑流水线。
     Rerun,
+    /// Market package publication.
+    Market,
 }
 
 /// 一次完整流水线运行记录。

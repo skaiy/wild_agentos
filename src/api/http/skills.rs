@@ -100,7 +100,9 @@ pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
 }
 
 /// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。best-effort。
-fn append_pipeline_run(run: &crate::tools::skill_pipeline::PipelineRun) -> std::io::Result<()> {
+pub(crate) fn append_pipeline_run(
+    run: &crate::tools::skill_pipeline::PipelineRun,
+) -> std::io::Result<()> {
     let mut runs = load_pipeline_runs();
     runs.insert(0, run.clone());
     if runs.len() > PIPELINE_RUNS_CAP {
