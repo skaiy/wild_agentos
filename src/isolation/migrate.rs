@@ -781,6 +781,9 @@ fn verify_vectors(
     plan: &MigrationPlan,
     planned: Vec<VectorMigrationReport>,
 ) -> Result<Vec<VectorMigrationReport>, MigrationError> {
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
     let snapshot_path = data_root.join("vector_store/index.snapshot");
     let snapshot = load_snapshot(&snapshot_path)
         .map_err(|_| MigrationError::VectorSnapshotRequired(snapshot_path.display().to_string()))?;
