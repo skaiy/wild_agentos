@@ -66,11 +66,11 @@ use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handle
 use ontology::{
     approve_action_approval_handler, delete_action_type_handler, delete_function_def_handler,
     delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
-    invoke_action_handler,
-    list_action_approvals_handler, ontology_types_handler, reject_action_approval_handler,
-    update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
-    update_link_type_handler, update_object_type_handler, upsert_action_type_handler,
-    upsert_function_def_handler, upsert_link_type_handler, upsert_object_type_handler,
+    invoke_action_handler, list_action_approvals_handler, ontology_types_handler,
+    reject_action_approval_handler, update_action_type_handler, update_domain_guardrails_handler,
+    update_function_def_handler, update_link_type_handler, update_object_type_handler,
+    upsert_action_type_handler, upsert_function_def_handler, upsert_link_type_handler,
+    upsert_object_type_handler,
 };
 use runtime::{health_handler, metrics_handler, unified_stats_handler};
 use skills::{
@@ -321,6 +321,23 @@ pub fn build_router(
             put(update_knowledge_pack_handler).delete(delete_knowledge_pack_handler),
         )
         .route("/api/v1/ontology/types", get(ontology_types_handler))
+        // ── 本体类型草稿：适配输入 → claims 隔离草稿 → 人工确认提升 ──
+        .route(
+            "/api/v1/ontology/type-drafts",
+            get(list_type_drafts_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/from-csv",
+            post(create_csv_type_draft_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/from-json-schema",
+            post(create_json_schema_type_draft_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/:draft_id/promote",
+            post(promote_type_draft_handler),
+        )
         // ── 本体元模型在线 CRUD（对象/链接）──
         .route(
             "/api/v1/ontology/object-types",

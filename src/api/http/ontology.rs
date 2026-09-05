@@ -12,8 +12,9 @@ use tracing::error;
 use crate::{
     isolation::IsolationClaims,
     knowledge_graph::{
+        ontology_draft::{self, DraftLinkInput, TypeDraftBundle},
         ontology_layer::ActionGuardrailConfig,
-        store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval},
+        store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingTypeDraft},
     },
 };
 
@@ -126,6 +127,346 @@ pub(crate) async fn update_domain_guardrails_handler(
 // 本体域固定为 ev-repair（当前单域）；首启由 ensure_seeded 幂等 seed。
 
 const ONT_DOMAIN: &str = "ev-repair";
+const TYPE_DRAFT_TTL_HOURS: i64 = 24;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CsvTypeDraftRequest {
+    pub csv: String,
+    #[serde(default)]
+    pub object_id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub primary_key: Option<String>,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JsonSchemaTypeDraftRequest {
+    pub schema: Value,
+    #[serde(default)]
+    pub object_id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromoteTypeDraftRequest {
+    pub confirm: bool,
+}
+
+/// Creates a claims-scoped draft only. It never writes to the production
+/// ontology meta graph and intentionally has no ActionType input/output.
+async fn create_type_draft(
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    source: &str,
+    bundle: TypeDraftBundle,
+) -> axum::response::Response {
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let now = chrono::Utc::now();
+    let draft = PendingTypeDraft {
+        draft_id: uuid::Uuid::new_v4().simple().to_string(),
+        source: source.to_string(),
+        bundle,
+        created_at: now.to_rfc3339(),
+        expires_at: (now + chrono::Duration::hours(TYPE_DRAFT_TTL_HOURS)).to_rfc3339(),
+    };
+    match kg.create_type_draft_for_claims(claims, &draft) {
+        Ok(()) => {
+            let _ = state.kg_store.flush();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "status": "draft",
+                    "draft_id": draft.draft_id,
+                    "source": draft.source,
+                    "expires_at": draft.expires_at,
+                    "preview": draft.bundle,
+                    "actions_generated": false,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/type-drafts/from-csv — infer a reviewable object
+/// type from CSV headers. Every property is conservatively a string.
+pub(crate) async fn create_csv_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<CsvTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_csv_headers(
+        &request.csv,
+        request.object_id.as_deref(),
+        request.label.as_deref(),
+        request.primary_key.as_deref(),
+        request.links,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "csv", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-json-schema — infer an ObjectType
+/// from a JSON Schema. Links must be explicit request input; none are inferred.
+pub(crate) async fn create_json_schema_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<JsonSchemaTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_json_schema(
+        &request.schema,
+        request.object_id.as_deref(),
+        request.label.as_deref(),
+        request.links,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "json_schema", bundle).await
+}
+
+fn type_draft_expired(draft: &PendingTypeDraft) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&draft.expires_at)
+        .map(|expires| expires <= chrono::Utc::now())
+        .unwrap_or(true)
+}
+
+fn active_type_drafts(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+) -> Result<Vec<PendingTypeDraft>, String> {
+    let drafts = kg.list_type_drafts_for_claims(claims)?;
+    Ok(drafts
+        .into_iter()
+        .filter(|draft| {
+            if type_draft_expired(draft) {
+                let _ = kg.delete_type_draft_for_claims(claims, &draft.draft_id);
+                false
+            } else {
+                true
+            }
+        })
+        .collect())
+}
+
+/// GET /api/v1/ontology/type-drafts — caller-only active draft list.
+pub(crate) async fn list_type_drafts_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match active_type_drafts(&kg, claims) {
+        Ok(drafts) => {
+            let _ = state.kg_store.flush();
+            (StatusCode::OK, Json(json!({"drafts": drafts}))).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/type-drafts/:draft_id/promote — the only draft path
+/// that writes production metadata. Existing IDs are rejected, never replaced.
+pub(crate) async fn promote_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(draft_id): axum::extract::Path<String>,
+    Json(request): Json<PromoteTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "promotion requires explicit confirm: true"})),
+        )
+            .into_response();
+    }
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let draft = match active_type_drafts(&kg, claims) {
+        Ok(drafts) => drafts.into_iter().find(|draft| draft.draft_id == draft_id),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let Some(draft) = draft else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "type draft not found", "draft_id": draft_id})),
+        )
+            .into_response();
+    };
+    let store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let current = match store.load_definition(ONT_DOMAIN) {
+        Ok(current) => current,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let existing_objects: std::collections::HashSet<_> = current
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    let existing_links: std::collections::HashSet<_> = current
+        .link_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    let mut draft_ids = std::collections::HashSet::new();
+    let duplicate_id = draft
+        .bundle
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .chain(draft.bundle.link_types.iter().map(|item| item.id.as_str()))
+        .find(|id| !draft_ids.insert(*id));
+    if let Some(id) = duplicate_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "draft contains duplicate type IDs", "id": id})),
+        )
+            .into_response();
+    }
+    if let Some(id) = draft
+        .bundle
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .find(|id| existing_objects.contains(id))
+        .or_else(|| {
+            draft
+                .bundle
+                .link_types
+                .iter()
+                .map(|item| item.id.as_str())
+                .find(|id| existing_links.contains(id))
+        })
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                json!({"error": "promotion would overwrite an existing production type", "id": id}),
+            ),
+        )
+            .into_response();
+    }
+    let draft_objects: std::collections::HashSet<_> = draft
+        .bundle
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    if let Some(link) = draft.bundle.link_types.iter().find(|link| {
+        !(existing_objects.contains(link.source.as_str())
+            || draft_objects.contains(link.source.as_str()))
+            || !(existing_objects.contains(link.target.as_str())
+                || draft_objects.contains(link.target.as_str()))
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "draft link references an unknown object type", "id": link.id})),
+        )
+            .into_response();
+    }
+    for object in &draft.bundle.object_types {
+        if let Err(error) = store.upsert_object_type(ONT_DOMAIN, object) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+        }
+    }
+    for link in &draft.bundle.link_types {
+        if let Err(error) = store.upsert_link_type(ONT_DOMAIN, link) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+        }
+    }
+    if let Err(error) = kg.delete_type_draft_for_claims(claims, &draft.draft_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    (StatusCode::OK, Json(json!({"status": "promoted", "draft_id": draft.draft_id,
+        "object_type_ids": draft.bundle.object_types.iter().map(|item| &item.id).collect::<Vec<_>>(),
+        "link_type_ids": draft.bundle.link_types.iter().map(|item| &item.id).collect::<Vec<_>>(),
+    }))).into_response()
+}
 
 /// 构造 OntologyStore 并确保已 seed（失败转 500 JSON）。
 fn ontology_store_ready(
@@ -1573,6 +1914,118 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "无引用后应可删");
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn type_draft_csv_requires_claims_and_explicit_human_promotion() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_type_draft_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route("/api/v1/ontology/types", get(ontology_types_handler))
+            .route(
+                "/api/v1/ontology/type-drafts",
+                get(list_type_drafts_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/from-csv",
+                post(create_csv_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        let body = json!({
+            "csv": "asset_id,Display Name,active\nA-1,Inverter,true\n",
+            "object_id": "imported asset",
+            "label": "Imported Asset"
+        });
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-csv")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-csv")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["actions_generated"], false);
+        assert!(created["preview"]["object_types"][0]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|property| property["prop_type"] == "string"));
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let no_confirm = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":false}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(no_confirm).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let promote = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(promote).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let types = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["id"] == "ImportedAsset"));
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
