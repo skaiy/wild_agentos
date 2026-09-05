@@ -110,12 +110,19 @@ Related work: [artifact store](https://github.com/skaiy/wild_agentos/issues/94),
 [external compute sandbox](https://github.com/skaiy/wild_agentos/issues/95), and
 [reproducible benchmark](https://github.com/skaiy/wild_agentos/issues/96).
 
-### [v0.3.0 Markets + IdP + Emergent](https://github.com/skaiy/wild_agentos/milestone/6)
+### v0.3.0 — complete: Markets + IdP + Emergent
 
-- Versioned Function / Skill marketplace.
-- OIDC / IdP; claims remain minted at the authentication boundary.
-- A gated emergent-tool pipeline.
-- Limited OWL / rules as an optional feature, disabled by default.
+- The versioned Logic and Skill package market provides immutable package
+  versions, claims-scoped tenant access, and explicit install, upgrade, and
+  rollback.
+- OIDC/JWKS authentication operates beside local-development HS256. It verifies
+  asymmetric JWTs against the configured issuer, audience, and JWKS endpoint,
+  and fails closed for invalid configuration or verification.
+- The emergent-tool promotion pipeline keeps generated tools untrusted until
+  each required sandbox/judge gate and human approval passes.
+- Limited RDFS inference is optional and disabled by default. It performs
+  query-time subclass and type expansion for claims-scoped graph reads without
+  persisting inferred triples.
 
 Related work: [marketplace](https://github.com/skaiy/wild_agentos/issues/97),
 [OIDC/IdP](https://github.com/skaiy/wild_agentos/issues/98),
