@@ -147,6 +147,23 @@ Run it locally with:
 cargo test --lib skill_package_gate_ --verbose
 ```
 
+### Published Skill MCP tools
+
+An external MCP client uses `POST /mcp` for JSON-RPC (`initialize`,
+`tools/list`, and `tools/call`). A tenant Skill appears only after its latest
+admission run passed with `visibility: tenant` and a DA explicitly adds an
+entry through `POST /api/v1/mcp/skill-exposures`. The exposure configuration is
+tenant-local and defaults to deny; `iri://` kernel Skills are never eligible.
+
+The MCP endpoint requires a verified Bearer JWT even in development mode. Tool
+discovery is filtered by both tenant and the Skill's `allowed_roles`; calls
+without an allowed role return HTTP 403. Arguments must be a JSON object and
+are validated against the published `input_schema` before the call is accepted.
+The response is a validated invocation envelope: package source is never
+evaluated by the MCP HTTP layer. This preserves the package gate's
+no-arbitrary-code-execution boundary while a runtime executor consumes the
+envelope.
+
 ### Hypergraph Composition
 The skill graph supports first-class hypergraph composition through `Hyperedge` and `CompositionType`: `Sequential`, `Parallel`, `Conditional`, `Optional`, and `Fallback`.
 
