@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "id": "instant-greeting",
+      "input": "Hello",
+      "expected_complexity": "instant",
+      "expected_roles": ["DA"]
+    },
+    {
+      "id": "emergency-fix",
+      "input": "Fix the production crash",
+      "expected_complexity": "emergency",
+      "expected_roles": ["DA", "CA", "AA"]
+    },
+    {
+      "id": "recursive-build",
+      "input": "Build a small service",
+      "expected_complexity": "recursive",
+      "expected_roles": ["PA", "DA", "CA", "AA"]
+    }
+  ]
+}

@@ -27,5 +27,7 @@ jobs:
       run: cargo build --workspace --verbose
     - name: Run isolation contract golden suite
       run: cargo test --workspace isolation_contract --verbose
+    - name: Run functional golden evaluation suite
+      run: ./scripts/test_golden.sh
     - name: Run tests
       run: cargo test --workspace --verbose

@@ -1766,6 +1766,104 @@ mod ontology_crud_tests {
     }
 
     #[tokio::test]
+    async fn golden_action_dry_run_and_guardrail_contract() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../evals/golden/action-invocation.json"))
+                .expect("golden action fixture must be valid JSON");
+        let dry_run = &fixture["dry_run"];
+        let tmp = std::env::temp_dir().join(format!("agentos_golden_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+
+        let state = make_state(&tmp);
+        let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        kg.update_for_claims(
+            &claims,
+            &ClaimsGraphUpdate::insert_data(format!(
+                "<{}> a <{}> . <{}> a <{}> .",
+                ev_instance_iri("Vehicle", "LVIN123"),
+                ev_term_iri("Vehicle"),
+                ev_instance_iri("FaultCode", "P0A80"),
+                ev_term_iri("FaultCode"),
+            )),
+        )
+        .unwrap();
+
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/actions/:id/invoke",
+                post(invoke_action_handler),
+            )
+            .with_state(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/ontology/actions/{}/invoke",
+                        dry_run["action_id"].as_str().unwrap()
+                    ))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::from(dry_run["request"].to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], dry_run["expected"]["status"]);
+        assert_eq!(body["action"], dry_run["action_id"]);
+        for expected in dry_run["expected"]["sparql_contains"].as_array().unwrap() {
+            assert!(
+                body["sparql"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|statement| statement
+                        .as_str()
+                        .unwrap()
+                        .contains(expected.as_str().unwrap())),
+                "dry run SPARQL is missing {expected}"
+            );
+        }
+        for field in dry_run["expected"]["result_fields"].as_array().unwrap() {
+            assert!(
+                body["result"].get(field.as_str().unwrap()).is_some(),
+                "dry run result is missing {field}"
+            );
+        }
+        assert!(
+            kg.query_sparql_for_claims(
+                &claims,
+                &format!(
+                    "SELECT ?o WHERE {{ ?o a <{}> }}",
+                    ev_term_iri("RepairOrder")
+                ),
+            )
+            .unwrap()
+            .is_empty(),
+            "dry run must not commit a repair order"
+        );
+        assert!(
+            serde_json::from_value::<ActionInvokeRequest>(fixture["guardrail"]["request"].clone())
+                .is_err(),
+            "callers must not override server-owned guardrails"
+        );
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
     async fn isolation_contract_ontology_actions_are_invisible_cross_tenant() {
         let tmp = std::env::temp_dir().join(format!("agentos_ontinvoke_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
