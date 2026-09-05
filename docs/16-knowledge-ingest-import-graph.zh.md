@@ -410,3 +410,41 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/search" \
 ## 13. 与工具链的关系
 
 Agent 侧另有工具 `knowledge_import_json` / `knowledge_query` / `knowledge_import_file` 等（见 `05-tool-system.md`、`07-knowledge-graph.md`）。本手册聚焦 **HTTP 二次开发**：运营后台、批处理脚本、外部系统对接应优先走 `/api/v1/kb/*` 与 `/api/v1/kg/*`，与工具语义对齐但路径、字段以上文 handler 为准。
+
+---
+
+## 14. 从 CSV / JSON Schema 生成本体类型草稿
+
+`POST /api/v1/ontology/type-drafts/from-csv` 与
+`POST /api/v1/ontology/type-drafts/from-json-schema` 提供轻量的「输入 schema
+→ 待人审本体元数据」桥接。两个接口均要求已验证 JWT 产生的
+`IsolationClaims`；草稿仅存放在调用方 claims 作用域的 draft 图，绝不直接写入
+生产本体元数据。
+
+CSV 只读取表头，生成一个 `ObjectType`，所有属性初始均为 `string`。JSON
+Schema 将根 `properties` 映射为属性（string、integer、number、boolean、
+date-time、字符串 enum）。关系只能由请求中的可选 `links` 显式给出，服务端
+不会猜测关系；两个适配器都不会生成 `ActionType`。
+
+```json
+POST /api/v1/ontology/type-drafts/from-csv
+{
+  "csv": "asset_id,display_name,active\nA-1,Inverter,true\n",
+  "object_id": "imported asset",
+  "label": "Imported Asset"
+}
+```
+
+响应含 `draft_id` 与 `preview`。人工审阅后，必须再显式提升：
+
+```json
+POST /api/v1/ontology/type-drafts/<draft_id>/promote
+{ "confirm": true }
+```
+
+提升操作同样要求已验证 claims。`confirm: false`、跨作用域草稿、指向未知对象的
+链接、以及与生产已有 ID 冲突的对象/链接都会被拒绝；提升绝不会自动覆盖已有
+`ObjectType` 或 `LinkType`。成功后可从 `GET /api/v1/ontology/types` 读取。
+
+这只是半自动草稿助手，并非完整的 Palantir 式本体流水线：不做自动语义推断、不
+自动生成 Action，也不替换 Oxigraph。

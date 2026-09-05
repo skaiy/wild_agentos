@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::isolation::IsolationClaims;
 
+use super::ontology_draft::TypeDraftBundle;
 use super::rdf_mapper::RdfMapper;
 use super::types::RdfQuad;
 
@@ -39,6 +40,19 @@ pub struct PendingActionApproval {
 
 const APPROVAL_BASE_IRI: &str = "https://agentos.ontology/action-approval/";
 const APPROVAL_VOCAB_IRI: &str = "https://agentos.ontology/action-approval/";
+const TYPE_DRAFT_BASE_IRI: &str = "https://agentos.ontology/type-draft/";
+const TYPE_DRAFT_VOCAB_IRI: &str = "https://agentos.ontology/type-draft/";
+
+/// A reviewable type proposal, stored only in the caller's claims scope until
+/// an explicit promotion writes it to the production ontology metadata.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PendingTypeDraft {
+    pub draft_id: String,
+    pub source: String,
+    pub bundle: TypeDraftBundle,
+    pub created_at: String,
+    pub expires_at: String,
+}
 
 impl ClaimsGraphUpdate {
     pub fn insert_data(triples: impl Into<String>) -> Self {
@@ -417,6 +431,99 @@ impl KnowledgeGraphStore {
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {e}"))?;
         Ok(format!("{production}/action-approvals"))
+    }
+
+    /// Persists a complete type draft in a dedicated, claims-derived graph.
+    /// The draft JSON is never inserted into the production ontology meta graph.
+    pub fn create_type_draft_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        draft: &PendingTypeDraft,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(&draft.draft_id, "type draft identifier")?;
+        let graph = self.type_drafts_graph_iri_for_claims(claims)?;
+        let subject = format!("{TYPE_DRAFT_BASE_IRI}{}", draft.draft_id);
+        let bundle = serde_json::to_string(&draft.bundle)
+            .map_err(|e| format!("type draft serialization failed: {e}"))?;
+        let lit = |value: &str| Self::sparql_literal(value);
+        self.store
+            .update(&format!(
+                "INSERT DATA {{ GRAPH <{graph}> {{ \
+                 <{subject}> <{vocab}draftId> {id} ; \
+                 <{vocab}source> {source} ; \
+                 <{vocab}bundleJson> {bundle} ; \
+                 <{vocab}createdAt> {created_at} ; \
+                 <{vocab}expiresAt> {expires_at} . }} }}",
+                vocab = TYPE_DRAFT_VOCAB_IRI,
+                id = lit(&draft.draft_id),
+                source = lit(&draft.source),
+                bundle = lit(&bundle),
+                created_at = lit(&draft.created_at),
+                expires_at = lit(&draft.expires_at),
+            ))
+            .map_err(|e| format!("claims-scoped type draft create failed: {e}"))
+    }
+
+    pub fn list_type_drafts_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<Vec<PendingTypeDraft>, String> {
+        let graph = self.type_drafts_graph_iri_for_claims(claims)?;
+        let query = format!(
+            "SELECT ?id ?source ?bundle ?created_at ?expires_at WHERE {{ GRAPH <{graph}> {{ \
+             ?draft <{vocab}draftId> ?id ; <{vocab}source> ?source ; \
+             <{vocab}bundleJson> ?bundle ; <{vocab}createdAt> ?created_at ; \
+             <{vocab}expiresAt> ?expires_at . }} }} ORDER BY ?created_at",
+            vocab = TYPE_DRAFT_VOCAB_IRI,
+        );
+        self.query_sparql_in_graph(&query, None)?
+            .into_iter()
+            .map(|row| {
+                let get = |name: &str| {
+                    row.get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("type draft query missing {name}"))
+                };
+                // Query results have RDF literal delimiters removed but retain
+                // their escapes. Decode that literal layer before parsing the
+                // canonical JSON draft snapshot.
+                let stored_bundle = get("?bundle")?;
+                let bundle_json = serde_json::from_str::<String>(&format!("\"{stored_bundle}\""))
+                    .unwrap_or(stored_bundle);
+                let bundle: TypeDraftBundle = serde_json::from_str(&bundle_json)
+                    .map_err(|e| format!("stored type draft is invalid: {e}"))?;
+                Ok(PendingTypeDraft {
+                    draft_id: get("?id")?,
+                    source: get("?source")?,
+                    bundle,
+                    created_at: get("?created_at")?,
+                    expires_at: get("?expires_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn delete_type_draft_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        draft_id: &str,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(draft_id, "type draft identifier")?;
+        let graph = self.type_drafts_graph_iri_for_claims(claims)?;
+        let subject = format!("{TYPE_DRAFT_BASE_IRI}{draft_id}");
+        self.store
+            .update(&format!(
+                "DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> ?p ?o }} }}"
+            ))
+            .map_err(|e| format!("claims-scoped type draft cleanup failed: {e}"))
+    }
+
+    fn type_drafts_graph_iri_for_claims(&self, claims: &IsolationClaims) -> Result<String, String> {
+        let production = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {e}"))?;
+        Ok(format!("{production}/ontology-type-drafts"))
     }
 
     fn validate_opaque_id(value: &str, kind: &str) -> Result<(), String> {

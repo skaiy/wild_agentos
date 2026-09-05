@@ -256,3 +256,43 @@ Agent tools include `knowledge_import_json`, `knowledge_query`, and
 admin consoles, batch scripts, and external integrations should use
 `/api/v1/kb/*` and `/api/v1/kg/*`. Tool semantics align, but the handler paths
 and fields here are authoritative.
+
+## 14. Ontology type drafts from CSV or JSON Schema
+
+`POST /api/v1/ontology/type-drafts/from-csv` and
+`POST /api/v1/ontology/type-drafts/from-json-schema` provide a deliberately
+small, review-first bridge from input schemas to ontology metadata. Both require
+a verified JWT with `IsolationClaims`; drafts are stored only in the caller's
+claims-scoped draft graph, never in production ontology metadata.
+
+CSV uses only its headers and proposes one `ObjectType`; each property starts as
+`string`. JSON Schema maps root `properties` to properties (string, integer,
+number, boolean, date-time, and string enums). Optional `links` are explicit
+request input—relationships are not guessed. Neither adapter creates
+`ActionType`s.
+
+```json
+POST /api/v1/ontology/type-drafts/from-csv
+{
+  "csv": "asset_id,display_name,active\nA-1,Inverter,true\n",
+  "object_id": "imported asset",
+  "label": "Imported Asset"
+}
+```
+
+The response has `draft_id` and `preview`. Inspect and edit the draft through
+the normal type workflow as needed, then promote it explicitly:
+
+```json
+POST /api/v1/ontology/type-drafts/<draft_id>/promote
+{ "confirm": true }
+```
+
+Promotion again requires verified claims. It rejects `confirm: false`, drafts
+outside the caller scope, links to unknown types, and any type ID that already
+exists in production; it never auto-overwrites an `ObjectType` or `LinkType`.
+After success, `GET /api/v1/ontology/types` exposes the promoted types.
+
+This is a semi-automatic draft helper, not a full Palantir-style ontology
+pipeline: there is no automatic semantic inference, no automatic action
+generation, and no replacement for Oxigraph.

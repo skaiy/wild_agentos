@@ -2,6 +2,7 @@ pub mod bridge;
 pub mod code_ast;
 pub mod extractor;
 pub mod ontology;
+pub mod ontology_draft;
 pub mod ontology_layer;
 pub mod ontology_store;
 pub mod rdf_mapper;
