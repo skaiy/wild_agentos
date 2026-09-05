@@ -207,7 +207,11 @@ mod tests {
             .with_state(received.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(axum::serve(listener, app));
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("mock A2A server error: {error}");
+            }
+        });
 
         let client =
             A2aOutboundClient::from_settings(&enabled_settings(format!("http://{address}")))
@@ -253,7 +257,11 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(axum::serve(listener, app));
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("mock A2A server error: {error}");
+            }
+        });
 
         let client =
             A2aOutboundClient::from_settings(&enabled_settings(format!("http://{address}")))
