@@ -1,0 +1,16 @@
+apiVersion: agentos.dev/v1
+kind: Skill
+metadata:
+  iri: skill://fixtures/package-green
+  name: package-green
+  version: 1.0.0
+spec:
+  description: A fixture package that passes the tenant publication gate.
+package:
+  schema: agentos.dev/skill-package/v1
+  side_effect_level: read
+  visibility: tenant
+  entrypoint: SKILL.md
+  golden_input: tests/golden-input.json
+  golden_output: tests/golden-output.json
+  judge_rules: judge.rules

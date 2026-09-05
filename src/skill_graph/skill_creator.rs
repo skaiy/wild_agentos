@@ -144,7 +144,12 @@ impl Default for SkillCreatorConfig {
     fn default() -> Self {
         Self {
             output_dir: PathBuf::from("./skills"),
-            auto_register: true,
+            // LLM-created definitions are drafts. They must go through the
+            // package gate before a tenant graph write; an explicit dev-only
+            // flag is the sole escape hatch for local experiments.
+            auto_register: std::env::var("AGENTOS_DEV_ALLOW_UNGATED_SKILL_REGISTER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             validate_before_register: true,
             default_security_level: "normal".to_string(),
         }

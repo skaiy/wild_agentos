@@ -302,6 +302,35 @@ graph TD
 
 违反检查的操作在提交前被拒绝，并返回具体错误原因。
 
+### Skill 包、门禁与发布
+
+可分发的 Skill 是一个目录，包含 `skill.yaml`、`SKILL.md` 入口文件，以及
+`tests/golden-input.json` 和 `tests/golden-output.json`。`skill.yaml` 的 `package`
+段使用 `schema: agentos.dev/skill-package/v1` 进行版本化，并且必须声明：
+
+```yaml
+package:
+  schema: agentos.dev/skill-package/v1
+  side_effect_level: none # none | read | write | execute
+  visibility: tenant      # system | tenant | session
+  entrypoint: SKILL.md
+  golden_input: tests/golden-input.json
+  golden_output: tests/golden-output.json
+  judge_rules: judge.rules # 可选的确定性 JSON-pointer 规则
+```
+
+Git 导入是租户级发布通道。它会在持久化或注册 Skill 前验证包清单、既有的
+Schema/签名/安全检查、golden 输入输出契约和可选的确定性 Judge 规则。声明
+`system` 的包会被拒绝；系统级 Skill 只能由内核维护。会话级创作保持隔离，不能
+静默升级为租户级。LLM Judge 默认关闭，内核门禁也绝不会执行导入包中的脚本。
+
+CI 中的 `skill-package-gate` job 同时执行一个通过和一个故意失败的 fixture。
+本地运行：
+
+```bash
+cargo test --lib skill_package_gate_ --verbose
+```
+
 ### 超图组合 (Hypergraph)
 
 技能图谱支持第一类超图组合，通过 `Hyperedge` 类型和 `CompositionType` 枚举定义复杂工作流：

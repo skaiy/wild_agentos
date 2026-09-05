@@ -708,6 +708,10 @@ pub(crate) async fn import_git_skill_handler(
         repo_url: Some(req.repo_url.trim().to_string()),
         clone_dir: Some(clone_dir.clone()),
         sub_path: req.path.clone(),
+        require_package: true,
+        // Git imports are the explicit tenant publication channel. The
+        // pipeline refuses system visibility and persists only after all gates.
+        visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
     };
     let registry = state.core.skills.clone();
     let run = run_pipeline(
@@ -765,7 +769,9 @@ pub(crate) struct PipelineRunsQuery {
 
 /// GET /api/v1/skills/pipeline-runs — 查询技能准入流水线运行记录（只读，无需鉴权）。
 /// 记录仅含文件名/命中计数等非敏感信息，可安全对管理台展示。
-pub(crate) async fn list_pipeline_runs_handler(Query(q): Query<PipelineRunsQuery>) -> impl IntoResponse {
+pub(crate) async fn list_pipeline_runs_handler(
+    Query(q): Query<PipelineRunsQuery>,
+) -> impl IntoResponse {
     let mut runs = load_pipeline_runs();
     if let Some(iri) = q.iri.filter(|s| !s.is_empty()) {
         runs.retain(|r| r.skill_iri == iri);
@@ -857,7 +863,6 @@ pub(crate) async fn pipeline_rerun_handler(
     )
         .into_response()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1457,5 +1462,4 @@ version: \"2.0.0\"\n\
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
-
 }
