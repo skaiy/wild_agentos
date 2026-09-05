@@ -263,6 +263,9 @@ pub fn verify(
         dry_run: false,
         phase: "verify",
         named_graphs,
+        vectors: Vec::new(),
+        l0: Vec::new(),
+        blobs: Vec::new(),
     })
 }
 
@@ -844,7 +847,7 @@ fn delete_vector_sources(
         return Ok(());
     }
     let vector_dir = data_root.join("vector_store");
-    let snapshot = load_snapshot(vector_dir.join("index.snapshot"))
+    let snapshot = load_snapshot(&vector_dir.join("index.snapshot"))
         .map_err(|_| MigrationError::VectorSnapshotRequired(vector_dir.display().to_string()))?;
     let engine = HyperspaceEngineImpl::open(
         &vector_dir,
