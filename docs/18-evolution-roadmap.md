@@ -13,7 +13,7 @@ Oxigraph RDF/SPARQL as its semantic-graph foundation, Hyperspace, the
 `IsolationClaims` naming contract, and an ontology Action **data** sandbox.
 
 - It is not a bare-metal microkernel operating system.
-- It is not a full Palantir clone.
+- It is not a comprehensive proprietary-platform recreation.
 - Graph queries continue to use Oxigraph and SPARQL; Nebula/Cypher does not
   replace them.
 - It does not mix separate product/business repositories or product boundaries
@@ -80,13 +80,16 @@ Skills, KB · Ontology, Keys · Models, and Isolation) in its separate
 repository. This roadmap notes that companion change only; it does not change
 that repository's scope or implementation.
 
-### [v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4)
+### v0.2.1 — complete: Ontology Data + Protocols
 
-- Semi-automatic ObjectType / LinkType drafts, with human approval required.
-- MCP inbound tenant catalog.
-- Skill-as-MCP publishing: gated tenant Skills can be explicitly exposed as
-  JWT/claims-authorized MCP tools (default deny; kernel Skills excluded).
-- A thin outbound A2A adapter without a kernel rewrite.
+- ObjectType / LinkType drafts can be generated from CSV or JSON Schema. They
+  are claims-scoped and require authorized approval before promotion.
+- The inbound MCP tool catalog is filtered by verified `IsolationClaims`.
+- Gated tenant Skills can be explicitly exposed as claims-authorized MCP tools
+  (default deny; kernel Skills excluded).
+- A thin outbound A2A adapter is feature-flagged off by default. It is
+  best-effort, does not add an inbound A2A server, and does not rewrite the
+  local task lifecycle. See [Outbound A2A adapter](19-a2a-outbound.md).
 
 Related work: [object-model drafts](https://github.com/skaiy/wild_agentos/issues/90),
 [MCP catalog](https://github.com/skaiy/wild_agentos/issues/91),
@@ -119,7 +122,7 @@ Related work: [marketplace](https://github.com/skaiy/wild_agentos/issues/97),
 ## Explicit non-goals
 
 1. No category-IV “microkernel OS” or bare-metal OS.
-2. No pursuit of a 100% Palantir recreation.
+2. No pursuit of a 100% recreation of any proprietary platform.
 3. No mixing separate product/business repositories or product boundaries into
    this open-source tree.
 4. No replacement of Oxigraph/SPARQL with Nebula/Cypher.

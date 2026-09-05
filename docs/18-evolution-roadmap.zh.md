@@ -11,7 +11,7 @@
 Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，使用 Oxigraph RDF/SPARQL 作为语义图底座，配合 Hyperspace、`IsolationClaims` 命名契约，以及本体 Action 的**数据**沙箱。
 
 - 它不是裸机微内核操作系统。
-- 它不是完整的 Palantir 克隆。
+- 它不追求完整复刻某个专有平台。
 - 图查询继续使用 Oxigraph 与 SPARQL；不以 Nebula/Cypher 替换它。
 - 不混合 其他业务/产品仓库或产品边界。
 - `IsolationClaims` 的 mint 是安全名称契约，**不等于**迁移已有数据。当前历史键状态见 [17. Isolation Contract](17-isolation-contract.zh.md)。
@@ -54,12 +54,16 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 配套 Admin #16 已在独立仓库交付五屏控制平面骨架（Runs、Skills、KB · Ontology、Keys · Models、Isolation）。本路线图仅记录该配套变更，不改变该仓库的范围或实现。
 
-### [v0.2.1 Ontology Data + Protocols](https://github.com/skaiy/wild_agentos/milestone/4)
+### v0.2.1 — 已完成：本体数据 + 协议
 
-- 半自动生成 ObjectType / LinkType 草稿，必须由人审批；
-- MCP 入站 tenant catalog；
-- Skill-as-MCP 发布；
-- 薄型出站 A2A adapter，不重构内核。
+- 可从 CSV 或 JSON Schema 生成 ObjectType / LinkType 草稿；它们按 claims
+  隔离，提升前必须由获授权人员审批；
+- 入站 MCP 工具目录由已验证的 `IsolationClaims` 过滤；
+- 受 gate 的租户 Skill 可显式发布为由 claims 授权的 MCP 工具（默认拒绝；
+  内核 Skill 被排除）；
+- 薄型出站 A2A adapter 由默认关闭的 feature flag 保护；它以尽力而为方式
+  工作，不提供入站 A2A server，也不重写本地任务生命周期。详见[出站 A2A
+  适配器](19-a2a-outbound.md)。
 
 对应工作项：[对象模型草稿](https://github.com/skaiy/wild_agentos/issues/90)、[MCP 目录](https://github.com/skaiy/wild_agentos/issues/91)、[Skill-as-MCP](https://github.com/skaiy/wild_agentos/issues/92)、[A2A adapter](https://github.com/skaiy/wild_agentos/issues/93)。
 
@@ -83,7 +87,7 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 ## 明确非目标
 
 1. 不做第四类“微内核 OS”或裸机 OS。
-2. 不追求 100% 复刻 Palantir。
+2. 不追求 100% 复刻任何专有平台。
 3. 不混入 其他业务/产品仓库或产品边界。
 4. 不用 Nebula/Cypher 取代 Oxigraph/SPARQL。
 5. 不把“已 mint 名称”宣称成“已完成历史数据迁移”。
