@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    blob::BlobStore,
     isolation::IsolationClaims,
     knowledge_graph::{
         store::KnowledgeGraphStore,
@@ -65,10 +66,9 @@ pub struct ArtifactUploadRequest {
     /// Standard base64-encoded artifact bytes. This avoids storing request
     /// credentials in a multipart side channel and is bounded by the route.
     pub content_base64: String,
-    pub content_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ArtifactMetadata {
     pub id: String,
     pub kind: ArtifactKind,
@@ -114,9 +114,7 @@ fn contains_plaintext_secret(bytes: &[u8]) -> bool {
     .any(|needle| text.contains(needle))
 }
 
-fn require_claims(
-    identity: &UserIdentity,
-) -> Result<&IsolationClaims, (StatusCode, Json<Value>)> {
+fn require_claims(identity: &UserIdentity) -> Result<&IsolationClaims, (StatusCode, Json<Value>)> {
     identity.isolation_claims().ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
@@ -248,10 +246,8 @@ pub(crate) async fn upload_artifact_handler(
 
     let id = uuid::Uuid::new_v4().hyphenated().to_string();
     let key = artifact_key(&id, request.kind);
-    let content_type = request
-        .content_type
-        .filter(|value| !value.is_empty() && value.len() <= 128 && !value.contains('\n'))
-        .unwrap_or_else(|| request.kind.content_type().to_string());
+    // Type is derived from the approved artifact kind, not request metadata.
+    let content_type = request.kind.content_type().to_string();
     let sha256 = hex::encode(Sha256::digest(&bytes));
     let metadata = ArtifactMetadata {
         id: id.clone(),
@@ -295,7 +291,11 @@ pub(crate) async fn list_artifacts_handler(
         Err(response) => return response.into_response(),
     };
     match load_metadata(&state, claims, None) {
-        Ok(artifacts) => (StatusCode::OK, Json(json!({ "count": artifacts.len(), "artifacts": artifacts }))).into_response(),
+        Ok(artifacts) => (
+            StatusCode::OK,
+            Json(json!({ "count": artifacts.len(), "artifacts": artifacts })),
+        )
+            .into_response(),
         Err(response) => response.into_response(),
     }
 }
@@ -311,18 +311,34 @@ pub(crate) async fn download_artifact_handler(
         Err(response) => return response.into_response(),
     };
     if uuid::Uuid::parse_str(&id).is_err() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid artifact id" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid artifact id" })),
+        )
+            .into_response();
     }
     let metadata = match load_metadata(&state, claims, Some(&id)) {
         Ok(mut records) => match records.pop() {
             Some(record) => record,
-            None => return (StatusCode::NOT_FOUND, Json(json!({ "error": "artifact not found" }))).into_response(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "artifact not found" })),
+                )
+                    .into_response()
+            }
         },
         Err(response) => return response.into_response(),
     };
     let blob = match &state.blob_store {
         Some(blob) => blob,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "artifact blob store unavailable" }))).into_response(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "artifact blob store unavailable" })),
+            )
+                .into_response()
+        }
     };
     match blob.get(claims, &metadata.blob_key).await {
         Ok(bytes) => (
@@ -331,13 +347,21 @@ pub(crate) async fn download_artifact_handler(
                 (header::CONTENT_TYPE, metadata.content_type),
                 (
                     header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}.{}\"", metadata.id, metadata.kind.extension()),
+                    format!(
+                        "attachment; filename=\"{}.{}\"",
+                        metadata.id,
+                        metadata.kind.extension()
+                    ),
                 ),
             ],
             bytes,
         )
             .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, Json(json!({ "error": "artifact content not found" }))).into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "artifact content not found" })),
+        )
+            .into_response(),
     }
 }
 
@@ -346,7 +370,7 @@ mod tests {
     use super::*;
     use crate::{
         api::http::{api_gov::ApiUsageState, SharedVectorStore},
-        blob::LocalFsBlobStore,
+        blob::{BlobStore, LocalFsBlobStore},
         config::GatewaySettings,
         core::core_types::{CoreConfig, SemanticCore},
         gateway::unified_gateway::UnifiedGateway,
@@ -357,7 +381,9 @@ mod tests {
     fn artifact_kinds_and_secret_guard_are_explicit() {
         assert_eq!(ArtifactKind::Patch.extension(), "patch");
         assert!(contains_plaintext_secret(b"export TOKEN=ghp_aSecretValue"));
-        assert!(!contains_plaintext_secret(b"export TOKEN=\"$TOKEN_FROM_ENV\""));
+        assert!(!contains_plaintext_secret(
+            b"export TOKEN=\"$TOKEN_FROM_ENV\""
+        ));
     }
 
     #[test]
@@ -429,13 +455,23 @@ mod tests {
             created_by: "actor-a".to_string(),
         };
         let blob = state.blob_store.as_ref().unwrap();
-        blob.put(&tenant_a, &metadata.blob_key, b"diff --git\n", "text/x-diff")
-            .await
-            .unwrap();
+        blob.put(
+            &tenant_a,
+            &metadata.blob_key,
+            b"diff --git\n",
+            "text/x-diff",
+        )
+        .await
+        .unwrap();
         save_metadata(&state, &tenant_a, &metadata).unwrap();
 
-        assert_eq!(load_metadata(&state, &tenant_a, Some(&id)).unwrap(), vec![metadata.clone()]);
-        assert!(load_metadata(&state, &tenant_b, Some(&id)).unwrap().is_empty());
+        assert_eq!(
+            load_metadata(&state, &tenant_a, Some(&id)).unwrap(),
+            vec![metadata.clone()]
+        );
+        assert!(load_metadata(&state, &tenant_b, Some(&id))
+            .unwrap()
+            .is_empty());
         assert!(blob.get(&tenant_b, &metadata.blob_key).await.is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
