@@ -29,6 +29,9 @@ jobs:
       run: cargo test --workspace isolation_contract --verbose
     - name: Run functional golden evaluation suite
       run: ./scripts/test_golden.sh
+    # Record-only: shared CI hardware is not a stable performance baseline.
+    - name: Run private deployment micro-benchmark
+      run: ./scripts/bench_private_deploy.sh --micro
     - name: Run tests
       run: cargo test --workspace --verbose
 
