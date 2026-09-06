@@ -17,6 +17,29 @@
 
 当前代码提供了有价值的摄取、图谱、本体、暂存和人工审批原语；它**尚未**提供一条在线全自动流水线，用于从持续变化的语料中提取本体对齐知识、验证知识、消解实体、提升 schema，并物化为受治理的知识仓库。以下设计说明了在不削弱现有安全与治理边界的前提下，需要具备哪些能力才能作出这一表述。
 
+## 双轨：前置本体设计与内核 Graph Engineering
+
+本设计包含两条互补、且有明确交接边界的轨道：
+
+- **轨道 A — 前置本体层设计自动化（Pre-kernel Ontology Design
+  Automation）：** 在具体企业场景接入 agent **之前**开展知识工程。它提升本体层
+  的起草与 promote 自动化程度——`ObjectType` / `LinkType` draft、LinkML、
+  glossary 输入以及 DDL/OpenAPI → draft——以加快业务 onboarding。其产物是可审阅
+  的本体，绝不是自动 promote 到生产的本体。已交付的
+  [#90 type-draft 基线](https://github.com/skaiy/wild_agentos/issues/90) 可从 CSV 和
+  JSON Schema 创建 draft。
+- **轨道 B — 内核 Graph Engineering：** AgentOS runtime 内部的治理图工程：
+  loops watching loops、anchor/frozen state 与 external judgment，治理 runtime 的
+  extract、materialize、skill loop 如何使用已审阅本体。这是
+  [#140](https://github.com/skaiy/wild_agentos/issues/140)、
+  [#144](https://github.com/skaiy/wild_agentos/issues/144)、
+  [#145](https://github.com/skaiy/wild_agentos/issues/145) 与
+  [#147](https://github.com/skaiy/wild_agentos/issues/147) 所代表的内核轨道。
+
+轨道 A 不会绕过轨道 B 的 runtime governance，轨道 B 也不会 promote 轨道 A 的
+产物。只有经过审阅的本体被人显式 promote 后，内核 loop 才能将其作为 promoted
+schema 使用。
+
 ## 当前能力地图
 
 ### 已具备
@@ -202,7 +225,37 @@ staging graph 必须由 claims 派生，并可与 production graph 分开寻址�
 
 ## 分阶段交付桶
 
-### P0 — 受约束提取进入 staging
+### 轨道 A — 前置本体层设计自动化
+
+#### 已交付基线 — schema → type-draft
+
+[#90](https://github.com/skaiy/wild_agentos/issues/90) 已交付基线能力：CSV 和 JSON
+Schema 可生成 claims-scoped type draft，且必须由获授权人员显式 promote。除非明确提供，
+当前 draft 不会自行发明 `LinkType`。
+
+#### 计划中 — 更广输入与关系草稿
+
+- 将多源 schema → type-draft 扩展至 DDL、OpenAPI、Excel glossary 和 LinkML。
+- 基于明确 FK 证据或 co-occurrence 建议 relationship draft，但仅限 draft；任何建议
+  都不得自动创建或 promote 生产 `LinkType`。
+- 在业务场景接入 agent 前输出 domain coverage/readiness report，说明 domain pack 缺少的
+  type 与 relationship。
+- 为 draft↔promoted diff 增加 schema-evolution CI，包括 compatibility 检查。
+
+#### P3 — LLM schema induction，仅生成 draft
+
+- 让 LLM 辅助的 schema induction 将新的 object/link 概念提议为独立、可审阅的 draft，
+  且仅限于 draft。
+- 永不自动 promote ontology draft，也绝不让 schema induction 静默创建 `ActionType`。
+- 只有显式人工 promote 后，新 type 才可进入之后的 constrained extraction domain。
+- 面向管理员的 ontology design studio 是后续界面，不是本轨道的前置条件。
+
+### 轨道 B — 内核 Graph Engineering
+
+本 runtime 轨道运用治理图控制——loops watching loops、anchor/frozen state 与 external
+judgment——来约束使用 promoted ontology 的 extraction、materialization 和 skill loop。
+
+#### P0 — 受约束提取进入 staging
 
 - **已完成的首个切片：** [#138](https://github.com/skaiy/wild_agentos/issues/138)
   的 constrained extraction 及 [#139](https://github.com/skaiy/wild_agentos/issues/139)
@@ -217,7 +270,7 @@ staging graph 必须由 claims 派生，并可与 production graph 分开寻址�
 - fail closed，只能把候选写入 claims-scoped staging graph。
 - 记录 source provenance 与被拒绝/有歧义的 mapping。
 
-### P1 — 质量 gate 与审阅
+#### P1 — 质量 gate 与审阅
 
 - [#140](https://github.com/skaiy/wild_agentos/issues/140)：将 `KgQualityGate`
   作为中速 quality supervisory loop，使用针对 type、predicate、cardinality 和
@@ -225,33 +278,27 @@ staging graph 必须由 claims 派生，并可与 production graph 分开寻址�
 - 可选、以 source 为依据的 Judge/refiner 位于确定性检查后，但绝不可覆盖失败的 anchor。
 - 增加 review queue，用于暂存候选、证据、违规及 approve/reject decision。
 
-### P1.5 — 带 anchor 的 materialize
+#### P1.5 — 带 anchor 的 materialize
 
 - 只有在 quality gate 和 HITL approval 都通过后，才可从 staging 写入 production。
 - 对已写入的 claims-scoped graph 进行 SPARQL re-read，并在 audit trail 中记录这项独立的
   post-write verification。
 
-### P2 — 带 external judgment 的实体消解
+#### P2 — 带 external judgment 的实体消解
 
 - [#141](https://github.com/skaiy/wild_agentos/issues/141)：增加保守的 entity resolution
   与 deduplication，并提供保留 provenance、可审阅的 merge suggestion；merge 由人工提供
   external judgment。
 - 增加显式配置的 blob-watch/reindex job，并具备 idempotent cursor、retry、observability 和 backpressure。
 
-### P2b — 冻结提取评测与 measurement-decay 审计
+#### P2b — 冻结提取评测与 measurement-decay 审计
 
 - 冻结 ontology-extraction golden evaluation 和 Text2KGBench fixture，避免 extractor 或
   optimizer 改写自己的 scorecard。
 - 审计 metric、fixture 和 provenance 是否仍在衡量以 source 为依据的 ontology quality，
   而不是已经衰减的 proxy。
-
-### P3 — schema induction draft 与慢速目标审查
-
-- 将新的 object/link 概念作为独立、可审阅的 draft 提议。
-- 永不自动 promote ontology draft，也绝不让 schema induction 静默创建 `ActionType`。
-- 只有显式人工 promote 后，新 type 才可进入之后的 constrained extraction domain。
-- 运行慢速 ontology-health 与 extraction-goal 审查；它可以停止或重定义提取，但绝不自动
-  promote draft。
+- 运行慢速 ontology-health 与 extraction-goal 审查；它可以停止或重定义 extraction，
+  但绝不自动 promote draft。
 
 ## 非目标
 

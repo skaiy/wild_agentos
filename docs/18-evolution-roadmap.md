@@ -129,14 +129,15 @@ Related work: [marketplace](https://github.com/skaiy/wild_agentos/issues/97),
 [emergent tools](https://github.com/skaiy/wild_agentos/issues/99), and
 [limited OWL/rules](https://github.com/skaiy/wild_agentos/issues/100).
 
-### Proposed — v0.5.0 Ontology KE + Graph Engineering governance
+### Proposed — dual-track ontology and Graph Engineering
 
 [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
-documents a future design for open extraction, canonicalization, quality
-supervisory loops, staging, human promotion, anchored materialization, and
-ontology-health review. This is a proposal, not a released milestone or
-implementation claim; current code does not provide a fully online, automatic
-ontology engineering pipeline.
+defines two complementary proposed tracks: pre-kernel Ontology Design
+Automation creates reviewable ontology drafts before a business scenario is
+wired into agents; kernel Graph Engineering governs the runtime extract,
+materialize, and skill loops that use a promoted ontology. Neither track
+auto-promotes a production ontology. This is a design, not a released
+milestone or an implementation claim.
 
 ## Explicit non-goals
 

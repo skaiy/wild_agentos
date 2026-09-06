@@ -23,6 +23,31 @@ validates it, resolves entities, promotes schema, and materializes a governed
 warehouse. The design below describes what would be required to make that
 statement true without weakening the current security and governance boundary.
 
+## Two tracks: pre-kernel ontology design vs kernel Graph Engineering
+
+This design has two complementary tracks with an intentional hand-off:
+
+- **Track A — Pre-kernel Ontology Design Automation:** knowledge engineering
+  *before* a concrete enterprise scenario is wired into agents. It raises the
+  automation of drafting and promoting the ontology layer—`ObjectType` /
+  `LinkType` drafts, LinkML, glossary inputs, and DDL/OpenAPI-to-draft—so that
+  business onboarding is faster. It produces a reviewable ontology, never an
+  automatically promoted production ontology. The already shipped
+  [#90 type-draft baseline](https://github.com/skaiy/wild_agentos/issues/90)
+  creates drafts from CSV and JSON Schema.
+- **Track B — Kernel Graph Engineering:** governance graph engineering inside
+  the AgentOS runtime: loops watching loops, anchors/frozen state, and
+  external judgment govern how runtime extract, materialize, and skill loops
+  may use the reviewed ontology. This is the kernel track represented by
+  [#140](https://github.com/skaiy/wild_agentos/issues/140),
+  [#144](https://github.com/skaiy/wild_agentos/issues/144),
+  [#145](https://github.com/skaiy/wild_agentos/issues/145), and
+  [#147](https://github.com/skaiy/wild_agentos/issues/147).
+
+Track A does not bypass Track B's runtime governance, and Track B does not
+promote Track A output. A human must explicitly promote a reviewed ontology
+before a kernel loop can use it as a promoted schema.
+
 ## Current capability map
 
 ### Available now
@@ -256,7 +281,45 @@ promote a new type or to bypass the existing approval boundary.
 
 ## Phased delivery buckets
 
-### P0 — constrained extraction into staging
+### Track A — Pre-kernel Ontology Design Automation
+
+#### Baseline shipped — schema → type-draft
+
+[#90](https://github.com/skaiy/wild_agentos/issues/90) already delivers the
+baseline: CSV and JSON Schema generate claims-scoped type drafts, and an
+authorized person must explicitly promote them. Drafts currently do not invent
+`LinkType`s unless they are explicitly supplied.
+
+#### Planned — broader inputs and relationship drafts
+
+- Extend multi-source schema → type-draft to DDL, OpenAPI, Excel glossaries,
+  and LinkML.
+- Suggest relationship drafts from explicit FK evidence or co-occurrence, as
+  drafts only; no suggestion may create or promote a production `LinkType`
+  automatically.
+- Produce a domain coverage/readiness report before a scenario attaches to
+  agents, identifying types and relationships missing from a domain pack.
+- Add schema-evolution CI for draft↔promoted diffs, including compatibility
+  checks.
+
+#### P3 — LLM schema induction, drafts only
+
+- Let LLM-assisted schema induction propose novel object/link concepts as
+  separately reviewable drafts only.
+- Never auto-promote an ontology draft, and never use schema induction to
+  silently create `ActionType`s.
+- Require explicit human promotion before a newly proposed type enters a later
+  constrained extraction domain.
+- An admin-facing ontology design studio is a follow-on surface, not a
+  prerequisite for this track.
+
+### Track B — Kernel Graph Engineering
+
+This runtime track applies governance-graph controls—loops watching loops,
+anchors/frozen state, and external judgment—to extraction, materialization,
+and skill loops that use a promoted ontology.
+
+#### P0 — constrained extraction into staging
 
 - **Done, first slices:** [#138](https://github.com/skaiy/wild_agentos/issues/138)
   constrained extraction and [#139](https://github.com/skaiy/wild_agentos/issues/139)
@@ -273,7 +336,7 @@ promote a new type or to bypass the existing approval boundary.
 - Fail closed and write candidates to a claims-scoped staging graph only.
 - Record source provenance and rejected/ambiguous mappings.
 
-### P1 — quality gate and review
+#### P1 — quality gate and review
 
 - [#140](https://github.com/skaiy/wild_agentos/issues/140): make
   `KgQualityGate` the medium-speed quality supervisory loop, with deterministic
@@ -283,13 +346,13 @@ promote a new type or to bypass the existing approval boundary.
 - Add a review queue for staged candidates, evidence, violations, and
   approve/reject decisions.
 
-### P1.5 — materialize with anchors
+#### P1.5 — materialize with anchors
 
 - Move staging to production only after the quality gate and HITL approval.
 - Re-read the written claims-scoped graph with SPARQL and record that
   independent post-write verification in the audit trail.
 
-### P2 — entity resolution with external judgment
+#### P2 — entity resolution with external judgment
 
 - [#141](https://github.com/skaiy/wild_agentos/issues/141): add conservative
   entity resolution and deduplication with provenance-preserving, reviewable
@@ -297,20 +360,12 @@ promote a new type or to bypass the existing approval boundary.
 - Add explicitly configured blob-watch/reindex jobs with idempotent cursors,
   retries, observability, and backpressure.
 
-### P2b — frozen extraction evaluation and measurement-decay audit
+#### P2b — frozen extraction evaluation and measurement-decay audit
 
 - Freeze ontology-extraction golden evaluations and Text2KGBench fixtures so
   extractors or optimizers cannot rewrite their own scorecard.
 - Audit whether metrics, fixtures, and provenance still measure source-grounded
   ontology quality rather than a decayed proxy.
-
-### P3 — schema induction drafts and slow goal review
-
-- Propose novel object/link concepts as separately reviewable drafts.
-- Never auto-promote an ontology draft, and never use schema induction to
-  silently create `ActionType`s.
-- Require explicit human promotion before a newly proposed type enters a later
-  constrained extraction domain.
 - Run the slow ontology-health and extraction-goal review; it may stop or
   redefine extraction, but never auto-promotes a draft.
 
