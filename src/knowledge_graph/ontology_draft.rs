@@ -275,7 +275,7 @@ pub fn from_sql_ddl(ddl: &str, links: Vec<DraftLinkInput>) -> Result<TypeDraftBu
             icon: "Table".into(),
             color: "slate".into(),
             primary_key: key.clone(),
-            title_property: key,
+            title_property: key.clone(),
             kind: ObjectKind::Knowledge,
             properties: table
                 .columns
