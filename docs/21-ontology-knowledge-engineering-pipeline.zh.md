@@ -135,6 +135,43 @@ LlamaIndex PropertyGraph extractor 也可作为 Apache-2.0 ecosystem 中的 patt
 - 分发 CC-BY-NC GLiNER 权重。
 - 将完整 GraphRAG 或 KAG stack vendor 到 Rust binary。
 
+## Graph Engineering 视角（治理图 ≠ 数据图）
+
+Oxigraph RDF 是**数据图**：它存储 claims、实体、关系、provenance 和验证证据。
+Graph Engineering 增加的是不同的**治理图**：让生成、检查、审批、审计和仲裁数据决策的
+各个 loop 的显式拓扑。它不是另一种用于替换的 graph store。
+
+公开的 [Graph Engineering 表述](https://agentfactory.panaversity.org/docs/graph-engineering-crash-course)
+指出，单一优化 loop 会因 Goodhart/指标操纵、目标盲区、loop 冲突和 measurement decay
+而失败；其补救是采用多速度的 supervisory loop，并设置三类 guardrail：anchor、frozen
+node 和 external judgment。workflow 可以排列步骤，却不能天然表达谁可以质疑结果、哪类
+证据独立，以及相互冲突的目标如何解决。
+
+现有 WAO 的 staging、HITL 审批、`ASK`-before-Judge 顺序和 `IsolationClaims` 已经包含
+这个模型的一部分。v0.5.0 应将它们提升为明确的 supervisory loop，而不只视为 workflow
+步骤：
+
+| Guardrail | WAO 映射 |
+|---|---|
+| **Anchors** | `IsolationClaims` 和 OIDC identity；确定性的 SPARQL/SHACL 检查；materialization 后的 SPARQL re-read。绝不只接受 LLM 所报告的“成功”。 |
+| **Frozen nodes** | golden evaluation、Text2KGBench fixture 和已 promote 的 `ObjectType` schema domain 均受保护。extractor 和 optimizer loop 不得修改它们。 |
+| **External judgment** | 人工 promote type 并审批 instance materialization；价值目标也由人工设定和修订。 |
+
+提议的 cadence layer 为：
+
+- **Fast：** 受约束提取至 staging（[#138](https://github.com/skaiy/wild_agentos/issues/138)，已完成）。
+- **Medium：** `KgQualityGate` 加 review queue（[#140](https://github.com/skaiy/wild_agentos/issues/140)）；之后可选择加入 business 或 quality metric。
+- **Slow：** ontology health，以及“是否仍应提取这个？”的目标审查。
+- **Arbitration：** 对 quality 与 coverage 冲突作出显式裁决的路径。
+
+因此，Graph Engineering 不等同于 (1) 决定执行顺序的 **workflow**，也不等同于 (2) 持久化
+RDF 事实的 **knowledge-graph store**。治理图连接有边界的 loop 及其权限；数据图是在受治理
+边界内供这些 loop 读取和写入的证据。
+
+同一 cross-cutting pattern 也在概念上适用于已交付的 Skill golden evaluation 和
+emergent-tool promotion：受保护的证据、独立 gate 和人工 promotion 使 loop 可被治理。
+这些已交付能力保持现有文档所述状态；本提案不将已完成工作重新列为未完成。
+
 ## Wild AgentOS 的目标架构
 
 Oxigraph 和 SPARQL 保持为 RDF/query 基础。`IsolationClaims` 仍是选择 tenant/project 存储目标的唯一权威；claims 缺失或无效时，所有写路径仍必须 fail closed。
@@ -167,7 +204,10 @@ staging graph 必须由 claims 派生，并可与 production graph 分开寻址�
 
 ### P0 — 受约束提取进入 staging
 
-- **已实现的首个切片：** `POST /api/v1/ontology/constrained-extractions`
+- **已完成的首个切片：** [#138](https://github.com/skaiy/wild_agentos/issues/138)
+  的 constrained extraction 及 [#139](https://github.com/skaiy/wild_agentos/issues/139)
+  的 Morph-KGC structured-source materialization，已建立流水线的有边界输入。
+  `POST /api/v1/ontology/constrained-extractions`
   接收带 provenance 的上游候选，针对已 promote 的
   `ObjectType`/`LinkType` 做确定性 canonicalize，并且只将接受的
   triple 及每项 mapping decision 写入 claims mint 的 staging 图；绝不
@@ -179,20 +219,39 @@ staging graph 必须由 claims 派生，并可与 production graph 分开寻址�
 
 ### P1 — 质量 gate 与审阅
 
-- 为 type、predicate、cardinality、provenance policy 增加确定性 `ASK` assertion。
-- 在确定性检查后增加可选、以 source 为依据的 Judge/refiner。
+- [#140](https://github.com/skaiy/wild_agentos/issues/140)：将 `KgQualityGate`
+  作为中速 quality supervisory loop，使用针对 type、predicate、cardinality 和
+  provenance policy 的确定性 `ASK`/SHACL anchor。
+- 可选、以 source 为依据的 Judge/refiner 位于确定性检查后，但绝不可覆盖失败的 anchor。
 - 增加 review queue，用于暂存候选、证据、违规及 approve/reject decision。
 
-### P2 — 连续 job 与消解
+### P1.5 — 带 anchor 的 materialize
 
+- 只有在 quality gate 和 HITL approval 都通过后，才可从 staging 写入 production。
+- 对已写入的 claims-scoped graph 进行 SPARQL re-read，并在 audit trail 中记录这项独立的
+  post-write verification。
+
+### P2 — 带 external judgment 的实体消解
+
+- [#141](https://github.com/skaiy/wild_agentos/issues/141)：增加保守的 entity resolution
+  与 deduplication，并提供保留 provenance、可审阅的 merge suggestion；merge 由人工提供
+  external judgment。
 - 增加显式配置的 blob-watch/reindex job，并具备 idempotent cursor、retry、observability 和 backpressure。
-- 增加 entity resolution 与 deduplication，包括可审阅的 merge suggestion 和保留 provenance 的 materialization。
 
-### P3 — 受限 schema induction，仅生成 draft
+### P2b — 冻结提取评测与 measurement-decay 审计
+
+- 冻结 ontology-extraction golden evaluation 和 Text2KGBench fixture，避免 extractor 或
+  optimizer 改写自己的 scorecard。
+- 审计 metric、fixture 和 provenance 是否仍在衡量以 source 为依据的 ontology quality，
+  而不是已经衰减的 proxy。
+
+### P3 — schema induction draft 与慢速目标审查
 
 - 将新的 object/link 概念作为独立、可审阅的 draft 提议。
 - 永不自动 promote ontology draft，也绝不让 schema induction 静默创建 `ActionType`。
 - 只有显式人工 promote 后，新 type 才可进入之后的 constrained extraction domain。
+- 运行慢速 ontology-health 与 extraction-goal 审查；它可以停止或重定义提取，但绝不自动
+  promote draft。
 
 ## 非目标
 
@@ -216,3 +275,11 @@ staging graph 必须由 claims 派生，并可与 production graph 分开寻址�
 6. schema induction 仅生成 draft。新的 `ObjectType`、`LinkType`、`ActionType` 均需对应的显式人工治理；任何 extraction run 都不能静默改变 production ontology。
 7. 已批准候选可复现地物化到 claims-scoped graph（及可选 vector index），并有 audit record 串联 source、canonicalization、check、reviewer decision 和 result。
 8. schema-evolution CI 保护 backwards compatibility 和 isolation contract，包括 minting 与 historical-data migration 的区别。
+9. 有证据证明 multi-loop supervision：快速提取、中速质量/审阅、慢速目标/ontology-health
+   审查，以及 quality-versus-coverage arbitration 都具备明确权限和 audit record。
+10. 通过 identity、确定性 SPARQL/SHACL 检查和 materialization 后 graph re-read 独立验证
+    anchor；仅有 LLM success report 绝不可满足 gate。
+11. frozen golden evaluation、Text2KGBench fixture 和已 promote schema domain 不能被正在评估
+    的 extractor 或 optimizer 修改。
+12. type promotion 和 instance materialization 必须有人类提供 external judgment，价值目标的
+    权威也保留给人类。

@@ -91,11 +91,12 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 对应工作项：[市场](https://github.com/skaiy/wild_agentos/issues/97)、[OIDC/IdP](https://github.com/skaiy/wild_agentos/issues/98)、[emergent tools](https://github.com/skaiy/wild_agentos/issues/99)、[有限 OWL/rules](https://github.com/skaiy/wild_agentos/issues/100)。
 
-### 提议 — 本体知识工程流水线（仅设计）
+### 提议 — v0.5.0 本体 KE + Graph Engineering 治理
 
 [本体知识工程流水线](21-ontology-knowledge-engineering-pipeline.zh.md)记录开放提取、
-canonicalization、质量 gate、staging、人工 promote 和实例 materialization 的受治理未来设计。
-这不是已发布里程碑，也不代表已实现：当前代码不提供完整在线、自动化的本体工程流水线。
+canonicalization、质量 supervisory loop、staging、人工 promote、带 anchor 的 materialization
+和 ontology-health 审查的未来设计。这是提案，不是已发布里程碑，也不代表已实现：当前代码
+不提供完整在线、自动化的本体工程流水线。
 
 ## 明确非目标
 

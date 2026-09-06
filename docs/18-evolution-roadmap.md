@@ -129,13 +129,14 @@ Related work: [marketplace](https://github.com/skaiy/wild_agentos/issues/97),
 [emergent tools](https://github.com/skaiy/wild_agentos/issues/99), and
 [limited OWL/rules](https://github.com/skaiy/wild_agentos/issues/100).
 
-### Proposed — Ontology Knowledge Engineering Pipeline (design only)
+### Proposed — v0.5.0 Ontology KE + Graph Engineering governance
 
 [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
-documents a governed future design for open extraction, canonicalization,
-quality gates, staging, human promotion, and instance materialization. It is
-not a released milestone or an implementation claim: current code does not
-provide a fully online, automatic ontology engineering pipeline.
+documents a future design for open extraction, canonicalization, quality
+supervisory loops, staging, human promotion, anchored materialization, and
+ontology-health review. This is a proposal, not a released milestone or
+implementation claim; current code does not provide a fully online, automatic
+ontology engineering pipeline.
 
 ## Explicit non-goals
 
