@@ -796,6 +796,33 @@ pub(crate) struct SqlDdlTypeDraftRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PromoteTypeDraftRequest {
     pub confirm: bool,
+    #[serde(default)]
+    pub force_breaking: bool,
+    #[serde(default)]
+    pub audit: Option<BreakingPromotionAuditInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BreakingPromotionAuditInput {
+    /// Human explanation for accepting an incompatible production schema change.
+    pub reason: String,
+    /// Stable external review/change identifier for later investigation.
+    pub ticket: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TypePromotionAudit<'a> {
+    audit_id: String,
+    timestamp: String,
+    draft_id: &'a str,
+    actor_id: &'a str,
+    tenant_id: &'a str,
+    project_id: &'a str,
+    force_breaking: bool,
+    reason: Option<&'a str>,
+    ticket: Option<&'a str>,
+    compatibility_changes: &'a [ontology_draft::CompatibilityChange],
 }
 
 /// Creates a claims-scoped draft only. It never writes to the production
@@ -996,7 +1023,8 @@ pub(crate) async fn list_type_drafts_handler(
 }
 
 /// POST /api/v1/ontology/type-drafts/:draft_id/promote — the only draft path
-/// that writes production metadata. Existing IDs are rejected, never replaced.
+/// that writes production metadata. Existing IDs are compatibility-gated before
+/// being replaced, so production schemas cannot be silently broken.
 pub(crate) async fn promote_type_draft_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
@@ -1080,26 +1108,33 @@ pub(crate) async fn promote_type_draft_handler(
         )
             .into_response();
     }
-    if let Some(id) = draft
-        .bundle
-        .object_types
+    let compatibility_changes = ontology_draft::compatibility_changes(&current, &draft.bundle);
+    let breaking_changes = compatibility_changes
         .iter()
-        .map(|item| item.id.as_str())
-        .find(|id| existing_objects.contains(id))
-        .or_else(|| {
-            draft
-                .bundle
-                .link_types
-                .iter()
-                .map(|item| item.id.as_str())
-                .find(|id| existing_links.contains(id))
-        })
-    {
+        .filter(|change| change.breaking)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !breaking_changes.is_empty() && !request.force_breaking {
         return (
             StatusCode::CONFLICT,
-            Json(
-                json!({"error": "promotion would overwrite an existing production type", "id": id}),
-            ),
+            Json(json!({
+                "error": "promotion contains breaking ontology changes; retry only with force_breaking: true and audit.reason/audit.ticket",
+                "compatibility_changes": compatibility_changes,
+            })),
+        )
+            .into_response();
+    }
+    let audit_input = request.audit.as_ref();
+    if !breaking_changes.is_empty()
+        && audit_input
+            .is_none_or(|audit| audit.reason.trim().is_empty() || audit.ticket.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "breaking promotion requires non-empty audit.reason and audit.ticket",
+                "compatibility_changes": compatibility_changes,
+            })),
         )
             .into_response();
     }
@@ -1131,6 +1166,35 @@ pub(crate) async fn promote_type_draft_handler(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
         }
     }
+    let audit = TypePromotionAudit {
+        audit_id: uuid::Uuid::new_v4().simple().to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        draft_id: &draft.draft_id,
+        actor_id: claims.actor_id(),
+        tenant_id: claims.tenant_id(),
+        project_id: claims.project_id(),
+        force_breaking: request.force_breaking,
+        reason: audit_input.map(|input| input.reason.trim()),
+        ticket: audit_input.map(|input| input.ticket.trim()),
+        compatibility_changes: &compatibility_changes,
+    };
+    let audit_value = match serde_json::to_value(&audit) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("could not serialize promotion audit: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    if let Err(error) = store.record_type_promotion_audit(&audit.audit_id, &audit_value) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
     if let Err(error) = kg.delete_type_draft_for_claims(claims, &draft.draft_id) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1142,6 +1206,8 @@ pub(crate) async fn promote_type_draft_handler(
     (StatusCode::OK, Json(json!({"status": "promoted", "draft_id": draft.draft_id,
         "object_type_ids": draft.bundle.object_types.iter().map(|item| &item.id).collect::<Vec<_>>(),
         "link_type_ids": draft.bundle.link_types.iter().map(|item| &item.id).collect::<Vec<_>>(),
+        "compatibility_changes": compatibility_changes,
+        "audit": audit,
     }))).into_response()
 }
 
@@ -2777,6 +2843,93 @@ mod ontology_crud_tests {
             .unwrap()
             .iter()
             .any(|object| object["id"] == "ImportedAsset"));
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn breaking_type_draft_promotion_requires_force_and_audit_fields() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_breaking_type_draft_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/type-drafts/from-csv",
+                post(create_csv_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        // The promoted Brand type has country and logo_url. This draft omits
+        // them, exercising the production compatibility gate.
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-csv")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(
+                json!({"csv": "name\nAcme\n", "object_id": "Brand"}).to_string(),
+            ))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let reject = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        let rejected = app.clone().oneshot(reject).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = serde_json::from_slice(
+            &axum::body::to_bytes(rejected.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(rejected["compatibility_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["kind"] == "property_removed"));
+
+        let force = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(
+                r#"{"confirm":true,"force_breaking":true,"audit":{"reason":"source schema retirement","ticket":"ENG-152"}}"#,
+            ))
+            .unwrap();
+        let promoted = app.clone().oneshot(force).await.unwrap();
+        assert_eq!(promoted.status(), StatusCode::OK);
+        let promoted: Value = serde_json::from_slice(
+            &axum::body::to_bytes(promoted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(promoted["audit"]["actor_id"], "ontology-tester");
+        assert_eq!(promoted["audit"]["ticket"], "ENG-152");
+        assert_eq!(promoted["audit"]["force_breaking"], true);
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);

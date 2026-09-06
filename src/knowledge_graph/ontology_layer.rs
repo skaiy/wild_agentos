@@ -18,7 +18,7 @@ pub fn ev(s: &str) -> String {
 }
 
 /// 属性数据类型。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PropertyType {
     String,
@@ -111,7 +111,7 @@ pub fn object_kind_of(id: &str) -> ObjectKind {
 }
 
 /// 链接基数。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cardinality {
     OneToOne,

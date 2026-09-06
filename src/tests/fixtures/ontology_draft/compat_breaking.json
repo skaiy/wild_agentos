@@ -1,0 +1,28 @@
+{
+  "object_types": [
+    {
+      "id": "Device",
+      "iri": "https://agentos.ontology/ev/Device",
+      "label": "Device",
+      "description": "A device whose identifier was renamed.",
+      "icon": "Box",
+      "color": "slate",
+      "primary_key": "device_id",
+      "title_property": "device_id",
+      "properties": [
+        {"name": "device_id", "label": "Device ID", "prop_type": "string", "required": true}
+      ]
+    }
+  ],
+  "link_types": [
+    {
+      "id": "installedAt",
+      "iri": "https://agentos.ontology/ev/installedAt",
+      "label": "Installed at",
+      "description": "Changed target and cardinality.",
+      "source": "Device",
+      "target": "Region",
+      "cardinality": "many_to_many"
+    }
+  ]
+}
