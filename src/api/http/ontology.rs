@@ -3003,6 +3003,7 @@ mod ontology_crud_tests {
         let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
         let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
         let token = test_jwt("tenant-a");
+        let mut audits = state.core.events.subscribe();
         let app = Router::new()
             .route(
                 "/api/v1/ontology/constrained-extractions/:id/quality-gate",
@@ -3127,6 +3128,12 @@ mod ontology_crud_tests {
         assert_eq!(body["status"], "materialized");
         assert_eq!(body["anchor"]["passed"], true);
         assert!(body["anchor"]["staging_triple_count"].as_u64().is_some());
+        let audit = audits.recv().await.unwrap();
+        assert_eq!(audit.event_type, ACTION_AUDIT_EVENT);
+        let audit: Value = serde_json::from_str(&audit.payload).unwrap();
+        assert_eq!(audit["extraction_id"], "approved");
+        assert_eq!(audit["decision"], "materialized");
+        assert_eq!(audit["anchor"]["passed"], true);
         assert!(
             !kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { <urn:approved> ?p ?o }")
                 .unwrap()
