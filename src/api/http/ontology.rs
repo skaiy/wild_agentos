@@ -591,10 +591,18 @@ fn quality_gate_reports_for_extraction(
                 .filter_map(|row| {
                     row.get("?report")
                         .and_then(|value| value.as_str())
-                        .and_then(|json| serde_json::from_str::<QualityGateReport>(json).ok())
+                        .and_then(decode_sparql_literal)
+                        .and_then(|json| serde_json::from_str::<QualityGateReport>(&json).ok())
                 })
                 .collect()
         })
+}
+
+/// Oxigraph's display form keeps RDF literal escapes after the outer quotes
+/// are removed by the generic query serializer. Decode that literal before
+/// parsing the report JSON so persisted gate evidence can govern a later call.
+fn decode_sparql_literal(value: &str) -> Option<String> {
+    serde_json::from_str::<String>(&format!("\"{value}\"")).ok()
 }
 
 /// POST /api/v1/ontology/constrained-extractions/:id/materialize
@@ -3090,6 +3098,13 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(passed_gate.status(), StatusCode::OK);
+        assert_eq!(
+            quality_gate_reports_for_extraction(&kg, &claims, "approved")
+                .unwrap()
+                .len(),
+            1,
+            "a passed gate report must be available to materialization"
+        );
         let materialized = app
             .oneshot(post(
                 "/api/v1/ontology/constrained-extractions/approved/materialize".into(),
@@ -3098,13 +3113,17 @@ mod ontology_crud_tests {
             ))
             .await
             .unwrap();
-        assert_eq!(materialized.status(), StatusCode::OK);
-        let body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(materialized.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let materialized_status = materialized.status();
+        let materialized_body = axum::body::to_bytes(materialized.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            materialized_status,
+            StatusCode::OK,
+            "materialization response: {}",
+            String::from_utf8_lossy(&materialized_body)
+        );
+        let body: Value = serde_json::from_slice(&materialized_body).unwrap();
         assert_eq!(body["status"], "materialized");
         assert_eq!(body["anchor"]["passed"], true);
         assert!(body["anchor"]["staging_triple_count"].as_u64().is_some());
