@@ -340,6 +340,27 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
 - 运行慢速 ontology-health 与 extraction-goal 审查；它可以停止或重定义 extraction，
   但绝不自动 promote draft。
 
+#### 已实现的慢速 loop 证据 — ontology health report
+
+`GET /api/v1/ontology/health` 为该慢速 loop 提供 claims-scoped、只读的证据输入，报告：
+
+- 已持久化 review/gate 的 staging extraction 的 canonicalization reject rate；
+- 按 deterministic anchor 汇总的 quality-gate 失败（存在时也包含 pySHACL/Judge 结果）；
+- 每个已 promote `ObjectType` 的 instance count 与 sparse 标记；以及
+- stale 和 expired 的 type draft，且不会在读取时清理它们。
+
+接口可选接受 `sparse_type_threshold`（默认 `1`）和
+`stale_draft_hours`（默认 `24`）查询参数。证据范围仅限有已持久化
+review/gate record 的 extraction ID，因为只有这些 claims-scoped record 能被安全枚举；
+它不会列出或检查其他 tenant/project 的图。
+
+建议在发布前、里程碑节点，或 coverage/quality 趋势变化时运行。将输出作为人工
+goal-review 的输入：人可以决定停止、重新设定目标，或调查 extraction。该报告不会写入
+production，不会创建 type draft，也不能 resolve review、materialize instance 或 promote
+schema。若发现需要 schema proposal，必须显式调用已有的
+`/api/v1/ontology/type-drafts/from-*` API 创建 draft，并在人工审阅后使用其独立的
+`confirm: true` promotion endpoint。
+
 ## 非目标
 
 本设计不会：
