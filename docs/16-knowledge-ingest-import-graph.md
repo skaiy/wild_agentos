@@ -344,10 +344,34 @@ POST /api/v1/ontology/type-drafts/<draft_id>/promote
 { "confirm": true }
 ```
 
-Promotion again requires verified claims. It rejects `confirm: false`, drafts
-outside the caller scope, links to unknown types, and any type ID that already
-exists in production; it never auto-overwrites an `ObjectType` or `LinkType`.
-After success, `GET /api/v1/ontology/types` exposes the promoted types.
+Promotion again requires verified claims. Before writing it compares every
+draft type whose ID already exists in production. Adding a property is
+compatible. Removing or renaming a property, restricting a property, changing
+a property type, changing LinkType cardinality, or changing a LinkType endpoint
+is breaking and is rejected by default with a `409` and a machine-readable
+`compatibility_changes` list. Omitted types do not mean deletion: a draft is
+never treated as a whole-ontology replacement.
+
+A reviewed breaking change must be explicit and traceable:
+
+```json
+POST /api/v1/ontology/type-drafts/<draft_id>/promote
+{
+  "confirm": true,
+  "force_breaking": true,
+  "audit": {
+    "reason": "Approved source-schema retirement",
+    "ticket": "ENG-152"
+  }
+}
+```
+
+For a breaking promotion, `force_breaking: true` and non-empty
+`audit.reason`/`audit.ticket` are both mandatory. The service records the
+verified actor, tenant/project, timestamp, compatibility decision, and supplied
+audit fields in an append-only promotion audit record before removing the
+draft. This preserves a replayable trail; production types are never silently
+broken. After success, `GET /api/v1/ontology/types` exposes the promoted types.
 
 This is a semi-automatic draft helper, not a full Palantir-style ontology
 pipeline: there is no automatic semantic inference, no automatic action

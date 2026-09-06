@@ -35,6 +35,158 @@ pub struct DraftLinkInput {
     pub cardinality: Cardinality,
 }
 
+/// A proposed schema change classified against an already-promoted type.
+///
+/// The comparison only considers type IDs present in the draft. A draft is not
+/// a full replacement of the ontology, so an omitted type never means delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompatibilityChange {
+    pub kind: &'static str,
+    pub type_id: String,
+    pub detail: String,
+    pub breaking: bool,
+}
+
+/// Compare a draft bundle with the promoted ontology without changing either.
+///
+/// Additions are compatible. Removals, property type/requiredness restrictions,
+/// property renames, and LinkType cardinality or endpoint changes are breaking.
+pub fn compatibility_changes(
+    promoted: &super::ontology_layer::OntologyDefinition,
+    draft: &TypeDraftBundle,
+) -> Vec<CompatibilityChange> {
+    let mut changes = Vec::new();
+    for proposed in &draft.object_types {
+        let Some(current) = promoted
+            .object_types
+            .iter()
+            .find(|item| item.id == proposed.id)
+        else {
+            continue;
+        };
+        let removed = current
+            .properties
+            .iter()
+            .filter(|property| {
+                !proposed
+                    .properties
+                    .iter()
+                    .any(|next| next.name == property.name)
+            })
+            .collect::<Vec<_>>();
+        let added = proposed
+            .properties
+            .iter()
+            .filter(|property| {
+                !current
+                    .properties
+                    .iter()
+                    .any(|old| old.name == property.name)
+            })
+            .collect::<Vec<_>>();
+        let mut renamed = vec![false; added.len()];
+        for old in &removed {
+            if let Some((index, new)) = added.iter().enumerate().find(|(index, new)| {
+                !renamed[*index]
+                    && old.prop_type == new.prop_type
+                    && old.required == new.required
+                    && old.enum_values == new.enum_values
+            }) {
+                renamed[index] = true;
+                changes.push(CompatibilityChange {
+                    kind: "property_renamed",
+                    type_id: proposed.id.clone(),
+                    detail: format!("property `{}` renamed to `{}`", old.name, new.name),
+                    breaking: true,
+                });
+            } else {
+                changes.push(CompatibilityChange {
+                    kind: "property_removed",
+                    type_id: proposed.id.clone(),
+                    detail: format!("property `{}` removed", old.name),
+                    breaking: true,
+                });
+            }
+        }
+        for (index, new) in added.iter().enumerate() {
+            if !renamed[index] {
+                changes.push(CompatibilityChange {
+                    kind: "property_added",
+                    type_id: proposed.id.clone(),
+                    detail: format!("property `{}` added", new.name),
+                    breaking: false,
+                });
+            }
+        }
+        for old in &current.properties {
+            let Some(new) = proposed
+                .properties
+                .iter()
+                .find(|next| next.name == old.name)
+            else {
+                continue;
+            };
+            if old.prop_type != new.prop_type {
+                changes.push(CompatibilityChange {
+                    kind: "property_type_changed",
+                    type_id: proposed.id.clone(),
+                    detail: format!("property `{}` changed type", old.name),
+                    breaking: true,
+                });
+            }
+            if !old.required && new.required {
+                changes.push(CompatibilityChange {
+                    kind: "property_requiredness_restricted",
+                    type_id: proposed.id.clone(),
+                    detail: format!("property `{}` became required", old.name),
+                    breaking: true,
+                });
+            }
+            if old
+                .enum_values
+                .iter()
+                .any(|value| !new.enum_values.contains(value))
+            {
+                changes.push(CompatibilityChange {
+                    kind: "property_enum_restricted",
+                    type_id: proposed.id.clone(),
+                    detail: format!("property `{}` removed enum values", old.name),
+                    breaking: true,
+                });
+            }
+        }
+    }
+    for proposed in &draft.link_types {
+        let Some(current) = promoted
+            .link_types
+            .iter()
+            .find(|item| item.id == proposed.id)
+        else {
+            continue;
+        };
+        if current.source != proposed.source || current.target != proposed.target {
+            changes.push(CompatibilityChange {
+                kind: "link_endpoints_changed",
+                type_id: proposed.id.clone(),
+                detail: format!(
+                    "link endpoints changed from `{} -> {}` to `{} -> {}`",
+                    current.source, current.target, proposed.source, proposed.target
+                ),
+                breaking: true,
+            });
+        }
+        if current.cardinality != proposed.cardinality {
+            changes.push(CompatibilityChange {
+                kind: "link_cardinality_changed",
+                type_id: proposed.id.clone(),
+                detail: "link cardinality changed".into(),
+                breaking: true,
+            });
+        }
+    }
+    changes
+}
+
 fn default_cardinality() -> Cardinality {
     Cardinality::OneToMany
 }
@@ -647,6 +799,67 @@ fn normalize_type_id(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn compatibility_fixture_baseline() -> super::super::ontology_layer::OntologyDefinition {
+        let draft: TypeDraftBundle = serde_json::from_str(include_str!(
+            "../tests/fixtures/ontology_draft/compat_additive.json"
+        ))
+        .unwrap();
+        let mut device = draft.object_types[0].clone();
+        device.properties.retain(|property| property.name == "id");
+        let mut site = device.clone();
+        site.id = "Site".into();
+        site.iri = ev("Site");
+        let mut region = device.clone();
+        region.id = "Region".into();
+        region.iri = ev("Region");
+        super::super::ontology_layer::OntologyDefinition {
+            domain: "fixture".into(),
+            guardrails: Default::default(),
+            object_types: vec![device, site, region],
+            link_types: vec![LinkType {
+                id: "installedAt".into(),
+                iri: ev("installedAt"),
+                label: "Installed at".into(),
+                description: "Fixture link".into(),
+                source: "Device".into(),
+                target: "Site".into(),
+                cardinality: Cardinality::OneToMany,
+            }],
+            action_types: vec![],
+            functions: vec![],
+        }
+    }
+
+    #[test]
+    fn compatibility_fixture_allows_additive_property() {
+        let draft: TypeDraftBundle = serde_json::from_str(include_str!(
+            "../tests/fixtures/ontology_draft/compat_additive.json"
+        ))
+        .unwrap();
+        let changes = compatibility_changes(&compatibility_fixture_baseline(), &draft);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, "property_added");
+        assert!(!changes[0].breaking);
+    }
+
+    #[test]
+    fn compatibility_fixture_detects_renames_and_link_breakage() {
+        let draft: TypeDraftBundle = serde_json::from_str(include_str!(
+            "../tests/fixtures/ontology_draft/compat_breaking.json"
+        ))
+        .unwrap();
+        let changes = compatibility_changes(&compatibility_fixture_baseline(), &draft);
+        assert!(changes
+            .iter()
+            .any(|change| change.kind == "property_renamed" && change.breaking));
+        assert!(changes
+            .iter()
+            .any(|change| change.kind == "link_endpoints_changed" && change.breaking));
+        assert!(changes
+            .iter()
+            .any(|change| change.kind == "link_cardinality_changed" && change.breaking));
+    }
 
     #[test]
     fn csv_headers_produce_a_safe_object_draft() {

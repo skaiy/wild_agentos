@@ -492,9 +492,31 @@ POST /api/v1/ontology/type-drafts/<draft_id>/promote
 { "confirm": true }
 ```
 
-提升操作同样要求已验证 claims。`confirm: false`、跨作用域草稿、指向未知对象的
-链接、以及与生产已有 ID 冲突的对象/链接都会被拒绝；提升绝不会自动覆盖已有
-`ObjectType` 或 `LinkType`。成功后可从 `GET /api/v1/ontology/types` 读取。
+提升操作同样要求已验证 claims。写入前，服务会比较草稿中与生产环境 ID 相同的每个
+类型。新增属性属于兼容变更；删除或重命名属性、收紧属性约束、改变属性类型、改变
+`LinkType` 基数、或改变 `LinkType` 两端点都是破坏性变更，默认以 `409` 拒绝，并返回
+机器可读的 `compatibility_changes` 列表。草稿中未出现的类型不表示删除：草稿绝不会被
+当作完整本体替换。
+
+已经评审的破坏性变更必须显式确认并留下可追溯信息：
+
+```json
+POST /api/v1/ontology/type-drafts/<draft_id>/promote
+{
+  "confirm": true,
+  "force_breaking": true,
+  "audit": {
+    "reason": "已批准淘汰来源 schema",
+    "ticket": "ENG-152"
+  }
+}
+```
+
+发生破坏性提升时，`force_breaking: true` 以及非空的
+`audit.reason`/`audit.ticket` 缺一不可。服务会在删除草稿前，把经验证的
+actor、tenant/project、时间戳、兼容性判定和提交的审计字段写入只追加的提升审计记录，
+从而可复盘；生产类型绝不会被静默破坏。成功后可从
+`GET /api/v1/ontology/types` 读取。
 
 这只是半自动草稿助手，并非完整的 Palantir 式本体流水线：不做自动语义推断、不
 自动生成 Action，也不替换 Oxigraph。

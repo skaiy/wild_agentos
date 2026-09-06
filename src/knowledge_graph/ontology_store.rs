@@ -21,6 +21,8 @@ use super::ontology_layer::{
 
 /// 本体元定义命名图（与实例图 `graph:pack/ev-repair` 隔离）。
 pub const META_GRAPH: &str = "graph:ontology/meta";
+/// Append-only audit graph for explicit type-draft promotion decisions.
+pub const TYPE_PROMOTION_AUDIT_GRAPH: &str = "graph:ontology/type-promotion-audit";
 /// meta 命名空间前缀。
 pub const META_NS: &str = "https://agentos.ontology/meta/";
 /// RDF/RDFS 常量。
@@ -482,6 +484,37 @@ impl OntologyStore {
         let _ = self.backup_meta_graph();
         let value = serde_json::to_value(link).map_err(|e| e.to_string())?;
         self.write_element(MetaKind::LinkType, &link.id, &link.label, value, domain)
+    }
+
+    /// Persist the server-generated record for every type-draft promotion.
+    ///
+    /// The payload contains verified identity fields and the compatibility
+    /// decision. It is intentionally append-only so forced breaking changes
+    /// remain replayable after the source draft is deleted.
+    pub fn record_type_promotion_audit(
+        &self,
+        audit_id: &str,
+        record: &serde_json::Value,
+    ) -> Result<(), String> {
+        if audit_id.is_empty()
+            || !audit_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("invalid type promotion audit identifier".into());
+        }
+        let subject = format!("{META_NS}type-promotion-audit/{audit_id}");
+        let payload = serde_json::to_string(record)
+            .map_err(|error| format!("could not encode type promotion audit: {error}"))?;
+        let update = format!(
+            "INSERT DATA {{ GRAPH <{TYPE_PROMOTION_AUDIT_GRAPH}> {{ {} }} }}",
+            fmt_lit(&subject, &format!("{META_NS}json"), &payload),
+        );
+        self.store
+            .update(&update)
+            .map_err(|error| format!("type promotion audit write failed: {error}"))?;
+        let _ = self.store.flush();
+        Ok(())
     }
 
     /// 引用完整性：返回引用该 ObjectType 的下游元素描述列表（非空即不可删）。
