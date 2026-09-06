@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ontology_layer::OntologyDefinition,
+    ontology_layer::{ObjectType, OntologyDefinition},
     types::{EdgeDef, LLMExtractionOutput, NodeDef},
 };
 
@@ -59,12 +59,30 @@ pub fn canonicalize(
     let mut decisions = Vec::new();
     let mut node_types = HashMap::new();
     let mut nodes = Vec::new();
+    let mut seen_node_ids = std::collections::HashSet::new();
     for node in &extracted.nodes {
+        if !seen_node_ids.insert(node.id.clone()) {
+            decisions.push(CanonicalizationDecision {
+                kind: "node".into(),
+                candidate: node.id.clone(),
+                status: CanonicalizationStatus::Rejected,
+                canonical_iri: None,
+                candidates: vec![],
+                reason: "duplicate node identifier".into(),
+            });
+            continue;
+        }
         match resolve(&object_index, &node.node_type) {
             Resolution::Accepted(iri) => {
                 node_types.insert(node.id.clone(), iri.clone());
                 let mut canonical = node.clone();
                 canonical.node_type = iri.clone();
+                let object_type = ontology
+                    .object_types
+                    .iter()
+                    .find(|object| object.iri == iri)
+                    .expect("indexed object exists");
+                canonical.properties = canonicalize_properties(node, object_type, &mut decisions);
                 nodes.push(canonical);
                 decisions.push(accepted("object_type", &node.node_type, iri));
             }
@@ -209,6 +227,38 @@ fn rejected_edge(edge: &EdgeDef, reason: &str) -> CanonicalizationDecision {
     }
 }
 
+/// Properties are intentionally restricted to the canonical object's declared
+/// schema. Besides preserving ontology conformance, this prevents an upstream
+/// candidate from injecting an arbitrary IRI into the SPARQL serializer.
+fn canonicalize_properties(
+    node: &NodeDef,
+    object_type: &ObjectType,
+    decisions: &mut Vec<CanonicalizationDecision>,
+) -> HashMap<String, serde_json::Value> {
+    node.properties
+        .iter()
+        .filter_map(|(name, value)| {
+            if object_type
+                .properties
+                .iter()
+                .any(|property| property.name == *name)
+            {
+                Some((name.clone(), value.clone()))
+            } else {
+                decisions.push(CanonicalizationDecision {
+                    kind: "property".into(),
+                    candidate: format!("{}.{}", node.id, name),
+                    status: CanonicalizationStatus::Rejected,
+                    canonical_iri: None,
+                    candidates: vec![],
+                    reason: "property is not declared by the canonical ObjectType".into(),
+                });
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +319,46 @@ mod tests {
         let result = canonicalize(&input, &ev_repair_ontology());
         assert!(result.extraction.nodes.is_empty());
         assert_eq!(result.decisions[0].status, CanonicalizationStatus::Rejected);
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_and_properties_outside_the_canonical_schema() {
+        let mut unsafe_properties = HashMap::new();
+        unsafe_properties.insert("name".into(), serde_json::json!("allowed"));
+        unsafe_properties.insert(
+            "https://attacker.invalid/> ?s ?p ?o {".into(),
+            serde_json::json!("blocked"),
+        );
+        let input = LLMExtractionOutput {
+            nodes: vec![
+                NodeDef {
+                    id: "brand".into(),
+                    node_type: "Brand".into(),
+                    label: "A".into(),
+                    description: None,
+                    properties: unsafe_properties,
+                },
+                NodeDef {
+                    id: "brand".into(),
+                    node_type: "FaultCode".into(),
+                    label: "B".into(),
+                    description: None,
+                    properties: HashMap::new(),
+                },
+            ],
+            edges: vec![],
+        };
+        let result = canonicalize(&input, &ev_repair_ontology());
+        assert_eq!(result.extraction.nodes.len(), 1);
+        assert_eq!(result.extraction.nodes[0].properties.len(), 1);
+        assert!(result
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "duplicate node identifier"));
+        assert!(result
+            .decisions
+            .iter()
+            .any(|decision| decision.kind == "property"
+                && decision.status == CanonicalizationStatus::Rejected));
     }
 }
