@@ -363,6 +363,22 @@ pub(crate) struct JsonSchemaTypeDraftRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct OpenApiTypeDraftRequest {
+    pub document: Value,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SqlDdlTypeDraftRequest {
+    pub ddl: String,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PromoteTypeDraftRequest {
     pub confirm: bool,
 }
@@ -466,6 +482,46 @@ pub(crate) async fn create_json_schema_type_draft_handler(
         }
     };
     create_type_draft(&state, claims, "json_schema", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-openapi — create reviewable types
+/// from OpenAPI 3 component schemas. Links must be explicit annotations/input.
+pub(crate) async fn create_openapi_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<OpenApiTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_openapi(&request.document, request.links) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "openapi", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-sql-ddl — create reviewable types
+/// from a supported CREATE TABLE DDL subset. Links require explicit FK evidence.
+pub(crate) async fn create_sql_ddl_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<SqlDdlTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_sql_ddl(&request.ddl, request.links) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "sql_ddl", bundle).await
 }
 
 fn type_draft_expired(draft: &PendingTypeDraft) -> bool {
@@ -2220,6 +2276,126 @@ mod ontology_crud_tests {
 
         let types = app
             .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["id"] == "ImportedAsset"));
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn openapi_type_draft_is_claims_scoped_and_promoted_only_after_confirmation() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_openapi_type_draft_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route("/api/v1/ontology/types", get(ontology_types_handler))
+            .route(
+                "/api/v1/ontology/type-drafts/from-openapi",
+                post(create_openapi_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        let body = json!({
+            "document": {
+                "openapi": "3.0.3",
+                "info": {"title": "Asset API", "version": "1"},
+                "components": {
+                    "schemas": {
+                        "ImportedAsset": {
+                            "type": "object",
+                            "required": ["asset_id"],
+                            "properties": {
+                                "asset_id": {"type": "string"},
+                                "active": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-openapi")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-openapi")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["source"], "openapi");
+        assert_eq!(created["actions_generated"], false);
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let no_confirm = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":false}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(no_confirm).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let promote = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(promote).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let types = app
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/v1/ontology/types")

@@ -460,18 +460,21 @@ Agent 侧另有工具 `knowledge_import_json` / `knowledge_query` / `knowledge_i
 
 ---
 
-## 14. 从 CSV / JSON Schema 生成本体类型草稿
+## 14. 从 CSV、JSON Schema、OpenAPI 或 SQL DDL 生成本体类型草稿
 
 `POST /api/v1/ontology/type-drafts/from-csv` 与
 `POST /api/v1/ontology/type-drafts/from-json-schema` 提供轻量的「输入 schema
-→ 待人审本体元数据」桥接。两个接口均要求已验证 JWT 产生的
+→ 待人审本体元数据」桥接。新增 `/from-openapi`（OpenAPI 3 component schema）
+和 `/from-sql-ddl`（`CREATE TABLE` 子集）端点，且遵循同一边界。所有接口均要求已验证 JWT 产生的
 `IsolationClaims`；草稿仅存放在调用方 claims 作用域的 draft 图，绝不直接写入
 生产本体元数据。
 
 CSV 只读取表头，生成一个 `ObjectType`，所有属性初始均为 `string`。JSON
 Schema 将根 `properties` 映射为属性（string、integer、number、boolean、
-date-time、字符串 enum）。关系只能由请求中的可选 `links` 显式给出，服务端
-不会猜测关系；两个适配器都不会生成 `ActionType`。
+date-time、字符串 enum）。OpenAPI 读取 object component schema，关系仅能来自
+`x-ontology-links` 标注或请求的可选 `links`。SQL DDL 读取表、列、主键和显式
+`FOREIGN KEY` / `REFERENCES` 子句。适配器不会猜测关系：只有调用方输入、标注或明确
+的外键证据才能形成 `LinkType` 草稿；所有适配器都不会生成 `ActionType`。
 
 ```json
 POST /api/v1/ontology/type-drafts/from-csv
