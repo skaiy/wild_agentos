@@ -22,7 +22,8 @@ pub use discovery::{SkillDiscoveryEngine, SkillMatch, Task5W2H};
 pub use embedding::SkillGraphEmbedder;
 pub use emergent_tools::{
     EmergentToolCandidate, EmergentToolGate, EmergentToolGateScope, EmergentToolGateVerdict,
-    EmergentToolPromotion, EmergentToolRecord, EmergentToolState, EmergentToolStore,
+    EmergentToolPromotion, EmergentToolRecord, EmergentToolRuleReview, EmergentToolState,
+    EmergentToolStore,
 };
 pub use evolution::{
     is_methodology_iri, EvolutionApproval, EvolutionPatch, EvolutionProposal,
