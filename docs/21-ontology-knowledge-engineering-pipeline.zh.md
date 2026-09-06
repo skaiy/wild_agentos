@@ -195,6 +195,8 @@ RDF 事实的 **knowledge-graph store**。治理图连接有边界的 loop 及�
 emergent-tool promotion：受保护的证据、独立 gate 和人工 promotion 使 loop 可被治理。
 这些已交付能力保持现有文档所述状态；本提案不将已完成工作重新列为未完成。
 
+具体的 Skill/Emergent 跨切会在评测前验证包中声明的冻结 golden 夹具 SHA-256 摘要，记录具名的安全/隔离/副作用规则审查，并将晋升审计证据与已审候选项摘要一并保存。优化器可以改进候选项，但不能改写评测它的夹具，也不能自行取得 tenant 级权限。
+
 ## Wild AgentOS 的目标架构
 
 Oxigraph 和 SPARQL 保持为 RDF/query 基础。`IsolationClaims` 仍是选择 tenant/project 存储目标的唯一权威；claims 缺失或无效时，所有写路径仍必须 fail closed。

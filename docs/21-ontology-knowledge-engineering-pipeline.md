@@ -245,6 +245,13 @@ evaluations and emergent-tool promotion: protected evidence, independent gates,
 and human promotion make a loop governable. Those shipped features remain as
 documented; this proposal does not reopen their completed work.
 
+For the concrete Skill/Emergent cross-cut, tenant admission verifies
+package-declared SHA-256 digests for frozen golden fixtures before evaluation,
+records a named safety/isolation/side-effect rule review, and stores promotion
+audit evidence with the reviewed candidate digest. An optimizer may improve a
+candidate but cannot change the fixture that measures it or grant itself tenant
+authority.
+
 ## Target architecture for Wild AgentOS
 
 Oxigraph and SPARQL remain the RDF/query foundation. `IsolationClaims` remain

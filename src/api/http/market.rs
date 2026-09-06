@@ -274,6 +274,11 @@ pub(crate) async fn publish_package_handler(
     for skill in &request.skills {
         let mut ctx = PipelineContext::local(PipelineSource::Market, identity.user_id.clone());
         ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Tenant;
+        ctx.tenant_promotion_review = Some(
+            crate::tools::skill_pipeline::TenantPromotionReview::completed(
+                identity.user_id.clone(),
+            ),
+        );
         let run = run_pipeline(
             &state.core.skills,
             skill,

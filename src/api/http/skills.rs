@@ -14,6 +14,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::tools::skill_pipeline::TenantPromotionReview;
 use crate::tools::skill_registry::SkillMeta;
 
 use super::iam::UserIdentity;
@@ -268,7 +269,9 @@ pub(crate) async fn register_skill_handler(
     }
     // 走技能准入流水线（Lint→Security→Test→Publish）：签名/Schema 等门禁在流水线内统一裁决，
     // 仅当门禁放行时 publish 回调才会真正持久化并注册技能。
-    use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
+    use crate::tools::skill_pipeline::{
+        run_pipeline, PipelineContext, PipelineSource, TenantPromotionReview,
+    };
     let iri = skill.skill_iri.clone();
     let ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
     let registry = state.core.skills.clone();
@@ -728,6 +731,7 @@ pub(crate) async fn import_git_skill_handler(
         // Git imports are the explicit tenant publication channel. The
         // pipeline refuses system visibility and persists only after all gates.
         visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
+        tenant_promotion_review: Some(TenantPromotionReview::completed(identity.user_id.clone())),
     };
     let registry = state.core.skills.clone();
     let run = run_pipeline(
@@ -976,11 +980,19 @@ mod tests {
 
         let registry = crate::tools::skill_registry::SkillRegistry::new();
         let skill = sample_skill();
-        let mut ctx = crate::tools::skill_pipeline::PipelineContext::local(
-            crate::tools::skill_pipeline::PipelineSource::Manual,
-            "tester",
-        );
-        ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Tenant;
+        let mut ctx = crate::tools::skill_pipeline::PipelineContext {
+            source: crate::tools::skill_pipeline::PipelineSource::Git,
+            triggered_by: "tester".into(),
+            repo_url: None,
+            clone_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/skills/package-green"),
+            ),
+            sub_path: ".".into(),
+            require_package: true,
+            visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
+            tenant_promotion_review: Some(TenantPromotionReview::completed("reviewer:tester")),
+        };
         let published = crate::tools::skill_pipeline::run_pipeline(
             &registry,
             &skill,
@@ -991,6 +1003,9 @@ mod tests {
         assert!(is_tenant_published_skill(&skill.skill_iri));
 
         ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Session;
+        ctx.require_package = false;
+        ctx.clone_dir = None;
+        ctx.tenant_promotion_review = None;
         let session_update = crate::tools::skill_pipeline::run_pipeline(
             &registry,
             &skill,
