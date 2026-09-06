@@ -83,24 +83,48 @@ pub(crate) async fn create_entity_resolution_suggestion_handler(
         return unauthorized_isolation_claims().into_response();
     };
     if !valid_iri(&request.source_iri) || request.mention.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "source_iri must be a valid IRI and mention is required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "source_iri must be a valid IRI and mention is required"})),
+        )
+            .into_response();
     }
     let mention = normalized_entity_text(&request.mention);
     if mention.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "mention must contain at least one letter or number"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "mention must contain at least one letter or number"})),
+        )
+            .into_response();
     }
     let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
         Ok(kg) => kg,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
     };
     let source_exists = match kg.query_sparql_for_claims(
-        claims, &format!("SELECT ?p WHERE {{ <{}> ?p ?o }} LIMIT 1", request.source_iri),
+        claims,
+        &format!(
+            "SELECT ?p WHERE {{ <{}> ?p ?o }} LIMIT 1",
+            request.source_iri
+        ),
     ) {
         Ok(rows) => !rows.is_empty(),
-        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
     };
     if !source_exists {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "source entity not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "source entity not found"})),
+        )
+            .into_response();
     }
     let candidates = match kg.query_sparql_for_claims(
         claims,
@@ -109,11 +133,18 @@ pub(crate) async fn create_entity_resolution_suggestion_handler(
         Ok(rows) => rows,
         Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
     };
-    let mut matches: Vec<(String, String)> = candidates.into_iter().filter_map(|row| {
-        let candidate = row.get("?candidate")?.as_str()?.trim_matches(['<', '>']).to_owned();
-        let label = row.get("?label")?.as_str()?.to_owned();
-        (normalized_entity_text(&label) == mention).then_some((candidate, label))
-    }).collect();
+    let mut matches: Vec<(String, String)> = candidates
+        .into_iter()
+        .filter_map(|row| {
+            let candidate = row
+                .get("?candidate")?
+                .as_str()?
+                .trim_matches(['<', '>'])
+                .to_owned();
+            let label = row.get("?label")?.as_str()?.to_owned();
+            (normalized_entity_text(&label) == mention).then_some((candidate, label))
+        })
+        .collect();
     matches.sort();
     let Some((target_iri, target_label)) = matches.into_iter().next() else {
         return (StatusCode::OK, Json(json!({
@@ -129,23 +160,50 @@ pub(crate) async fn create_entity_resolution_suggestion_handler(
         evidence = evidence_iri, ns = ENTITY_RESOLUTION_PROVENANCE_NS,
         mention = sparql_literal(&request.mention), target_label = sparql_literal(&target_label),
     );
-    if let Err(error) = kg.update_staging_for_claims(claims, &approval_id, &ClaimsGraphUpdate::insert_data(triples)) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response();
+    if let Err(error) = kg.update_staging_for_claims(
+        claims,
+        &approval_id,
+        &ClaimsGraphUpdate::insert_data(triples),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
     }
     let approval = PendingActionApproval {
-        approval_id: approval_id.clone(), staging_id: approval_id.clone(),
-        staging_graph: kg.staging_graph_iri_for_claims(claims, &approval_id).expect("generated identifier is valid"),
+        approval_id: approval_id.clone(),
+        staging_id: approval_id.clone(),
+        staging_graph: kg
+            .staging_graph_iri_for_claims(claims, &approval_id)
+            .expect("generated identifier is valid"),
         action_id: "entity-resolution".into(),
-        anchor_query: Some(format!("SELECT ?same WHERE {{ <{}> <{}> <{}> }} LIMIT 1", request.source_iri, OWL_SAME_AS, target_iri)),
+        anchor_query: Some(format!(
+            "SELECT ?same WHERE {{ <{}> <{}> <{}> }} LIMIT 1",
+            request.source_iri, OWL_SAME_AS, target_iri
+        )),
         created_at: chrono::Utc::now().to_rfc3339(),
-        expires_at: (chrono::Utc::now() + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS)).to_rfc3339(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS))
+            .to_rfc3339(),
     };
     if let Err(error) = kg.create_action_approval_for_claims(claims, &approval) {
         let _ = kg.drop_staging_for_claims(claims, &approval_id);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
     }
     let _ = state.kg_store.flush();
-    emit_action_audit(&state, claims, "entity-resolution", &approval_id, "pending", &[]).await;
+    emit_action_audit(
+        &state,
+        claims,
+        "entity-resolution",
+        &approval_id,
+        "pending",
+        &[],
+    )
+    .await;
     (StatusCode::OK, Json(json!({
         "status": "pending_approval", "approval_id": approval_id,
         "source_iri": request.source_iri, "target_iri": target_iri,
@@ -2058,7 +2116,7 @@ fn commit_via_staging(
             staging_id,
             staging_graph: staging,
             action_id: action_id.to_string(),
-        anchor_query: None,
+            anchor_query: None,
             created_at: now.to_rfc3339(),
             expires_at: (now + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS)).to_rfc3339(),
         };
@@ -4210,6 +4268,16 @@ mod ontology_action_tests {
     use crate::isolation::IsolationClaims;
     use crate::knowledge_graph::store::KnowledgeGraphStore;
     use oxigraph::store::Store;
+
+    #[test]
+    fn entity_resolution_matcher_is_exact_after_normalization() {
+        assert_eq!(normalized_entity_text("ACME, Inc."), "acmeinc");
+        assert_eq!(normalized_entity_text("ＡＣＭＥ"), "ａｃｍｅ");
+        assert_ne!(
+            normalized_entity_text("Acme Incorporated"),
+            normalized_entity_text("Acme Inc.")
+        );
+    }
 
     fn test_claims(tenant: &str) -> IsolationClaims {
         IsolationClaims::from_verified(tenant, "repair", "tester").unwrap()
