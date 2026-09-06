@@ -13,4 +13,6 @@ package:
   entrypoint: SKILL.md
   golden_input: tests/golden-input.json
   golden_output: tests/golden-output.json
+  golden_input_sha256: 7a162fa55b877809f8570b83a2b2e9667749212ac8bed8d46f740caa37624f7b
+  golden_output_sha256: 029be8752fb9a767546d118b4e3572e779b75cecf0cd1aee0e98dfbecfb7ae2a
   judge_rules: judge.rules

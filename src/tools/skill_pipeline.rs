@@ -1,11 +1,12 @@
 //! Skill CI/CD Pipeline Engine —— 技能准入流水线引擎。
 //!
-//! 每次技能注册（手动 POST / Git 导入 / 手动重跑）都会真实执行以下四个阶段：
+//! 每次技能注册（手动 POST / Git 导入 / 手动重跑）都会真实执行以下五个阶段：
 //! 1. `Lint`     —— 技能包清单/元数据规范校验 + input/output JSON Schema 可编译性校验。
 //! 2. `Security` —— Ed25519 签名核验 + 命名空间/权限-安全级一致性 + 克隆目录敏感模式扫描。
 //! 3. `Test`     —— Schema 自测（模板 JSON 解析 + 示例夹具校验）+ skill_iri 冲突检测 +
 //!    可选的仓库测试框架检测/执行（受 `AGENTOS_PIPELINE_RUN_REPO_TESTS` 门控）。
-//! 4. `Publish`  —— 仅当前三阶段无 Failed 时，通过回调真正注册并持久化技能。
+//! 4. `Rule review` —— 租户晋升前的人工安全/隔离/副作用审查。
+//! 5. `Publish`  —— 仅当前门禁无 Failed 时，通过回调真正注册并持久化技能。
 //!
 //! 每次运行产出一条 [`PipelineRun`]，由上层持久化到 `data/pipeline_runs.json`，供前端展示。
 //!
@@ -15,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::tools::skill_registry::{SignatureStatus, SkillMeta, SkillRegistry};
 
@@ -143,6 +145,10 @@ pub struct PipelineRun {
     /// performed until every gate has passed.
     #[serde(default = "default_visibility")]
     pub visibility: SkillVisibility,
+    /// Named external judgment required before a tenant-visible Skill can be
+    /// admitted. Session-only authoring does not require this review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_promotion_review: Option<TenantPromotionReview>,
     /// 触发者 user_id。
     pub triggered_by: String,
     /// Git 来源时的仓库地址（脱敏无需，URL 非机密）。
@@ -189,6 +195,47 @@ pub enum SideEffectLevel {
     Execute,
 }
 
+/// Auditable rule-review checklist for a tenant-level Skill promotion.
+///
+/// The package gates supply deterministic evidence; this record captures the
+/// named human judgment that those checks are appropriate for the tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantPromotionReview {
+    pub reviewer: String,
+    pub reviewed_at: String,
+    pub security_reviewed: bool,
+    pub isolation_reviewed: bool,
+    pub side_effect_reviewed: bool,
+}
+
+impl TenantPromotionReview {
+    pub fn completed(reviewer: impl Into<String>) -> Self {
+        Self {
+            reviewer: reviewer.into(),
+            reviewed_at: chrono::Utc::now().to_rfc3339(),
+            security_reviewed: true,
+            isolation_reviewed: true,
+            side_effect_reviewed: true,
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.reviewer.trim().is_empty() {
+            return Err("tenant promotion review requires a named reviewer");
+        }
+        if !self.security_reviewed {
+            return Err("tenant promotion review is missing the security check");
+        }
+        if !self.isolation_reviewed {
+            return Err("tenant promotion review is missing the isolation check");
+        }
+        if !self.side_effect_reviewed {
+            return Err("tenant promotion review is missing the side-effect check");
+        }
+        Ok(())
+    }
+}
+
 /// Parsed package metadata. Packages are directories with a `skill.yaml`,
 /// `SKILL.md` entrypoint, and golden JSON input/output fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +246,8 @@ pub struct SkillPackageManifest {
     pub entrypoint: String,
     pub golden_input: String,
     pub golden_output: String,
+    pub golden_input_sha256: Option<String>,
+    pub golden_output_sha256: Option<String>,
     pub judge_rules: Option<String>,
 }
 
@@ -266,6 +315,8 @@ impl SkillPackageManifest {
             entrypoint,
             golden_input,
             golden_output,
+            golden_input_sha256: values.remove("package.golden_input_sha256"),
+            golden_output_sha256: values.remove("package.golden_output_sha256"),
             judge_rules: values.remove("package.judge_rules"),
         })
     }
@@ -284,6 +335,8 @@ pub struct PipelineContext {
     /// JSON API payloads remain supported for session-scoped authoring.
     pub require_package: bool,
     pub visibility: SkillVisibility,
+    /// Required for tenant publication, and persisted with the pipeline run.
+    pub tenant_promotion_review: Option<TenantPromotionReview>,
 }
 
 impl PipelineContext {
@@ -297,6 +350,7 @@ impl PipelineContext {
             sub_path: ".".into(),
             require_package: false,
             visibility: SkillVisibility::Session,
+            tenant_promotion_review: None,
         }
     }
 
@@ -460,12 +514,47 @@ fn load_package_manifest(ctx: &PipelineContext) -> Result<(PathBuf, SkillPackage
             return Err(format!("package required file is missing: {path}"));
         }
     }
+    for (path, expected, label) in [
+        (
+            &manifest.golden_input,
+            manifest.golden_input_sha256.as_deref(),
+            "golden input",
+        ),
+        (
+            &manifest.golden_output,
+            manifest.golden_output_sha256.as_deref(),
+            "golden output",
+        ),
+    ] {
+        let expected = expected
+            .ok_or_else(|| format!("{label} must declare a SHA-256 digest to remain frozen"))?;
+        verify_frozen_fixture(&dir.join(path), expected, label)?;
+    }
     if let Some(rules) = &manifest.judge_rules {
         if !dir.join(rules).is_file() {
             return Err(format!("package judge rules file is missing: {rules}"));
         }
     }
     Ok((dir, manifest))
+}
+
+/// Verifies a fixture against the immutable digest declared by its package.
+/// This is deliberately checked before parsing or evaluating the fixture, so
+/// an optimizer cannot rewrite its own tenant-admission scorecard.
+fn verify_frozen_fixture(path: &Path, expected: &str, label: &str) -> Result<(), String> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{label} SHA-256 digest must be 64 hexadecimal characters"
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("{label} cannot be read: {error}"))?;
+    let actual = hex::encode(Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "{label} no longer matches its frozen SHA-256 digest; refusing evaluation"
+        ));
+    }
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -755,6 +844,34 @@ fn test_stage(registry: &SkillRegistry, skill: &SkillMeta, ctx: &PipelineContext
     b.finish(summary)
 }
 
+fn tenant_rule_review_stage(ctx: &PipelineContext) -> StageResult {
+    let mut b = StageResult::new("rule_review", "租户晋升规则审查");
+    if ctx.visibility != SkillVisibility::Tenant {
+        b.details.push("⊘ 会话级技能不需要租户晋升审查".to_string());
+        let mut result = b.finish("已跳过（非租户晋升）");
+        result.status = StageStatus::Skipped;
+        return result;
+    }
+
+    match ctx.tenant_promotion_review.as_ref() {
+        Some(review) => match review.validate() {
+            Ok(()) => {
+                b.pass(format!("具名审查者：{}", review.reviewer.trim()));
+                b.pass("安全、隔离与副作用等级检查已完成");
+                b.finish("租户晋升规则审查通过")
+            }
+            Err(error) => {
+                b.fail(error);
+                b.finish("租户晋升规则审查未通过")
+            }
+        },
+        None => {
+            b.fail("tenant publication requires a named external rule review");
+            b.finish("租户晋升规则审查未通过")
+        }
+    }
+}
+
 fn read_json_fixture(path: &Path, label: &str) -> Result<serde_json::Value, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("{label} cannot be read: {e}"))?;
     serde_json::from_str(&raw).map_err(|e| format!("{label} is invalid JSON: {e}"))
@@ -834,7 +951,7 @@ fn run_repo_tests(dir: &Path, framework: &str) -> std::io::Result<bool> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// 阶段 4：Publish —— 通过回调真正注册/持久化
+// 阶段 5：Publish —— 通过回调真正注册/持久化
 // ────────────────────────────────────────────────────────────────────────────
 
 /// 发布回调：接收最终技能，返回 Ok(摘要) 表示注册成功，Err(错误) 表示注册失败。
@@ -844,7 +961,7 @@ pub type PublishFn<'a> = dyn FnOnce(&SkillMeta) -> Result<String, String> + 'a;
 // 编排入口
 // ────────────────────────────────────────────────────────────────────────────
 
-/// 执行完整流水线。前三阶段任一 Failed 则门禁拒绝，跳过发布并将 publish 阶段标记为 Skipped。
+/// Executes all gates. Any failed stage blocks publication.
 pub fn run_pipeline(
     registry: &SkillRegistry,
     skill: &SkillMeta,
@@ -854,10 +971,11 @@ pub fn run_pipeline(
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
 
-    let mut stages = Vec::with_capacity(4);
+    let mut stages = Vec::with_capacity(5);
     stages.push(lint_stage(skill, ctx));
     stages.push(security_stage(registry, skill, ctx));
     stages.push(test_stage(registry, skill, ctx));
+    stages.push(tenant_rule_review_stage(ctx));
 
     let gate_passed = !stages.iter().any(|s| s.status == StageStatus::Failed);
 
@@ -900,6 +1018,7 @@ pub fn run_pipeline(
         version: skill.version.clone(),
         source: ctx.source,
         visibility: ctx.visibility,
+        tenant_promotion_review: ctx.tenant_promotion_review.clone(),
         triggered_by: ctx.triggered_by.clone(),
         repo_url: ctx.repo_url.clone(),
         started_at,
@@ -949,7 +1068,7 @@ mod tests {
         );
         assert!(run.gate_passed, "gate should pass: {:?}", run.stages);
         assert!(run.published);
-        assert_eq!(run.stages.len(), 4);
+        assert_eq!(run.stages.len(), 5);
     }
 
     #[test]
@@ -990,6 +1109,7 @@ mod tests {
             sub_path: ".".into(),
             require_package: true,
             visibility: SkillVisibility::Tenant,
+            tenant_promotion_review: Some(TenantPromotionReview::completed("reviewer:ci")),
         }
     }
 
@@ -1043,5 +1163,38 @@ mod tests {
             }),
             "failure should identify the golden input gate"
         );
+    }
+
+    #[test]
+    fn frozen_fixture_digest_rejects_an_optimizer_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("golden.json");
+        std::fs::write(&fixture, br#"{"result":"expected"}"#).unwrap();
+        let digest = hex::encode(Sha256::digest(br#"{"result":"expected"}"#));
+        verify_frozen_fixture(&fixture, &digest, "golden output").unwrap();
+
+        std::fs::write(&fixture, br#"{"result":"optimizer-written"}"#).unwrap();
+        assert!(verify_frozen_fixture(&fixture, &digest, "golden output").is_err());
+    }
+
+    #[test]
+    fn tenant_publication_requires_a_complete_named_rule_review() {
+        let registry = SkillRegistry::new();
+        let skill = sample_skill();
+        let mut ctx = PipelineContext::local(PipelineSource::Manual, "optimizer");
+        ctx.visibility = SkillVisibility::Tenant;
+        let run = run_pipeline(
+            &registry,
+            &skill,
+            &ctx,
+            Box::new(|_| Ok("published".into())),
+        );
+
+        assert!(!run.gate_passed);
+        assert!(!run.published);
+        assert!(run
+            .stages
+            .iter()
+            .any(|stage| { stage.stage == "rule_review" && stage.status == StageStatus::Failed }));
     }
 }

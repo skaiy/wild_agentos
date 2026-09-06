@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::memory::l0_store::L0Store;
 use crate::CoreError;
@@ -91,6 +92,45 @@ impl EmergentToolGateVerdict {
     }
 }
 
+/// Human rule-review evidence required before a session tool can become
+/// tenant-visible. The completed checklist is persisted with the promotion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmergentToolRuleReview {
+    pub reviewer: String,
+    pub reviewed_at: DateTime<Utc>,
+    pub safety_reviewed: bool,
+    pub isolation_reviewed: bool,
+    pub side_effect_reviewed: bool,
+}
+
+impl EmergentToolRuleReview {
+    pub fn completed(reviewer: impl Into<String>) -> Self {
+        Self {
+            reviewer: reviewer.into(),
+            reviewed_at: Utc::now(),
+            safety_reviewed: true,
+            isolation_reviewed: true,
+            side_effect_reviewed: true,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CoreError> {
+        if self.reviewer.trim().is_empty() {
+            return Err(CoreError::ValidationFailed {
+                message: "Tenant promotion rule review requires a named reviewer".to_string(),
+            });
+        }
+        if !(self.safety_reviewed && self.isolation_reviewed && self.side_effect_reviewed) {
+            return Err(CoreError::ValidationFailed {
+                message:
+                    "Tenant promotion rule review must cover safety, isolation, and side effects"
+                        .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Adapter boundary for an external sandbox/test/judge implementation.
 ///
 /// The kernel does not execute generated code itself. Implementations may
@@ -114,11 +154,17 @@ pub struct EmergentToolCandidate {
 /// Durable audit trail for a human-controlled state transition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmergentToolPromotion {
+    pub audit_id: String,
     pub from: EmergentToolState,
     pub to: EmergentToolState,
     pub approver: String,
+    /// SHA-256 of the reviewed definition, avoiding source duplication in audit
+    /// data while binding the verdict to the candidate that was checked.
+    pub candidate_sha256: String,
     pub gate_scope: EmergentToolGateScope,
     pub gate: EmergentToolGateVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_review: Option<EmergentToolRuleReview>,
     pub promoted_at: DateTime<Utc>,
 }
 
@@ -203,6 +249,7 @@ impl EmergentToolStore {
         tool_id: &str,
         approver: &str,
         gate: &dyn EmergentToolGate,
+        rule_review: Option<EmergentToolRuleReview>,
     ) -> Result<EmergentToolRecord, CoreError> {
         if approver.trim().is_empty() {
             return Err(CoreError::ValidationFailed {
@@ -219,6 +266,14 @@ impl EmergentToolStore {
                 message: "Rejected or published emergent tools cannot be promoted".to_string(),
             })?;
         let gate_scope = EmergentToolGateScope::for_target(target)?;
+        if target == EmergentToolState::TenantCandidate {
+            rule_review
+                .as_ref()
+                .ok_or_else(|| CoreError::ValidationFailed {
+                    message: "Tenant promotion requires an external rule review".to_string(),
+                })?
+                .validate()?;
+        }
         let verdict = gate.evaluate(&record.candidate, gate_scope)?;
         if !verdict.passed {
             return Err(CoreError::ValidationFailed {
@@ -229,11 +284,14 @@ impl EmergentToolStore {
             });
         }
         record.promotions.push(EmergentToolPromotion {
+            audit_id: uuid::Uuid::new_v4().to_string(),
             from: record.state,
             to: target,
             approver: approver.trim().to_string(),
+            candidate_sha256: candidate_digest(&record.candidate)?,
             gate_scope,
             gate: verdict,
+            rule_review,
             promoted_at: Utc::now(),
         });
         record.state = target;
@@ -273,6 +331,13 @@ impl EmergentToolStore {
         self.l0
             .store(&format!("{PREFIX}{}", record.tool_id), &content)
     }
+}
+
+fn candidate_digest(candidate: &EmergentToolCandidate) -> Result<String, CoreError> {
+    let serialized = serde_json::to_vec(candidate).map_err(|error| CoreError::StorageError {
+        message: format!("Failed to serialize emergent tool candidate for audit: {error}"),
+    })?;
+    Ok(hex::encode(Sha256::digest(serialized)))
 }
 
 #[cfg(test)]
@@ -333,18 +398,25 @@ mod tests {
         assert_eq!(proposed.state, EmergentToolState::Proposed);
 
         let session = store
-            .approve_and_promote(&proposed.tool_id, "reviewer-1", &PassingGate)
+            .approve_and_promote(&proposed.tool_id, "reviewer-1", &PassingGate, None)
             .unwrap();
         assert_eq!(session.state, EmergentToolState::SessionEnabled);
         let tenant = store
-            .approve_and_promote(&session.tool_id, "reviewer-2", &PassingGate)
+            .approve_and_promote(
+                &session.tool_id,
+                "reviewer-2",
+                &PassingGate,
+                Some(EmergentToolRuleReview::completed("reviewer-2")),
+            )
             .unwrap();
         assert_eq!(tenant.state, EmergentToolState::TenantCandidate);
         let published = store
-            .approve_and_promote(&tenant.tool_id, "reviewer-3", &PassingGate)
+            .approve_and_promote(&tenant.tool_id, "reviewer-3", &PassingGate, None)
             .unwrap();
         assert_eq!(published.state, EmergentToolState::Published);
         assert_eq!(published.promotions.len(), 3);
+        assert!(published.promotions[1].rule_review.is_some());
+        assert!(!published.promotions[1].candidate_sha256.is_empty());
     }
 
     #[test]
@@ -352,7 +424,7 @@ mod tests {
         let store = store("tenant-a");
         let proposed = store.propose("session-1", candidate()).unwrap();
         assert!(store
-            .approve_and_promote(&proposed.tool_id, "reviewer", &RejectingGate)
+            .approve_and_promote(&proposed.tool_id, "reviewer", &RejectingGate, None)
             .is_err());
         assert_eq!(
             store.get(&proposed.tool_id).unwrap().unwrap().state,
@@ -370,7 +442,24 @@ mod tests {
 
         assert!(tenant_b.get(&record.tool_id).unwrap().is_none());
         assert!(tenant_b
-            .approve_and_promote(&record.tool_id, "reviewer", &PassingGate)
+            .approve_and_promote(&record.tool_id, "reviewer", &PassingGate, None)
             .is_err());
+    }
+
+    #[test]
+    fn tenant_promotion_requires_a_complete_external_rule_review() {
+        let store = store("tenant-a");
+        let proposed = store.propose("session-1", candidate()).unwrap();
+        let session = store
+            .approve_and_promote(&proposed.tool_id, "reviewer-1", &PassingGate, None)
+            .unwrap();
+
+        assert!(store
+            .approve_and_promote(&session.tool_id, "reviewer-2", &PassingGate, None)
+            .is_err());
+        assert_eq!(
+            store.get(&session.tool_id).unwrap().unwrap().state,
+            EmergentToolState::SessionEnabled
+        );
     }
 }
