@@ -66,12 +66,12 @@ async fn materialize_rml_with_worker(
     mapping: &[u8],
     sources: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
-    let worker = std::env::var(MORPH_KGC_WORKER)
+    let worker = std::env::var(MORPH_KGC_WORKER_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             format!(
-                "RML worker is not configured; set {MORPH_KGC_WORKER} to an executable sidecar adapter"
+                "RML worker is not configured; set {MORPH_KGC_WORKER_ENV} to an executable sidecar adapter"
             )
         })?;
     let root = std::env::temp_dir().join(format!("wao-rml-{}", uuid::Uuid::new_v4()));
