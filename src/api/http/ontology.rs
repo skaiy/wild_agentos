@@ -25,6 +25,7 @@ use crate::{
         ontology_draft::{
             self, DraftLinkInput, InductionDocument, TypeDraftBundle, TypeDraftProvenance,
         },
+        ontology_health,
         ontology_layer::ActionGuardrailConfig,
         quality_gate::{
             JudgeConfig, JudgeReport, JudgeVerdict, KgQualityGate, QualityGateReport,
@@ -580,6 +581,87 @@ pub(crate) struct StagingQuery {
 #[serde(deny_unknown_fields)]
 pub(crate) struct MaterializeExtractionRequest {
     pub confirm: bool,
+}
+
+/// Optional thresholds for the claims-scoped, read-only slow health loop.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OntologyHealthQuery {
+    /// Object types at or below this production instance count are sparse.
+    #[serde(default = "default_sparse_type_threshold")]
+    pub sparse_type_threshold: u64,
+    /// A non-expired type draft at or above this age is considered stale.
+    #[serde(default = "default_stale_draft_hours")]
+    pub stale_draft_hours: i64,
+}
+
+fn default_sparse_type_threshold() -> u64 {
+    1
+}
+
+fn default_stale_draft_hours() -> i64 {
+    24
+}
+
+/// GET /api/v1/ontology/health
+///
+/// Slow-loop evidence for an authenticated claims scope: canonicalization
+/// rejection rate, quality-gate failures, sparse promoted ObjectTypes, and
+/// stale/expired type drafts. It is strictly read-only: it creates no draft,
+/// never resolves a review, and cannot promote or materialize anything.
+pub(crate) async fn ontology_health_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Query(query): Query<OntologyHealthQuery>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if query.stale_draft_hours < 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "stale_draft_hours must be non-negative"})),
+        )
+            .into_response();
+    }
+    let ontology_store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let ontology = match ontology_store.load_definition(ONT_DOMAIN) {
+        Ok(ontology) => ontology,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match ontology_health::report(
+        &kg,
+        claims,
+        &ontology,
+        query.sparse_type_threshold,
+        query.stale_draft_hours,
+    ) {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
 }
 
 fn extraction_provenance_triples(

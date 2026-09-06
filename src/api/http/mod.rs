@@ -88,7 +88,8 @@ use ontology::{
     delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
     invoke_action_handler, list_action_approvals_handler, list_extraction_reviews_handler,
     materialize_constrained_extraction_handler, ontology_readiness_report_handler,
-    ontology_types_handler, list_type_drafts_handler, promote_type_draft_handler,
+    ontology_health_handler, ontology_types_handler, list_type_drafts_handler,
+    promote_type_draft_handler,
     quality_gate_handler, reject_action_approval_handler, resolve_extraction_review_handler,
     update_action_type_handler,
     update_domain_guardrails_handler, update_function_def_handler, update_link_type_handler,
@@ -371,6 +372,7 @@ pub fn build_router(
             put(update_knowledge_pack_handler).delete(delete_knowledge_pack_handler),
         )
         .route("/api/v1/ontology/types", get(ontology_types_handler))
+        .route("/api/v1/ontology/health", get(ontology_health_handler))
         .route(
             "/api/v1/ontology/readiness-report",
             post(ontology_readiness_report_handler),

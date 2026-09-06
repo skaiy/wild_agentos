@@ -421,6 +421,31 @@ and skill loops that use a promoted ontology.
 - Run the slow ontology-health and extraction-goal review; it may stop or
   redefine extraction, but never auto-promotes a draft.
 
+#### Implemented slow-loop evidence — ontology health report
+
+`GET /api/v1/ontology/health` is the claims-scoped, read-only evidence input
+for this slow loop. It reports:
+
+- the canonicalization reject rate for reviewed staging extractions;
+- quality-gate failures grouped by deterministic anchor (plus pySHACL/Judge
+  outcomes when present);
+- instance counts and a sparse flag for every promoted `ObjectType`; and
+- stale and expired type drafts, without cleaning them up.
+
+The endpoint accepts optional `sparse_type_threshold` (default `1`) and
+`stale_draft_hours` (default `24`) query parameters. Its evidence scope is
+limited to extraction IDs that have a persisted review/gate record, since those
+are the claims-scoped records that can be enumerated safely. It does not list
+or inspect another tenant/project's graphs.
+
+Run it before a release, at a milestone, or when coverage/quality trends change.
+Treat the output as a human goal-review input: a person may decide to stop,
+retarget, or investigate extraction. The report performs no production write,
+does not create a type draft, and cannot resolve a review, materialize
+instances, or promote schema. If a finding warrants a schema proposal, submit
+it explicitly through an existing `/api/v1/ontology/type-drafts/from-*` API and
+use its separate `confirm: true` promotion endpoint after human review.
+
 ## Non-goals
 
 This design does not:
