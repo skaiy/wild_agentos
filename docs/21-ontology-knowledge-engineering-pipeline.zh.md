@@ -238,9 +238,30 @@ Schema 可生成 claims-scoped type draft，且必须由获授权人员显式 pr
 - 将多源 schema → type-draft 扩展至 DDL、OpenAPI、Excel glossary 和 LinkML。
 - 基于明确 FK 证据或 co-occurrence 建议 relationship draft，但仅限 draft；任何建议
   都不得自动创建或 promote 生产 `LinkType`。
-- 在业务场景接入 agent 前输出 domain coverage/readiness report，说明 domain pack 缺少的
-  type 与 relationship。
 - 为 draft↔promoted diff 增加 schema-evolution CI，包括 compatibility 检查。
+
+#### 已交付 — 场景接入前的本体就绪报告
+
+建议在将业务场景接入 agent 前调用
+`POST /api/v1/ontology/readiness-report`，并提供 domain pack 所需的
+`ObjectType` 与 `LinkType` ID：
+
+```json
+{
+  "required_object_types": ["Vehicle", "FaultCode", "RepairOrder"],
+  "required_link_types": ["triggers", "diagnoses"]
+}
+```
+
+该接口要求已验证的 `IsolationClaims`；缺失时以 `401` fail closed。它仅读取已
+promote 的本体定义及当前调用方未过期的 type draft，并将每一项报告为
+`promoted`、`draft` 或 `missing`，同时返回覆盖率、open draft，以及建议用于
+创建 draft 的资产。只有所有需求都已 `promoted` 时，场景才可接入；open draft
+不算覆盖。
+
+这是纯读取审计：不会 seed metadata、删除过期 draft、promote draft，也不会写入
+任何实例图。将报告的缺项交给现有的 schema/glossary/DDL/OpenAPI → draft 工作流；
+promotion 仍必须经单独的显式人工确认接口。
 
 #### P3 — LLM schema induction，仅生成 draft
 
