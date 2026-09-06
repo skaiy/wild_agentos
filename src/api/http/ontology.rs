@@ -21,7 +21,10 @@ use crate::{
         extractor::KnowledgeExtractor,
         ontology_draft::{self, DraftLinkInput, TypeDraftBundle},
         ontology_layer::ActionGuardrailConfig,
-        quality_gate::{KgQualityGate, QualityGateReport, QualityGateRequest},
+        quality_gate::{
+            JudgeConfig, JudgeReport, JudgeVerdict, KgQualityGate, QualityGateReport,
+            QualityGateRequest,
+        },
         rdf_mapper::RdfMapper,
         store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingTypeDraft},
         types::LLMExtractionOutput,
@@ -360,12 +363,19 @@ pub(crate) async fn quality_gate_handler(
                 .into_response()
         }
     };
-    let report = match KgQualityGate::evaluate(&kg, claims, &extraction_id, &request, None) {
+    let mut report = match KgQualityGate::evaluate(&kg, claims, &extraction_id, &request, None) {
         Ok(report) => report,
         Err(error) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
         }
     };
+    if report.deterministic_passed {
+        if let Some(judge_config) = &request.judge {
+            let judge =
+                run_llm_quality_judge(&state, &kg, claims, &extraction_id, judge_config).await;
+            report = KgQualityGate::apply_judge(report, judge);
+        }
+    }
     if let Err(error) = persist_quality_gate_report(&kg, claims, &report) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -380,6 +390,55 @@ pub(crate) async fn quality_gate_handler(
         StatusCode::UNPROCESSABLE_ENTITY
     };
     (status, Json(json!(report))).into_response()
+}
+
+async fn run_llm_quality_judge(
+    state: &AppState,
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+    config: &JudgeConfig,
+) -> JudgeReport {
+    use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
+
+    let evidence = match kg.staging_ntriples_for_claims(claims, extraction_id) {
+        Ok(value) => value,
+        Err(error) => return failed_judge_report(format!("read staging evidence: {error}")),
+    };
+    let message = ChatMessage {
+        role: "user".into(),
+        content: ChatContent::Text(format!(
+            "You are a source-grounded KG quality reviewer. Review only this staging evidence. \
+Return strict JSON with verdict (approve|needs_review|reject), rationale, and non-empty \
+source_citations. Do not claim authority to override deterministic policy.\n\n{evidence}"
+        )),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let default_model = state.gateway.default_model();
+    let model = config.model.as_deref().unwrap_or(&default_model);
+    let content = state
+        .gateway
+        .chat_with_model(model, vec![message])
+        .await
+        .ok()
+        .and_then(|response| response.choices.into_iter().next())
+        .and_then(|choice| choice.message.content);
+    match content.and_then(|text| serde_json::from_str::<JudgeReport>(&text).ok()) {
+        Some(report) if !report.source_citations.is_empty() => report,
+        Some(_) => failed_judge_report("Judge returned no source citations".into()),
+        None => failed_judge_report("Judge did not return valid source-grounded JSON".into()),
+    }
+}
+
+fn failed_judge_report(rationale: String) -> JudgeReport {
+    JudgeReport {
+        verdict: JudgeVerdict::Reject,
+        rationale,
+        source_citations: Vec::new(),
+    }
 }
 
 /// GET /api/v1/ontology/constrained-extractions/:id/review

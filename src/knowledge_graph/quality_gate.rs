@@ -29,6 +29,10 @@ pub struct QualityGateRequest {
     /// Supplying shapes is an explicit opt-in to the sidecar.
     #[serde(default)]
     pub pyshacl_shapes_ttl: Option<String>,
+    /// Explicitly enables the source-grounded LLM Judge for this review. The
+    /// Judge is called only after every deterministic anchor has passed.
+    #[serde(default)]
+    pub judge: Option<JudgeConfig>,
 }
 
 fn default_policy_version() -> String {
@@ -44,6 +48,13 @@ fn default_arbitration() -> QualityCoverageArbitration {
 pub enum QualityCoverageArbitration {
     Compliance,
     Coverage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeConfig {
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -165,6 +176,20 @@ impl KgQualityGate {
             production_write: false,
         })
     }
+
+    /// Applies a Judge outcome without weakening deterministic authority.
+    pub fn apply_judge(mut report: QualityGateReport, judge: JudgeReport) -> QualityGateReport {
+        if report.deterministic_passed {
+            report.passed = judge.verdict == JudgeVerdict::Approve;
+            report.review_status = if report.passed {
+                "pending_review".into()
+            } else {
+                "blocked".into()
+            };
+            report.judge = Some(judge);
+        }
+        report
+    }
 }
 
 pub fn validate_request(request: &QualityGateRequest) -> Result<(), String> {
@@ -271,6 +296,7 @@ mod tests {
             policy_version: DEFAULT_POLICY_VERSION.into(),
             arbitration: QualityCoverageArbitration::Coverage,
             pyshacl_shapes_ttl: None,
+            judge: None,
         };
         let report =
             KgQualityGate::evaluate(&kg, &claims, "extract1", &request, Some(&ApprovingJudge))
