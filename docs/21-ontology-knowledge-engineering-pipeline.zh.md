@@ -285,9 +285,16 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
 
 #### P1.5 — 带 anchor 的 materialize
 
-- 只有在 quality gate 和 HITL approval 都通过后，才可从 staging 写入 production。
-- 对已写入的 claims-scoped graph 进行 SPARQL re-read，并在 audit trail 中记录这项独立的
-  post-write verification。
+- **已实现（#144）：** `POST
+  /api/v1/ontology/constrained-extractions/:extraction_id/materialize` 只接受已验证的
+  `IsolationClaims`、路径中的 extraction ID 以及 `{"confirm": true}`。它不接受
+  `named_graph`；staging 与 production 均由服务器从 claims mint。写入前必须有通过的
+  quality-gate report，或一条已记录的人工 approve review。
+- 服务端复制 claims-derived staging graph 并保留 staging 用于审计，然后通过 SPARQL 独立
+  re-read production graph 的 triple count。仅当该 anchor 通过时才返回 `materialized`；
+  否则返回 `materialize_failed`，并发出含 source extraction、authority、reviewer 与 anchor
+  evidence 的 `ACTION_AUDIT`。LLM 或 worker 的完成状态绝不能作为成功证据。
+- materialization 不会 promote `ObjectType`、`LinkType` 或 `ActionType`。
 
 #### P2 — 带 external judgment 的实体消解
 
