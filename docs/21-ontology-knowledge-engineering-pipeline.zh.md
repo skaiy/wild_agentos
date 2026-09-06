@@ -83,6 +83,58 @@
 
 > **开放提取 → canonicalize 到本体 → verify/refine → stage → 人工 promote → 物化实例**，优于“让 LLM 将 triples 直接倾倒到生产环境”。
 
+## 开源选型与吸收（可商用协议）
+
+本节是设计层面的选型快照，不构成依赖审批或实施计划。实际采用当天必须重新核验项目的 SPDX 表达式、传递依赖、模型权重条款和分发条款。尤其是，代码仓库的许可证并不自动覆盖其模型权重。
+
+### 协议与集成策略
+
+- 对 WAO 可能依赖、借鉴模式或随产品分发的任何内容，优先选用
+  **Apache-2.0**、**MIT** 或 **BSD-3-Clause**。
+- Oxigraph 加 SPARQL 仍是内核。Neo4j、FalkorDB、Memgraph 和 Cypher 都不是主 RDF store 或查询语言的替代方案。
+- 采用三种吸收方式之一：**(A)** 仅参考 pattern/algorithm；**(B)** 可选的进程外 sidecar 或 worker；**(C)** Rust crate 或 thin adapter。Python stack 优先 A/B；仅在许可证和 ABI 都合适时采用 C。
+- **LGPL** 可用于商业场景，但 linking 义务需要审查，优先采用隔离的进程边界。**NOASSERTION**、不清晰的 dual license，以及 **CC-BY-NC** 模型条款应当排除或交由法务审查。
+- 流水线可以生成候选，但绝不可自动 promote ontology type 或 production instance。
+
+### 选型表
+
+| 项目 | 许可证（SPDX 快照） | 适配性 | 吸收方式 | 优先级 |
+|---|---|---|---|---|
+| Oxigraph（已在代码树中） | Apache-2.0 OR MIT | RDF/SPARQL 基础 | 保留 | baseline |
+| spaCy | MIT | NER/chunking 基线 | 可选 sidecar 或预处理 worker | P0 |
+| GLiNER（`urchade/GLiNER`）+ 仅 Apache-2.0 模型权重（v2+/multi v2.1） | Apache-2.0（代码）；**排除**早期 CC-BY-NC 权重 | 针对已 promote `ObjectType` label 的 zero-shot NER | sidecar / ONNX，或成熟后使用 Rust `gline-rs` | P0 |
+| GLinker（`Knowledgator/GLinker`） | Apache-2.0 | entity linking L1–L3 | pattern + 可选 sidecar 用于 P2 ER | P2 |
+| RetriCo（`Knowledgator/RetriCo`） | Apache-2.0 | 模块化 extract-pipeline DAG | **pattern**（processor DAG）；不采用 Neo4j/Falkor backend | P0–P1 |
+| Morph-KGC | Apache-2.0 | R2RML/RML CSV/DB → RDF | 将结构化 source 批量物化进 Oxigraph | P0 |
+| RDFLib + pySHACL | BSD-3 / Apache-2.0 | SHACL 验证 | promote 前的质量 gate ASK/SHACL；Python job 可写入由 Rust 消费的 report JSON | P1 |
+| LinkML | Apache-2.0 | schema authoring → RDF/JSON Schema | type-draft / schema-evolution CI artifact | P1–P3 |
+| OpenSPG + KAG | Apache-2.0 | schema-constrained build + 双向 chunk↔entity index | **pattern**：schema-constrained construction 和 mutual index；不强制采用 SPG store | P1–P2 |
+| Microsoft GraphRAG | MIT | community summary / hierarchical RAG | 仅作**可选 retrieval pattern**；extractor 经 WAO API 写入 staging；注意 maintenance-mode | P2（query side，不用于 ontology promote） |
+| Text2KGBench | Apache-2.0 | ontology-conformance evaluation | constrained extraction 的 golden eval | P1 |
+| iText2KG | LGPL-2.1 | incremental ER pattern | **仅 pattern** 或 LGPL-isolated process；未经审查不得静态链接到 AGPL kernel | reference |
+| `neo4j-graphrag-python` | NOASSERTION | — | SPDX 未明确前**不得采用** | exclude |
+
+LlamaIndex PropertyGraph extractor 也可作为 Apache-2.0 ecosystem 中的 pattern 参考，但 Cypher 和 property-graph store 仍是 WAO kernel 的非目标。
+
+### 吸收映射
+
+| WAO 模块 | OSS 输入 | 吸收边界 |
+|---|---|---|
+| `OntologyExtractJob` | RetriCo processor-DAG pattern；spaCy/GLiNER extractor；面向结构化输入的 Morph-KGC | A/B：worker 只产生带 provenance 的候选。 |
+| `Canonicalizer` | KAG schema-constrained construction；[OAK+MEND](https://arxiv.org/abs/2605.29168) 风格 embedding map | 针对 promoted type 在树内实现；引用并采用研究 pattern，而非引入其 stack。 |
+| `KgQualityGate` | pySHACL；SPARQL `ASK`；Text2KGBench metric | deterministic failure 在 staging/promotion 前仍须 fail closed。 |
+| Entity resolution | GLinker 与 iText2KG 的 incremental-matching pattern | A/B：保守、可审阅且保留 provenance 的 match。 |
+| Staging/HITL | 无 | 保留 WAO Action/type-draft governance；不以外部项目替换。 |
+| Mutual index | KAG chunk↔entity pattern | 在 Blob 中存储 chunk ID 加 provenance quad；不引入 SPG store。 |
+
+### 明确不吸收的内容
+
+- 用 Neo4j、FalkorDB 或 Memgraph 替换 Oxigraph。
+- 将 Cypher 作为主查询语言。
+- 自动 promote 任何 OSS pipeline 的输出。
+- 分发 CC-BY-NC GLiNER 权重。
+- 将完整 GraphRAG 或 KAG stack vendor 到 Rust binary。
+
 ## Wild AgentOS 的目标架构
 
 Oxigraph 和 SPARQL 保持为 RDF/query 基础。`IsolationClaims` 仍是选择 tenant/project 存储目标的唯一权威；claims 缺失或无效时，所有写路径仍必须 fail closed。

@@ -112,6 +112,71 @@ The resulting design rule is:
 > promote → materialize instances** is safer and more maintainable than “an LLM
 > dumps triples into production.”
 
+## Open-source selection & absorption (commercially usable licenses)
+
+This is a design-level selection snapshot, not a dependency approval or an
+implementation plan. Re-verify each project's SPDX expression, transitive
+dependencies, model-weight terms, and distribution terms on the day it is
+adopted. In particular, a repository license does not automatically license
+its model weights.
+
+### License and integration policy
+
+- Prefer **Apache-2.0**, **MIT**, or **BSD-3-Clause** for anything WAO might
+  depend on, vendor patterns from, or ship beside.
+- Oxigraph plus SPARQL remain the kernel. Neo4j, FalkorDB, Memgraph, and Cypher
+  are not replacements for the primary RDF store or query language.
+- Use one of three absorption modes: **(A)** pattern/algorithm reference only;
+  **(B)** optional out-of-process sidecar or worker; or **(C)** a Rust crate or
+  thin adapter. Prefer A/B for Python stacks. Use C only where both license and
+  ABI fit.
+- **LGPL** is commercially usable, but its linking obligations require review;
+  an isolated process boundary is preferred. **NOASSERTION**, unclear dual
+  licensing, and **CC-BY-NC** model terms are exclude-or-legal-review cases.
+- A pipeline may generate candidates, but it may never auto-promote ontology
+  types or production instances.
+
+### Selection table
+
+| Project | License (SPDX snapshot) | Fit | Absorb how | Priority |
+|---|---|---|---|---|
+| Oxigraph (already in tree) | Apache-2.0 OR MIT | RDF/SPARQL foundation | keep | baseline |
+| spaCy | MIT | NER/chunking baseline | optional sidecar or preprocessing worker | P0 |
+| GLiNER (`urchade/GLiNER`) + Apache-2.0 model weights only (v2+/multi v2.1) | Apache-2.0 (code); **exclude** CC-BY-NC early weights | zero-shot NER against promoted `ObjectType` labels | sidecar / ONNX, or Rust `gline-rs` if mature | P0 |
+| GLinker (`Knowledgator/GLinker`) | Apache-2.0 | entity linking L1–L3 | pattern + optional sidecar for P2 ER | P2 |
+| RetriCo (`Knowledgator/RetriCo`) | Apache-2.0 | modular extract-pipeline DAG | **pattern** (processor DAG); do not adopt Neo4j/Falkor backends | P0–P1 |
+| Morph-KGC | Apache-2.0 | R2RML/RML CSV/DB → RDF | batch-materialize structured sources into Oxigraph | P0 |
+| RDFLib + pySHACL | BSD-3 / Apache-2.0 | SHACL validation | quality-gate ASK/SHACL before promote; Python job may write report JSON consumed by Rust | P1 |
+| LinkML | Apache-2.0 | schema authoring → RDF/JSON Schema | type-draft / schema-evolution CI artifacts | P1–P3 |
+| OpenSPG + KAG | Apache-2.0 | schema-constrained build + mutual chunk↔entity index | **patterns**: schema-constrained construction and mutual index; do not force an SPG store | P1–P2 |
+| Microsoft GraphRAG | MIT | community summaries / hierarchical RAG | **optional retrieval pattern** only; extractors write staging through WAO APIs; maintenance-mode caveat | P2 (query side, not ontology promote) |
+| Text2KGBench | Apache-2.0 | ontology-conformance evaluation | golden evaluations for constrained extraction | P1 |
+| iText2KG | LGPL-2.1 | incremental ER patterns | **pattern only** or LGPL-isolated process; do not statically link into the AGPL kernel without review | reference |
+| `neo4j-graphrag-python` | NOASSERTION | — | **do not adopt** until SPDX is clear | exclude |
+
+LlamaIndex PropertyGraph extractors are also useful as a pattern in the
+Apache-2.0 ecosystem, but Cypher and property-graph stores remain non-goals for
+the WAO kernel.
+
+### Absorption map
+
+| WAO module | OSS input | Boundary for absorption |
+|---|---|---|
+| `OntologyExtractJob` | RetriCo processor-DAG pattern; spaCy/GLiNER extractors; Morph-KGC for structured inputs | A/B: workers produce provenance-bearing candidates only. |
+| `Canonicalizer` | KAG schema-constrained construction; [OAK+MEND](https://arxiv.org/abs/2605.29168)-style embedding map | Implement in-tree against promoted types; cite and use the research pattern, not its stack. |
+| `KgQualityGate` | pySHACL; SPARQL `ASK`; Text2KGBench metrics | Deterministic failures remain fail-closed before staging/promotion. |
+| Entity resolution | GLinker and iText2KG incremental-matching patterns | A/B: conservative, reviewable matches with provenance. |
+| Staging/HITL | None | Keep WAO Action/type-draft governance; no external replacement. |
+| Mutual index | KAG chunk↔entity pattern | Store chunk IDs in Blob plus provenance quads; do not introduce an SPG store. |
+
+### Explicit non-absorb decisions
+
+- Replacing Oxigraph with Neo4j, FalkorDB, or Memgraph.
+- Using Cypher as the primary query language.
+- Auto-promoting output from any OSS pipeline.
+- Shipping CC-BY-NC GLiNER weights.
+- Vendoring entire GraphRAG or KAG stacks into the Rust binary.
+
 ## Target architecture for Wild AgentOS
 
 Oxigraph and SPARQL remain the RDF/query foundation. `IsolationClaims` remain
