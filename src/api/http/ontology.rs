@@ -1010,7 +1010,9 @@ pub(crate) async fn create_schema_induction_type_draft_handler(
             .into_response();
     }
     let provenance = TypeDraftProvenance {
-        model_version: request.model_version.filter(|version| !version.trim().is_empty()),
+        model_version: request
+            .model_version
+            .filter(|version| !version.trim().is_empty()),
         rule_version: request.rule_version,
         source_document_ids,
     };
@@ -3049,7 +3051,10 @@ mod ontology_crud_tests {
             created["preview"]["provenance"]["source_document_ids"][0],
             "maintenance-handbook-v2"
         );
-        assert!(created["preview"]["link_types"].as_array().unwrap().is_empty());
+        assert!(created["preview"]["link_types"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         let draft_id = created["draft_id"].as_str().unwrap();
 
         let types = app
