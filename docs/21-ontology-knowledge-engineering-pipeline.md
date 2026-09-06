@@ -177,6 +177,49 @@ the WAO kernel.
 - Shipping CC-BY-NC GLiNER weights.
 - Vendoring entire GraphRAG or KAG stacks into the Rust binary.
 
+## Graph Engineering lens (governance graph ≠ data graph)
+
+Oxigraph RDF is the **data graph**: it stores claims, entities, relations,
+provenance, and validation evidence. Graph Engineering adds a distinct
+**governance graph**: the explicit topology of loops that make, check, approve,
+audit, and arbitrate decisions about that data. It is not another graph-store
+replacement.
+
+The public [Graph Engineering framing](https://agentfactory.panaversity.org/docs/graph-engineering-crash-course)
+warns that a single optimizing loop fails through Goodhart/metric gaming, goal
+blindness, loop conflict, and measurement decay. Its remedy is multi-speed
+supervisory loops with three guardrails: anchors, frozen nodes, and external
+judgment. A workflow can sequence steps, but it does not by itself express who
+can challenge a result, which evidence is independent, or how conflicting
+objectives are resolved.
+
+Existing WAO staging, HITL approval, `ASK`-before-Judge ordering, and
+`IsolationClaims` already embody parts of this model. v0.5.0 should make them
+explicit supervisory loops rather than treating them only as workflow steps:
+
+| Guardrail | WAO mapping |
+|---|---|
+| **Anchors** | `IsolationClaims` and OIDC identity; deterministic SPARQL/SHACL checks; post-materialization SPARQL re-read. Never accept an LLM-reported “success” as sufficient evidence. |
+| **Frozen nodes** | Golden evaluations, Text2KGBench fixtures, and the promoted `ObjectType` schema domain are protected. Extractor and optimizer loops must not mutate them. |
+| **External judgment** | Humans promote types and approve instance materialization; humans also set and revise value goals. |
+
+The proposed cadence layers are:
+
+- **Fast:** constrained extraction to staging ([#138](https://github.com/skaiy/wild_agentos/issues/138), done).
+- **Medium:** `KgQualityGate` plus review queue ([#140](https://github.com/skaiy/wild_agentos/issues/140)); optional business or quality metrics may be added later.
+- **Slow:** ontology-health and “should we still extract this?” goal review.
+- **Arbitration:** an explicit decision path for quality-versus-coverage conflicts.
+
+Graph Engineering is therefore distinct from (1) a **workflow**, which orders
+execution; and (2) the **knowledge-graph store**, which persists RDF facts.
+The governance graph connects bounded loops and their authority; the data graph
+is evidence those loops read and write under governed boundaries.
+
+This cross-cutting pattern also applies conceptually to the shipped Skill golden
+evaluations and emergent-tool promotion: protected evidence, independent gates,
+and human promotion make a loop governable. Those shipped features remain as
+documented; this proposal does not reopen their completed work.
+
 ## Target architecture for Wild AgentOS
 
 Oxigraph and SPARQL remain the RDF/query foundation. `IsolationClaims` remain
@@ -215,7 +258,10 @@ promote a new type or to bypass the existing approval boundary.
 
 ### P0 — constrained extraction into staging
 
-- **Implemented first slice:** `POST /api/v1/ontology/constrained-extractions`
+- **Done, first slices:** [#138](https://github.com/skaiy/wild_agentos/issues/138)
+  constrained extraction and [#139](https://github.com/skaiy/wild_agentos/issues/139)
+  Morph-KGC structured-source materialization establish bounded inputs to the
+  pipeline. `POST /api/v1/ontology/constrained-extractions`
   accepts provenance-bearing upstream candidates, deterministically
   canonicalizes them against promoted `ObjectType`/`LinkType` definitions, and
   writes accepted triples plus every mapping decision only to a claims-minted
@@ -229,26 +275,44 @@ promote a new type or to bypass the existing approval boundary.
 
 ### P1 — quality gate and review
 
-- Add deterministic `ASK` assertions for type, predicate, cardinality, and
-  provenance policy.
-- Add an optional, source-grounded Judge/refiner after deterministic checks.
+- [#140](https://github.com/skaiy/wild_agentos/issues/140): make
+  `KgQualityGate` the medium-speed quality supervisory loop, with deterministic
+  `ASK`/SHACL anchors for type, predicate, cardinality, and provenance policy.
+- An optional, source-grounded Judge/refiner follows deterministic checks but
+  never overrides a failed anchor.
 - Add a review queue for staged candidates, evidence, violations, and
   approve/reject decisions.
 
-### P2 — continuous jobs and resolution
+### P1.5 — materialize with anchors
 
+- Move staging to production only after the quality gate and HITL approval.
+- Re-read the written claims-scoped graph with SPARQL and record that
+  independent post-write verification in the audit trail.
+
+### P2 — entity resolution with external judgment
+
+- [#141](https://github.com/skaiy/wild_agentos/issues/141): add conservative
+  entity resolution and deduplication with provenance-preserving, reviewable
+  merge suggestions; a human provides external judgment on merges.
 - Add explicitly configured blob-watch/reindex jobs with idempotent cursors,
   retries, observability, and backpressure.
-- Add entity resolution and deduplication, including reviewable merge
-  suggestions and provenance-preserving materialization.
 
-### P3 — limited schema induction as drafts only
+### P2b — frozen extraction evaluation and measurement-decay audit
+
+- Freeze ontology-extraction golden evaluations and Text2KGBench fixtures so
+  extractors or optimizers cannot rewrite their own scorecard.
+- Audit whether metrics, fixtures, and provenance still measure source-grounded
+  ontology quality rather than a decayed proxy.
+
+### P3 — schema induction drafts and slow goal review
 
 - Propose novel object/link concepts as separately reviewable drafts.
 - Never auto-promote an ontology draft, and never use schema induction to
   silently create `ActionType`s.
 - Require explicit human promotion before a newly proposed type enters a later
   constrained extraction domain.
+- Run the slow ontology-health and extraction-goal review; it may stop or
+  redefine extraction, but never auto-promotes a draft.
 
 ## Non-goals
 
@@ -289,3 +353,13 @@ demonstrably true:
 8. Schema-evolution CI protects backwards compatibility and isolation
    contracts, including the distinction between minting and historical-data
    migration.
+9. Multi-loop supervision is evidenced: fast extraction, medium quality/review,
+   slow goal/ontology-health review, and quality-versus-coverage arbitration
+   have explicit authority and audit records.
+10. Anchors are verified independently through identity, deterministic
+    SPARQL/SHACL checks, and post-materialization graph re-reads; an LLM
+    success report alone never satisfies the gate.
+11. Frozen golden evaluations, Text2KGBench fixtures, and the promoted schema
+    domain cannot be mutated by an extractor or optimizer being evaluated.
+12. A human supplies external judgment for type promotion and instance
+    materialization, and retains authority over the value goals.
