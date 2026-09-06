@@ -329,6 +329,29 @@ impl KnowledgeGraphStore {
         self.query_sparql_in_graph(sparql, Some(&graph))
     }
 
+    /// Serializes exactly one claims-minted staging graph as N-Triples for a
+    /// validation sidecar. The sidecar never receives another tenant's graph.
+    pub fn staging_ntriples_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<String, String> {
+        let graph = self.staging_graph_iri_for_claims(claims, staging_id)?;
+        let graph_name = NamedNodeRef::new(graph.as_str())
+            .map_err(|e| format!("invalid staging graph IRI: {e}"))?;
+        let mut triples = String::new();
+        for quad in self.store.iter() {
+            let quad = quad.map_err(|e| format!("read staging graph failed: {e}"))?;
+            if quad.graph_name.as_ref() == GraphNameRef::NamedNode(graph_name) {
+                triples.push_str(&format!(
+                    "{} {} {} .\n",
+                    quad.subject, quad.predicate, quad.object
+                ));
+            }
+        }
+        Ok(triples)
+    }
+
     /// Merges the staging graph derived from verified claims into its minted
     /// production graph. Neither graph is caller-selectable.
     pub fn commit_staging_for_claims(

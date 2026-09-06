@@ -6,6 +6,7 @@ pub mod ontology;
 pub mod ontology_draft;
 pub mod ontology_layer;
 pub mod ontology_store;
+pub mod quality_gate;
 pub mod rdf_mapper;
 pub mod store;
 pub mod types;
