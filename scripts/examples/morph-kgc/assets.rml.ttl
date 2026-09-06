@@ -1,0 +1,16 @@
+@prefix ex: <https://example.test/ontology/> .
+@prefix ql: <http://semweb.mmlab.be/ns/ql#> .
+@prefix rml: <http://semweb.mmlab.be/ns/rml#> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+
+<#AssetMap>
+  a rr:TriplesMap;
+  rml:logicalSource [
+    rml:source "assets.csv";
+    rml:referenceFormulation ql:CSV
+  ];
+  rr:subjectMap [ rr:template "https://example.test/assets/{asset_id}" ];
+  rr:predicateObjectMap [
+    rr:predicate ex:name;
+    rr:objectMap [ rml:reference "name" ]
+  ].

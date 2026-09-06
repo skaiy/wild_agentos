@@ -215,6 +215,53 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/import-graph" \
 <iri://entity/BMS_a067> <http://www.w3.org/2000/01/rdf-schema#label> "BMS_a067 — 高压电池需要维修" .
 ```
 
+### 6.4 可选 RML / Morph-KGC 物化
+
+`POST /api/v1/kb/bases/:id/materialize-rml` 是独立、可选的 RML/R2RML
+批处理路径，**不会**替换或改变 `import-graph`：简单 CSV、JSONL 和简化
+NT/TTL 仍应使用原接口。
+
+WAO 不会把 Morph-KGC 静态链接进 Rust 二进制；运维方在进程外运行 worker，
+并显式配置其绝对路径：
+
+```bash
+# 在专用 worker image/virtualenv 中执行。Morph-KGC 的许可证为 Apache-2.0。
+pip install morph-kgc
+chmod +x scripts/morph_kgc_worker.py
+export MORPH_KGC_WORKER="$PWD/scripts/morph_kgc_worker.py"
+# 可选；范围 1–600 秒，默认 60 秒。
+export MORPH_KGC_WORKER_TIMEOUT_SECS=60
+```
+
+随仓库提供的 `scripts/morph_kgc_worker.py` 使用 Apache-2.0
+[Morph-KGC](https://github.com/morph-kgc/morph-kgc) 包，属于可信的、
+由运维方管理的 sidecar。它每次只接收全新的临时 source 目录、mapping 路径和
+输出路径，并只输出 N-Triples。若需更强 OS/container 隔离，可将
+`MORPH_KGC_WORKER` 指向一个调度到隔离 worker 的 wrapper；绝不可指向用户可控
+的可执行文件。
+
+该接口的 multipart 字段为 `mapping`、一个或多个带文件名的 `source` 和可选
+`clear_before`；刻意不接受 `graph` 或 `named_graph`。必须提供已验证的
+`IsolationClaims`；WAO 仍通过既有的 claims-minted Oxigraph 写路径写入。
+每次成功物化都会在同一图记录生成的 run IRI、mapping 版本（其 SHA-256）和每个
+source 文件的 SHA-256。
+
+仓库内最小样例同时包含 CSV 和 RML mapping：
+
+```bash
+KB_ID=<图谱库 uuid>
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/materialize-rml" \
+  -H "$AUTHORIZATION" \
+  -F "mapping=@scripts/examples/morph-kgc/assets.rml.ttl;type=text/turtle" \
+  -F "source=@scripts/examples/morph-kgc/assets.csv;type=text/csv" \
+  -F "clear_before=true"
+```
+
+成功响应含 `status: "materialized"`、`triples_written > 0`、
+`mapping_version` / `mapping_checksum` 和 `source_checksums`。缺少已验证 claims 返回 `401`；
+未配置 worker 返回 `503`；worker 失败或输出不合法返回 `502`。mapping 由进程外
+worker 执行；若租户不可信，必须在 worker 外再施加相应隔离策略。
+
 ---
 
 ## 7. 程序化导入：`POST /api/v1/kg/import`
