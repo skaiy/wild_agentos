@@ -297,10 +297,33 @@ authorized person must explicitly promote them. Drafts currently do not invent
 - Suggest relationship drafts from explicit FK evidence or co-occurrence, as
   drafts only; no suggestion may create or promote a production `LinkType`
   automatically.
-- Produce a domain coverage/readiness report before a scenario attaches to
-  agents, identifying types and relationships missing from a domain pack.
 - Add schema-evolution CI for draft↔promoted diffs, including compatibility
   checks.
+
+#### Shipped — pre-attach ontology readiness report
+
+`POST /api/v1/ontology/readiness-report` is the recommended onboarding gate
+before attaching a business scenario to agents. Supply the domain pack's
+required `ObjectType` and `LinkType` IDs:
+
+```json
+{
+  "required_object_types": ["Vehicle", "FaultCode", "RepairOrder"],
+  "required_link_types": ["triggers", "diagnoses"]
+}
+```
+
+The endpoint requires verified `IsolationClaims` and fails closed with `401`
+when they are absent. It reads the promoted ontology definition and only the
+caller's non-expired type drafts, then reports each requirement as
+`promoted`, `draft`, or `missing`, with coverage totals, open drafts, and
+assets recommended for draft creation. A scenario is attach-ready only when
+every requirement is promoted—an open draft is explicitly not coverage.
+
+This is a pure read audit: it does not seed metadata, delete expired drafts,
+promote drafts, or write any instance graph. Feed the reported missing items
+into the existing schema/glossary/DDL/OpenAPI-to-draft workflows; promotion
+still requires the separate explicit human-confirmation endpoint.
 
 #### P3 — LLM schema induction, drafts only
 
