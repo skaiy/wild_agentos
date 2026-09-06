@@ -28,8 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "Usage: isolation-migrate --data-root <PATH> --plan <PLAN.json> [--execute]\n\
                      \n\
-                     Plans named-graph migration by default. --execute runs plan → copy → verify.\n\
-                     The graph store is <PATH>/kg. Source graphs remain intact unless both\n\
+                     Plans offline graph, vector, L0, and local-blob migration by default.\n\
+                     --execute runs plan → copy → verify. Source data remains intact unless both\n\
                      --delete-source and --confirm-delete-source are provided."
                 );
                 return Ok(());
@@ -43,8 +43,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let migration_plan = read_plan(plan_path)?;
     if execute {
         // This CLI is explicitly offline. It is not reachable from HTTP handlers.
-        let store = Store::open(data_root.join("kg"))?;
+        let store = if migration_plan.named_graphs.is_empty() {
+            Store::new()?
+        } else {
+            Store::open(data_root.join("kg"))?
+        };
         let report = migrate(
+            &data_root,
             &store,
             &migration_plan,
             delete_source,
@@ -59,8 +64,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // Oxigraph's read-only open prevents a dry-run from creating a RocksDB
         // directory, WAL, or audit file.
-        let store = Store::open_read_only(data_root.join("kg"))?;
-        let report = plan(&store, &migration_plan)?;
+        let store = if migration_plan.named_graphs.is_empty() {
+            Store::new()?
+        } else {
+            Store::open_read_only(data_root.join("kg"))?
+        };
+        let report = plan(&data_root, &store, &migration_plan)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
     Ok(())
