@@ -361,6 +361,194 @@ const ONT_DOMAIN: &str = "ev-repair";
 const TYPE_DRAFT_TTL_HOURS: i64 = 24;
 const EXTRACTION_PROVENANCE_NS: &str = "https://agentos.ontology/extraction/";
 
+/// A scenario's required ontology surface, supplied before the scenario is
+/// attached to agents. IDs are matched exactly to promoted ontology IDs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OntologyReadinessRequest {
+    pub required_object_types: Vec<String>,
+    pub required_link_types: Vec<String>,
+}
+
+fn normalized_required_ids(ids: Vec<String>, kind: &str) -> Result<Vec<String>, String> {
+    let mut unique = std::collections::BTreeSet::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(format!("{kind} IDs must not be empty"));
+        }
+        unique.insert(id.to_string());
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn readiness_items(
+    required: &[String],
+    promoted: &std::collections::HashSet<&str>,
+    drafted: &std::collections::HashSet<&str>,
+) -> Vec<Value> {
+    required
+        .iter()
+        .map(|id| {
+            let status = if promoted.contains(id.as_str()) {
+                "promoted"
+            } else if drafted.contains(id.as_str()) {
+                "draft"
+            } else {
+                "missing"
+            };
+            json!({ "id": id, "status": status })
+        })
+        .collect()
+}
+
+/// POST /api/v1/ontology/readiness-report — read-only pre-attach domain
+/// coverage report. It reads the promoted meta-model and caller-scoped open
+/// drafts, but deliberately does not seed, promote, expire, or materialize.
+pub(crate) async fn ontology_readiness_report_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<OntologyReadinessRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let required_objects =
+        match normalized_required_ids(request.required_object_types, "ObjectType") {
+            Ok(ids) => ids,
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+            }
+        };
+    let required_links = match normalized_required_ids(request.required_link_types, "LinkType") {
+        Ok(ids) => ids,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+        }
+    };
+
+    // Do not call `ontology_store_ready`: its first-use seed is a write, which
+    // is forbidden for this audit endpoint.
+    use crate::knowledge_graph::ontology_store::OntologyStore;
+    let ontology_store = match OntologyStore::with_shared_store(state.kg_store.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let ontology = match ontology_store.load_definition(ONT_DOMAIN) {
+        Ok(definition) => definition,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    // Unlike `active_type_drafts`, this is intentionally a pure read: expired
+    // drafts are excluded in memory and never cleaned up by a report request.
+    let open_drafts = match kg.list_type_drafts_for_claims(claims) {
+        Ok(drafts) => drafts
+            .into_iter()
+            .filter(|draft| !type_draft_expired(draft))
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let promoted_objects = ontology
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let promoted_links = ontology
+        .link_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let drafted_objects = open_drafts
+        .iter()
+        .flat_map(|draft| {
+            draft
+                .bundle
+                .object_types
+                .iter()
+                .map(|item| item.id.as_str())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let drafted_links = open_drafts
+        .iter()
+        .flat_map(|draft| draft.bundle.link_types.iter().map(|item| item.id.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    let object_types = readiness_items(&required_objects, &promoted_objects, &drafted_objects);
+    let link_types = readiness_items(&required_links, &promoted_links, &drafted_links);
+    let required_total = object_types.len() + link_types.len();
+    let promoted_total = object_types
+        .iter()
+        .chain(link_types.iter())
+        .filter(|item| item["status"] == "promoted")
+        .count();
+    let draft_total = object_types
+        .iter()
+        .chain(link_types.iter())
+        .filter(|item| item["status"] == "draft")
+        .count();
+    let missing = object_types
+        .iter()
+        .chain(link_types.iter())
+        .filter(|item| item["status"] == "missing")
+        .cloned()
+        .collect::<Vec<_>>();
+    let recommendations = missing
+        .iter()
+        .map(|item| {
+            let type_id = item["id"].as_str().unwrap_or_default();
+            json!({
+                "type_id": item["id"],
+                "kind": if required_objects.iter().any(|id| id == type_id) { "object_type" } else { "link_type" },
+                "recommended_next_step": "provide a schema, glossary, DDL, or OpenAPI asset to create a reviewable type draft; explicit human promotion remains required",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    (StatusCode::OK, Json(json!({
+        "domain": ONT_DOMAIN,
+        "read_only": true,
+        "scenario_attach_ready": missing.is_empty() && draft_total == 0,
+        "coverage": {
+            "required": required_total,
+            "promoted": promoted_total,
+            "open_draft": draft_total,
+            "missing": missing.len(),
+            "promoted_percent": if required_total == 0 { 100.0 } else { (promoted_total as f64 / required_total as f64) * 100.0 },
+        },
+        "object_types": object_types,
+        "link_types": link_types,
+        "open_drafts": open_drafts,
+        "gaps": missing,
+        "recommended_draft_assets": recommendations,
+    }))).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConstrainedExtractionSource {
@@ -2852,6 +3040,117 @@ mod ontology_crud_tests {
             &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn readiness_report_is_claims_scoped_read_only_and_identifies_gaps() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_readiness_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let claims =
+            IsolationClaims::from_verified("tenant-a", "repair", "ontology-tester").unwrap();
+        let ontology_store =
+            crate::knowledge_graph::ontology_store::OntologyStore::with_shared_store(
+                state.kg_store.clone(),
+            )
+            .unwrap();
+        ontology_store.ensure_seeded(ONT_DOMAIN).unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        kg.create_type_draft_for_claims(
+            &claims,
+            &PendingTypeDraft {
+                draft_id: "proposed-asset".into(),
+                source: "test".into(),
+                bundle: TypeDraftBundle {
+                    object_types: vec![crate::knowledge_graph::ontology_layer::ObjectType {
+                        id: "ProposedAsset".into(),
+                        iri: crate::knowledge_graph::ontology_layer::ev("ProposedAsset"),
+                        label: "Proposed Asset".into(),
+                        description: "draft".into(),
+                        icon: "Box".into(),
+                        color: "slate".into(),
+                        primary_key: "id".into(),
+                        title_property: "id".into(),
+                        kind: Default::default(),
+                        properties: vec![],
+                    }],
+                    link_types: vec![],
+                    provenance: None,
+                    suggested_links: vec![],
+                    warnings: vec![],
+                },
+                created_at: chrono::Utc::now().to_rfc3339(),
+                expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            },
+        )
+        .unwrap();
+        let before = ontology_store.load_definition(ONT_DOMAIN).unwrap();
+        let drafts_before = kg.list_type_drafts_for_claims(&claims).unwrap();
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/readiness-report",
+                post(ontology_readiness_report_handler),
+            )
+            .with_state(state.clone());
+        let body = json!({
+            "required_object_types": ["Vehicle", "ProposedAsset", "MissingAsset"],
+            "required_link_types": ["triggers"]
+        });
+        let no_claims = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/readiness-report")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(no_claims).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let report = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/ontology/readiness-report")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.status(), StatusCode::OK);
+        let report: Value = serde_json::from_slice(
+            &axum::body::to_bytes(report.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["read_only"], true);
+        assert_eq!(report["scenario_attach_ready"], false);
+        assert_eq!(report["coverage"]["promoted"], 2);
+        assert_eq!(report["coverage"]["open_draft"], 1);
+        assert_eq!(report["coverage"]["missing"], 1);
+        assert!(report["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["id"] == "MissingAsset"));
+        assert_eq!(
+            ontology_store
+                .load_definition(ONT_DOMAIN)
+                .unwrap()
+                .object_types
+                .len(),
+            before.object_types.len()
+        );
+        assert_eq!(
+            kg.list_type_drafts_for_claims(&claims).unwrap().len(),
+            drafts_before.len()
+        );
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// 阶段0 无回归：GET /api/v1/ontology/types 改读 Oxigraph 元命名图后，
