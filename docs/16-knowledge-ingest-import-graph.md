@@ -308,19 +308,24 @@ admin consoles, batch scripts, and external integrations should use
 `/api/v1/kb/*` and `/api/v1/kg/*`. Tool semantics align, but the handler paths
 and fields here are authoritative.
 
-## 14. Ontology type drafts from CSV or JSON Schema
+## 14. Ontology type drafts from CSV, JSON Schema, OpenAPI, or SQL DDL
 
 `POST /api/v1/ontology/type-drafts/from-csv` and
 `POST /api/v1/ontology/type-drafts/from-json-schema` provide a deliberately
-small, review-first bridge from input schemas to ontology metadata. Both require
-a verified JWT with `IsolationClaims`; drafts are stored only in the caller's
+small, review-first bridge from input schemas to ontology metadata. The
+additional `/from-openapi` (OpenAPI 3 component schemas) and `/from-sql-ddl`
+(a `CREATE TABLE` subset) endpoints use the same boundary. All require a
+verified JWT with `IsolationClaims`; drafts are stored only in the caller's
 claims-scoped draft graph, never in production ontology metadata.
 
 CSV uses only its headers and proposes one `ObjectType`; each property starts as
 `string`. JSON Schema maps root `properties` to properties (string, integer,
-number, boolean, date-time, and string enums). Optional `links` are explicit
-request input—relationships are not guessed. Neither adapter creates
-`ActionType`s.
+number, boolean, date-time, and string enums). OpenAPI reads object component
+schemas; it includes relationships only from an `x-ontology-links` annotation
+or optional request `links`. SQL DDL reads tables, columns, primary keys, and
+explicit `FOREIGN KEY` / `REFERENCES` clauses. No adapter guesses relationships:
+only caller input, annotations, or explicit foreign-key evidence can form a
+`LinkType` draft. Neither adapter creates `ActionType`s.
 
 ```json
 POST /api/v1/ontology/type-drafts/from-csv
