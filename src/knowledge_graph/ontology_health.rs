@@ -99,6 +99,7 @@ pub fn report(
     let staging = staging_health(kg, claims, &reviews)?;
     let type_counts = production_type_counts(kg, claims)?;
     let drafts = kg.list_type_drafts_for_claims(claims)?;
+    let type_drafts_observed = drafts.len();
     let stale_type_drafts = stale_drafts(drafts, stale_after_hours);
 
     let reviewed_extractions = reviews
@@ -115,7 +116,7 @@ pub fn report(
         evidence: HealthEvidence {
             reviewed_extractions,
             quality_gate_reports: reports.len(),
-            type_drafts_observed: stale_type_drafts.stale.len() + stale_type_drafts.expired.len(),
+            type_drafts_observed,
         },
         staging,
         quality_gates: quality_gate_health(&reports),
@@ -264,9 +265,15 @@ fn stale_drafts(drafts: Vec<PendingTypeDraft>, stale_after_hours: i64) -> StaleD
             expires_at: draft.expires_at,
             age_hours,
         };
-        if expires.map(|expires| expires <= now).unwrap_or(true) {
+        if expires
+            .map(|expires| expires.with_timezone(&Utc) <= now)
+            .unwrap_or(true)
+        {
             expired.push(view);
-        } else if created.map(|created| created <= cutoff).unwrap_or(true) {
+        } else if created
+            .map(|created| created.with_timezone(&Utc) <= cutoff)
+            .unwrap_or(true)
+        {
             stale.push(view);
         }
     }
