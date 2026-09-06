@@ -1088,11 +1088,6 @@ pub(crate) async fn promote_type_draft_handler(
         .iter()
         .map(|item| item.id.as_str())
         .collect();
-    let existing_links: std::collections::HashSet<_> = current
-        .link_types
-        .iter()
-        .map(|item| item.id.as_str())
-        .collect();
     let mut draft_ids = std::collections::HashSet::new();
     let duplicate_id = draft
         .bundle

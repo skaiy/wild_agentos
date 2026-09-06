@@ -802,7 +802,7 @@ mod tests {
 
     fn compatibility_fixture_baseline() -> super::super::ontology_layer::OntologyDefinition {
         let draft: TypeDraftBundle = serde_json::from_str(include_str!(
-            "../../tests/fixtures/ontology_draft/compat_additive.json"
+            "../tests/fixtures/ontology_draft/compat_additive.json"
         ))
         .unwrap();
         let mut device = draft.object_types[0].clone();
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn compatibility_fixture_allows_additive_property() {
         let draft: TypeDraftBundle = serde_json::from_str(include_str!(
-            "../../tests/fixtures/ontology_draft/compat_additive.json"
+            "../tests/fixtures/ontology_draft/compat_additive.json"
         ))
         .unwrap();
         let changes = compatibility_changes(&compatibility_fixture_baseline(), &draft);
@@ -846,7 +846,7 @@ mod tests {
     #[test]
     fn compatibility_fixture_detects_renames_and_link_breakage() {
         let draft: TypeDraftBundle = serde_json::from_str(include_str!(
-            "../../tests/fixtures/ontology_draft/compat_breaking.json"
+            "../tests/fixtures/ontology_draft/compat_breaking.json"
         ))
         .unwrap();
         let changes = compatibility_changes(&compatibility_fixture_baseline(), &draft);
