@@ -27,8 +27,8 @@ pub mod api_gov;
 pub mod iam;
 use api_gov::{ApiClient, ApiKey, ApiUsageState};
 pub mod agents;
-pub mod artifacts;
 pub mod api_clients;
+pub mod artifacts;
 pub mod chat;
 pub mod config;
 pub mod core_ops;
@@ -79,7 +79,8 @@ use mcp_skills::{
     upsert_skill_exposure_handler,
 };
 use ontology::{
-    approve_action_approval_handler, create_csv_type_draft_handler,
+    approve_action_approval_handler, constrained_extraction_handler,
+    constrained_extraction_query_handler, create_csv_type_draft_handler,
     create_json_schema_type_draft_handler, delete_action_type_handler, delete_function_def_handler,
     delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
     invoke_action_handler, list_action_approvals_handler, list_type_drafts_handler,
@@ -364,6 +365,14 @@ pub fn build_router(
             put(update_knowledge_pack_handler).delete(delete_knowledge_pack_handler),
         )
         .route("/api/v1/ontology/types", get(ontology_types_handler))
+        .route(
+            "/api/v1/ontology/constrained-extractions",
+            post(constrained_extraction_handler),
+        )
+        .route(
+            "/api/v1/ontology/constrained-extractions/:id",
+            get(constrained_extraction_query_handler),
+        )
         // ── 本体类型草稿：适配输入 → claims 隔离草稿 → 人工确认提升 ──
         .route(
             "/api/v1/ontology/type-drafts",

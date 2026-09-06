@@ -211,10 +211,15 @@ canonical mappings, validation results, reviewer decision, and materialization
 result should be auditable. A successful canonicalization is not a license to
 promote a new type or to bypass the existing approval boundary.
 
-## Phased delivery buckets (not coded)
+## Phased delivery buckets
 
 ### P0 — constrained extraction into staging
 
+- **Implemented first slice:** `POST /api/v1/ontology/constrained-extractions`
+  accepts provenance-bearing upstream candidates, deterministically
+  canonicalizes them against promoted `ObjectType`/`LinkType` definitions, and
+  writes accepted triples plus every mapping decision only to a claims-minted
+  staging graph. It never promotes types or writes the production graph.
 - Add an ontology-constrained extraction API whose domain is **promoted types
   only**.
 - Run post-extraction canonicalization against promoted `ObjectType` and

@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod canonicalizer;
 pub mod code_ast;
 pub mod extractor;
 pub mod ontology;
