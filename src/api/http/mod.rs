@@ -64,10 +64,10 @@ use kb::{
     import_graph_knowledge_base_handler, ingest_knowledge_base_handler, kb_document_raw_handler,
     knowledge_base_stats_handler, list_kb_categories_handler, list_kb_documents_handler,
     list_knowledge_bases_handler, list_knowledge_packs_handler, load_kb_categories,
-    load_knowledge_bases, load_knowledge_packs, reindex_knowledge_base_handler,
-    save_knowledge_packs, search_knowledge_base_handler, update_kb_category_handler,
-    update_knowledge_base_handler, update_knowledge_pack_handler, upload_knowledge_base_handler,
-    KB_UPLOAD_MAX_BYTES,
+    load_knowledge_bases, load_knowledge_packs, materialize_rml_knowledge_base_handler,
+    reindex_knowledge_base_handler, save_knowledge_packs, search_knowledge_base_handler,
+    update_kb_category_handler, update_knowledge_base_handler, update_knowledge_pack_handler,
+    upload_knowledge_base_handler, KB_UPLOAD_MAX_BYTES,
 };
 use market::{
     install_package_handler, list_packages_handler, publish_package_handler,
@@ -481,6 +481,11 @@ pub fn build_router(
         .route(
             "/api/v1/kb/bases/:id/import-graph",
             post(import_graph_knowledge_base_handler)
+                .layer(DefaultBodyLimit::max(KB_UPLOAD_MAX_BYTES)),
+        )
+        .route(
+            "/api/v1/kb/bases/:id/materialize-rml",
+            post(materialize_rml_knowledge_base_handler)
                 .layer(DefaultBodyLimit::max(KB_UPLOAD_MAX_BYTES)),
         )
         .route(

@@ -168,6 +168,57 @@ JSONL has one object per line with the CSV keys. Simplified N-Triples accepts
 `<s> <p> <o> .` or `<s> <p> "literal" .`; `#` starts a comment. Triples do not
 expand short prefixes, so provide complete IRIs.
 
+### Optional RML / Morph-KGC materialization
+
+`POST /api/v1/kb/bases/:id/materialize-rml` is a separate, opt-in batch path
+for RML/R2RML mappings. It does **not** replace or alter `import-graph`:
+continue to use CSV, JSONL, and simplified NT/TTL with that endpoint.
+
+WAO does not link Morph-KGC into the Rust binary. Instead, an operator runs an
+out-of-process executable and explicitly configures its absolute path:
+
+```bash
+# In a dedicated worker image/virtualenv. Morph-KGC is Apache-2.0.
+pip install morph-kgc
+chmod +x scripts/morph_kgc_worker.py
+export MORPH_KGC_WORKER="$PWD/scripts/morph_kgc_worker.py"
+# Optional, bounded to 1–600 seconds (default 60).
+export MORPH_KGC_WORKER_TIMEOUT_SECS=60
+```
+
+The included adapter `scripts/morph_kgc_worker.py` uses the Apache-2.0
+[Morph-KGC](https://github.com/morph-kgc/morph-kgc) package and must be treated
+as a trusted operator-managed sidecar. It receives a fresh temporary source
+directory, mapping path, and output path; it returns N-Triples only. For
+stronger OS/container isolation, point `MORPH_KGC_WORKER` at a wrapper that
+dispatches to the isolated worker. Do not point it at a user-controlled
+executable.
+
+The endpoint accepts multipart `mapping`, one or more named `source` files,
+and optional `clear_before`; it deliberately accepts no `graph` or
+`named_graph`. Verified `IsolationClaims` are mandatory and WAO writes the
+worker output through the usual claims-minted Oxigraph path. Each successful
+materialization records a generated run IRI, a mapping version (its SHA-256),
+and every source file SHA-256 in that same graph.
+
+The minimal checked-in example has a CSV source plus RML mapping:
+
+```bash
+KB_ID=<graph-base-uuid>
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/materialize-rml" \
+  -H "$AUTHORIZATION" \
+  -F "mapping=@scripts/examples/morph-kgc/assets.rml.ttl;type=text/turtle" \
+  -F "source=@scripts/examples/morph-kgc/assets.csv;type=text/csv" \
+  -F "clear_before=true"
+```
+
+Success returns `status: "materialized"` with `triples_written > 0`,
+`mapping_version` / `mapping_checksum`, and `source_checksums`. Missing verified claims returns
+`401`; an unset worker returns `503`; worker failure or invalid output returns
+`502`. The mapping is evaluated by the separately operated worker, so it must
+not be accepted from an untrusted tenant without an isolation policy around
+that worker.
+
 ## 7. Programmatic import: `POST /api/v1/kg/import`
 
 `KgImportRequest` writes `NodeDef` / `EdgeDef` through `RdfMapper` without a KB
