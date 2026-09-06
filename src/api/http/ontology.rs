@@ -2834,6 +2834,7 @@ mod ontology_crud_tests {
                         properties: vec![],
                     }],
                     link_types: vec![],
+                    provenance: None,
                     suggested_links: vec![],
                     warnings: vec![],
                 },
