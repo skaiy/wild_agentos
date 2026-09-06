@@ -355,9 +355,19 @@ and skill loops that use a promoted ontology.
 
 #### P1.5 — materialize with anchors
 
-- Move staging to production only after the quality gate and HITL approval.
-- Re-read the written claims-scoped graph with SPARQL and record that
-  independent post-write verification in the audit trail.
+- **Implemented (#144):** `POST
+  /api/v1/ontology/constrained-extractions/:extraction_id/materialize` accepts
+  only verified `IsolationClaims`, the path extraction ID, and
+  `{"confirm": true}`. It accepts no `named_graph`; both staging and
+  production targets are server-minted from claims. A passed quality-gate
+  report or a recorded approved human review is required before the write.
+- The server copies the claims-derived staging graph, retains staging for
+  audit, then independently SPARQL re-reads the production graph's triple
+  count. It returns `materialized` only when that anchor passes; otherwise it
+  returns `materialize_failed` and emits an `ACTION_AUDIT` event with the
+  source extraction, authority, reviewer, and anchor evidence. LLM or worker
+  completion is never success evidence.
+- Materialization never promotes an `ObjectType`, `LinkType`, or `ActionType`.
 
 #### P2 — entity resolution with external judgment
 

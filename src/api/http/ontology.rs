@@ -27,8 +27,8 @@ use crate::{
         },
         rdf_mapper::RdfMapper,
         store::{
-            ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingExtractionReview,
-            PendingTypeDraft,
+            ClaimsGraphUpdate, KnowledgeGraphStore, MaterializationAnchor, PendingActionApproval,
+            PendingExtractionReview, PendingTypeDraft,
         },
         types::LLMExtractionOutput,
     },
@@ -171,6 +171,12 @@ pub(crate) struct ConstrainedExtractionRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StagingQuery {
     pub sparql: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MaterializeExtractionRequest {
+    pub confirm: bool,
 }
 
 fn extraction_provenance_triples(
@@ -556,19 +562,8 @@ pub(crate) async fn constrained_extraction_review_handler(
                 .into_response()
         }
     };
-    let query = format!(
-        "SELECT ?report WHERE {{ <{EXTRACTION_PROVENANCE_NS}run/{extraction_id}> \
-         <{EXTRACTION_PROVENANCE_NS}qualityReport> ?report }}"
-    );
-    let reports = match kg.query_staging_for_claims(claims, &extraction_id, &query) {
-        Ok(rows) => rows
-            .into_iter()
-            .filter_map(|row| {
-                row.get("?report")
-                    .and_then(|value| value.as_str())
-                    .and_then(|json| serde_json::from_str::<QualityGateReport>(json).ok())
-            })
-            .collect::<Vec<_>>(),
+    let reports = match quality_gate_reports_for_extraction(&kg, claims, &extraction_id) {
+        Ok(reports) => reports,
         Err(error) => {
             return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
         }
@@ -579,6 +574,153 @@ pub(crate) async fn constrained_extraction_review_handler(
         "production_write": false,
     }))
     .into_response()
+}
+
+fn quality_gate_reports_for_extraction(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+) -> Result<Vec<QualityGateReport>, String> {
+    let query = format!(
+        "SELECT ?report WHERE {{ <{EXTRACTION_PROVENANCE_NS}run/{extraction_id}> \
+         <{EXTRACTION_PROVENANCE_NS}qualityReport> ?report }}"
+    );
+    kg.query_staging_for_claims(claims, extraction_id, &query)
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    row.get("?report")
+                        .and_then(|value| value.as_str())
+                        .and_then(|json| serde_json::from_str::<QualityGateReport>(json).ok())
+                })
+                .collect()
+        })
+}
+
+/// POST /api/v1/ontology/constrained-extractions/:id/materialize
+///
+/// This is the only staging-to-production path for constrained extractions.
+/// It accepts no client-selected graph and treats the post-write claims-scoped
+/// SPARQL re-read as the success anchor—not an upstream worker or LLM report.
+pub(crate) async fn materialize_constrained_extraction_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+    Json(request): Json<MaterializeExtractionRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "materialization requires confirm: true"})),
+        )
+            .into_response();
+    }
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let reports = match quality_gate_reports_for_extraction(&kg, claims, &extraction_id) {
+        Ok(reports) => reports,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    let reviews = match kg.list_extraction_reviews_for_claims(claims) {
+        Ok(reviews) => reviews,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let approved_review = reviews
+        .iter()
+        .find(|review| review.extraction_id == extraction_id && review.decision == "approved");
+    let gate_passed = reports.iter().any(|report| report.passed);
+    let authority = if gate_passed {
+        Some("quality_gate_passed")
+    } else if approved_review.is_some() {
+        Some("recorded_human_override")
+    } else {
+        None
+    };
+    let Some(authority) = authority else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "materialization requires a passed quality gate or a recorded approved human override",
+                "production_write": false,
+            })),
+        )
+            .into_response();
+    };
+
+    let anchor = match kg.materialize_staging_with_anchor_for_claims(claims, &extraction_id) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            emit_materialization_audit(
+                &state,
+                claims,
+                &extraction_id,
+                authority,
+                approved_review.map(|review| review.review_id.as_str()),
+                None,
+                "materialize_failed",
+                Some(&error),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "materialize_failed", "error": error, "production_write": true})),
+            )
+                .into_response();
+        }
+    };
+    let status = if anchor.passed {
+        "materialized"
+    } else {
+        "materialize_failed"
+    };
+    emit_materialization_audit(
+        &state,
+        claims,
+        &extraction_id,
+        authority,
+        approved_review.map(|review| review.review_id.as_str()),
+        Some(&anchor),
+        status,
+        (!anchor.passed).then_some("post-write SPARQL anchor failed"),
+    )
+    .await;
+    let _ = state.kg_store.flush();
+    let http_status = if anchor.passed {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        http_status,
+        Json(json!({
+            "status": status,
+            "extraction_id": extraction_id,
+            "authority": authority,
+            "review_id": approved_review.map(|review| review.review_id.as_str()),
+            "anchor": anchor,
+            "production_write": true,
+        })),
+    )
+        .into_response()
 }
 
 fn persist_quality_gate_report(
@@ -1337,6 +1479,73 @@ struct ActionAuditEvent<'a> {
     decision: &'a str,
     violations: &'a [String],
     timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializationAuditEvent<'a> {
+    tenant_id: &'a str,
+    project_id: &'a str,
+    actor_id: &'a str,
+    extraction_id: &'a str,
+    authority: &'a str,
+    reviewer_id: &'a str,
+    review_id: Option<&'a str>,
+    anchor: Option<&'a MaterializationAnchor>,
+    decision: &'a str,
+    error: Option<&'a str>,
+    timestamp: String,
+}
+
+async fn emit_materialization_audit(
+    state: &AppState,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+    authority: &str,
+    review_id: Option<&str>,
+    anchor: Option<&MaterializationAnchor>,
+    decision: &str,
+    error: Option<&str>,
+) {
+    let event = MaterializationAuditEvent {
+        tenant_id: claims.tenant_id(),
+        project_id: claims.project_id(),
+        actor_id: claims.actor_id(),
+        extraction_id,
+        authority,
+        // The caller who makes the explicit confirm is the accountable human
+        // decision-maker for this write. A prior review id, if any, is linked
+        // separately because legacy review records do not retain actor IDs.
+        reviewer_id: claims.actor_id(),
+        review_id,
+        anchor,
+        decision,
+        error,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let payload = match serde_json::to_string(&event) {
+        Ok(payload) => payload,
+        Err(error) => {
+            error!(
+                extraction_id,
+                decision,
+                %error,
+                "failed to serialize materialization audit event"
+            );
+            return;
+        }
+    };
+    state
+        .core
+        .events
+        .emit(
+            &claims
+                .graph_iri()
+                .unwrap_or_else(|_| "graph://invalid".to_string()),
+            ACTION_AUDIT_EVENT,
+            "ontology-materialization-api",
+            &payload,
+        )
+        .await;
 }
 
 async fn emit_action_audit(
@@ -2769,6 +2978,143 @@ mod ontology_crud_tests {
                 .is_empty(),
             "constrained extraction must not write the production graph"
         );
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn materialization_requires_confirmation_claims_and_gate_then_returns_anchor() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_materialize_extraction_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/constrained-extractions/:id/quality-gate",
+                post(quality_gate_handler),
+            )
+            .route(
+                "/api/v1/ontology/constrained-extractions/:id/materialize",
+                post(materialize_constrained_extraction_handler),
+            )
+            .with_state(state.clone());
+        let post = |uri: String, token: Option<&str>, body: Value| {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            request
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // Missing verified claims and missing explicit confirmation both fail
+        // before any production graph operation.
+        let no_claims = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/no-claims/materialize".into(),
+                None,
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_claims.status(), StatusCode::UNAUTHORIZED);
+        let no_confirm = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/no-confirm/materialize".into(),
+                Some(&token),
+                json!({"confirm": false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_confirm.status(), StatusCode::BAD_REQUEST);
+
+        kg.update_staging_for_claims(
+            &claims,
+            "blocked",
+            &ClaimsGraphUpdate::insert_data("<urn:blocked> <urn:p> <urn:o> ."),
+        )
+        .unwrap();
+        let failed_gate = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/blocked/quality-gate".into(),
+                Some(&token),
+                json!({"assertions": [{"code": "must_be_empty", "query": "ASK { ?s ?p ?o }"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(failed_gate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let blocked = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/blocked/materialize".into(),
+                Some(&token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+        assert!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { <urn:blocked> ?p ?o }")
+                .unwrap()
+                .is_empty(),
+            "a failed gate must never materialize staging"
+        );
+
+        kg.update_staging_for_claims(
+            &claims,
+            "approved",
+            &ClaimsGraphUpdate::insert_data("<urn:approved> <urn:p> <urn:o> ."),
+        )
+        .unwrap();
+        let passed_gate = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/approved/quality-gate".into(),
+                Some(&token),
+                json!({"assertions": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(passed_gate.status(), StatusCode::OK);
+        let materialized = app
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/approved/materialize".into(),
+                Some(&token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(materialized.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(materialized.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], "materialized");
+        assert_eq!(body["anchor"]["passed"], true);
+        assert!(body["anchor"]["staging_triple_count"].as_u64().is_some());
+        assert!(
+            !kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { <urn:approved> ?p ?o }")
+                .unwrap()
+                .is_empty(),
+            "HTTP success requires production evidence from the SPARQL anchor"
+        );
+
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }

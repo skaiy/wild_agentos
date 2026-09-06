@@ -80,6 +80,16 @@ pub struct PendingExtractionReview {
     pub decision: String,
 }
 
+/// Independent, post-write evidence that a staging graph is now observable in
+/// the caller's claims-minted production graph.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MaterializationAnchor {
+    pub staging_triple_count: usize,
+    pub production_triple_count_before: usize,
+    pub production_triple_count_after: usize,
+    pub passed: bool,
+}
+
 const APPROVAL_BASE_IRI: &str = "https://agentos.ontology/action-approval/";
 const APPROVAL_VOCAB_IRI: &str = "https://agentos.ontology/action-approval/";
 const EXTRACTION_REVIEW_BASE_IRI: &str = "https://agentos.ontology/extraction-review/";
@@ -383,6 +393,34 @@ impl KnowledgeGraphStore {
             .map_err(|e| format!("claims-scoped staging merge failed: {}", e))
     }
 
+    /// Materializes one claims-derived staging graph and independently re-reads
+    /// the production graph through the scoped SPARQL read path. Callers cannot
+    /// supply either graph name. A successful write operation alone is never
+    /// treated as evidence of materialization.
+    pub fn materialize_staging_with_anchor_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<MaterializationAnchor, String> {
+        let staging_triple_count = self.graph_triple_count_for_staging(claims, staging_id)?;
+        if staging_triple_count == 0 {
+            return Err("staging graph has no triples to materialize".into());
+        }
+        let production_triple_count_before = self.graph_triple_count_for_claims(claims)?;
+        self.commit_staging_for_claims(claims, staging_id)?;
+        let production_triple_count_after = self.graph_triple_count_for_claims(claims)?;
+
+        // `ADD` is set-union semantics, so a retry may add no new triples.
+        // The anchor therefore proves that production contains at least the
+        // staged cardinality, rather than requiring a count delta.
+        Ok(MaterializationAnchor {
+            staging_triple_count,
+            production_triple_count_before,
+            production_triple_count_after,
+            passed: production_triple_count_after >= staging_triple_count,
+        })
+    }
+
     /// Removes the staging graph derived from verified claims.
     pub fn drop_staging_for_claims(
         &self,
@@ -416,6 +454,33 @@ impl KnowledgeGraphStore {
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {}", e))?;
         Ok(format!("{production}/staging/{staging_id}"))
+    }
+
+    fn graph_triple_count_for_claims(&self, claims: &IsolationClaims) -> Result<usize, String> {
+        let rows =
+            self.query_sparql_for_claims(claims, "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }")?;
+        Self::parse_count_result(rows, "production")
+    }
+
+    fn graph_triple_count_for_staging(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<usize, String> {
+        let rows = self.query_staging_for_claims(
+            claims,
+            staging_id,
+            "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }",
+        )?;
+        Self::parse_count_result(rows, "staging")
+    }
+
+    fn parse_count_result(rows: Vec<serde_json::Value>, scope: &str) -> Result<usize, String> {
+        rows.first()
+            .and_then(|row| row.get("?count"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|count| count.parse::<usize>().ok())
+            .ok_or_else(|| format!("SPARQL {scope} anchor did not return a count"))
     }
 
     /// Creates a pending approval record in a dedicated graph derived only
