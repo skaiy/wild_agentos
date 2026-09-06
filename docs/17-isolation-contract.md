@@ -22,18 +22,20 @@ parse JSON bodies, inspect headers, or validate credentials.
 
 `X-Identity` is a development simulation only. It never creates
 `IsolationClaims` and is not a production tenant identity source. JWT identities
-verified by the HTTP boundary do create claims. Production deployments should use
-OIDC/JWKS mode (`AGENTOS_AUTH_MODE=oidc`) with
+verified by the HTTP boundary do create claims. `AGENTOS_ENV=production` requires
+OIDC/JWKS mode (`AGENTOS_AUTH_MODE=oidc`) and refuses to boot if HS256 is
+selected. OIDC mode requires
 `AGENTOS_OIDC_JWKS_URL`, `AGENTOS_OIDC_ISSUER`, and
 `AGENTOS_OIDC_AUDIENCE`; issuer and audience are required and verification
 accepts only asymmetric OIDC algorithms. JWKS are retrieved from the configured
 endpoint, cached briefly, and refreshed once for an unknown key ID. The default
 `hs256` mode validates with `AGENTOS_JWT_SECRET` and is retained for local
-development only. OIDC/JWKS configuration errors, missing keys, invalid
-signatures, and invalid issuer/audience all fail closed. Unverified requests
-have no claims and cannot use the claims-scoped graph or blob paths.
-The JWKS URL must use HTTPS; loopback HTTP is accepted only for local
-development and test fixtures.
+development only. Startup refuses incomplete OIDC configuration, and OIDC/JWKS
+configuration errors, missing keys, invalid signatures, and invalid
+issuer/audience all fail closed. Unverified requests have no claims and cannot
+use the claims-scoped graph or blob paths. The JWKS URL must be a valid HTTPS
+URL; loopback HTTP is accepted only for local development and test fixtures,
+never in production.
 `JwtClaims.project_id` is an optional `Option<String>` field with a serde
 default. A verified JWT without `project_id`, or with an empty `project_id`,
 mints the `default` project. A non-empty value is passed to
