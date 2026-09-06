@@ -21,8 +21,15 @@ use crate::{
         extractor::KnowledgeExtractor,
         ontology_draft::{self, DraftLinkInput, TypeDraftBundle},
         ontology_layer::ActionGuardrailConfig,
+        quality_gate::{
+            JudgeConfig, JudgeReport, JudgeVerdict, KgQualityGate, QualityGateReport,
+            QualityGateRequest,
+        },
         rdf_mapper::RdfMapper,
-        store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingTypeDraft},
+        store::{
+            ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingExtractionReview,
+            PendingTypeDraft,
+        },
         types::LLMExtractionOutput,
     },
 };
@@ -333,6 +340,264 @@ pub(crate) async fn constrained_extraction_query_handler(
         Ok(rows) => Json(json!({"rows": rows})).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
     }
+}
+
+/// POST /api/v1/ontology/constrained-extractions/:id/quality-gate
+///
+/// Runs the medium-speed supervisory loop only against the caller's
+/// claims-minted staging graph. It persists an immutable report on that same
+/// extraction for review; it never materializes or promotes anything.
+pub(crate) async fn quality_gate_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+    Json(request): Json<QualityGateRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let mut report = match KgQualityGate::evaluate(&kg, claims, &extraction_id, &request, None) {
+        Ok(report) => report,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    if report.deterministic_passed {
+        if let Some(judge_config) = &request.judge {
+            let judge =
+                run_llm_quality_judge(&state, &kg, claims, &extraction_id, judge_config).await;
+            report = KgQualityGate::apply_judge(report, judge);
+        }
+    }
+    let review = PendingExtractionReview {
+        review_id: uuid::Uuid::new_v4().simple().to_string(),
+        extraction_id: extraction_id.clone(),
+        staging_graph: match kg.staging_graph_iri_for_claims(claims, &extraction_id) {
+            Ok(graph) => graph,
+            Err(error) => {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": error}))).into_response()
+            }
+        },
+        gate_status: report.review_status.clone(),
+        report_json: serde_json::to_string(&report).unwrap_or_default(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        decision: "pending".into(),
+    };
+    if let Err(error) = persist_quality_gate_report(&kg, claims, &report) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    if let Err(error) = kg.create_extraction_review_for_claims(claims, &review) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    let status = if report.passed {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (status, Json(json!({ "report": report, "review": review }))).into_response()
+}
+
+async fn run_llm_quality_judge(
+    state: &AppState,
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+    config: &JudgeConfig,
+) -> JudgeReport {
+    use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
+
+    let evidence = match kg.staging_ntriples_for_claims(claims, extraction_id) {
+        Ok(value) => value,
+        Err(error) => return failed_judge_report(format!("read staging evidence: {error}")),
+    };
+    let message = ChatMessage {
+        role: "user".into(),
+        content: ChatContent::Text(format!(
+            "You are a source-grounded KG quality reviewer. Review only this staging evidence. \
+Return strict JSON with verdict (approve|needs_review|reject), rationale, and non-empty \
+source_citations. Do not claim authority to override deterministic policy.\n\n{evidence}"
+        )),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let default_model = state.gateway.default_model();
+    let model = config.model.as_deref().unwrap_or(&default_model);
+    let content = state
+        .gateway
+        .chat_with_model(model, vec![message])
+        .await
+        .ok()
+        .and_then(|response| response.choices.into_iter().next())
+        .and_then(|choice| choice.message.content);
+    match content.and_then(|text| serde_json::from_str::<JudgeReport>(&text).ok()) {
+        Some(report) if !report.source_citations.is_empty() => report,
+        Some(_) => failed_judge_report("Judge returned no source citations".into()),
+        None => failed_judge_report("Judge did not return valid source-grounded JSON".into()),
+    }
+}
+
+fn failed_judge_report(rationale: String) -> JudgeReport {
+    JudgeReport {
+        verdict: JudgeVerdict::Reject,
+        rationale,
+        source_citations: Vec::new(),
+    }
+}
+
+/// GET /api/v1/ontology/extraction-reviews — claims-scoped review queue.
+pub(crate) async fn list_extraction_reviews_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match kg.list_extraction_reviews_for_claims(claims) {
+        Ok(reviews) => Json(json!({"reviews": reviews, "production_write": false})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/extraction-reviews/:id/{approve,reject}
+///
+/// Records external human judgment only. P1.5 owns any future materialization.
+pub(crate) async fn resolve_extraction_review_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path((review_id, decision)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let decision = match decision.as_str() {
+        "approve" => "approved",
+        "reject" => "rejected",
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "unknown review action"})),
+            )
+                .into_response()
+        }
+    };
+    match kg.resolve_extraction_review_for_claims(claims, &review_id, decision) {
+        Ok(()) => Json(json!({
+            "review_id": review_id, "decision": decision, "production_write": false
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+    }
+}
+
+/// GET /api/v1/ontology/constrained-extractions/:id/review
+///
+/// Returns reports attached to one extraction. Approval/rejection remains a
+/// human/HITL operation; this endpoint deliberately cannot commit staging.
+pub(crate) async fn constrained_extraction_review_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let query = format!(
+        "SELECT ?report WHERE {{ <{EXTRACTION_PROVENANCE_NS}run/{extraction_id}> \
+         <{EXTRACTION_PROVENANCE_NS}qualityReport> ?report }}"
+    );
+    let reports = match kg.query_staging_for_claims(claims, &extraction_id, &query) {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| {
+                row.get("?report")
+                    .and_then(|value| value.as_str())
+                    .and_then(|json| serde_json::from_str::<QualityGateReport>(json).ok())
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    Json(json!({
+        "extraction_id": extraction_id,
+        "quality_gate_reports": reports,
+        "production_write": false,
+    }))
+    .into_response()
+}
+
+fn persist_quality_gate_report(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    report: &QualityGateReport,
+) -> Result<(), String> {
+    let serialized = serde_json::to_string(report)
+        .map_err(|error| format!("serialize quality gate report: {error}"))?;
+    let run = format!("{EXTRACTION_PROVENANCE_NS}run/{}", report.extraction_id);
+    let triple = format!(
+        "<{run}> <{EXTRACTION_PROVENANCE_NS}qualityReport> \"{}\" .",
+        sparql_literal(&serialized)
+    );
+    kg.update_staging_for_claims(
+        claims,
+        &report.extraction_id,
+        &ClaimsGraphUpdate::insert_data(triple),
+    )
 }
 
 #[derive(Debug, Deserialize)]
