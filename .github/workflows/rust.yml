@@ -5,11 +5,26 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  schedule:
+    - cron: "17 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ontology-ke-golden-fixture-gate:
+    name: Ontology KE frozen fixture gate
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Verify frozen ontology KE fixture integrity
+      env:
+        ONTOLOGY_KE_GOLDEN_BASE_REF: origin/${{ github.base_ref || 'main' }}
+        ONTOLOGY_KE_GOLDEN_PR_BODY: ${{ github.event.pull_request.body }}
+      run: ./scripts/check_ontology_ke_golden.sh
+
   build:
 
     runs-on: ubuntu-latest
