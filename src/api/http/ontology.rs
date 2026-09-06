@@ -26,7 +26,10 @@ use crate::{
             QualityGateRequest,
         },
         rdf_mapper::RdfMapper,
-        store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingTypeDraft},
+        store::{
+            ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingExtractionReview,
+            PendingTypeDraft,
+        },
         types::LLMExtractionOutput,
     },
 };
@@ -376,7 +379,28 @@ pub(crate) async fn quality_gate_handler(
             report = KgQualityGate::apply_judge(report, judge);
         }
     }
+    let review = PendingExtractionReview {
+        review_id: uuid::Uuid::new_v4().simple().to_string(),
+        extraction_id: extraction_id.clone(),
+        staging_graph: match kg.staging_graph_iri_for_claims(claims, &extraction_id) {
+            Ok(graph) => graph,
+            Err(error) => {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": error}))).into_response()
+            }
+        },
+        gate_status: report.review_status.clone(),
+        report_json: serde_json::to_string(&report).unwrap_or_default(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        decision: "pending".into(),
+    };
     if let Err(error) = persist_quality_gate_report(&kg, claims, &report) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    if let Err(error) = kg.create_extraction_review_for_claims(claims, &review) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": error})),
@@ -389,7 +413,7 @@ pub(crate) async fn quality_gate_handler(
     } else {
         StatusCode::UNPROCESSABLE_ENTITY
     };
-    (status, Json(json!(report))).into_response()
+    (status, Json(json!({ "report": report, "review": review }))).into_response()
 }
 
 async fn run_llm_quality_judge(
@@ -438,6 +462,75 @@ fn failed_judge_report(rationale: String) -> JudgeReport {
         verdict: JudgeVerdict::Reject,
         rationale,
         source_citations: Vec::new(),
+    }
+}
+
+/// GET /api/v1/ontology/extraction-reviews — claims-scoped review queue.
+pub(crate) async fn list_extraction_reviews_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match kg.list_extraction_reviews_for_claims(claims) {
+        Ok(reviews) => Json(json!({"reviews": reviews, "production_write": false})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/extraction-reviews/:id/{approve,reject}
+///
+/// Records external human judgment only. P1.5 owns any future materialization.
+pub(crate) async fn resolve_extraction_review_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path((review_id, decision)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let decision = match decision.as_str() {
+        "approve" => "approved",
+        "reject" => "rejected",
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "unknown review action"})),
+            )
+                .into_response()
+        }
+    };
+    match kg.resolve_extraction_review_for_claims(claims, &review_id, decision) {
+        Ok(()) => Json(json!({
+            "review_id": review_id, "decision": decision, "production_write": false
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
     }
 }
 

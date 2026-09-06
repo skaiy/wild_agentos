@@ -67,8 +67,23 @@ pub struct PendingActionApproval {
     pub expires_at: String,
 }
 
+/// A claims-scoped human review record for a constrained extraction. Resolving
+/// this record never materializes staging into the production graph.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PendingExtractionReview {
+    pub review_id: String,
+    pub extraction_id: String,
+    pub staging_graph: String,
+    pub gate_status: String,
+    pub report_json: String,
+    pub created_at: String,
+    pub decision: String,
+}
+
 const APPROVAL_BASE_IRI: &str = "https://agentos.ontology/action-approval/";
 const APPROVAL_VOCAB_IRI: &str = "https://agentos.ontology/action-approval/";
+const EXTRACTION_REVIEW_BASE_IRI: &str = "https://agentos.ontology/extraction-review/";
+const EXTRACTION_REVIEW_VOCAB_IRI: &str = "https://agentos.ontology/extraction-review/";
 const TYPE_DRAFT_BASE_IRI: &str = "https://agentos.ontology/type-draft/";
 const TYPE_DRAFT_VOCAB_IRI: &str = "https://agentos.ontology/type-draft/";
 
@@ -501,6 +516,109 @@ impl KnowledgeGraphStore {
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {e}"))?;
         Ok(format!("{production}/action-approvals"))
+    }
+
+    pub fn create_extraction_review_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        review: &PendingExtractionReview,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(&review.review_id, "review identifier")?;
+        Self::validate_opaque_id(&review.extraction_id, "extraction identifier")?;
+        let expected = self.staging_graph_iri_for_claims(claims, &review.extraction_id)?;
+        if review.staging_graph != expected {
+            return Err("review staging graph is not claims-derived".into());
+        }
+        let graph = self.extraction_reviews_graph_iri_for_claims(claims)?;
+        let subject = format!("{EXTRACTION_REVIEW_BASE_IRI}{}", review.review_id);
+        let lit = |value: &str| Self::sparql_literal(value);
+        self.store
+            .update(&format!(
+                "INSERT DATA {{ GRAPH <{graph}> {{ <{subject}> \
+             <{vocab}reviewId> {id} ; <{vocab}extractionId> {extraction_id} ; \
+             <{vocab}stagingGraph> {staging_graph} ; <{vocab}gateStatus> {gate_status} ; \
+             <{vocab}reportJson> {report_json} ; <{vocab}createdAt> {created_at} ; \
+             <{vocab}decision> {decision} . }} }}",
+                vocab = EXTRACTION_REVIEW_VOCAB_IRI,
+                id = lit(&review.review_id),
+                extraction_id = lit(&review.extraction_id),
+                staging_graph = lit(&review.staging_graph),
+                gate_status = lit(&review.gate_status),
+                report_json = lit(&review.report_json),
+                created_at = lit(&review.created_at),
+                decision = lit(&review.decision),
+            ))
+            .map_err(|e| format!("claims-scoped extraction review create failed: {e}"))
+    }
+
+    pub fn list_extraction_reviews_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<Vec<PendingExtractionReview>, String> {
+        let graph = self.extraction_reviews_graph_iri_for_claims(claims)?;
+        let query = format!(
+            "SELECT ?id ?extraction_id ?staging_graph ?gate_status ?report_json ?created_at ?decision WHERE {{ \
+             GRAPH <{graph}> {{ ?review <{vocab}reviewId> ?id ; \
+             <{vocab}extractionId> ?extraction_id ; <{vocab}stagingGraph> ?staging_graph ; \
+             <{vocab}gateStatus> ?gate_status ; <{vocab}reportJson> ?report_json ; \
+             <{vocab}createdAt> ?created_at ; <{vocab}decision> ?decision . }} }} ORDER BY ?created_at",
+            vocab = EXTRACTION_REVIEW_VOCAB_IRI,
+        );
+        self.query_sparql_in_graph(&query, None)?
+            .into_iter()
+            .map(|row| {
+                let get = |name: &str| {
+                    row.get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("review query missing {name}"))
+                };
+                Ok(PendingExtractionReview {
+                    review_id: get("?id")?,
+                    extraction_id: get("?extraction_id")?,
+                    staging_graph: get("?staging_graph")?,
+                    gate_status: get("?gate_status")?,
+                    report_json: get("?report_json")?,
+                    created_at: get("?created_at")?,
+                    decision: get("?decision")?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn resolve_extraction_review_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        review_id: &str,
+        decision: &str,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(review_id, "review identifier")?;
+        if !matches!(decision, "approved" | "rejected") {
+            return Err("review decision must be approved or rejected".into());
+        }
+        let graph = self.extraction_reviews_graph_iri_for_claims(claims)?;
+        let subject = format!("{EXTRACTION_REVIEW_BASE_IRI}{review_id}");
+        self.store
+            .update(&format!(
+                "DELETE {{ GRAPH <{graph}> {{ <{subject}> <{vocab}decision> ?old }} }} \
+             INSERT {{ GRAPH <{graph}> {{ <{subject}> <{vocab}decision> \"{decision}\" }} }} \
+             WHERE {{ GRAPH <{graph}> {{ <{subject}> <{vocab}decision> ?old }} }}",
+                vocab = EXTRACTION_REVIEW_VOCAB_IRI,
+            ))
+            .map_err(|e| format!("claims-scoped extraction review resolve failed: {e}"))
+    }
+
+    fn extraction_reviews_graph_iri_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<String, String> {
+        Ok(format!(
+            "{}{}",
+            claims
+                .graph_iri()
+                .map_err(|e| format!("invalid verified graph scope: {e}"))?,
+            "/extraction-reviews"
+        ))
     }
 
     /// Persists a complete type draft in a dedicated, claims-derived graph.
@@ -1737,5 +1855,52 @@ mod tests {
             query,
             "ASK { GRAPH <graph://tenant-a/project-a/staging/test> { ?s ?p ?o } }"
         );
+    }
+
+    #[test]
+    fn extraction_reviews_are_claims_scoped_and_never_commit_staging() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let tenant_a = claims();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-a", "actor-b").unwrap();
+        let extraction_id = "extract1";
+        let staging_graph = store
+            .staging_graph_iri_for_claims(&tenant_a, extraction_id)
+            .unwrap();
+        store
+            .create_extraction_review_for_claims(
+                &tenant_a,
+                &PendingExtractionReview {
+                    review_id: "review1".into(),
+                    extraction_id: extraction_id.into(),
+                    staging_graph,
+                    gate_status: "pending_review".into(),
+                    report_json: "{}".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    decision: "pending".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_extraction_reviews_for_claims(&tenant_a)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .list_extraction_reviews_for_claims(&tenant_b)
+            .unwrap()
+            .is_empty());
+        store
+            .resolve_extraction_review_for_claims(&tenant_a, "review1", "approved")
+            .unwrap();
+        assert_eq!(
+            store.list_extraction_reviews_for_claims(&tenant_a).unwrap()[0].decision,
+            "approved"
+        );
+        assert!(store
+            .query_sparql_for_claims(&tenant_a, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .is_empty());
     }
 }

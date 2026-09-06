@@ -85,11 +85,12 @@ use ontology::{
     create_openapi_type_draft_handler, create_sql_ddl_type_draft_handler,
     delete_action_type_handler, delete_function_def_handler, delete_link_type_handler,
     delete_object_type_handler, domain_guardrails_handler, invoke_action_handler,
-    list_action_approvals_handler, list_type_drafts_handler, ontology_types_handler,
-    promote_type_draft_handler, quality_gate_handler, reject_action_approval_handler,
-    update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
-    update_link_type_handler, update_object_type_handler, upsert_action_type_handler,
-    upsert_function_def_handler, upsert_link_type_handler, upsert_object_type_handler,
+    list_action_approvals_handler, list_extraction_reviews_handler, list_type_drafts_handler,
+    ontology_types_handler, promote_type_draft_handler, quality_gate_handler,
+    reject_action_approval_handler, resolve_extraction_review_handler, update_action_type_handler,
+    update_domain_guardrails_handler, update_function_def_handler, update_link_type_handler,
+    update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
+    upsert_link_type_handler, upsert_object_type_handler,
 };
 use runtime::{health_handler, metrics_handler, unified_stats_handler};
 use skills::{
@@ -382,6 +383,14 @@ pub fn build_router(
         .route(
             "/api/v1/ontology/constrained-extractions/:id/review",
             get(constrained_extraction_review_handler),
+        )
+        .route(
+            "/api/v1/ontology/extraction-reviews",
+            get(list_extraction_reviews_handler),
+        )
+        .route(
+            "/api/v1/ontology/extraction-reviews/:id/:decision",
+            post(resolve_extraction_review_handler),
         )
         // ── 本体类型草稿：适配输入 → claims 隔离草稿 → 人工确认提升 ──
         .route(

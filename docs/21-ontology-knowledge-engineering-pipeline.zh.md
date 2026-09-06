@@ -274,8 +274,8 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
 
 - **已实现（#140）：** `KgQualityGate` 在入审前运行 claims-scoped、可配置的
   SPARQL `ASK` 锚点与显式启用的 pySHACL sidecar。其带版本的质量/覆盖率仲裁默认
-  合规优先；报告附着在 staging `extraction_id` 上，确定性锚点失败时 Judge 不会运行，
-  也绝不能推翻结果。
+  合规优先；报告附着在 staging `extraction_id` 与 claims-scoped review queue 上，
+  approve/reject 只记录人工决定而不写生产图；确定性锚点失败时 Judge 不会运行，也绝不能推翻结果。
 
 - [#140](https://github.com/skaiy/wild_agentos/issues/140)：将 `KgQualityGate`
   作为中速 quality supervisory loop，使用针对 type、predicate、cardinality 和

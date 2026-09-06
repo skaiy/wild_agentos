@@ -341,8 +341,9 @@ and skill loops that use a promoted ontology.
 - **Implemented (#140):** `KgQualityGate` runs claims-scoped, configurable
   SPARQL `ASK` anchors and an opt-in pySHACL sidecar before review. Its
   versioned quality-vs-coverage arbitration defaults to compliance; reports
-  remain attached to the staging `extraction_id`, and a Judge cannot run—or
-  overturn the result—when a deterministic anchor fails.
+  remain attached to the staging `extraction_id` and claims-scoped review
+  queue; approve/reject records no production write, and a Judge cannot
+  run—or overturn the result—when a deterministic anchor fails.
 
 - [#140](https://github.com/skaiy/wild_agentos/issues/140): make
   `KgQualityGate` the medium-speed quality supervisory loop, with deterministic
