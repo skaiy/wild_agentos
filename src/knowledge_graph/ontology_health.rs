@@ -3,7 +3,7 @@
 //! This module intentionally aggregates only claims-scoped, persisted evidence.
 //! It neither creates drafts nor mutates staging, production, or ontology metadata.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -155,7 +155,7 @@ fn staging_health(
     let extraction_ids = reviews
         .iter()
         .map(|review| review.extraction_id.as_str())
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let mut health = StagingHealth {
         canonicalization_decisions: 0,
         accepted: 0,
