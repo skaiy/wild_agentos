@@ -2806,7 +2806,8 @@ mod ontology_crud_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         let state = make_state(&tmp);
-        let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let claims =
+            IsolationClaims::from_verified("tenant-a", "repair", "ontology-tester").unwrap();
         let ontology_store =
             crate::knowledge_graph::ontology_store::OntologyStore::with_shared_store(
                 state.kg_store.clone(),
