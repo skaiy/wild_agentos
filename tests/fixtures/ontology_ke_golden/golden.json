@@ -4,7 +4,8 @@
   "required_case_ids": [
     "accepted-promoted-link",
     "reject-unpromoted-type",
-    "reject-link-domain-mismatch"
+    "reject-link-domain-mismatch",
+    "gate-ask-fail-closed"
   ],
   "metrics": {
     "minimum_ontology_conformance_rate": 1.0,
@@ -107,6 +108,8 @@
         "staged_edges": 1,
         "accepted_decisions": 3,
         "rejected_decisions": 0,
+        "ask_query": "ASK { ?s a <https://golden.agentos.example/repair/UnpromotedSensor> }",
+        "deterministic_passed": true,
         "ask_violation": false
       }
     },
@@ -129,6 +132,8 @@
         "staged_edges": 0,
         "accepted_decisions": 0,
         "rejected_decisions": 1,
+        "ask_query": "ASK { ?s a <https://golden.agentos.example/repair/UnpromotedSensor> }",
+        "deterministic_passed": true,
         "ask_violation": false
       }
     },
@@ -168,7 +173,50 @@
         "staged_edges": 0,
         "accepted_decisions": 2,
         "rejected_decisions": 1,
+        "ask_query": "ASK { ?s a <https://golden.agentos.example/repair/UnpromotedSensor> }",
+        "deterministic_passed": true,
         "ask_violation": false
+      }
+    },
+    {
+      "id": "gate-ask-fail-closed",
+      "text": "Fault P0A1 affects the battery system.",
+      "candidates": {
+        "nodes": [
+          {
+            "id": "p0a1",
+            "node_type": "FaultCode",
+            "label": "P0A1",
+            "properties": {
+              "code": "P0A1"
+            }
+          },
+          {
+            "id": "battery",
+            "node_type": "System",
+            "label": "Battery",
+            "properties": {
+              "name": "Battery"
+            }
+          }
+        ],
+        "edges": [
+          {
+            "source": "p0a1",
+            "target": "battery",
+            "relation": "affectsSystem",
+            "properties": {}
+          }
+        ]
+      },
+      "expected": {
+        "staged_nodes": 2,
+        "staged_edges": 1,
+        "accepted_decisions": 3,
+        "rejected_decisions": 0,
+        "ask_query": "ASK { ?s ?p ?o }",
+        "deterministic_passed": false,
+        "ask_violation": true
       }
     }
   ]

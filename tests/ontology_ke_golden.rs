@@ -50,6 +50,8 @@ struct ExpectedResult {
     staged_edges: usize,
     accepted_decisions: usize,
     rejected_decisions: usize,
+    ask_query: String,
+    deterministic_passed: bool,
     ask_violation: bool,
 }
 
@@ -133,8 +135,7 @@ fn golden_ontology_ke_extract_canonicalize_and_gate_multi_metric() {
             &QualityGateRequest {
                 assertions: vec![SparqlAskAssertion {
                     code: "unpromoted_type_must_not_stage".into(),
-                    query: "ASK { ?s a <https://golden.agentos.example/repair/UnpromotedSensor> }"
-                        .into(),
+                    query: case.expected.ask_query.clone(),
                 }],
                 policy_version: "ontology-ke-golden/v1".into(),
                 arbitration: QualityCoverageArbitration::Compliance,
@@ -147,6 +148,11 @@ fn golden_ontology_ke_extract_canonicalize_and_gate_multi_metric() {
         assert_eq!(
             report.ask[0].violation, case.expected.ask_violation,
             "golden ASK result changed for {}",
+            case.id
+        );
+        assert_eq!(
+            report.deterministic_passed, case.expected.deterministic_passed,
+            "golden deterministic gate status changed for {}",
             case.id
         );
         assert_eq!(report.production_write, false);
