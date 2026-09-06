@@ -163,10 +163,15 @@ flowchart LR
 
 staging graph 必须由 claims 派生，并可与 production graph 分开寻址。source blob/version、extractor/model configuration、建议 canonical mapping、validation result、reviewer decision 和 materialization result 都应可审计。canonicalization 成功不代表可 promote 新 type，也不代表可绕过现有 approval 边界。
 
-## 分阶段交付桶（未编码）
+## 分阶段交付桶
 
 ### P0 — 受约束提取进入 staging
 
+- **已实现的首个切片：** `POST /api/v1/ontology/constrained-extractions`
+  接收带 provenance 的上游候选，针对已 promote 的
+  `ObjectType`/`LinkType` 做确定性 canonicalize，并且只将接受的
+  triple 及每项 mapping decision 写入 claims mint 的 staging 图；绝不
+  promote type，也绝不写 production 图。
 - 增加本体约束 extraction API，其 domain **仅限 promoted type**。
 - 对 promoted `ObjectType` 和 `LinkType` 执行提取后 canonicalization。
 - fail closed，只能把候选写入 claims-scoped staging graph。

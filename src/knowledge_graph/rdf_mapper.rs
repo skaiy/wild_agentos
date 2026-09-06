@@ -222,15 +222,25 @@ impl RdfMapper {
     }
 
     pub fn quads_to_sparql_insert(quads: &[RdfQuad], graph: &str) -> String {
-        let mut triples = Vec::new();
-        for quad in quads {
-            let s = format!("<{}>", quad.subject);
-            let p = format!("<{}>", quad.predicate);
-            let o = Self::format_rdf_value(&quad.object);
-            triples.push(format!("{} {} {} .", s, p, o));
-        }
-        let body = triples.join("\n  ");
+        let body = Self::quads_to_sparql_triples(quads);
         format!("INSERT DATA {{ GRAPH <{}> {{\n  {}\n}} }}", graph, body)
+    }
+
+    /// Serializes graph-local triples without a `GRAPH` clause. Callers that
+    /// hold verified claims can pass this to a claims-minted graph update.
+    pub fn quads_to_sparql_triples(quads: &[RdfQuad]) -> String {
+        quads
+            .iter()
+            .map(|quad| {
+                format!(
+                    "<{}> <{}> {} .",
+                    quad.subject,
+                    quad.predicate,
+                    Self::format_rdf_value(&quad.object)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ")
     }
 }
 

@@ -4,7 +4,12 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::error;
@@ -12,9 +17,13 @@ use tracing::error;
 use crate::{
     isolation::IsolationClaims,
     knowledge_graph::{
+        canonicalizer::{canonicalize, CanonicalizationDecision},
+        extractor::KnowledgeExtractor,
         ontology_draft::{self, DraftLinkInput, TypeDraftBundle},
         ontology_layer::ActionGuardrailConfig,
+        rdf_mapper::RdfMapper,
         store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingActionApproval, PendingTypeDraft},
+        types::LLMExtractionOutput,
     },
 };
 
@@ -128,6 +137,203 @@ pub(crate) async fn update_domain_guardrails_handler(
 
 const ONT_DOMAIN: &str = "ev-repair";
 const TYPE_DRAFT_TTL_HOURS: i64 = 24;
+const EXTRACTION_PROVENANCE_NS: &str = "https://agentos.ontology/extraction/";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConstrainedExtractionSource {
+    pub blob_id: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConstrainedExtractionRequest {
+    /// The versioned source text used by an upstream extractor. This first
+    /// slice accepts extraction candidates explicitly so LLM/sidecar selection
+    /// stays outside the trusted graph-write boundary.
+    pub text: String,
+    pub source: ConstrainedExtractionSource,
+    pub extractor: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub candidates: LLMExtractionOutput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagingQuery {
+    pub sparql: String,
+}
+
+fn extraction_provenance_triples(
+    extraction_id: &str,
+    request: &ConstrainedExtractionRequest,
+    decisions: &[CanonicalizationDecision],
+) -> Result<String, String> {
+    let run = format!("{EXTRACTION_PROVENANCE_NS}run/{extraction_id}");
+    let literal = |value: &str| format!("\"{}\"", sparql_literal(value));
+    let mut triples = vec![format!(
+        "<{run}> <{ns}blobId> {blob} ; <{ns}blobVersion> {version} ; \
+         <{ns}extractor> {extractor} ; <{ns}sourceText> {text} .",
+        ns = EXTRACTION_PROVENANCE_NS,
+        blob = literal(&request.source.blob_id),
+        version = literal(&request.source.version),
+        extractor = literal(&request.extractor),
+        text = literal(&request.text),
+    )];
+    if let Some(model) = &request.model {
+        triples.push(format!(
+            "<{run}> <{ns}model> {model} .",
+            ns = EXTRACTION_PROVENANCE_NS,
+            model = literal(model),
+        ));
+    }
+    for (index, decision) in decisions.iter().enumerate() {
+        let decision_iri = format!("{EXTRACTION_PROVENANCE_NS}decision/{extraction_id}/{index}");
+        let serialized = serde_json::to_string(decision)
+            .map_err(|error| format!("serialize canonicalization decision: {error}"))?;
+        triples.push(format!(
+            "<{run}> <{ns}decision> <{decision_iri}> . \
+             <{decision_iri}> <{ns}json> {serialized} .",
+            ns = EXTRACTION_PROVENANCE_NS,
+            serialized = literal(&serialized),
+        ));
+    }
+    Ok(triples.join("\n"))
+}
+
+/// POST /api/v1/ontology/constrained-extractions
+///
+/// Canonicalizes open extraction candidates solely against the current,
+/// explicitly promoted ObjectType and LinkType definitions, then writes only
+/// accepted candidates and complete provenance to a claims-minted staging
+/// graph. This endpoint cannot select or write the production graph.
+pub(crate) async fn constrained_extraction_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<ConstrainedExtractionRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if request.text.trim().is_empty()
+        || request.source.blob_id.trim().is_empty()
+        || request.source.version.trim().is_empty()
+        || request.extractor.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "text, source.blob_id, source.version, and extractor are required"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = KnowledgeExtractor::validate_extraction(
+        &serde_json::to_string(&request.candidates).unwrap_or_default(),
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+    }
+    let ontology_store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let ontology = match ontology_store.load_definition(ONT_DOMAIN) {
+        Ok(ontology) => ontology,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let canonical = canonicalize(&request.candidates, &ontology);
+    let extraction_id = uuid::Uuid::new_v4().simple().to_string();
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let staging_graph = match kg.staging_graph_iri_for_claims(claims, &extraction_id) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": error}))).into_response()
+        }
+    };
+    let mapped = RdfMapper::map_extraction(&canonical.extraction, &staging_graph);
+    let mut triples = RdfMapper::quads_to_sparql_triples(&mapped.quads);
+    let provenance =
+        match extraction_provenance_triples(&extraction_id, &request, &canonical.decisions) {
+            Ok(triples) => triples,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": error})),
+                )
+                    .into_response()
+            }
+        };
+    if !triples.is_empty() {
+        triples.push('\n');
+    }
+    triples.push_str(&provenance);
+    if let Err(error) = kg.update_staging_for_claims(
+        claims,
+        &extraction_id,
+        &ClaimsGraphUpdate::insert_data(triples),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    Json(json!({
+        "status": "staged",
+        "extraction_id": extraction_id,
+        "staging_graph": staging_graph,
+        "entities_staged": mapped.entity_count,
+        "relations_staged": mapped.relation_count,
+        "decisions": canonical.decisions,
+        "production_write": false,
+    }))
+    .into_response()
+}
+
+/// GET /api/v1/ontology/constrained-extractions/:id? sparql=...
+///
+/// Reads only the caller's claims-derived staging graph; `GRAPH` clauses are
+/// rejected by the store so callers cannot select another graph.
+pub(crate) async fn constrained_extraction_query_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+    Query(query): Query<StagingQuery>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match kg.query_staging_for_claims(claims, &extraction_id, &query.sparql) {
+        Ok(rows) => Json(json!({"rows": rows})).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2034,6 +2240,94 @@ mod ontology_crud_tests {
             .iter()
             .any(|object| object["id"] == "ImportedAsset"));
 
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn constrained_extraction_requires_claims_and_writes_only_staging() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_constrained_extract_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/constrained-extractions",
+                post(constrained_extraction_handler),
+            )
+            .with_state(state.clone());
+        let body = json!({
+            "text": "P0A1 affects the battery system.",
+            "source": {"blob_id": "manual-p0a1", "version": "v1"},
+            "extractor": "test-extractor",
+            "model": "test-model",
+            "candidates": {
+                "nodes": [
+                    {"id": "p0a1", "node_type": "FaultCode", "label": "P0A1", "properties": {}},
+                    {"id": "battery", "node_type": "System", "label": "Battery system", "properties": {}}
+                ],
+                "edges": [
+                    {"source": "p0a1", "target": "battery", "relation": "affectsSystem", "properties": {}}
+                ]
+            }
+        });
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/constrained-extractions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/constrained-extractions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["status"], "staged");
+        assert_eq!(response["production_write"], false);
+        let extraction_id = response["extraction_id"].as_str().unwrap();
+        let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let staging = kg
+            .query_staging_for_claims(&claims, extraction_id, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+            .unwrap();
+        assert!(
+            staging
+                .iter()
+                .any(|row| row["?o"] == "https://agentos.ontology/ev/FaultCode"),
+            "canonical type triple must be present in staging"
+        );
+        assert!(
+            staging
+                .iter()
+                .any(|row| row["?p"] == "https://agentos.ontology/extraction/blobId"),
+            "source blob provenance must be present in staging"
+        );
+        assert!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+                .unwrap()
+                .is_empty(),
+            "constrained extraction must not write the production graph"
+        );
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
