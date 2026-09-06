@@ -298,9 +298,15 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
 
 #### P2 — 带 external judgment 的实体消解
 
-- [#141](https://github.com/skaiy/wild_agentos/issues/141)：增加保守的 entity resolution
-  与 deduplication，并提供保留 provenance、可审阅的 merge suggestion；merge 由人工提供
-  external judgment。
+- **已实现（#141）：** `POST /api/v1/ontology/entity-resolution/suggestions`
+  在 claims 作用域内重复执行受 GLinker 启发的「mention → retrieve →
+  disambiguate」检查。冻结的首版 matcher 只接受规范化后完全相等的
+  `rdfs:label`（score `1.0`，threshold `0.98`），仅向 staging graph 写入
+  `owl:sameAs` 和 provenance，并创建待人工批准的 suggestion，绝不自动合并。
+  既有的 `/action-approvals/:approval_id/approve` 在批准后 materialize，并独立
+  SPARQL 回读由服务端生成的 anchor；anchor 缺失时返回 `needs_repair` 且保留记录
+  以供修复。GLinker 只作为 Apache-2.0 架构模式参考；本进程不链接 GLinker
+  代码、模型权重或 LGPL 组件。
 - 增加显式配置的 blob-watch/reindex job，并具备 idempotent cursor、retry、observability 和 backpressure。
 
 #### P2b — 冻结提取评测与 measurement-decay 审计

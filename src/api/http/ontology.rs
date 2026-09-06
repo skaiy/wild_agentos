@@ -39,12 +39,120 @@ use crate::{
 use super::{iam::UserIdentity, ontology_guardrails, AppState};
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+const ENTITY_RESOLUTION_PROVENANCE_NS: &str = "https://agentos.ontology/entity-resolution/";
+const ENTITY_RESOLUTION_THRESHOLD: f32 = 0.98;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EntityResolutionSuggestionRequest {
+    pub source_iri: String,
+    pub mention: String,
+}
 
 fn sparql_literal(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+fn normalized_entity_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn valid_iri(value: &str) -> bool {
+    oxigraph::model::NamedNodeRef::new(value).is_ok()
+}
+
+/// POST /api/v1/ontology/entity-resolution/suggestions.
+///
+/// A supervised, GLinker-inspired mention → retrieve → disambiguate path.
+/// Retrieval is claims-scoped and the frozen matcher only accepts exact
+/// normalized labels. Its output is always an approval-held suggestion.
+pub(crate) async fn create_entity_resolution_suggestion_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<EntityResolutionSuggestionRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if !valid_iri(&request.source_iri) || request.mention.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "source_iri must be a valid IRI and mention is required"}))).into_response();
+    }
+    let mention = normalized_entity_text(&request.mention);
+    if mention.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "mention must contain at least one letter or number"}))).into_response();
+    }
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response(),
+    };
+    let source_exists = match kg.query_sparql_for_claims(
+        claims, &format!("SELECT ?p WHERE {{ <{}> ?p ?o }} LIMIT 1", request.source_iri),
+    ) {
+        Ok(rows) => !rows.is_empty(),
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+    };
+    if !source_exists {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "source entity not found"}))).into_response();
+    }
+    let candidates = match kg.query_sparql_for_claims(
+        claims,
+        &format!("SELECT DISTINCT ?candidate ?label WHERE {{ ?candidate <{RDFS_LABEL}> ?label . FILTER(?candidate != <{}>) }} LIMIT 50", request.source_iri),
+    ) {
+        Ok(rows) => rows,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+    };
+    let mut matches: Vec<(String, String)> = candidates.into_iter().filter_map(|row| {
+        let candidate = row.get("?candidate")?.as_str()?.trim_matches(['<', '>']).to_owned();
+        let label = row.get("?label")?.as_str()?.to_owned();
+        (normalized_entity_text(&label) == mention).then_some((candidate, label))
+    }).collect();
+    matches.sort();
+    let Some((target_iri, target_label)) = matches.into_iter().next() else {
+        return (StatusCode::OK, Json(json!({
+            "status": "not_presented", "reason": "no candidate met the frozen conservative threshold",
+            "threshold": ENTITY_RESOLUTION_THRESHOLD, "production_write": false,
+        }))).into_response();
+    };
+    let approval_id = uuid::Uuid::new_v4().simple().to_string();
+    let evidence_iri = format!("{ENTITY_RESOLUTION_PROVENANCE_NS}suggestion/{approval_id}");
+    let triples = format!(
+        "<{source}> <{same_as}> <{target}> . <{evidence}> <{ns}sourceEntity> <{source}> ; <{ns}targetEntity> <{target}> ; <{ns}mention> \"{mention}\" ; <{ns}targetLabel> \"{target_label}\" ; <{ns}score> \"1.0\" ; <{ns}matcher> \"exact-normalized-label-v1\" .",
+        source = request.source_iri, target = target_iri, same_as = OWL_SAME_AS,
+        evidence = evidence_iri, ns = ENTITY_RESOLUTION_PROVENANCE_NS,
+        mention = sparql_literal(&request.mention), target_label = sparql_literal(&target_label),
+    );
+    if let Err(error) = kg.update_staging_for_claims(claims, &approval_id, &ClaimsGraphUpdate::insert_data(triples)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response();
+    }
+    let approval = PendingActionApproval {
+        approval_id: approval_id.clone(), staging_id: approval_id.clone(),
+        staging_graph: kg.staging_graph_iri_for_claims(claims, &approval_id).expect("generated identifier is valid"),
+        action_id: "entity-resolution".into(),
+        anchor_query: Some(format!("SELECT ?same WHERE {{ <{}> <{}> <{}> }} LIMIT 1", request.source_iri, OWL_SAME_AS, target_iri)),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS)).to_rfc3339(),
+    };
+    if let Err(error) = kg.create_action_approval_for_claims(claims, &approval) {
+        let _ = kg.drop_staging_for_claims(claims, &approval_id);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": error}))).into_response();
+    }
+    let _ = state.kg_store.flush();
+    emit_action_audit(&state, claims, "entity-resolution", &approval_id, "pending", &[]).await;
+    (StatusCode::OK, Json(json!({
+        "status": "pending_approval", "approval_id": approval_id,
+        "source_iri": request.source_iri, "target_iri": target_iri,
+        "score": 1.0, "threshold": ENTITY_RESOLUTION_THRESHOLD,
+        "evidence": { "mention": request.mention, "target_label": target_label, "matcher": "exact-normalized-label-v1" },
+        "production_write": false,
+    }))).into_response()
 }
 
 /// GET /api/v1/ontology/types — 返回新能源车维修域本体定义（对象/链接/动作/函数）
@@ -1950,6 +2058,7 @@ fn commit_via_staging(
             staging_id,
             staging_graph: staging,
             action_id: action_id.to_string(),
+        anchor_query: None,
             created_at: now.to_rfc3339(),
             expires_at: (now + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS)).to_rfc3339(),
         };
@@ -2117,6 +2226,35 @@ async fn resolve_action_approval(
                 Json(json!({ "error": format!("approval merge failed: {e}") })),
             )
                 .into_response();
+        }
+        // Entity-resolution and other supervisory flows supply this query
+        // server-side. A successful ADD is not evidence: re-read the
+        // claims-minted production graph before declaring approval complete.
+        if let Some(anchor_query) = &approval.anchor_query {
+            match kg.query_sparql_for_claims(claims, anchor_query) {
+                Ok(rows) if !rows.is_empty() => {}
+                Ok(_) | Err(_) => {
+                    let _ = state.kg_store.flush();
+                    emit_action_audit(
+                        state,
+                        claims,
+                        &approval.action_id,
+                        &approval.staging_id,
+                        "needs_repair",
+                        &["post_merge_sparql_anchor_failed".into()],
+                    )
+                    .await;
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "needs_repair",
+                            "approval_id": approval.approval_id,
+                            "error": "post-merge SPARQL anchor failed; approval retained for repair",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
         }
     }
     if let Err(e) = kg.drop_staging_for_claims(claims, &approval.staging_id) {

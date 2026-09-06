@@ -371,9 +371,17 @@ and skill loops that use a promoted ontology.
 
 #### P2 — entity resolution with external judgment
 
-- [#141](https://github.com/skaiy/wild_agentos/issues/141): add conservative
-  entity resolution and deduplication with provenance-preserving, reviewable
-  merge suggestions; a human provides external judgment on merges.
+- **Implemented (#141):** `POST /api/v1/ontology/entity-resolution/suggestions`
+  repeats a claims-scoped, GLinker-inspired mention → retrieve → disambiguate
+  check. The frozen initial matcher accepts only exact normalized
+  `rdfs:label` matches (score `1.0`, threshold `0.98`), writes
+  `owl:sameAs` plus provenance only to a staging graph, and creates an
+  approval-held suggestion. It never auto-merges. The existing
+  `/action-approvals/:approval_id/approve` endpoint materializes an approved
+  suggestion and independently re-reads its server-authored SPARQL anchor;
+  an absent anchor returns `needs_repair` and retains the record for repair.
+  GLinker is used as an Apache-2.0 architectural pattern only; no GLinker
+  code, model weights, or LGPL component is linked into this process.
 - Add explicitly configured blob-watch/reindex jobs with idempotent cursors,
   retries, observability, and backpressure.
 
