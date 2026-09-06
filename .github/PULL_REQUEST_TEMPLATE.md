@@ -6,6 +6,12 @@
 
 <!-- e.g. Closes #123 -->
 
+## Ontology KE Golden Fixture Audit
+
+<!-- Required only when tests/fixtures/ontology_ke_golden/ changes. -->
+- [ ] Ontology KE golden fixture change reviewed
+Ontology KE golden fixture audit: N/A
+
 ## Type of Change
 
 - [ ] Bug fix

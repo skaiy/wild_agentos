@@ -1,0 +1,175 @@
+{
+  "suite_version": "ontology-ke-golden/v1",
+  "minimum_case_count": 3,
+  "required_case_ids": [
+    "accepted-promoted-link",
+    "reject-unpromoted-type",
+    "reject-link-domain-mismatch"
+  ],
+  "metrics": {
+    "minimum_ontology_conformance_rate": 1.0,
+    "minimum_invalid_rejection_rate": 1.0,
+    "required_illegal_production_writes": 0
+  },
+  "promoted_ontology": {
+    "domain": "golden-repair",
+    "guardrails": {
+      "assertions": []
+    },
+    "object_types": [
+      {
+        "id": "FaultCode",
+        "iri": "https://golden.agentos.example/repair/FaultCode",
+        "label": "Fault Code",
+        "description": "A promoted diagnostic fault code.",
+        "icon": "alert",
+        "color": "red",
+        "primary_key": "code",
+        "title_property": "code",
+        "properties": [
+          {
+            "name": "code",
+            "label": "Code",
+            "prop_type": "string",
+            "required": true,
+            "enum_values": []
+          }
+        ]
+      },
+      {
+        "id": "System",
+        "iri": "https://golden.agentos.example/repair/System",
+        "label": "System",
+        "description": "A promoted vehicle system.",
+        "icon": "cpu",
+        "color": "blue",
+        "primary_key": "name",
+        "title_property": "name",
+        "properties": [
+          {
+            "name": "name",
+            "label": "Name",
+            "prop_type": "string",
+            "required": true,
+            "enum_values": []
+          }
+        ]
+      }
+    ],
+    "link_types": [
+      {
+        "id": "affectsSystem",
+        "iri": "https://golden.agentos.example/repair/affectsSystem",
+        "label": "affects system",
+        "description": "A fault affects a vehicle system.",
+        "source": "FaultCode",
+        "target": "System",
+        "cardinality": "many_to_one"
+      }
+    ],
+    "action_types": [],
+    "functions": []
+  },
+  "cases": [
+    {
+      "id": "accepted-promoted-link",
+      "text": "Fault P0A1 affects the battery system.",
+      "candidates": {
+        "nodes": [
+          {
+            "id": "p0a1",
+            "node_type": "FaultCode",
+            "label": "P0A1",
+            "properties": {
+              "code": "P0A1"
+            }
+          },
+          {
+            "id": "battery",
+            "node_type": "System",
+            "label": "Battery",
+            "properties": {
+              "name": "Battery"
+            }
+          }
+        ],
+        "edges": [
+          {
+            "source": "p0a1",
+            "target": "battery",
+            "relation": "affectsSystem",
+            "properties": {}
+          }
+        ]
+      },
+      "expected": {
+        "staged_nodes": 2,
+        "staged_edges": 1,
+        "accepted_decisions": 3,
+        "rejected_decisions": 0,
+        "ask_violation": false
+      }
+    },
+    {
+      "id": "reject-unpromoted-type",
+      "text": "An unreviewed sensor observes the battery.",
+      "candidates": {
+        "nodes": [
+          {
+            "id": "sensor",
+            "node_type": "UnpromotedSensor",
+            "label": "Sensor",
+            "properties": {}
+          }
+        ],
+        "edges": []
+      },
+      "expected": {
+        "staged_nodes": 0,
+        "staged_edges": 0,
+        "accepted_decisions": 0,
+        "rejected_decisions": 1,
+        "ask_violation": false
+      }
+    },
+    {
+      "id": "reject-link-domain-mismatch",
+      "text": "The battery affects fault P0A1.",
+      "candidates": {
+        "nodes": [
+          {
+            "id": "battery",
+            "node_type": "System",
+            "label": "Battery",
+            "properties": {
+              "name": "Battery"
+            }
+          },
+          {
+            "id": "p0a1",
+            "node_type": "FaultCode",
+            "label": "P0A1",
+            "properties": {
+              "code": "P0A1"
+            }
+          }
+        ],
+        "edges": [
+          {
+            "source": "battery",
+            "target": "p0a1",
+            "relation": "affectsSystem",
+            "properties": {}
+          }
+        ]
+      },
+      "expected": {
+        "staged_nodes": 2,
+        "staged_edges": 0,
+        "accepted_decisions": 2,
+        "rejected_decisions": 1,
+        "ask_violation": false
+      }
+    }
+  ]
+}

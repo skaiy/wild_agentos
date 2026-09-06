@@ -13,6 +13,12 @@ Current inventory:
 - `golden/agent-plans.json`: heuristic Agent task classification and PDCA role plans.
 - `golden/skill-markdown.json`: static Skill Markdown parsing, including required and optional parameters.
 - `golden/action-invocation.json`: Action dry-run response and the guardrail ownership boundary.
+- `../tests/fixtures/ontology_ke_golden/golden.json`: frozen ontology-constrained
+  extract/canonicalize/`KgQualityGate` scorecard. Run
+  `./scripts/check_ontology_ke_golden.sh` and
+  `cargo test --test ontology_ke_golden --verbose`; its freeze and change-review
+  policy is documented in
+  [docs/22-ontology-ke-golden-freeze-policy.md](../docs/22-ontology-ke-golden-freeze-policy.md).
 - Isolation remains covered by the existing `isolation_contract` suite; run it with
   `cargo test --workspace isolation_contract --verbose`.
 
