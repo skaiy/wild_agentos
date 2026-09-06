@@ -19,7 +19,9 @@ use crate::{
     knowledge_graph::{
         canonicalizer::{canonicalize, CanonicalizationDecision},
         extractor::KnowledgeExtractor,
-        ontology_draft::{self, DraftLinkInput, TypeDraftBundle},
+        ontology_draft::{
+            self, DraftLinkInput, InductionDocument, TypeDraftBundle, TypeDraftProvenance,
+        },
         ontology_layer::ActionGuardrailConfig,
         quality_gate::{
             JudgeConfig, JudgeReport, JudgeVerdict, KgQualityGate, QualityGateReport,
@@ -792,6 +794,24 @@ pub(crate) struct SqlDdlTypeDraftRequest {
     pub links: Vec<DraftLinkInput>,
 }
 
+/// Pre-kernel schema induction input. Candidate terms may come from a human,
+/// an LLM, or a rule engine; this endpoint only turns them into isolated drafts.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SchemaInductionRequest {
+    #[serde(default)]
+    pub candidate_terms: Vec<String>,
+    #[serde(default)]
+    pub documents: Vec<InductionDocument>,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    pub rule_version: String,
+    /// Required when document text is not included. Document bodies are never
+    /// persisted; only these stable source identifiers are retained.
+    #[serde(default)]
+    pub source_document_ids: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PromoteTypeDraftRequest {
@@ -964,6 +984,49 @@ pub(crate) async fn create_sql_ddl_type_draft_handler(
         }
     };
     create_type_draft(&state, claims, "sql_ddl", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-induction — create pre-kernel,
+/// reviewable schema candidates from terminology and/or corpus documents.
+/// It is draft-only: neither promotion nor ActionType creation is possible.
+pub(crate) async fn create_schema_induction_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<SchemaInductionRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let mut source_document_ids = request.source_document_ids;
+    source_document_ids.extend(request.documents.iter().map(|document| document.id.clone()));
+    source_document_ids.sort();
+    source_document_ids.dedup();
+    if source_document_ids.iter().any(|id| id.trim().is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "source document ids must not be empty"})),
+        )
+            .into_response();
+    }
+    let provenance = TypeDraftProvenance {
+        model_version: request
+            .model_version
+            .filter(|version| !version.trim().is_empty()),
+        rule_version: request.rule_version,
+        source_document_ids,
+    };
+    let bundle = match ontology_draft::induce_from_terms(
+        request.candidate_terms,
+        &request.documents,
+        provenance,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "schema_induction", bundle).await
 }
 
 fn type_draft_expired(draft: &PendingTypeDraft) -> bool {
@@ -2925,6 +2988,129 @@ mod ontology_crud_tests {
         assert_eq!(promoted["audit"]["actor_id"], "ontology-tester");
         assert_eq!(promoted["audit"]["ticket"], "ENG-152");
         assert_eq!(promoted["audit"]["force_breaking"], true);
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn schema_induction_stays_out_of_types_until_explicitly_promoted() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("agentos_induction_draft_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route("/api/v1/ontology/types", get(ontology_types_handler))
+            .route(
+                "/api/v1/ontology/type-drafts/from-induction",
+                post(create_schema_induction_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        let body = json!({
+            "candidate_terms": ["Field Sensor", "record"],
+            "documents": [{
+                "id": "maintenance-handbook-v2",
+                "text": "Field Sensor readings are collected. Field Sensor alerts are reviewed."
+            }],
+            "model_version": "terms-assistant-1",
+            "rule_version": "terminology-v1"
+        });
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-induction")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["source"], "schema_induction");
+        assert_eq!(created["actions_generated"], false);
+        assert_eq!(
+            created["preview"]["provenance"]["model_version"],
+            "terms-assistant-1"
+        );
+        assert_eq!(
+            created["preview"]["provenance"]["rule_version"],
+            "terminology-v1"
+        );
+        assert_eq!(
+            created["preview"]["provenance"]["source_document_ids"][0],
+            "maintenance-handbook-v2"
+        );
+        assert!(created["preview"]["link_types"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let types = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|object| object["id"] != "FieldSensor"));
+
+        let promote = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(promote).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let types = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["id"] == "FieldSensor"));
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
