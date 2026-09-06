@@ -63,6 +63,12 @@ pub struct PendingActionApproval {
     pub staging_id: String,
     pub staging_graph: String,
     pub action_id: String,
+    /// An optional, server-authored scoped SPARQL SELECT that must return at
+    /// least one row after an approved staging graph is materialized.
+    ///
+    /// This supports supervisory workflows whose success evidence is an
+    /// independent graph re-read, rather than a worker/model completion.
+    pub anchor_query: Option<String>,
     pub created_at: String,
     pub expires_at: String,
 }
@@ -499,12 +505,17 @@ impl KnowledgeGraphStore {
         let graph = self.approvals_graph_iri_for_claims(claims)?;
         let subject = format!("{APPROVAL_BASE_IRI}{}", approval.approval_id);
         let lit = |value: &str| Self::sparql_literal(value);
+        let anchor = approval
+            .anchor_query
+            .as_deref()
+            .map(|query| format!(" ; <{APPROVAL_VOCAB_IRI}anchorQuery> {}", lit(query)))
+            .unwrap_or_default();
         let update = format!(
             "INSERT DATA {{ GRAPH <{graph}> {{ \
              <{subject}> <{vocab}approvalId> {id} ; \
              <{vocab}stagingId> {staging_id} ; \
              <{vocab}stagingGraph> {staging_graph} ; \
-             <{vocab}actionId> {action_id} ; \
+             <{vocab}actionId> {action_id}{anchor} ; \
              <{vocab}createdAt> {created_at} ; \
              <{vocab}expiresAt> {expires_at} . \
              }} }}",
@@ -513,6 +524,7 @@ impl KnowledgeGraphStore {
             staging_id = lit(&approval.staging_id),
             staging_graph = lit(&approval.staging_graph),
             action_id = lit(&approval.action_id),
+            anchor = anchor,
             created_at = lit(&approval.created_at),
             expires_at = lit(&approval.expires_at),
         );
@@ -528,7 +540,7 @@ impl KnowledgeGraphStore {
     ) -> Result<Vec<PendingActionApproval>, String> {
         let graph = self.approvals_graph_iri_for_claims(claims)?;
         let query = format!(
-            "SELECT ?id ?staging_id ?staging_graph ?action_id ?created_at ?expires_at WHERE {{ \
+            "SELECT ?id ?staging_id ?staging_graph ?action_id ?anchor_query ?created_at ?expires_at WHERE {{ \
              GRAPH <{graph}> {{ \
              ?approval <{vocab}approvalId> ?id ; \
                  <{vocab}stagingId> ?staging_id ; \
@@ -536,6 +548,7 @@ impl KnowledgeGraphStore {
                  <{vocab}actionId> ?action_id ; \
                  <{vocab}createdAt> ?created_at ; \
                  <{vocab}expiresAt> ?expires_at . \
+             OPTIONAL {{ ?approval <{vocab}anchorQuery> ?anchor_query }} \
              }} }} ORDER BY ?created_at",
             vocab = APPROVAL_VOCAB_IRI,
         );
@@ -553,6 +566,10 @@ impl KnowledgeGraphStore {
                     staging_id: get("?staging_id")?,
                     staging_graph: get("?staging_graph")?,
                     action_id: get("?action_id")?,
+                    anchor_query: row
+                        .get("?anchor_query")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                     created_at: get("?created_at")?,
                     expires_at: get("?expires_at")?,
                 })
