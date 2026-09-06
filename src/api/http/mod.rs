@@ -81,6 +81,7 @@ use mcp_skills::{
 use ontology::{
     approve_action_approval_handler, constrained_extraction_handler,
     constrained_extraction_query_handler, constrained_extraction_review_handler,
+    create_entity_resolution_suggestion_handler,
     create_csv_type_draft_handler, create_json_schema_type_draft_handler,
     create_openapi_type_draft_handler, create_schema_induction_type_draft_handler,
     create_sql_ddl_type_draft_handler, delete_action_type_handler, delete_function_def_handler,
@@ -483,6 +484,10 @@ pub fn build_router(
         .route(
             "/api/v1/ontology/action-approvals/:approval_id/discard",
             post(reject_action_approval_handler),
+        )
+        .route(
+            "/api/v1/ontology/entity-resolution/suggestions",
+            post(create_entity_resolution_suggestion_handler),
         )
         // ── 知识库分类管理 CRUD ──
         .route(
