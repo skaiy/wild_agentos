@@ -376,3 +376,33 @@ broken. After success, `GET /api/v1/ontology/types` exposes the promoted types.
 This is a semi-automatic draft helper, not a full Palantir-style ontology
 pipeline: there is no automatic semantic inference, no automatic action
 generation, and no replacement for Oxigraph.
+
+### 14.1 Pre-kernel schema induction
+
+`POST /api/v1/ontology/type-drafts/from-induction` accepts a corpus and/or a
+candidate terminology list and produces a `TypeDraftBundle` with ambiguity and
+overly broad candidate warnings. Candidate terms can be prepared by a human,
+an LLM, or a versioned rule engine; this endpoint performs only conservative
+draft construction and never calls an LLM itself.
+
+```json
+POST /api/v1/ontology/type-drafts/from-induction
+{
+  "candidate_terms": ["Field Sensor", "record"],
+  "documents": [{
+    "id": "maintenance-handbook-v2",
+    "text": "Field Sensor readings are collected. Field Sensor alerts are reviewed."
+  }],
+  "model_version": "terms-assistant-1",
+  "rule_version": "terminology-v1"
+}
+```
+
+The persisted draft records `model_version` when supplied, `rule_version`, and
+the source document IDs. Document text is used to find repeated title-case
+terms but is not persisted in the draft. The response remains a claims-scoped
+draft, with no `LinkType` or `ActionType`; it is absent from `GET
+/api/v1/ontology/types` until the existing explicit `{ "confirm": true }`
+promotion endpoint is called. This pre-kernel schema work is distinct from
+runtime constrained extraction, which creates instances only under already
+promoted types.

@@ -520,3 +520,28 @@ actor、tenant/project、时间戳、兼容性判定和提交的审计字段写�
 
 这只是半自动草稿助手，并非完整的 Palantir 式本体流水线：不做自动语义推断、不
 自动生成 Action，也不替换 Oxigraph。
+
+### 14.1 核外前置 schema induction
+
+`POST /api/v1/ontology/type-drafts/from-induction` 接收语料和/或候选术语表，
+返回带有歧义、候选过宽警告的 `TypeDraftBundle`。候选术语可由人工、LLM 或带版本的
+规则引擎准备；该接口仅进行保守的草稿构造，本身不会调用 LLM。
+
+```json
+POST /api/v1/ontology/type-drafts/from-induction
+{
+  "candidate_terms": ["Field Sensor", "record"],
+  "documents": [{
+    "id": "maintenance-handbook-v2",
+    "text": "Field Sensor readings are collected. Field Sensor alerts are reviewed."
+  }],
+  "model_version": "terms-assistant-1",
+  "rule_version": "terminology-v1"
+}
+```
+
+持久化的草稿会记录（如提供）`model_version`、`rule_version` 和源文档 id。文档正文仅
+用于发现重复的首字母大写术语，不会被写入草稿。响应仍是 claims 作用域的草稿，不含
+`LinkType` 或 `ActionType`；在调用既有、明确的 `{ "confirm": true }` promote 接口
+前，不会出现在 `GET /api/v1/ontology/types`。这项核外 schema 工作不同于运行时
+constrained extraction：后者只会在已 promote 的类型下创建实例。
