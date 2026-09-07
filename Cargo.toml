@@ -54,7 +54,7 @@ base64 = "0.21"
 ring = "0.17"
 
 # IAM / JWT
-jsonwebtoken = "9"
+jsonwebtoken = { version = "=10.3.0", features = ["rust_crypto"] }
 
 # gRPC
 tonic = "0.10"
@@ -88,7 +88,7 @@ parking_lot = "0.12"
 dashmap = "5.5"
 
 # 指标
-prometheus = "0.13"
+prometheus = "0.14"
 
 # 文件操作
 glob = "0.3"
@@ -118,7 +118,7 @@ tree-sitter-c = "0.23"
 tree-sitter-cpp = "0.23"
 sha2 = "0.10"
 similar = "2.5"
-lru = "0.12"
+lru = "0.16.3"
 hex = "0.4"
 notify = "6.1"
 notify-debouncer-mini = "0.4"
