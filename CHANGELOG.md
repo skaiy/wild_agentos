@@ -31,6 +31,12 @@
   compatibility-gated promotion with explicit `force_breaking` audit evidence.
   The companion Admin ontology design studio is delivered separately and does
   not expand this repository's scope.
+- Extended the explicit, offline `isolation-migrate` tool to safely migrate
+  historical local vectors, L0 data, and blobs in addition to named graphs;
+  it validates targets and records audit evidence while retaining sources by
+  default.
+- Production deployments now require OIDC/JWKS authentication and refuse to
+  boot with HS256 or incomplete OIDC configuration.
 
 ## [0.3.0] — 2026-09-05
 
