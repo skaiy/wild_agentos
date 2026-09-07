@@ -5,11 +5,26 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  schedule:
+    - cron: "17 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ontology-ke-golden-fixture-gate:
+    name: Ontology KE frozen fixture gate
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Verify frozen ontology KE fixture integrity
+      env:
+        ONTOLOGY_KE_GOLDEN_BASE_REF: origin/${{ github.base_ref || 'main' }}
+        ONTOLOGY_KE_GOLDEN_PR_BODY: ${{ github.event.pull_request.body }}
+      run: ./scripts/check_ontology_ke_golden.sh
+
   build:
 
     runs-on: ubuntu-latest
@@ -25,5 +40,26 @@ jobs:
       uses: Swatinem/rust-cache@v2
     - name: Build
       run: cargo build --workspace --verbose
+    - name: Run isolation contract golden suite
+      run: cargo test --workspace isolation_contract --verbose
+    - name: Run functional golden evaluation suite
+      run: ./scripts/test_golden.sh
+    # Record-only: shared CI hardware is not a stable performance baseline.
+    - name: Run private deployment micro-benchmark
+      run: ./scripts/bench_private_deploy.sh --micro
     - name: Run tests
       run: cargo test --workspace --verbose
+
+  skill-package-gate:
+    name: Skill package gate fixtures
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+    - name: Cache Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Verify passing package fixture
+      run: cargo test --lib skill_package_gate_accepts_green_fixture_and_publishes --verbose
+    - name: Verify failing package fixture is blocked
+      run: cargo test --lib skill_package_gate_rejects_red_fixture_without_publishing --verbose

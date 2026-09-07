@@ -1,0 +1,32 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Asset API", "version": "1.0.0" },
+  "components": {
+    "schemas": {
+      "Asset": {
+        "type": "object",
+        "required": ["asset_id", "active"],
+        "properties": {
+          "asset_id": { "type": "string", "description": "Stable asset ID" },
+          "active": { "type": "boolean" },
+          "installed_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Site": {
+        "type": "object",
+        "properties": {
+          "site_id": { "type": "integer" },
+          "name": { "type": "string" }
+        }
+      }
+    }
+  },
+  "x-ontology-links": [
+    {
+      "id": "AssetAtSite",
+      "source": "Asset",
+      "target": "Site",
+      "cardinality": "many_to_one"
+    }
+  ]
+}

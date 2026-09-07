@@ -1,30 +1,30 @@
-# 4. 总线系统
+# 4. Bus System
 
-## 4.1 模块概览
+## 4.1 Module Overview
 
-总线系统是 Agent OS 的通信基础设施，包含事件总线和内存总线两个核心组件。事件总线负责 Agent 间的事件通知（动态 TypeMask 位图路由），内存总线负责记忆层间的一致性协调。
+The bus system is Agent OS's communication infrastructure. It comprises an event bus and a memory bus. The event bus sends notifications between Agents using dynamic TypeMask bitmap routing, while the memory bus coordinates consistency between memory layers.
 
 ```mermaid
 graph TB
-    subgraph 事件总线
-        EB["EventBus<br/>broadcast channel + 动态 TypeMask 位图路由"]
-        EF["EventFilter<br/>按 task_iri / event_types / type_mask 过滤"]
-        SUB["Subscription<br/>O(1) 位图匹配"]
+    subgraph Event_bus
+        EB["EventBus<br/>broadcast channel + dynamic TypeMask bitmap routing"]
+        EF["EventFilter<br/>filter by task_iri / event_types / type_mask"]
+        SUB["Subscription<br/>O(1) bitmap matching"]
     end
 
-    subgraph 内存总线
-        MB["MemoryBus<br/>内存事件通知"]
-        CE["ConsistencyEngine<br/>MESI 一致性"]
+    subgraph Memory_bus
+        MB["MemoryBus<br/>memory event notifications"]
+        CE["ConsistencyEngine<br/>MESI consistency"]
     end
 
-    subgraph 事件类型
-        ET1["Task 生命周期<br/>6种"]
-        ET2["PDCA 阶段<br/>8种"]
-        ET3["Agent 事件<br/>3种"]
-        ET4["Memory 事件<br/>4种"]
-        ET5["5W2H 约束<br/>2种"]
-        ET6["人工审批<br/>2种"]
-        ET7["系统事件<br/>3种"]
+    subgraph Event_types
+        ET1["Task lifecycle<br/>6 types"]
+        ET2["PDCA phases<br/>8 types"]
+        ET3["Agent events<br/>3 types"]
+        ET4["Memory events<br/>4 types"]
+        ET5["5W2H constraints<br/>2 types"]
+        ET6["Human approval<br/>2 types"]
+        ET7["System events<br/>3 types"]
     end
 
     EB --> EF --> SUB
@@ -32,23 +32,23 @@ graph TB
     ET1 & ET2 & ET3 & ET4 & ET5 & ET6 & ET7 --> EB
 ```
 
-## 4.2 EventBus — 事件总线
+## 4.2 EventBus — Event Bus
 
-**文件**: `src/core/event_bus.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/core/event_bus.rs`
+**Implementation status**: ✅ Complete
 
-基于 broadcast channel + 动态 TypeMask 位图路由的高效事件总线。
+An efficient event bus based on a broadcast channel and dynamic TypeMask bitmap routing.
 
-### 核心设计
+### Core Design
 
-**TypeMask 动态位图路由**:
+**Dynamic TypeMask bitmap routing**:
 
-每种事件类型在首次注册时被分配一个唯一的 bit 位，通过 HashMap 维护类型到位图的映射。匹配时通过 AND 运算实现 O(1) 过滤。
+Each event type receives a unique bit when it is first registered. A HashMap maintains the type-to-bitmap mapping, and an AND operation performs O(1) matching.
 
 ```rust
 pub struct TypeMask {
-    masks: HashMap<String, u64>,  // 类型名 → 位图
-    next_bit: u32,                // 下一个可用 bit
+    masks: HashMap<String, u64>,  // type name → bitmap
+    next_bit: u32,                // next available bit
 }
 
 impl TypeMask {
@@ -58,9 +58,9 @@ impl TypeMask {
 }
 ```
 
-TypeMask 支持最多 64 种事件类型（u64 位宽）。
+TypeMask supports up to 64 event types (the width of `u64`).
 
-### EventType 枚举
+### `EventType` Enum
 
 ```rust
 pub enum EventType {
@@ -97,7 +97,7 @@ pub enum EventType {
 }
 ```
 
-### 优先级机制
+### Priority Mechanism
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -109,14 +109,14 @@ pub enum EventPriority {
 }
 ```
 
-| 优先级 | 值 | 适用场景 |
+| Priority | Value | Use case |
 |--------|-----|---------|
-| Low | 0 | 日志、统计等 |
-| Normal | 1 | 常规 Agent 事件（默认） |
-| High | 2 | 任务状态变更、重要数据更新 |
-| Critical | 3 | 系统错误、紧急修复通知 |
+| Low | 0 | Logging and statistics |
+| Normal | 1 | Standard Agent events (default) |
+| High | 2 | Task state changes and important data updates |
+| Critical | 3 | System errors and urgent repair notifications |
 
-### 核心结构体
+### Core Structs
 
 ```rust
 pub struct EventBus {
@@ -154,20 +154,20 @@ pub struct EventFilter {
 }
 ```
 
-### 核心方法
+### Core Methods
 
-| 方法 | 功能 |
+| Method | Purpose |
 |------|------|
-| `new(capacity)` | 创建事件总线 |
-| `emit(task_iri, type, source, payload)` | 发布 Normal 优先级事件 |
-| `emit_with_priority(task_iri, type, source, payload, priority)` | 发布指定优先级事件 |
-| `subscribe()` | 订阅所有事件 |
-| `subscribe_with_filter(subscription)` | 带过滤的订阅 |
-| `register_type(type_name)` | 注册类型到位图路由 |
-| `get_combined_mask(types)` | 获取多个类型的组合位图 |
-| `spawn_consumer(types, handler)` | 启动后台异步消费者 |
+| `new(capacity)` | Create an event bus |
+| `emit(task_iri, type, source, payload)` | Publish a Normal-priority event |
+| `emit_with_priority(task_iri, type, source, payload, priority)` | Publish an event at the specified priority |
+| `subscribe()` | Subscribe to all events |
+| `subscribe_with_filter(subscription)` | Subscribe with a filter |
+| `register_type(type_name)` | Register a type for bitmap routing |
+| `get_combined_mask(types)` | Get the combined bitmap for multiple types |
+| `spawn_consumer(types, handler)` | Start a background asynchronous consumer |
 
-### 事件匹配 O(1) 流程
+### O(1) Event-Matching Flow
 
 ```mermaid
 sequenceDiagram
@@ -186,50 +186,50 @@ sequenceDiagram
     DA->>EB: subscribe(PLAN_COMPLETED)
     Note over EB: Subscription.type_mask = 1 << 3
 
-    Note over EB: DA 匹配: DA.type_mask & event.type_mask != 0
-    Note over EB: PA 不匹配: PA.type_mask & event.type_mask == 0
-    EB-->>DA: 通知
+    Note over EB: DA matches: DA.type_mask & event.type_mask != 0
+    Note over EB: PA does not match: PA.type_mask & event.type_mask == 0
+    EB-->>DA: Notify
 ```
 
-### 异步消费者
+### Asynchronous Consumers
 
-EventBus 支持 `spawn_consumer` 方法启动后台 tokio 任务处理事件：
+EventBus supports `spawn_consumer` to start a background Tokio task that processes events:
 
 ```rust
 bus.spawn_consumer(
     vec!["PLAN_COMPLETED".to_string(), "DO_COMPLETED".to_string()],
     |event| async move {
-        // 异步处理事件
+        // Process the event asynchronously
     }
 );
 ```
 
-## 4.3 MemoryBus — 内存事件总线
+## 4.3 MemoryBus — Memory Event Bus
 
-**文件**: `src/memory/memory_bus.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/memory/memory_bus.rs`
+**Implementation status**: ✅ Complete
 
-内存事件总线，负责跨层内存一致性通知。
+The memory event bus handles cross-layer memory-consistency notifications.
 
-**事件类型**:
+**Event types**:
 
-| 事件 | 触发条件 | 处理动作 |
+| Event | Trigger | Action |
 |------|---------|---------|
-| `Invalidate(iri)` | L0 数据被修改 | 使所有 L1 缓存行无效 |
-| `WriteBack(iri)` | L1 脏数据需回写 | 将 L1 数据写回 L0 |
-| `Evict(iri)` | L1 超出 Token 预算 | 淘汰低优先级缓存行 |
-| `Prefetch(iri)` | 预测即将访问 | 提前加载到 L2 |
-| `Sync(iri, layer)` | 层间同步请求 | 同步指定层的数据 |
+| `Invalidate(iri)` | L0 data is modified | Invalidate all L1 cache lines |
+| `WriteBack(iri)` | Dirty L1 data must be written back | Write L1 data back to L0 |
+| `Evict(iri)` | L1 exceeds its token budget | Evict low-priority cache lines |
+| `Prefetch(iri)` | An upcoming access is predicted | Load into L2 in advance |
+| `Sync(iri, layer)` | Inter-layer synchronization request | Synchronize data in the specified layer |
 
-**批量操作**:
+**Batch operations**:
 
-| 方法 | 功能 |
+| Method | Purpose |
 |------|------|
-| `publish_invalidate(iri, scope)` | 单节点缓存失效 |
-| `publish_invalidate_batch(iris, scope)` | 批量缓存失效（合并为单次事件） |
-| `publish_with_priority(iri, scope, priority)` | 带优先级的事件发布 |
+| `publish_invalidate(iri, scope)` | Invalidate a single node cache |
+| `publish_invalidate_batch(iris, scope)` | Batch cache invalidation (merged into one event) |
+| `publish_with_priority(iri, scope, priority)` | Publish an event with priority |
 
-**一致性保证流程**:
+**Consistency-guarantee flow**:
 
 ```mermaid
 sequenceDiagram
@@ -240,25 +240,25 @@ sequenceDiagram
     participant L1_2 as L1 (DA-2)
     participant L0
 
-    DA1->>L1_1: 修改数据 (M 状态)
-    L1_1->>MB: 发布 WriteBack(iri)
-    MB->>CE: 处理一致性
-    CE->>L0: 回写数据
-    CE->>MB: 发布 Invalidate(iri)
-    MB->>L1_2: 使缓存行无效 (I 状态)
-    Note over L1_2: 下次访问时从 L0 重新加载
+    DA1->>L1_1: Modify data (M state)
+    L1_1->>MB: Publish WriteBack(iri)
+    MB->>CE: Process consistency
+    CE->>L0: Write back data
+    CE->>MB: Publish Invalidate(iri)
+    MB->>L1_2: Invalidate cache line (I state)
+    Note over L1_2: Reload from L0 on next access
 ```
 
-## 4.4 ConsistencyEngine — MESI 一致性
+## 4.4 ConsistencyEngine — MESI Consistency
 
-**文件**: `src/memory/consistency_engine.rs`  
-**实现状态**: ✅ 完整
+**File**: `src/memory/consistency_engine.rs`
+**Implementation status**: ✅ Complete
 
 ```mermaid
 stateDiagram-v2
     [*] --> Invalid
     Invalid --> Shared: Read Hit
-    Invalid --> Exclusive: Read Miss (独占加载)
+    Invalid --> Exclusive: Read Miss (exclusive load)
     Shared --> Modified: Write Hit
     Shared --> Invalid: Invalidate
     Exclusive --> Modified: Write Hit
@@ -267,42 +267,42 @@ stateDiagram-v2
     Modified --> Invalid: Invalidate
 ```
 
-## 4.5 JSON-LD 语义层
+## 4.5 JSON-LD Semantic Layer
 
-**文件**: `src/jsonld/`  
-**实现状态**: ✅ 完整
+**File**: `src/jsonld/`
+**Implementation status**: ✅ Complete
 
-JSON-LD 语义层提供了数据总线的语义互操作能力，是连接所有模块的"统一数据总线"。
+The JSON-LD semantic layer provides semantic interoperability for the data bus: it is the “unified data bus” connecting all modules.
 
-**核心组件**:
+**Core components**:
 
-| 组件 | 文件 | 功能 |
+| Component | File | Purpose |
 |------|------|------|
-| Context | `jsonld/context.rs` | @context 语义映射 |
-| Types | `jsonld/types.rs` | @type 多态定义 |
-| Utils | `jsonld/utils.rs` | IRI 工具函数 |
-| Framing | `jsonld/framing.rs` | 按需投影裁剪 |
-| TypeRouter | `jsonld/type_router.rs` | 类型路由决策 |
+| Context | `jsonld/context.rs` | `@context` semantic mapping |
+| Types | `jsonld/types.rs` | `@type` polymorphic definitions |
+| Utils | `jsonld/utils.rs` | IRI utility functions |
+| Framing | `jsonld/framing.rs` | On-demand projection trimming |
+| TypeRouter | `jsonld/type_router.rs` | Type-routing decisions |
 
-**语义总线架构**:
+**Semantic bus architecture**:
 
 ```mermaid
 graph TB
-    subgraph 语义映射
-        CTX["@context<br/>字段→IRI映射"]
-        TYPE["@type<br/>多态发现"]
-        ID["@id<br/>实体对齐"]
+    subgraph Semantic_mapping
+        CTX["@context<br/>field-to-IRI mapping"]
+        TYPE["@type<br/>polymorphic discovery"]
+        ID["@id<br/>entity alignment"]
     end
 
-    subgraph 语义操作
-        FRAME["Framing<br/>按需投影"]
-        ROUTE["TypeRouter<br/>类型路由"]
-        MERGE["图合并<br/>实体融合"]
+    subgraph Semantic_operations
+        FRAME["Framing<br/>on-demand projection"]
+        ROUTE["TypeRouter<br/>type routing"]
+        MERGE["graph merging<br/>entity fusion"]
     end
 
-    subgraph 消费者
-        SA["SA 调度"]
-        L3["L3 投影"]
+    subgraph Consumers
+        SA["SA scheduling"]
+        L3["L3 projection"]
         SR["SkillRegistry"]
         AR["AgentRunner"]
     end

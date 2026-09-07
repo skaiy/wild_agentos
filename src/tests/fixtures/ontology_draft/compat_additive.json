@@ -1,0 +1,19 @@
+{
+  "object_types": [
+    {
+      "id": "Device",
+      "iri": "https://agentos.ontology/ev/Device",
+      "label": "Device",
+      "description": "A device with an additive serial number.",
+      "icon": "Box",
+      "color": "slate",
+      "primary_key": "id",
+      "title_property": "id",
+      "properties": [
+        {"name": "id", "label": "ID", "prop_type": "string", "required": true},
+        {"name": "serial", "label": "Serial", "prop_type": "string", "required": false}
+      ]
+    }
+  ],
+  "link_types": []
+}

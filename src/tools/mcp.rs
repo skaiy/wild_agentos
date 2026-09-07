@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::isolation::IsolationClaims;
 use crate::CoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +83,44 @@ pub struct MCPTool {
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    /// A missing scope is shared by every authenticated tenant. The server
+    /// still rejects requests without verified claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_scope: Option<MCPToolScope>,
+    #[serde(default)]
+    pub risk_level: MCPToolRiskLevel,
+}
+
+/// Tenant/project binding for an inbound MCP tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MCPToolScope {
+    pub tenant_id: String,
+    pub project_id: String,
+}
+
+impl MCPToolScope {
+    pub fn from_claims(claims: &IsolationClaims) -> Self {
+        Self {
+            tenant_id: claims.tenant_id().to_string(),
+            project_id: claims.project_id().to_string(),
+        }
+    }
+
+    fn matches(&self, claims: &IsolationClaims) -> bool {
+        self.tenant_id == claims.tenant_id() && self.project_id == claims.project_id()
+    }
+}
+
+/// Risk disclosed to MCP clients. High and critical tools are marked
+/// destructive in the MCP annotations payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MCPToolRiskLevel {
+    Low,
+    #[default]
+    Normal,
+    High,
+    Critical,
 }
 
 impl MCPTool {
@@ -91,14 +130,42 @@ impl MCPTool {
             description: description.to_string(),
             input_schema,
             output_schema: None,
+            isolation_scope: None,
+            risk_level: MCPToolRiskLevel::Normal,
         }
     }
 
+    /// Bind this tool to the verified tenant/project scope.
+    pub fn scoped_to(mut self, claims: &IsolationClaims) -> Self {
+        self.isolation_scope = Some(MCPToolScope::from_claims(claims));
+        self
+    }
+
+    pub fn with_risk_level(mut self, risk_level: MCPToolRiskLevel) -> Self {
+        self.risk_level = risk_level;
+        self
+    }
+
+    fn is_visible_to(&self, claims: &IsolationClaims) -> bool {
+        self.isolation_scope
+            .as_ref()
+            .map(|scope| scope.matches(claims))
+            .unwrap_or(true)
+    }
+
     pub fn to_mcp_format(&self) -> Value {
+        let destructive = matches!(
+            self.risk_level,
+            MCPToolRiskLevel::High | MCPToolRiskLevel::Critical
+        );
         json!({
             "name": self.name,
             "description": self.description,
             "inputSchema": self.input_schema,
+            "annotations": {
+                "destructiveHint": destructive,
+                "x-agentos-risk-level": self.risk_level,
+            },
         })
     }
 }
@@ -180,22 +247,32 @@ where
 }
 
 pub struct MCPToolRegistry {
-    tools: RwLock<HashMap<String, MCPTool>>,
-    handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
+    tools: RwLock<HashMap<String, Vec<RegisteredMCPTool>>>,
+}
+
+struct RegisteredMCPTool {
+    tool: MCPTool,
+    handler: Arc<dyn ToolHandler>,
 }
 
 impl MCPToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
-            handlers: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn register<H: ToolHandler + 'static>(&self, tool: MCPTool, handler: H) {
         let name = tool.name.clone();
-        self.tools.write().insert(name.clone(), tool);
-        self.handlers.write().insert(name, Arc::new(handler));
+        let mut tools = self.tools.write();
+        let registrations = tools.entry(name).or_default();
+        // A registration is unique inside its tenant/project scope. Replacing
+        // it leaves registrations for other scopes untouched.
+        registrations.retain(|registered| registered.tool.isolation_scope != tool.isolation_scope);
+        registrations.push(RegisteredMCPTool {
+            tool,
+            handler: Arc::new(handler),
+        });
     }
 
     pub fn register_fn<F, Fut>(&self, tool: MCPTool, handler: F)
@@ -207,20 +284,82 @@ impl MCPToolRegistry {
     }
 
     pub fn list_tools(&self) -> Vec<MCPTool> {
-        self.tools.read().values().cloned().collect()
+        self.tools
+            .read()
+            .values()
+            .flat_map(|registrations| {
+                registrations
+                    .iter()
+                    .map(|registered| registered.tool.clone())
+            })
+            .collect()
+    }
+
+    /// Lists only tools that can be disclosed to verified claims. Requests
+    /// without claims are intentionally fail-closed.
+    pub fn list_tools_for_claims(&self, claims: Option<&IsolationClaims>) -> Vec<MCPTool> {
+        let Some(claims) = claims else {
+            return Vec::new();
+        };
+
+        self.tools
+            .read()
+            .values()
+            .flat_map(|registrations| registrations.iter())
+            .filter(|registered| registered.tool.is_visible_to(claims))
+            .map(|registered| registered.tool.clone())
+            .collect()
     }
 
     pub fn get_tool(&self, name: &str) -> Option<MCPTool> {
-        self.tools.read().get(name).cloned()
+        self.tools
+            .read()
+            .get(name)
+            .and_then(|registrations| registrations.first())
+            .map(|registered| registered.tool.clone())
     }
 
     pub async fn execute(&self, name: &str, arguments: Value) -> Result<Value, CoreError> {
-        let handler = self.handlers.read().get(name).cloned();
+        let handler = self
+            .tools
+            .read()
+            .get(name)
+            .and_then(|registrations| registrations.first())
+            .map(|registered| Arc::clone(&registered.handler));
 
         match handler {
             Some(h) => h.execute(arguments).await,
             None => Err(CoreError::Internal {
                 message: format!("Tool not found: {}", name),
+            }),
+        }
+    }
+
+    pub async fn execute_for_claims(
+        &self,
+        name: &str,
+        arguments: Value,
+        claims: Option<&IsolationClaims>,
+    ) -> Result<Value, CoreError> {
+        let claims = claims.ok_or_else(|| CoreError::ValidationFailed {
+            message: "Verified IsolationClaims are required for inbound MCP tools".to_string(),
+        })?;
+        let handler = self
+            .tools
+            .read()
+            .get(name)
+            .and_then(|registrations| {
+                registrations
+                    .iter()
+                    .find(|registered| registered.tool.is_visible_to(claims))
+            })
+            .map(|registered| Arc::clone(&registered.handler));
+
+        match handler {
+            Some(handler) => handler.execute(arguments).await,
+            None => Err(CoreError::ValidationFailed {
+                // Do not disclose whether this name exists in another scope.
+                message: "Tool is not available for this tenant/project".to_string(),
             }),
         }
     }
@@ -269,6 +408,16 @@ impl MCPServer {
     }
 
     pub async fn handle_message(&self, message: MCPMessage) -> MCPMessage {
+        self.handle_message_with_claims(message, None).await
+    }
+
+    /// Handles an inbound MCP request using claims minted by an authentication
+    /// boundary. Catalog listing and invocation fail closed without claims.
+    pub async fn handle_message_with_claims(
+        &self,
+        message: MCPMessage,
+        claims: Option<&IsolationClaims>,
+    ) -> MCPMessage {
         let method = match &message.method {
             Some(m) => m,
             None => return MCPMessage::error(-32600, "Invalid request", message.id.clone()),
@@ -276,9 +425,16 @@ impl MCPServer {
 
         match method.as_str() {
             "tools/list" => {
+                if claims.is_none() {
+                    return MCPMessage::error(
+                        -32001,
+                        "Verified IsolationClaims are required for inbound MCP tools",
+                        message.id,
+                    );
+                }
                 let tools: Vec<Value> = self
                     .tools
-                    .list_tools()
+                    .list_tools_for_claims(claims)
                     .iter()
                     .map(|t| t.to_mcp_format())
                     .collect();
@@ -286,11 +442,22 @@ impl MCPServer {
             }
 
             "tools/call" => {
+                if claims.is_none() {
+                    return MCPMessage::error(
+                        -32001,
+                        "Verified IsolationClaims are required for inbound MCP tools",
+                        message.id,
+                    );
+                }
                 let params = message.params.clone().unwrap_or(Value::Null);
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-                match self.tools.execute(tool_name, arguments).await {
+                match self
+                    .tools
+                    .execute_for_claims(tool_name, arguments, claims)
+                    .await
+                {
                     Ok(result) => MCPMessage::response(
                         json!({"content": [{"type": "text", "text": result.to_string()}]}),
                         message.id.unwrap_or(Value::Null),
@@ -344,12 +511,19 @@ impl MCPClient {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<MCPTool>, CoreError> {
+        self.list_tools_with_claims(None).await
+    }
+
+    pub async fn list_tools_with_claims(
+        &self,
+        claims: Option<&IsolationClaims>,
+    ) -> Result<Vec<MCPTool>, CoreError> {
         let server = self.server.as_ref().ok_or_else(|| CoreError::Internal {
             message: "Not connected to server".to_string(),
         })?;
 
         let message = MCPMessage::request("tools/list", None);
-        let response = server.handle_message(message).await;
+        let response = server.handle_message_with_claims(message, claims).await;
 
         if let Some(error) = response.error {
             return Err(CoreError::Internal {
@@ -367,6 +541,15 @@ impl MCPClient {
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, CoreError> {
+        self.call_tool_with_claims(name, arguments, None).await
+    }
+
+    pub async fn call_tool_with_claims(
+        &self,
+        name: &str,
+        arguments: Value,
+        claims: Option<&IsolationClaims>,
+    ) -> Result<Value, CoreError> {
         let server = self.server.as_ref().ok_or_else(|| CoreError::Internal {
             message: "Not connected to server".to_string(),
         })?;
@@ -379,7 +562,7 @@ impl MCPClient {
             })),
         );
 
-        let response = server.handle_message(message).await;
+        let response = server.handle_message_with_claims(message, claims).await;
 
         if let Some(error) = response.error {
             return Err(CoreError::Internal {
@@ -448,7 +631,8 @@ pub fn create_default_mcp_server() -> MCPServer {
                 },
                 "required": ["path"],
             }),
-        ),
+        )
+        .with_risk_level(MCPToolRiskLevel::Low),
         |args| async move {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let encoding = args
@@ -477,7 +661,8 @@ pub fn create_default_mcp_server() -> MCPServer {
                 },
                 "required": ["path", "content"],
             }),
-        ),
+        )
+        .with_risk_level(MCPToolRiskLevel::High),
         |args| async move {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -506,7 +691,8 @@ pub fn create_default_mcp_server() -> MCPServer {
                 },
                 "required": ["url"],
             }),
-        ),
+        )
+        .with_risk_level(MCPToolRiskLevel::High),
         |args| async move {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
@@ -527,9 +713,14 @@ pub fn create_default_mcp_server() -> MCPServer {
 mod tests {
     use super::*;
 
+    fn claims(tenant: &str, project: &str) -> IsolationClaims {
+        IsolationClaims::from_verified(tenant, project, "test-actor").unwrap()
+    }
+
     #[tokio::test]
     async fn test_mcp_server() {
         let server = MCPServer::new("test");
+        let tenant = claims("tenant-a", "project-a");
 
         server.tools.register_fn(
             MCPTool::new("echo", "Echo input", json!({"type": "object"})),
@@ -537,7 +728,9 @@ mod tests {
         );
 
         let message = MCPMessage::request("tools/list", None);
-        let response = server.handle_message(message).await;
+        let response = server
+            .handle_message_with_claims(message, Some(&tenant))
+            .await;
 
         assert!(response.result.is_some());
         let result = response.result.as_ref().unwrap();
@@ -550,9 +743,91 @@ mod tests {
         let server = Arc::new(create_default_mcp_server());
         let mut client = MCPClient::new();
         client.connect(server);
+        let tenant = claims("tenant-a", "project-a");
 
-        let tools = client.list_tools().await.unwrap();
+        let tools = client.list_tools_with_claims(Some(&tenant)).await.unwrap();
         assert!(!tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbound_catalog_is_scoped_to_verified_claims() {
+        let server = MCPServer::new("test");
+        let tenant_a = claims("tenant-a", "project");
+        let tenant_b = claims("tenant-b", "project");
+
+        server.tools.register_fn(
+            MCPTool::new("tenant-a-tool", "Visible only to tenant A", json!({}))
+                .scoped_to(&tenant_a),
+            |_| async { Ok(json!({"tenant": "a"})) },
+        );
+        server.tools.register_fn(
+            MCPTool::new("tenant-b-tool", "Visible only to tenant B", json!({}))
+                .scoped_to(&tenant_b),
+            |_| async { Ok(json!({"tenant": "b"})) },
+        );
+        server.tools.register_fn(
+            MCPTool::new("shared-read", "Visible to authenticated tenants", json!({}))
+                .with_risk_level(MCPToolRiskLevel::Low),
+            |_| async { Ok(json!({"shared": true})) },
+        );
+
+        let listed_for_a = server
+            .handle_message_with_claims(MCPMessage::request("tools/list", None), Some(&tenant_a))
+            .await;
+        let listed_tools = listed_for_a.result.unwrap();
+        let names_for_a: Vec<String> = listed_tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .map(str::to_string)
+            .collect();
+        assert!(names_for_a.contains(&"tenant-a-tool".to_string()));
+        assert!(names_for_a.contains(&"shared-read".to_string()));
+        assert!(!names_for_a.contains(&"tenant-b-tool".to_string()));
+
+        let cross_tenant_call = server
+            .handle_message_with_claims(
+                MCPMessage::request(
+                    "tools/call",
+                    Some(json!({"name": "tenant-b-tool", "arguments": {}})),
+                ),
+                Some(&tenant_a),
+            )
+            .await;
+        assert_eq!(cross_tenant_call.error.unwrap().code, -32603);
+    }
+
+    #[tokio::test]
+    async fn inbound_catalog_rejects_requests_without_claims() {
+        let server = MCPServer::new("test");
+        server.tools.register_fn(
+            MCPTool::new("echo", "Echo input", json!({"type": "object"})),
+            |args| async move { Ok(args) },
+        );
+
+        let list_response = server
+            .handle_message(MCPMessage::request("tools/list", None))
+            .await;
+        assert_eq!(list_response.error.unwrap().code, -32001);
+
+        let call_response = server
+            .handle_message(MCPMessage::request(
+                "tools/call",
+                Some(json!({"name": "echo", "arguments": {}})),
+            ))
+            .await;
+        assert_eq!(call_response.error.unwrap().code, -32001);
+    }
+
+    #[test]
+    fn mcp_catalog_discloses_dangerous_tools() {
+        let tool = MCPTool::new("file_write", "Writes a file", json!({}))
+            .with_risk_level(MCPToolRiskLevel::High);
+        let format = tool.to_mcp_format();
+
+        assert_eq!(format["annotations"]["x-agentos-risk-level"], "high");
+        assert_eq!(format["annotations"]["destructiveHint"], true);
     }
 
     #[test]

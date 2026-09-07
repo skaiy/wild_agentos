@@ -80,7 +80,9 @@ impl Default for BootstrapConfig {
             max_skill_complexity: 10,
             enable_auto_reduce: true,
             reduce_threshold_uses: 100,
-            storage_tier_default: StorageTier::L0Permanent,
+            // Learned material is a non-production draft. Tenant/L0
+            // publication must go through the package admission gate.
+            storage_tier_default: StorageTier::L2Blackboard,
         }
     }
 }
@@ -113,6 +115,15 @@ impl BootstrapEngine {
         &self,
         request: LearnRequest,
     ) -> Result<BootstrapResult, CoreError> {
+        if self.config.storage_tier_default == StorageTier::L0Permanent
+            && !std::env::var("AGENTOS_DEV_ALLOW_UNGATED_SKILL_REGISTER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        {
+            return Err(CoreError::ValidationFailed {
+                message: "Bootstrap learn creates a draft only; tenant/L0 publication requires the Skill package gate".to_string(),
+            });
+        }
         if request.quality_score < self.config.min_quality_score {
             return Err(CoreError::ValidationFailed {
                 message: format!(
@@ -152,7 +163,8 @@ impl BootstrapEngine {
                 .with_task(&request.task_iri)
                 .with_quality_score(request.quality_score);
 
-        self.store_skill(&skill, StorageTier::L0Permanent).await?;
+        self.store_skill(&skill, self.config.storage_tier_default)
+            .await?;
 
         {
             let mut meta = self.bootstrap_meta.write().await;
@@ -162,7 +174,9 @@ impl BootstrapEngine {
             entry.record_learn(bootstrap_source);
         }
 
-        self.index_to_l2(&skill).await?;
+        if self.config.storage_tier_default != StorageTier::L2Blackboard {
+            self.index_to_l2(&skill).await?;
+        }
 
         Ok(BootstrapResult {
             skill_iri,
@@ -170,7 +184,7 @@ impl BootstrapEngine {
             operation: BootstrapOperation::Learn,
             quality_score: request.quality_score,
             created_at: Utc::now(),
-            storage_tier: StorageTier::L0Permanent,
+            storage_tier: self.config.storage_tier_default,
         })
     }
 
@@ -586,6 +600,7 @@ mod tests {
         assert_eq!(config.min_quality_score, 0.7);
         assert_eq!(config.min_success_rate, 0.8);
         assert!(config.enable_auto_reduce);
+        assert_eq!(config.storage_tier_default, StorageTier::L2Blackboard);
     }
 
     #[test]

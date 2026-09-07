@@ -1,0 +1,547 @@
+> *本文是 [16-knowledge-ingest-import-graph.md](16-knowledge-ingest-import-graph.md) 的中文版本。*
+
+---
+
+# 16. 知识摄取与 `/import-graph` 二次开发手册
+
+> 关联 Issue：[#7 知识摄取与 /import-graph](https://github.com/skaiy/wild_agentos/issues/7)  
+> 关联代码：`src/api/http/mod.rs`（KB CRUD / upload / ingest / import-graph / kg import+query）、`src/knowledge_graph/`、`src/memory/hyperspace_store.rs`、`src/blob/`  
+> 关联文档：`07-knowledge-graph.md`（图谱内核与命名图）、`03-memory-system.md`（Oxigraph + hyperspace 存储栈）、[17-isolation-contract.zh.md](17-isolation-contract.zh.md)（可信 claims 边界、命名与历史键）
+> **范围外**：不涉及 iDME 图内核替换；本文只讲当前 Wild AgentOS 已落地的 HTTP 摄取/导入路径。
+
+按本文走完「建库 → 导入样例 → SPARQL 查询」即可验收。
+
+---
+
+## 1. 两套入口，别混用
+
+| 场景 | 知识库类型 | 主路径 | 落库位置 |
+|------|------------|--------|----------|
+| 非结构化文本 / 文件语义检索 | `kb_type=vector` | `POST /api/v1/kb/bases/:id/upload`、`.../ingest`、`.../search` | Hyperspace 向量库（目标由 claims-minted `vector://{tenant}/{project}` 决定） |
+| 结构化三元组 / 实体关系图 | `kb_type=graph` | `POST /api/v1/kb/bases/:id/import-graph` | Oxigraph（目标由 claims-minted `graph://{tenant}/{project}` 决定） |
+| 程序化节点/边 JSON 写入 | claims 作用域内 | `POST /api/v1/kg/import` | Oxigraph（忽略请求体 `graph`） |
+| SPARQL SELECT | claims 作用域内 | `POST /api/v1/kg/query` | Oxigraph（忽略客户端 `named_graph`） |
+
+向量路径只认向量库；`import-graph` 只认图谱库。调错类型会直接 `400`（例如「仅向量知识库支持文件上传」「仅图谱知识库支持三元组导入」）。
+
+---
+
+## 2. 架构约束（二次开发必读）
+
+```mermaid
+flowchart LR
+  subgraph 可热换
+    EMB["Embedding 服务<br/>ollama / oneapi / fallback"]
+  end
+  subgraph 固定底座
+    OXI["图存储 Oxigraph<br/>不可换"]
+    HS["向量存储 hyperspace<br/>不可换"]
+  end
+  UP["upload / ingest"] --> EMB --> HS
+  IG["import-graph / kg/import"] --> OXI
+  Q["kg/query SPARQL"] --> OXI
+  S["kb/.../search"] --> HS
+```
+
+| 组件 | 可否替换 | 说明 |
+|------|----------|------|
+| **Embedding 模型/服务** | ✅ 可换 | 配置 `embedding` 段或 `POST /api/v1/embedding/activate`；变更后热切换并排队重建向量索引 |
+| **图存储（Oxigraph）** | ❌ 不可换 | 系统唯一 RDF/SPARQL 引擎；KB 图、`kg/*`、记忆 L2 等同实例共享，靠命名图隔离 |
+| **向量存储（hyperspace）** | ❌ 不可换 | 嵌入式 HNSW（`crates/hyperspace-engine`）；不接外部向量库 |
+
+原文对象存储走 `BlobStore`（MinIO 或 LocalFs 兜底）。未启用时：向量上传仍可 embedding 入库，但原文不落盘，后续 `reindex` 会跳过。
+
+---
+
+## 3. 命名图 / 命名空间隔离
+
+当前 HTTP KG/KB/import/query/RAG 路径只接受认证边界验证后产生的
+`IsolationClaims`。服务器从 claims mint 目标；客户端提交的 `graph`、
+`named_graph`、`namespace`（以及等价的 KB 目标字段）均不选择存储位置。
+知识库 catalog 元数据也经 claims-scoped store API 写入，不由请求字段拼接隔离键。
+
+| 类型 | claims-minted 目标 | 用途 |
+|------|------|------|------|
+| graph | `graph://{tenant}/{project}` | Oxigraph 命名图 IRI |
+| vector | `vector://{tenant}/{project}` | Hyperspace 向量命名空间与 JSON-LD named-graph 元数据 |
+
+Minting 只验证和构造名称，不迁移数据。历史 `tenant:` 图或命名空间不会被迁移、重写或由这条新路径读穿。完整命名和历史键状态见 [Isolation Contract](17-isolation-contract.zh.md)。
+
+`X-Identity` 仅用于开发模拟，**绝不**产生 `IsolationClaims`，也不是生产租户身份来源。当前 HTTP 边界使用已验证 JWT 产生 claims；缺少或无效的 JWT claims 会 fail closed，返回认证/授权错误（401/403），不会返回空的成功结果。
+
+---
+
+## 4. 鉴权与公共约定
+
+```bash
+# 使用认证边界验证、且含 tenant/project scope 的 JWT
+export AUTHORIZATION='Authorization: Bearer <verified-jwt>'
+```
+
+默认服务根路径以本机部署为准（下文用 `http://127.0.0.1:8080` 占位）。单文件上传/导入体积极限 **60MB**（`KB_UPLOAD_MAX_BYTES`）。
+
+---
+
+## 5. 建库
+
+### 5.1 创建图谱库
+
+```http
+POST /api/v1/kb/bases
+Content-Type: application/json
+Authorization: Bearer <verified-jwt>
+
+{
+  "name": "故障码样例图",
+  "description": "issue#7 最小导入样例",
+  "kb_type": "graph",
+  "category_id": null
+}
+```
+
+成功 `201`，响应含：
+
+```json
+{
+  "id": "<kb_uuid>",
+  "status": "created",
+  "base": {
+    "id": "<kb_uuid>",
+    "name": "故障码样例图",
+    "kb_type": "graph",
+    "graph": "graph://<tenant>/<project>",
+    "vector_namespace": "",
+    ...
+  }
+}
+```
+
+记下 `id`。本路径的图目标由验证后的 claims 确定；不要把响应中的存储字段或客户端值作为下一请求的路由参数。
+
+### 5.2 创建向量库（可选，走 upload/ingest）
+
+```json
+{
+  "name": "维修手册向量库",
+  "kb_type": "vector",
+  "description": "纯文本语义召回"
+}
+```
+
+向量数据写入由 claims mint 的 `vector://<tenant>/<project>` 命名空间。
+
+相关只读接口：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/kb/bases` | 列表 |
+| GET | `/api/v1/kb/bases/:id/stats` | 图库返回 `triples`；向量库暂不枚举 chunk 数 |
+| DELETE | `/api/v1/kb/bases/:id` | 删除；图类型会清空对应命名图 |
+
+---
+
+## 6. 图谱导入：`POST /api/v1/kb/bases/:id/import-graph`
+
+**仅 `kb_type=graph`。** Multipart 字段：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `file` | 有文件时必填 | 导入文件；也可只传 `schema` |
+| `format` | 否 | `csv` \| `jsonl` \| `triples`（亦接受 `nt`/`ttl` 别名）；缺省按扩展名推断，再缺省 `csv` |
+| `schema` | 否 | 任意文本，写入命名图元三元组 `kbSchema` |
+| `clear_before` | 否 | `true`/`1`/`yes` 时先清空 claims-minted 图中的现有三元组 |
+
+扩展名推断：`.jsonl`/`.json` → jsonl；`.nt`/`.ttl`/`.triples` → triples；其余 → csv。`format=cypher` 会明确拒绝（Oxigraph 走 SPARQL）。
+
+### 6.1 CSV（推荐最小样例）
+
+表头不区分大小写；列名可匹配 `subject|s`、`predicate|p|relation|rel`、`object|o`、可选 `object_type|otype|type`。无匹配则按列位置 0/1/2。
+
+短 ID 会展开：主语 → `iri://entity/{sanitize}`，谓语 → `iri://relation/{sanitize}`；已是 `http(s)://` / `iri://` 则原样。`object_type=iri` 强制当 IRI，`literal` 强制字面量。
+
+**样例文件 `fault_sample.csv`：**
+
+```csv
+subject,predicate,object,object_type
+BMS_a067,rdf:type,http://aps.local/ontology/FaultCode,iri
+BMS_a067,rdfs:label,BMS_a067 — 高压电池需要维修,literal
+BMS_a067,code,BMS_a067,literal
+BMS_a068,rdf:type,http://aps.local/ontology/FaultCode,iri
+BMS_a068,rdfs:label,BMS_a068 — 电池需要维修,literal
+pack1,hasFault,BMS_a067,iri
+```
+
+说明：`rdf:` / `rdfs:` / `aps:` 前缀在 `import-graph` 的短 ID 路径上会经 `expand_iri` 展开（如 `rdfs:label` → `http://www.w3.org/2000/01/rdf-schema#label`）。属性短名 `code` 会变成 `iri://relation/code`。若希望与 `kg/import` 的属性 IRI（`https://agentos.ontology/meta/code`）对齐，CSV 里请写完整谓词 IRI。
+
+```bash
+KB_ID=<图谱库 uuid>
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/import-graph" \
+  -H "$AUTHORIZATION" \
+  -F "file=@fault_sample.csv;type=text/csv" \
+  -F "format=csv" \
+  -F "clear_before=true"
+```
+
+成功示例：
+
+```json
+{
+  "status": "imported",
+  "graph": "graph://<tenant>/<project>",
+  "format": "csv",
+  "triples_written": 6,
+  "entities": 3,
+  "relations": 4,
+  "schema_saved": false
+}
+```
+
+### 6.2 JSONL
+
+每行一个对象，键同 CSV：`subject`/`s`、`predicate`/`p`/`relation`/`rel`、`object`/`o`、可选 `object_type`。
+
+```jsonl
+{"subject":"BMS_a067","predicate":"http://www.w3.org/1999/02/22-rdf-syntax-ns#type","object":"http://aps.local/ontology/FaultCode","object_type":"iri"}
+{"subject":"BMS_a067","predicate":"http://www.w3.org/2000/01/rdf-schema#label","object":"BMS_a067 — 高压电池需要维修","object_type":"literal"}
+{"subject":"pack1","predicate":"hasFault","object":"BMS_a067","object_type":"iri"}
+```
+
+### 6.3 Triples（简化 N-Triples）
+
+每行：`<s> <p> <o> .` 或 `<s> <p> "literal" .`（`#` 开头为注释）。此处主谓宾**不会**再做短前缀展开，请写完整 IRI。
+
+```nt
+<iri://entity/BMS_a067> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://aps.local/ontology/FaultCode> .
+<iri://entity/BMS_a067> <http://www.w3.org/2000/01/rdf-schema#label> "BMS_a067 — 高压电池需要维修" .
+```
+
+### 6.4 可选 RML / Morph-KGC 物化
+
+`POST /api/v1/kb/bases/:id/materialize-rml` 是独立、可选的 RML/R2RML
+批处理路径，**不会**替换或改变 `import-graph`：简单 CSV、JSONL 和简化
+NT/TTL 仍应使用原接口。
+
+WAO 不会把 Morph-KGC 静态链接进 Rust 二进制；运维方在进程外运行 worker，
+并显式配置其绝对路径：
+
+```bash
+# 在专用 worker image/virtualenv 中执行。Morph-KGC 的许可证为 Apache-2.0。
+pip install morph-kgc
+chmod +x scripts/morph_kgc_worker.py
+export MORPH_KGC_WORKER="$PWD/scripts/morph_kgc_worker.py"
+# 可选；范围 1–600 秒，默认 60 秒。
+export MORPH_KGC_WORKER_TIMEOUT_SECS=60
+```
+
+随仓库提供的 `scripts/morph_kgc_worker.py` 使用 Apache-2.0
+[Morph-KGC](https://github.com/morph-kgc/morph-kgc) 包，属于可信的、
+由运维方管理的 sidecar。它每次只接收全新的临时 source 目录、mapping 路径和
+输出路径，并只输出 N-Triples。若需更强 OS/container 隔离，可将
+`MORPH_KGC_WORKER` 指向一个调度到隔离 worker 的 wrapper；绝不可指向用户可控
+的可执行文件。
+
+该接口的 multipart 字段为 `mapping`、一个或多个带文件名的 `source` 和可选
+`clear_before`；刻意不接受 `graph` 或 `named_graph`。必须提供已验证的
+`IsolationClaims`；WAO 仍通过既有的 claims-minted Oxigraph 写路径写入。
+每次成功物化都会在同一图记录生成的 run IRI、mapping 版本（其 SHA-256）和每个
+source 文件的 SHA-256。
+
+仓库内最小样例同时包含 CSV 和 RML mapping：
+
+```bash
+KB_ID=<图谱库 uuid>
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${KB_ID}/materialize-rml" \
+  -H "$AUTHORIZATION" \
+  -F "mapping=@scripts/examples/morph-kgc/assets.rml.ttl;type=text/turtle" \
+  -F "source=@scripts/examples/morph-kgc/assets.csv;type=text/csv" \
+  -F "clear_before=true"
+```
+
+成功响应含 `status: "materialized"`、`triples_written > 0`、
+`mapping_version` / `mapping_checksum` 和 `source_checksums`。缺少已验证 claims 返回 `401`；
+未配置 worker 返回 `503`；worker 失败或输出不合法返回 `502`。mapping 由进程外
+worker 执行；若租户不可信，必须在 worker 外再施加相应隔离策略。
+
+---
+
+## 7. 程序化导入：`POST /api/v1/kg/import`
+
+不依赖 KB 记录，直接往指定命名图写 `NodeDef` / `EdgeDef`（经 `RdfMapper`）。
+
+请求体（`KgImportRequest`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `nodes` | array | 必填；`id` / `node_type` / `label`，可选 `description` / `properties` |
+| `edges` | array | 默认 `[]`；`source` / `target` / `relation`，可选 `properties` |
+| `graph` | string | 可兼容传入但被忽略；服务端使用 claims-minted 图 |
+| `clear_before` | bool | 默认 **true**：写入前清空 claims-minted 图 |
+
+节点映射要点（与 `07-knowledge-graph.md` 一致）：
+
+- 实体 IRI：`iri://entity/{sanitize(id)}`
+- `rdf:type` ← `node_type`（`aps:` 等会展开）
+- `rdfs:label` ← `label`
+- 属性 key 非完整 IRI 时加前缀 `https://agentos.ontology/meta/`
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kg/import" \
+  -H "Content-Type: application/json" \
+  -H "$AUTHORIZATION" \
+  -d "{
+    \"graph\": \"client-selected-graph-is-ignored\",
+    \"clear_before\": true,
+    \"nodes\": [
+      {
+        \"id\": \"dtc:demo:BMS_a067\",
+        \"node_type\": \"aps:FaultCode\",
+        \"label\": \"BMS_a067 — 高压电池需要维修\",
+        \"properties\": { \"code\": \"BMS_a067\" }
+      }
+    ],
+    \"edges\": []
+  }"
+```
+
+成功：
+
+```json
+{
+  "status": "ok",
+  "entity_count": 1,
+  "relation_count": 0,
+  "quad_count": 3,
+  "graph": "graph://<tenant>/<project>"
+}
+```
+
+与 `import-graph` 的选择：
+
+- 已有 CSV/JSONL/NT 文件 → `import-graph`
+- Agent/服务端已有结构化节点边 → `kg/import`
+
+---
+
+## 8. SPARQL 查询：`POST /api/v1/kg/query`
+
+请求体（`KgQueryRequest`）：
+
+```json
+{
+  "sparql": "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 20",
+  "named_graph": "client-selected-graph-is-ignored"
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `sparql` | SPARQL SELECT（必填） |
+| `named_graph` | 可兼容传入但被忽略；服务端使用 claims-minted 图 |
+
+请求中的图选择不会覆盖 claims 作用域；查询在服务器选定的命名图中执行。
+
+**验收查询（按 §6 CSV 样例）：**
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kg/query" \
+  -H "Content-Type: application/json" \
+  -H "$AUTHORIZATION" \
+  -d "{
+    \"sparql\": \"SELECT ?label WHERE { ?s a <http://aps.local/ontology/FaultCode> ; <http://www.w3.org/2000/01/rdf-schema#label> ?label }\",
+    \"named_graph\": \"client-selected-graph-is-ignored\"
+  }"
+```
+
+期望：`status=ok`，`count>=1`，`results` 含故障码标签。跨租户命名图互不可见（集成测试见 `mod.rs` 中租户隔离用例）。
+
+查询失败（语法等）返回 `400` + `{ "error": "..." }`。
+
+---
+
+## 9. 向量摄取（upload / ingest）
+
+### 9.1 JSON 文本摄取
+
+```http
+POST /api/v1/kb/bases/:id/ingest
+Content-Type: application/json
+```
+
+```json
+{
+  "text": "单段文本",
+  "texts": ["多段之一", "多段之二"]
+}
+```
+
+- 仅向量库；`texts`/`text` 至少有一段非空
+- 按约 **500 字符**切块（UTF-8 友好），再 embedding 写入
+- 成功：`{ "status": "ingested", "chunks": N, "namespace": "vector://<tenant>/<project>" }`
+- embedding 未就绪：`503`「向量库未启用（embedding 初始化失败）」
+
+### 9.2 文件上传
+
+```http
+POST /api/v1/kb/bases/:id/upload
+Content-Type: multipart/form-data
+```
+
+| 字段 | 说明 |
+|------|------|
+| `file` | 可多次；缺文件 → `400` |
+| `chunk_size` | 50–4000，默认 500 |
+| `chunk_strategy` | 请求可传任意值；**当前仅实现 `fixed`**，响应里 `chunk_strategy_applied` 恒为 `fixed` |
+| `min_importance` | 0.0–1.0，默认 0.5 |
+
+可解析扩展名：`.txt` / `.md` / `.markdown` / `.csv` / `.log` / `.json` / `.jsonl`。PDF/Word 等会进台账 `status=stored`（原文可落 Blob），并标 `skipped_reason`，**不向量化**。
+
+成功摘要字段：`status=uploaded`、`namespace`、`total_chunks`、`files[]`（含 `doc_id`=sha256）。
+
+配套：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/kb/bases/:id/search` | body：`{ "query", "limit?" }`，limit 默认 5（钳制 1–20） |
+| GET | `/api/v1/kb/bases/:id/documents` | 原文台账 |
+| POST | `/api/v1/kb/bases/:id/reindex` | 从 Blob 重建向量（需 BlobStore） |
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/upload" \
+  -H "$AUTHORIZATION" \
+  -F "file=@manual.txt;type=text/plain" \
+  -F "chunk_size=500"
+
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/search" \
+  -H "Content-Type: application/json" \
+  -H "$AUTHORIZATION" \
+  -d '{"query":"高压电池维修","limit":5}'
+```
+
+---
+
+## 10. Embedding 可换，底座不可换
+
+配置段 `embedding`（`src/config/settings.rs`）：`provider` 默认 `ollama`，另有 `oneapi`、`fallback`。HTTP 侧：
+
+- 改系统配置中的 `embedding` → 热切换向量库维度/模型，并排队 `reindex`
+- `POST /api/v1/embedding/activate`：把某个已登记的 embedding 型号桥接为生效服务
+
+**换 embedding ≠ 换向量引擎**：仍是 Hyperspace；旧向量与新模型不兼容，必须重建。图查询始终走 Oxigraph SPARQL，与 embedding 无关。
+
+---
+
+## 11. 最小验收清单（对应 Issue #7）
+
+1. `POST /api/v1/kb/bases` 创建 `kb_type=graph`，拿到 `id` 与 `graph`
+2. `POST .../import-graph` 上传 §6.1 CSV（`clear_before=true`），确认 `status=imported` 且 `triples_written>0`
+3. `POST /api/v1/kg/query` 使用已验证 JWT；服务端在 claims-minted 图中执行 SELECT 故障码 label，`count>=1`
+4. （可选）再建 `kb_type=vector`，`upload` 一段 TXT，再 `search` 能召回
+5. 确认文档/设计未引入「替换 Oxigraph / hyperspace / iDME 图内核」的假设
+
+---
+
+## 12. 常见错误速查
+
+| HTTP | 典型 `error` | 处理 |
+|------|----------------|------|
+| 404 | `knowledge base not found` | 检查 `:id` |
+| 400 | `仅图谱知识库支持三元组导入` | 对向量库误调了 `import-graph` |
+| 400 | `仅向量知识库支持文件上传` / `ingest` | 对图库误调了 upload/ingest |
+| 400 | `未收到文件…或 schema` | multipart 字段名或空文件 |
+| 400 | `不支持的 format` / Cypher 提示 | 改用 csv/jsonl/triples |
+| 503 | `向量库未启用（embedding 初始化失败）` | 修好 embedding 配置并热切换 |
+| 400（query） | SPARQL 错误串 | 检查 IRI、GRAPH、前缀 |
+
+---
+
+## 13. 与工具链的关系
+
+Agent 侧另有工具 `knowledge_import_json` / `knowledge_query` / `knowledge_import_file` 等（见 `05-tool-system.md`、`07-knowledge-graph.md`）。本手册聚焦 **HTTP 二次开发**：运营后台、批处理脚本、外部系统对接应优先走 `/api/v1/kb/*` 与 `/api/v1/kg/*`，与工具语义对齐但路径、字段以上文 handler 为准。
+
+---
+
+## 14. 从 CSV、JSON Schema、OpenAPI 或 SQL DDL 生成本体类型草稿
+
+`POST /api/v1/ontology/type-drafts/from-csv` 与
+`POST /api/v1/ontology/type-drafts/from-json-schema` 提供轻量的「输入 schema
+→ 待人审本体元数据」桥接。新增 `/from-openapi`（OpenAPI 3 component schema）
+和 `/from-sql-ddl`（`CREATE TABLE` 子集）端点，且遵循同一边界。所有接口均要求已验证 JWT 产生的
+`IsolationClaims`；草稿仅存放在调用方 claims 作用域的 draft 图，绝不直接写入
+生产本体元数据。
+
+CSV 只读取表头，生成一个 `ObjectType`，所有属性初始均为 `string`。JSON
+Schema 将根 `properties` 映射为属性（string、integer、number、boolean、
+date-time、字符串 enum）。OpenAPI 读取 object component schema，关系仅能来自
+`x-ontology-links` 标注或请求的可选 `links`。SQL DDL 读取表、列、主键和显式
+`FOREIGN KEY` / `REFERENCES` 子句。适配器不会猜测关系：只有调用方输入、标注或明确
+的外键证据才能形成 `LinkType` 草稿；所有适配器都不会生成 `ActionType`。
+
+```json
+POST /api/v1/ontology/type-drafts/from-csv
+{
+  "csv": "asset_id,display_name,active\nA-1,Inverter,true\n",
+  "object_id": "imported asset",
+  "label": "Imported Asset"
+}
+```
+
+响应含 `draft_id` 与 `preview`。人工审阅后，必须再显式提升：
+
+```json
+POST /api/v1/ontology/type-drafts/<draft_id>/promote
+{ "confirm": true }
+```
+
+提升操作同样要求已验证 claims。写入前，服务会比较草稿中与生产环境 ID 相同的每个
+类型。新增属性属于兼容变更；删除或重命名属性、收紧属性约束、改变属性类型、改变
+`LinkType` 基数、或改变 `LinkType` 两端点都是破坏性变更，默认以 `409` 拒绝，并返回
+机器可读的 `compatibility_changes` 列表。草稿中未出现的类型不表示删除：草稿绝不会被
+当作完整本体替换。
+
+已经评审的破坏性变更必须显式确认并留下可追溯信息：
+
+```json
+POST /api/v1/ontology/type-drafts/<draft_id>/promote
+{
+  "confirm": true,
+  "force_breaking": true,
+  "audit": {
+    "reason": "已批准淘汰来源 schema",
+    "ticket": "ENG-152"
+  }
+}
+```
+
+发生破坏性提升时，`force_breaking: true` 以及非空的
+`audit.reason`/`audit.ticket` 缺一不可。服务会在删除草稿前，把经验证的
+actor、tenant/project、时间戳、兼容性判定和提交的审计字段写入只追加的提升审计记录，
+从而可复盘；生产类型绝不会被静默破坏。成功后可从
+`GET /api/v1/ontology/types` 读取。
+
+这只是半自动草稿助手，并非完整的 Palantir 式本体流水线：不做自动语义推断、不
+自动生成 Action，也不替换 Oxigraph。
+
+### 14.1 核外前置 schema induction
+
+`POST /api/v1/ontology/type-drafts/from-induction` 接收语料和/或候选术语表，
+返回带有歧义、候选过宽警告的 `TypeDraftBundle`。候选术语可由人工、LLM 或带版本的
+规则引擎准备；该接口仅进行保守的草稿构造，本身不会调用 LLM。
+
+```json
+POST /api/v1/ontology/type-drafts/from-induction
+{
+  "candidate_terms": ["Field Sensor", "record"],
+  "documents": [{
+    "id": "maintenance-handbook-v2",
+    "text": "Field Sensor readings are collected. Field Sensor alerts are reviewed."
+  }],
+  "model_version": "terms-assistant-1",
+  "rule_version": "terminology-v1"
+}
+```
+
+持久化的草稿会记录（如提供）`model_version`、`rule_version` 和源文档 id。文档正文仅
+用于发现重复的首字母大写术语，不会被写入草稿。响应仍是 claims 作用域的草稿，不含
+`LinkType` 或 `ActionType`；在调用既有、明确的 `{ "confirm": true }` promote 接口
+前，不会出现在 `GET /api/v1/ontology/types`。这项核外 schema 工作不同于运行时
+constrained extraction：后者只会在已 promote 的类型下创建实例。

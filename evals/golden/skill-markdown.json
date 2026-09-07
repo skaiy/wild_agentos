@@ -1,0 +1,11 @@
+{
+  "id": "markdown-skill-static-parse",
+  "input": "# Release Checklist\n\nPrepare a deterministic release checklist.\n\n## Parameters\n\n- version: version to release\n- notes: optional release notes\n\n## Steps\n\n- Validate the version\n- Publish the checklist\n\n## Tags\n\n- release\n- validation\n",
+  "expected": {
+    "name": "release_checklist",
+    "required_parameters": ["version"],
+    "optional_parameters": ["notes"],
+    "step_count": 2,
+    "tags": ["release", "validation"]
+  }
+}

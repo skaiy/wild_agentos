@@ -1,6 +1,6 @@
 [package]
 name = "wild-agent-os-core"
-version = "0.1.5"
+version = "0.5.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 
@@ -16,6 +16,9 @@ ontology = []
 ontology-embeddings = ["ontology"]
 # Causal layer (python3 + dowhy needed at runtime)
 ontology-causal = ["ontology"]
+# Mount a remote OpenHands/E2B-style HTTP sandbox gateway. Disabled by default:
+# the kernel's default build has no external sandbox-service requirement.
+external-sandbox = []
 
 [dependencies]
 # 异步运行时
@@ -119,6 +122,7 @@ lru = "0.12"
 hex = "0.4"
 notify = "6.1"
 notify-debouncer-mini = "0.4"
+tempfile = "3.10"
 
 # 文本/Unicode 处理
 unicode-width = "0.1"
@@ -135,10 +139,21 @@ tokio-test = "0.4"
 mockall = "0.12"
 criterion = "0.5"
 testcontainers = "0.15"
-tempfile = "3.10"
 
 [build-dependencies]
 tonic-build = "0.10"
+
+[[bin]]
+name = "isolation-diagnose"
+path = "src/bin/isolation_diagnose.rs"
+
+[[bin]]
+name = "isolation-migrate"
+path = "src/bin/isolation_migrate.rs"
+
+[[bin]]
+name = "private-deploy-bench"
+path = "src/bin/private_deploy_bench.rs"
 
 [[bench]]
 name = "bench_graph_backend"

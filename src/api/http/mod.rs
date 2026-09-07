@@ -28,14 +28,18 @@ pub mod iam;
 use api_gov::{ApiClient, ApiKey, ApiUsageState};
 pub mod agents;
 pub mod api_clients;
+pub mod artifacts;
 pub mod chat;
 pub mod config;
 pub mod core_ops;
 pub mod guard;
 pub mod kb;
+pub mod market;
 pub mod mcp;
+pub mod mcp_skills;
 pub mod models;
 pub mod ontology;
+pub mod ontology_guardrails;
 pub mod prompts;
 pub mod runtime;
 pub mod skills;
@@ -44,6 +48,10 @@ pub mod tasks;
 use agents::{
     create_agent_handler, delete_agent_handler, list_agents_handler, load_user_agents,
     migrate_legacy_agent_graphs, save_user_agents, update_agent_handler,
+};
+use artifacts::{
+    download_artifact_handler, list_artifacts_handler, upload_artifact_handler,
+    ARTIFACT_UPLOAD_MAX_BYTES,
 };
 use chat::{
     agent_chat_handler, openai_chat_completions_handler, openai_list_models_handler,
@@ -56,16 +64,35 @@ use kb::{
     import_graph_knowledge_base_handler, ingest_knowledge_base_handler, kb_document_raw_handler,
     knowledge_base_stats_handler, list_kb_categories_handler, list_kb_documents_handler,
     list_knowledge_bases_handler, list_knowledge_packs_handler, load_kb_categories,
-    load_knowledge_bases, load_knowledge_packs, reindex_knowledge_base_handler,
-    save_knowledge_packs, search_knowledge_base_handler, update_kb_category_handler,
-    update_knowledge_base_handler, update_knowledge_pack_handler, upload_knowledge_base_handler,
-    KB_UPLOAD_MAX_BYTES,
+    load_knowledge_bases, load_knowledge_packs, materialize_rml_knowledge_base_handler,
+    reindex_knowledge_base_handler, save_knowledge_packs, search_knowledge_base_handler,
+    update_kb_category_handler, update_knowledge_base_handler, update_knowledge_pack_handler,
+    upload_knowledge_base_handler, KB_UPLOAD_MAX_BYTES,
+};
+use market::{
+    install_package_handler, list_packages_handler, publish_package_handler,
+    rollback_package_handler, upgrade_package_handler,
 };
 use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
+use mcp_skills::{
+    delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
+    upsert_skill_exposure_handler,
+};
 use ontology::{
-    delete_action_type_handler, delete_function_def_handler, delete_link_type_handler,
-    delete_object_type_handler, invoke_action_handler, ontology_types_handler,
-    update_action_type_handler, update_function_def_handler, update_link_type_handler,
+    approve_action_approval_handler, constrained_extraction_handler,
+    constrained_extraction_query_handler, constrained_extraction_review_handler,
+    create_entity_resolution_suggestion_handler,
+    create_csv_type_draft_handler, create_json_schema_type_draft_handler,
+    create_openapi_type_draft_handler, create_schema_induction_type_draft_handler,
+    create_sql_ddl_type_draft_handler, delete_action_type_handler, delete_function_def_handler,
+    delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
+    invoke_action_handler, list_action_approvals_handler, list_extraction_reviews_handler,
+    materialize_constrained_extraction_handler, ontology_readiness_report_handler,
+    ontology_health_handler, ontology_types_handler, list_type_drafts_handler,
+    promote_type_draft_handler,
+    quality_gate_handler, reject_action_approval_handler, resolve_extraction_review_handler,
+    update_action_type_handler,
+    update_domain_guardrails_handler, update_function_def_handler, update_link_type_handler,
     update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
     upsert_link_type_handler, upsert_object_type_handler,
 };
@@ -262,6 +289,16 @@ pub fn build_router(
         .route("/api/v1/tasks/stream", post(stream_task_handler))
         .route("/api/v1/tasks/trends", get(list_task_trends_handler))
         .route(
+            "/api/v1/artifacts",
+            get(list_artifacts_handler)
+                .post(upload_artifact_handler)
+                .layer(DefaultBodyLimit::max(ARTIFACT_UPLOAD_MAX_BYTES)),
+        )
+        .route(
+            "/api/v1/artifacts/:id/download",
+            get(download_artifact_handler),
+        )
+        .route(
             "/api/v1/tasks/:task_iri/status",
             get(get_realtime_status_handler),
         )
@@ -304,6 +341,23 @@ pub fn build_router(
             "/api/v1/skills/pipeline-rerun",
             post(pipeline_rerun_handler),
         )
+        // ── Logic / Skill package market (immutable versions, claims-scoped) ──
+        .route(
+            "/api/v1/market/packages",
+            get(list_packages_handler).post(publish_package_handler),
+        )
+        .route(
+            "/api/v1/market/packages/:name/install",
+            post(install_package_handler),
+        )
+        .route(
+            "/api/v1/market/packages/:name/rollback",
+            post(rollback_package_handler),
+        )
+        .route(
+            "/api/v1/market/packages/:name/upgrade",
+            post(upgrade_package_handler),
+        )
         .route("/api/v1/guard/audit", get(guard_audit_handler))
         .route("/api/v1/guard/stats", get(guard_stats_handler))
         .route("/api/v1/kg/import", post(kg_import_handler))
@@ -318,6 +372,68 @@ pub fn build_router(
             put(update_knowledge_pack_handler).delete(delete_knowledge_pack_handler),
         )
         .route("/api/v1/ontology/types", get(ontology_types_handler))
+        .route("/api/v1/ontology/health", get(ontology_health_handler))
+        .route(
+            "/api/v1/ontology/readiness-report",
+            post(ontology_readiness_report_handler),
+        )
+        .route(
+            "/api/v1/ontology/constrained-extractions",
+            post(constrained_extraction_handler),
+        )
+        .route(
+            "/api/v1/ontology/constrained-extractions/:id",
+            get(constrained_extraction_query_handler),
+        )
+        .route(
+            "/api/v1/ontology/constrained-extractions/:id/quality-gate",
+            post(quality_gate_handler),
+        )
+        .route(
+            "/api/v1/ontology/constrained-extractions/:id/review",
+            get(constrained_extraction_review_handler),
+        )
+        .route(
+            "/api/v1/ontology/constrained-extractions/:id/materialize",
+            post(materialize_constrained_extraction_handler),
+        )
+        .route(
+            "/api/v1/ontology/extraction-reviews",
+            get(list_extraction_reviews_handler),
+        )
+        .route(
+            "/api/v1/ontology/extraction-reviews/:id/:decision",
+            post(resolve_extraction_review_handler),
+        )
+        // ── 本体类型草稿：适配输入 → claims 隔离草稿 → 人工确认提升 ──
+        .route(
+            "/api/v1/ontology/type-drafts",
+            get(list_type_drafts_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/from-csv",
+            post(create_csv_type_draft_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/from-json-schema",
+            post(create_json_schema_type_draft_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/from-openapi",
+            post(create_openapi_type_draft_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/from-sql-ddl",
+            post(create_sql_ddl_type_draft_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/from-induction",
+            post(create_schema_induction_type_draft_handler),
+        )
+        .route(
+            "/api/v1/ontology/type-drafts/:draft_id/promote",
+            post(promote_type_draft_handler),
+        )
         // ── 本体元模型在线 CRUD（对象/链接）──
         .route(
             "/api/v1/ontology/object-types",
@@ -334,6 +450,10 @@ pub fn build_router(
         .route(
             "/api/v1/ontology/link-types/:id",
             put(update_link_type_handler).delete(delete_link_type_handler),
+        )
+        .route(
+            "/api/v1/ontology/guardrails",
+            get(domain_guardrails_handler).put(update_domain_guardrails_handler),
         )
         // ── 本体元模型在线 CRUD（动作/函数）──
         .route(
@@ -355,6 +475,26 @@ pub fn build_router(
         .route(
             "/api/v1/ontology/actions/:id/invoke",
             post(invoke_action_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals",
+            get(list_action_approvals_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals/:approval_id/approve",
+            post(approve_action_approval_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals/:approval_id/reject",
+            post(reject_action_approval_handler),
+        )
+        .route(
+            "/api/v1/ontology/action-approvals/:approval_id/discard",
+            post(reject_action_approval_handler),
+        )
+        .route(
+            "/api/v1/ontology/entity-resolution/suggestions",
+            post(create_entity_resolution_suggestion_handler),
         )
         // ── 知识库分类管理 CRUD ──
         .route(
@@ -389,6 +529,11 @@ pub fn build_router(
         .route(
             "/api/v1/kb/bases/:id/import-graph",
             post(import_graph_knowledge_base_handler)
+                .layer(DefaultBodyLimit::max(KB_UPLOAD_MAX_BYTES)),
+        )
+        .route(
+            "/api/v1/kb/bases/:id/materialize-rml",
+            post(materialize_rml_knowledge_base_handler)
                 .layer(DefaultBodyLimit::max(KB_UPLOAD_MAX_BYTES)),
         )
         .route(
@@ -462,6 +607,15 @@ pub fn build_router(
         .route(
             "/api/v1/mcp/servers",
             get(list_mcp_servers_handler).post(register_mcp_server_handler),
+        )
+        // Published tenant Skills are explicitly opt-in MCP tools. `/mcp`
+        // is the external JSON-RPC endpoint; the management route is DA-only.
+        .route("/mcp", post(skill_mcp_handler))
+        .route(
+            "/api/v1/mcp/skill-exposures",
+            get(list_skill_exposures_handler)
+                .post(upsert_skill_exposure_handler)
+                .delete(delete_skill_exposure_handler),
         )
         // ── G6' Prompt/模型灰度版本管理 ──
         .route(
@@ -618,7 +772,12 @@ mod tests {
         let (st, _) = post_json(
             &router,
             "/api/v1/kg/import",
-            json!({"graph": "client:ignored", "nodes": [], "edges": []}),
+            json!({
+                "tenant": "attacker-controlled",
+                "graph": "client:ignored",
+                "nodes": [],
+                "edges": []
+            }),
             None,
         )
         .await;

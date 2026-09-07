@@ -1,0 +1,17 @@
+apiVersion: agentos.dev/v1
+kind: Skill
+metadata:
+  iri: skill://fixtures/package-red
+  name: package-red
+  version: 1.0.0
+spec:
+  description: A fixture package that fails the golden-input gate.
+package:
+  schema: agentos.dev/skill-package/v1
+  side_effect_level: read
+  visibility: tenant
+  entrypoint: SKILL.md
+  golden_input: tests/golden-input.json
+  golden_output: tests/golden-output.json
+  golden_input_sha256: 1d6cf777e9a5e74be0bf766b8c2618c8e5b5842979dd35d6b42c43c8dad994e8
+  golden_output_sha256: c4133f329dc79fd884b344e744b5b71994e79aae0fc30f9eda29ae35c5dcf2dd

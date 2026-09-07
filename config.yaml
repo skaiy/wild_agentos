@@ -11,6 +11,16 @@ gateway:
     analysis: "deepseek-v4-flash"
     default: "deepseek-v4-flash"
 
+# A2A outbound adapter: disabled unless explicitly opted in. The bearer token is
+# intentionally blank; provide deployment credentials through configuration/env,
+# never commit one here.
+a2a:
+  outbound:
+    enabled: false
+    endpoint: ""
+    bearer_token: ""
+    timeout_seconds: 15
+
 workspace:
   root: ""
   watch_enabled: true

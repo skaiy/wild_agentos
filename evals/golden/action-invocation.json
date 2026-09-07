@@ -1,0 +1,29 @@
+{
+  "dry_run": {
+    "id": "generate-repair-order",
+    "action_id": "GenerateRepairOrder",
+    "request": {
+      "target": "P0A80",
+      "params": {
+        "vehicle_vin": "LVIN123",
+        "assigned_to": "golden-eval",
+        "estimated_cost": 1200
+      },
+      "dry_run": true
+    },
+    "expected": {
+      "status": "dry_run",
+      "sparql_contains": ["RepairOrder", "forVehicle", "diagnoses"],
+      "result_fields": ["order_id"]
+    }
+  },
+  "guardrail": {
+    "id": "request-cannot-override-guardrails",
+    "request": {
+      "dry_run": true,
+      "guardrails": {
+        "max_triples": 0
+      }
+    }
+  }
+}

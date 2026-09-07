@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Explicit offline named-graph migration. See docs/17-isolation-contract.md.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec cargo run --quiet --bin isolation-migrate -- "$@"

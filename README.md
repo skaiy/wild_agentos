@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.5-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.5.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,14 @@ Welcome to the release timeline of **Wild AgentOS**, featuring production-grade 
 
 | Version | Release Date | Key Upgrades & Fused Features |
 |---------|--------------|------------------------------|
+| **v0.5.0** | **2026-09-07** | **Ontology Knowledge Engineering + Graph Engineering**<br>• Completes bounded, claims-scoped constrained extraction, optional Morph-KGC/RML materialization, quality/review supervision, and anchored staging-to-production materialization; no path auto-promotes schema or writes around verified claims.<br>• Adds conservative, approval-held entity-resolution suggestions through a process-isolated GLinker-style sidecar; no auto-merge path is provided.<br>• Freezes ontology KE golden evaluations behind a SHA gate, documents measurement-decay audit policy, and adds a read-only ontology health report for slow-loop review.<br>• Completes OpenAPI/SQL DDL drafts, draft-only schema induction, readiness reporting, and compatibility-gated promotion; companion Admin ontology design studio work remains separate. |
+| **v0.3.0** | **2026-09-05** | **Markets + IdP + Emergent**<br>• Adds a versioned Logic and Skill package market with immutable package versions, claims-scoped access, and explicit install, upgrade, and rollback.<br>• Adds OIDC/JWKS authentication beside local-development HS256, with asymmetric JWT verification and fail-closed issuer, audience, and JWKS validation.<br>• Adds a gated emergent-tool promotion pipeline: generated tools remain untrusted until sandbox/judge gates and required human approval pass.<br>• Adds optional, default-off limited RDFS inference for claims-scoped graph reads; query-time subclass and type expansion never persists inferred triples. |
+| **v0.2.2** | **2026-09-05** | **Artifacts + Sandbox + Bench**<br>• Adds a claims-scoped coding artifact store: immutable metadata is written to the caller’s `IsolationClaims` graph and bytes use a server-minted tenant blob prefix.<br>• Adds an external `SandboxProvider` adapter behind a default-off feature flag; its async path does not hold `MutexGuard` across an `await`.<br>• Adds reproducible private-deployment benchmarks for Oxigraph, redb, and Hyperspace that record measured results without fabricated speedups. |
+| **v0.2.1** | **2026-09-05** | **Ontology Data + Protocols**<br>• Adds claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema; promotion requires authorized human approval.<br>• Adds an inbound MCP tool catalog filtered by `IsolationClaims`, plus explicitly published, gated tenant Skills as MCP tools; kernel Skills remain excluded.<br>• Adds a thin outbound A2A adapter behind a default-off feature flag; it is best-effort and does not add an inbound server or alter the local task lifecycle. See [Outbound A2A adapter](docs/19-a2a-outbound.md). |
+| **v0.2.0** | **2026-09-05** | **Control Plane + Skill CI**<br>• Adds the Skill package format and CI gate: verification plus golden input/output checks, with the Judge hook disabled by default.<br>• Passing packages publish through the gated tenant channel; failing fixtures are blocked.<br>• Adds Rust-CI golden evaluations for Agent plans, Skill Markdown, and Action invocation via `scripts/test_golden.sh`.<br>• Companion Admin #16 delivered the separate-repository five-screen control-plane skeleton; this release does not change that repository's scope. |
+| **v0.1.8** | **2026-09-04** | **Ontology Action HITL**<br>• Adds configurable `commit_strategy` for automatic or approval-held Action staging, with merge/discard APIs and TTL expiry.<br>• Adds configurable guardrails, SPARQL `ASK` assertions, and a `high_risk` approval hook.<br>• Publishes `ACTION_AUDIT` EventBus events for committed, pending, approved, rejected, and violated outcomes; see the [Ontology Action Data Sandbox](docs/15-ontology-action-sandbox.md). |
+| **v0.1.7** | **2026-09-04** | **Isolation Proof & Eval**<br>• Adds the read-only `isolation-diagnose` CLI, customer-readable [Isolation Matrix](docs/17-isolation-matrix.md), and fail-closed `isolation_contract` CI coverage.<br>• Adds optional explicit `isolation-migrate`; it never uses a silent `UNION` and does not claim historical keys were migrated. |
+| **v0.1.6** | **2026-09-04** | **Isolation & Hardening**<br>• Verified JWT tenant/project claims now mint graph, blob, vector, and L0 targets; HTTP KG, ontology, KB, chat RAG, and runtime graph/vector tools are claims-scoped and fail closed when claims are absent.<br>• New user agents receive verified scope; public API-key chat is non-tenant-RAG.<br>• Adds optional `AGENTOS_TENANT_TOOL_CALL_CAP`, MCP disclosure, bash environment sanitization, tool-schema enforcement, and PDCA L0 envelopes.<br>• See the [Isolation Contract](docs/17-isolation-contract.md); historical keys are not migrated. |
 | **v0.1.5** | **2026-08-18** | **Cognitive Causal Engine & Advanced Graph Governance**<br>• **Causal Engine**: Standalone causal reasoning subsystem (`CausalEngine`, `FusionEngine`, `CausalStore`) to trace root causes and compute causal graphs of agent decisions.<br>• **Unified Graph Backend**: Consolidated fragmented graph operations into a single high-performance `GraphBackend`.<br>• **Graph Features**: Structural feature computation (PageRank, PageRank vector, centrality) and similarity scoring between cognitive snapshots.<br>• **Snapshot Timeline**: Temporal snapshot versioning with diff-based rollback and point-in-time state restoration.<br>• **Skill Center CRUD & Guard**: New client-side skill editing/deletion support, detail schema rendering, and strict **403 Forbidden** guards protecting system-level (`iri://`) builtins. |
 | **v0.1.4** | **2026-07-06** | **Model Registry Center (3-in-1 Consolidation) & Dynamic Ingestion**<br>• **Consolidated Model Registry**: Merged gateway, embedding, and resource mapping settings into a unified "Model Registry Center".<br>• **Auto Model Discovery**: Automatic endpoint model schema discovery (`/v1/models`) and keyword-matching modaly pre-evaluation.<br>• **Vector Service Bridge**: Dynamic hot-swapping embedding models, triggering zero-downtime database rebuilds and background indexing. |
 | **v0.1.3** | **2026-07-06** | **Multi-Modal Vision-Language (VL) Routing & Capability Slots**<br>• **Multi-Modal Gateway**: Automatic payload extraction (`ChatContent` parts) routing image payloads (Base64/URL) to VL models.<br>• **Agent Capability Slots**: Multi-model slot assignments per agent (e.g. Chat Slot → DeepSeek-V4, Vision Slot → Gemini-Pro). |
@@ -105,6 +113,15 @@ An MCP server is a third party. It receives the JSON-RPC requests Wild AgentOS s
 For `--mcp-server-stdio`, Wild AgentOS starts the server as a child process. That process inherits the Agent process environment, with any server-specific environment variables overlaid. Environment sanitization is tracked in [#26](https://github.com/skaiy/wild_agentos/issues/26) (implementation [#37](https://github.com/skaiy/wild_agentos/pull/37)); until that protection is applied to stdio MCP launches, do not put secrets in the Agent environment when starting a third-party server.
 
 MCP failures are fail-loud: a failed connection is reported as `status=error:...`, clears any discovered tools, and returns an error to the caller. Failed tool calls are also returned as errors—they are not skipped and never replaced with a `simulated` result.
+
+#### Published Skill MCP tools
+
+Tenant Skills that pass the publication gate can be explicitly exposed at
+`POST /mcp` as MCP tools. Exposure is default-deny, scoped to a tenant, and
+managed by DA users through `/api/v1/mcp/skill-exposures`; built-in `iri://`
+Skills are never exposed. A verified Bearer JWT is required for discovery and
+calls, and `allowed_roles` plus the Skill input schema are enforced. See
+[#92](https://github.com/skaiy/wild_agentos/issues/92).
 
 ### 13. Checkpoint & Recovery — Crash-Proof Long-Running Tasks
 Session state snapshots at critical points with full restoration on crash. Enables hour/day-long agent tasks and post-mortem replay debugging. `--resume <task_iri>` and `--list-checkpoints` commands for explicit session management.
@@ -207,27 +224,25 @@ cargo build -p wild-code-cli --release
 
 ## 🗺️ Roadmap
 
-**v0.1.x Release Series** (stabilization):
-- Binary distribution for Linux/macOS/Windows via GitHub Releases
-- Pre-built musl static builds for Linux (zero-dependency)
-- MCP tool ecosystem expansion and documentation
-- Checkpoint/resume polish and testing
+Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a comprehensive proprietary-platform recreation; it does not replace Oxigraph with Nebula/Cypher, mix separate product/business repositories or product boundaries into this open-source tree, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
 
-**v0.2.x Release Series** (planned):
-- Native web dashboard for agent monitoring and task management
-- Python/TypeScript SDK for easier integration
-- Skill marketplace prototype with community plugin registry
-- Multi-model routing with cost-aware scheduling
-
-**v0.3.x+ Release Series** (future):
-- Kubernetes deployment operator for production scaling
-- Distributed agent mesh across Edge nodes
-- Multi-modal agent support (vision, audio)
-- Multi-turn conversation memory compression
+- **v0.1.6 — done:** JWT `IsolationClaims` mint graph/blob/vector/L0 targets; relevant HTTP paths fail closed; historical keys are not migrated.
+- **v0.1.7 — done:** read-only minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and optional explicit migration with no silent `UNION`.
+- **v0.1.8 — done:** approval-held Action staging with merge/discard APIs and TTL, configurable guardrails plus SPARQL assertions, and `ACTION_AUDIT` event-bus audit.
+- **v0.2.0 — done:** Skill package verification, golden checks, default-off Judge hook, and gated tenant publishing; Rust-CI Agent/Skill/Action golden evaluations; companion Admin #16 delivered the separate-repository five-screen control-plane skeleton.
+- **v0.2.1 — done:** claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema with authorized approval before promotion; an `IsolationClaims`-filtered inbound MCP catalog; gated tenant Skill publishing as MCP tools; and a default-off, best-effort outbound A2A adapter. See [Outbound A2A adapter](docs/19-a2a-outbound.md).
+- **v0.2.2 — done:** a claims-scoped coding artifact store with `IsolationClaims` graph metadata and a server-minted tenant blob prefix; a default-off external `SandboxProvider` adapter that does not hold `MutexGuard` across an `await`; and reproducible private-deployment benchmarks for Oxigraph, redb, and Hyperspace without fabricated speedups.
+- **v0.3.0 — done:** versioned Logic and Skill package market with immutable versions and explicit install/upgrade/rollback; fail-closed OIDC/JWKS authentication beside local-development HS256; a gated, human-approved emergent-tool promotion pipeline; and default-off limited RDFS query-time inference that never persists inferred triples.
+- **v0.5.0 — done:** the two-track Ontology Knowledge Engineering / Graph Engineering milestone: staging-only constrained extraction and Morph-KGC/RML inputs; `KgQualityGate` and review; anchored, auditable materialization; conservative, approval-held entity-resolution suggestions; frozen golden SHA checks and read-only health reporting; OpenAPI/SQL DDL and induction drafts, readiness reporting, and compatibility-gated promotion. Tenant Skill/Emergent promotion now requires golden SHA verification, named rule review, and audit evidence. The companion Admin ontology design studio is delivered separately.
 
 ---
 
 ## 📊 Performance Targets
+
+This historical reference table is not a benchmark result. Do not change it or
+publish speedup ratios without a sourced measured run; use the
+[private deployment benchmark](docs/19-private-deploy-benchmark.md) to produce
+JSON and Markdown evidence on the target machine.
 
 | Operation | Latency | Throughput |
 |-----------|---------|-----------|
@@ -245,6 +260,12 @@ cargo build -p wild-code-cli --release
 
 - **Memory System** → [`docs/03-memory-system.md`](docs/03-memory-system.md) (L0 redb · HyperspaceEngine · Oxigraph SPARQL)
 - **Isolation Contract** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md) (verified claims and future naming; no storage migration)
+- **Isolation Matrix** → [`docs/17-isolation-matrix.md`](docs/17-isolation-matrix.md) (CI-verified fail-closed behavior; historical keys are not migrated)
+- **Evolution Roadmap** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md) (post-v0.1.6 strategy and explicit non-goals)
+- **Private Deployment Benchmark** → [`docs/19-private-deploy-benchmark.md`](docs/19-private-deploy-benchmark.md) (reproducible measured Oxigraph/redb/Hyperspace profile)
+- **Ontology Action Data Sandbox** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md) (staging graph guardrails; not a compute sandbox)
+- **Ontology KE Pipeline** → [`docs/21-ontology-knowledge-engineering-pipeline.md`](docs/21-ontology-knowledge-engineering-pipeline.md) (two-track milestone boundaries and remaining online-automation gaps)
+- **Ontology KE Golden Freeze Policy** → [`docs/22-ontology-ke-golden-freeze-policy.md`](docs/22-ontology-ke-golden-freeze-policy.md) (frozen scorecard and measurement-decay audit)
 - **Design Detail** → [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) · [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)

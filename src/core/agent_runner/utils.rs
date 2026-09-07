@@ -931,7 +931,7 @@ impl super::AgentRunner {
                             // syscall policies.
                             let executor = self.tool_executor.read().clone();
                             let result = executor
-                                .execute_with_security_context(
+                                .execute_with_security_context_and_claims(
                                     name,
                                     args,
                                     crate::skill_graph::security::SecurityContext::new(
@@ -940,6 +940,7 @@ impl super::AgentRunner {
                                     )
                                     .with_task(&ctx.task_iri),
                                     &advertised_tools,
+                                    ctx.isolation_claims.clone(),
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));

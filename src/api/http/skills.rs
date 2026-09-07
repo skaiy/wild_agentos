@@ -14,6 +14,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::tools::skill_pipeline::TenantPromotionReview;
 use crate::tools::skill_registry::SkillMeta;
 
 use super::iam::UserIdentity;
@@ -85,8 +86,24 @@ fn load_pipeline_runs() -> Vec<crate::tools::skill_pipeline::PipelineRun> {
     }
 }
 
+/// A Skill is externally publishable only when its most recent admission run
+/// succeeded with tenant visibility. This makes an MCP exposure fail closed if
+/// the Skill is later replaced by session-scoped authoring or a failed rerun.
+pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
+    load_pipeline_runs()
+        .into_iter()
+        .find(|run| run.skill_iri == skill_iri)
+        .is_some_and(|run| {
+            run.published
+                && run.gate_passed
+                && run.visibility == crate::tools::skill_pipeline::SkillVisibility::Tenant
+        })
+}
+
 /// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。best-effort。
-fn append_pipeline_run(run: &crate::tools::skill_pipeline::PipelineRun) -> std::io::Result<()> {
+pub(crate) fn append_pipeline_run(
+    run: &crate::tools::skill_pipeline::PipelineRun,
+) -> std::io::Result<()> {
     let mut runs = load_pipeline_runs();
     runs.insert(0, run.clone());
     if runs.len() > PIPELINE_RUNS_CAP {
@@ -252,7 +269,9 @@ pub(crate) async fn register_skill_handler(
     }
     // 走技能准入流水线（Lint→Security→Test→Publish）：签名/Schema 等门禁在流水线内统一裁决，
     // 仅当门禁放行时 publish 回调才会真正持久化并注册技能。
-    use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
+    use crate::tools::skill_pipeline::{
+        run_pipeline, PipelineContext, PipelineSource, TenantPromotionReview,
+    };
     let iri = skill.skill_iri.clone();
     let ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
     let registry = state.core.skills.clone();
@@ -708,6 +727,11 @@ pub(crate) async fn import_git_skill_handler(
         repo_url: Some(req.repo_url.trim().to_string()),
         clone_dir: Some(clone_dir.clone()),
         sub_path: req.path.clone(),
+        require_package: true,
+        // Git imports are the explicit tenant publication channel. The
+        // pipeline refuses system visibility and persists only after all gates.
+        visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
+        tenant_promotion_review: Some(TenantPromotionReview::completed(identity.user_id.clone())),
     };
     let registry = state.core.skills.clone();
     let run = run_pipeline(
@@ -765,7 +789,9 @@ pub(crate) struct PipelineRunsQuery {
 
 /// GET /api/v1/skills/pipeline-runs — 查询技能准入流水线运行记录（只读，无需鉴权）。
 /// 记录仅含文件名/命中计数等非敏感信息，可安全对管理台展示。
-pub(crate) async fn list_pipeline_runs_handler(Query(q): Query<PipelineRunsQuery>) -> impl IntoResponse {
+pub(crate) async fn list_pipeline_runs_handler(
+    Query(q): Query<PipelineRunsQuery>,
+) -> impl IntoResponse {
     let mut runs = load_pipeline_runs();
     if let Some(iri) = q.iri.filter(|s| !s.is_empty()) {
         runs.retain(|r| r.skill_iri == iri);
@@ -858,7 +884,6 @@ pub(crate) async fn pipeline_rerun_handler(
         .into_response()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,6 +969,57 @@ mod tests {
             output_mapping: Default::default(),
             skill_types: vec![],
         }
+    }
+
+    #[test]
+    fn tenant_publish_status_requires_latest_passing_tenant_run() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("tenant_publish_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+
+        let registry = crate::tools::skill_registry::SkillRegistry::new();
+        let skill = sample_skill();
+        let mut ctx = crate::tools::skill_pipeline::PipelineContext {
+            source: crate::tools::skill_pipeline::PipelineSource::Git,
+            triggered_by: "tester".into(),
+            repo_url: None,
+            clone_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/skills/package-green"),
+            ),
+            sub_path: ".".into(),
+            require_package: true,
+            visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
+            tenant_promotion_review: Some(TenantPromotionReview::completed("reviewer:tester")),
+        };
+        let published = crate::tools::skill_pipeline::run_pipeline(
+            &registry,
+            &skill,
+            &ctx,
+            Box::new(|_| Ok("published".into())),
+        );
+        append_pipeline_run(&published).unwrap();
+        assert!(is_tenant_published_skill(&skill.skill_iri));
+
+        ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Session;
+        ctx.require_package = false;
+        ctx.clone_dir = None;
+        ctx.tenant_promotion_review = None;
+        let session_update = crate::tools::skill_pipeline::run_pipeline(
+            &registry,
+            &skill,
+            &ctx,
+            Box::new(|_| Ok("session update".into())),
+        );
+        append_pipeline_run(&session_update).unwrap();
+        assert!(
+            !is_tenant_published_skill(&skill.skill_iri),
+            "a later session update must revoke external publication"
+        );
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
     }
     // ── 纯函数单元测试 ────────────────────────────────────────────────────────
 
@@ -1457,5 +1533,4 @@ version: \"2.0.0\"\n\
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
-
 }

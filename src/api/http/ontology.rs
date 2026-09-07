@@ -2,26 +2,263 @@
 //!
 //! 路由仍由 `mod.rs` 的 `build_router` 组装；知识包/KB 见 `kb.rs`。
 
-use std::sync::Arc;
+use std::{
+    process::{Command, Stdio},
+    sync::Arc,
+};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use serde::Deserialize;
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tracing::error;
 
 use crate::{
     isolation::IsolationClaims,
-    knowledge_graph::store::{ClaimsGraphUpdate, KnowledgeGraphStore},
+    knowledge_graph::{
+        canonicalizer::{canonicalize, CanonicalizationDecision},
+        extractor::KnowledgeExtractor,
+        ontology_draft::{
+            self, DraftLinkInput, InductionDocument, TypeDraftBundle, TypeDraftProvenance,
+        },
+        ontology_health,
+        ontology_layer::ActionGuardrailConfig,
+        quality_gate::{
+            JudgeConfig, JudgeReport, JudgeVerdict, KgQualityGate, QualityGateReport,
+            QualityGateRequest,
+        },
+        rdf_mapper::RdfMapper,
+        store::{
+            ClaimsGraphUpdate, KnowledgeGraphStore, MaterializationAnchor, PendingActionApproval,
+            PendingExtractionReview, PendingTypeDraft,
+        },
+        types::LLMExtractionOutput,
+    },
 };
 
-use super::{iam::UserIdentity, AppState};
+use super::{iam::UserIdentity, ontology_guardrails, AppState};
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+const ENTITY_RESOLUTION_PROVENANCE_NS: &str = "https://agentos.ontology/entity-resolution/";
+const ENTITY_RESOLUTION_THRESHOLD: f32 = 0.98;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EntityResolutionSuggestionRequest {
+    pub source_iri: String,
+    pub mention: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntityResolutionSidecarResponse {
+    target_iri: String,
+    score: f32,
+    evidence: Vec<String>,
+}
 
 fn sparql_literal(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+fn normalized_entity_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn valid_iri(value: &str) -> bool {
+    oxigraph::model::NamedNodeRef::new(value).is_ok()
+}
+
+fn run_entity_resolution_sidecar(
+    source_iri: &str,
+    mention: &str,
+    candidates: &[(String, String)],
+) -> Result<EntityResolutionSidecarResponse, String> {
+    let command = std::env::var("AGENTOS_KG_GLINKER_COMMAND").map_err(|_| {
+        "entity resolution requires AGENTOS_KG_GLINKER_COMMAND configured as one executable path"
+            .to_string()
+    })?;
+    if command.trim().is_empty() || command.contains(char::is_whitespace) {
+        return Err("AGENTOS_KG_GLINKER_COMMAND must be one executable path".into());
+    }
+    let input = json!({
+        "source_iri": source_iri, "mention": mention,
+        "candidates": candidates.iter().map(|(iri, label)| json!({"iri": iri, "label": label})).collect::<Vec<_>>(),
+        "min_score": ENTITY_RESOLUTION_THRESHOLD,
+    });
+    let mut child = Command::new(command).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+        .map_err(|error| format!("start entity-resolution sidecar: {error}"))?;
+    use std::io::Write;
+    child.stdin.as_mut().ok_or("entity-resolution sidecar stdin unavailable")?
+        .write_all(input.to_string().as_bytes())
+        .map_err(|error| format!("write entity-resolution sidecar input: {error}"))?;
+    let output = child.wait_with_output().map_err(|error| format!("wait for entity-resolution sidecar: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("entity-resolution sidecar failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| format!("entity-resolution sidecar returned invalid JSON: {error}"))
+}
+
+/// POST /api/v1/ontology/entity-resolution/suggestions.
+///
+/// A supervised, GLinker-inspired mention → retrieve → disambiguate path.
+/// Retrieval is claims-scoped and the frozen matcher only accepts exact
+/// normalized labels. Its output is always an approval-held suggestion.
+pub(crate) async fn create_entity_resolution_suggestion_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<EntityResolutionSuggestionRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if !valid_iri(&request.source_iri) || request.mention.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "source_iri must be a valid IRI and mention is required"})),
+        )
+            .into_response();
+    }
+    let mention = normalized_entity_text(&request.mention);
+    if mention.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "mention must contain at least one letter or number"})),
+        )
+            .into_response();
+    }
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let source_exists = match kg.query_sparql_for_claims(
+        claims,
+        &format!(
+            "SELECT ?p WHERE {{ <{}> ?p ?o }} LIMIT 1",
+            request.source_iri
+        ),
+    ) {
+        Ok(rows) => !rows.is_empty(),
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    if !source_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "source entity not found"})),
+        )
+            .into_response();
+    }
+    let candidates = match kg.query_sparql_for_claims(
+        claims,
+        &format!("SELECT DISTINCT ?candidate ?label WHERE {{ ?candidate <{RDFS_LABEL}> ?label . FILTER(?candidate != <{}>) }} LIMIT 50", request.source_iri),
+    ) {
+        Ok(rows) => rows,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+    };
+    let candidates: Vec<(String, String)> = candidates
+        .into_iter()
+        .filter_map(|row| {
+            let candidate = row
+                .get("?candidate")?
+                .as_str()?
+                .trim_matches(['<', '>'])
+                .to_owned();
+            let label = row.get("?label")?.as_str()?.to_owned();
+            Some((candidate, label))
+        })
+        .collect();
+    let result = match run_entity_resolution_sidecar(&request.source_iri, &request.mention, &candidates) {
+        Ok(result) => result,
+        Err(error) => return (StatusCode::BAD_GATEWAY, Json(json!({"error": error, "production_write": false}))).into_response(),
+    };
+    let target_label = candidates.iter().find(|(iri, _)| iri == &result.target_iri).map(|(_, label)| label.clone());
+    if result.score < ENTITY_RESOLUTION_THRESHOLD || target_label.is_none() || !valid_iri(&result.target_iri) {
+        return (StatusCode::OK, Json(json!({
+            "status": "not_presented", "reason": "no candidate met the frozen conservative threshold",
+            "threshold": ENTITY_RESOLUTION_THRESHOLD, "production_write": false,
+        }))).into_response();
+    }
+    let target_iri = result.target_iri;
+    let target_label = target_label.expect("checked above");
+    let approval_id = uuid::Uuid::new_v4().simple().to_string();
+    let evidence_iri = format!("{ENTITY_RESOLUTION_PROVENANCE_NS}suggestion/{approval_id}");
+    let triples = format!(
+        "<{source}> <{same_as}> <{target}> . <{evidence}> <{ns}sourceEntity> <{source}> ; <{ns}targetEntity> <{target}> ; <{ns}mention> \"{mention}\" ; <{ns}targetLabel> \"{target_label}\" ; <{ns}score> \"{score}\" ; <{ns}matcher> \"glinker-sidecar-v1\" .",
+        source = request.source_iri, target = target_iri, same_as = OWL_SAME_AS,
+        evidence = evidence_iri, ns = ENTITY_RESOLUTION_PROVENANCE_NS,
+        mention = sparql_literal(&request.mention), target_label = sparql_literal(&target_label),
+        score = result.score,
+    );
+    if let Err(error) = kg.update_staging_for_claims(
+        claims,
+        &approval_id,
+        &ClaimsGraphUpdate::insert_data(triples),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let approval = PendingActionApproval {
+        approval_id: approval_id.clone(),
+        staging_id: approval_id.clone(),
+        staging_graph: kg
+            .staging_graph_iri_for_claims(claims, &approval_id)
+            .expect("generated identifier is valid"),
+        action_id: "entity-resolution".into(),
+        anchor_query: Some(format!(
+            "SELECT ?same WHERE {{ <{}> <{}> <{}> }} LIMIT 1",
+            request.source_iri, OWL_SAME_AS, target_iri
+        )),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: (chrono::Utc::now() + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS))
+            .to_rfc3339(),
+    };
+    if let Err(error) = kg.create_action_approval_for_claims(claims, &approval) {
+        let _ = kg.drop_staging_for_claims(claims, &approval_id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    emit_action_audit(
+        &state,
+        claims,
+        "entity-resolution",
+        &approval_id,
+        "pending",
+        &[],
+    )
+    .await;
+    (StatusCode::OK, Json(json!({
+        "status": "pending_approval", "approval_id": approval_id,
+        "source_iri": request.source_iri, "target_iri": target_iri,
+        "score": result.score, "threshold": ENTITY_RESOLUTION_THRESHOLD,
+        "evidence": { "mention": request.mention, "target_label": target_label, "sidecar_evidence": result.evidence },
+        "production_write": false,
+    }))).into_response()
 }
 
 /// GET /api/v1/ontology/types — 返回新能源车维修域本体定义（对象/链接/动作/函数）
@@ -56,6 +293,60 @@ pub(crate) async fn ontology_types_handler(
     }))
 }
 
+/// GET /api/v1/ontology/guardrails — 返回当前 claims 已认证调用方可读取的域默认护栏。
+pub(crate) async fn domain_guardrails_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
+    let store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    match store.load_domain_guardrails(ONT_DOMAIN) {
+        Ok(guardrails) => {
+            Json(json!({ "domain": ONT_DOMAIN, "guardrails": guardrails })).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/v1/ontology/guardrails — 更新域默认护栏。
+///
+/// This endpoint is claims-authenticated. Invoke payloads cannot carry this configuration;
+/// their graph scope and policy are selected server-side from the stored ActionType/domain.
+pub(crate) async fn update_domain_guardrails_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(guardrails): Json<ActionGuardrailConfig>,
+) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return unauthorized_isolation_claims().into_response();
+    }
+    if let Err(error) = ontology_guardrails::validate_config(&guardrails) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
+    }
+    let store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    match store.upsert_domain_guardrails(ONT_DOMAIN, &guardrails) {
+        Ok(()) => Json(json!({ "status": "ok", "domain": ONT_DOMAIN, "guardrails": guardrails }))
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
 // ─── 阶段1：ObjectType + LinkType 在线 CRUD（存储驱动，写前备份 meta 图）───────
 //
 // 契约：
@@ -68,6 +359,1398 @@ pub(crate) async fn ontology_types_handler(
 // 本体域固定为 ev-repair（当前单域）；首启由 ensure_seeded 幂等 seed。
 
 const ONT_DOMAIN: &str = "ev-repair";
+const TYPE_DRAFT_TTL_HOURS: i64 = 24;
+const EXTRACTION_PROVENANCE_NS: &str = "https://agentos.ontology/extraction/";
+
+/// A scenario's required ontology surface, supplied before the scenario is
+/// attached to agents. IDs are matched exactly to promoted ontology IDs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OntologyReadinessRequest {
+    pub required_object_types: Vec<String>,
+    pub required_link_types: Vec<String>,
+}
+
+fn normalized_required_ids(ids: Vec<String>, kind: &str) -> Result<Vec<String>, String> {
+    let mut unique = std::collections::BTreeSet::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(format!("{kind} IDs must not be empty"));
+        }
+        unique.insert(id.to_string());
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn readiness_items(
+    required: &[String],
+    promoted: &std::collections::HashSet<&str>,
+    drafted: &std::collections::HashSet<&str>,
+) -> Vec<Value> {
+    required
+        .iter()
+        .map(|id| {
+            let status = if promoted.contains(id.as_str()) {
+                "promoted"
+            } else if drafted.contains(id.as_str()) {
+                "draft"
+            } else {
+                "missing"
+            };
+            json!({ "id": id, "status": status })
+        })
+        .collect()
+}
+
+/// POST /api/v1/ontology/readiness-report — read-only pre-attach domain
+/// coverage report. It reads the promoted meta-model and caller-scoped open
+/// drafts, but deliberately does not seed, promote, expire, or materialize.
+pub(crate) async fn ontology_readiness_report_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<OntologyReadinessRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let required_objects =
+        match normalized_required_ids(request.required_object_types, "ObjectType") {
+            Ok(ids) => ids,
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+            }
+        };
+    let required_links = match normalized_required_ids(request.required_link_types, "LinkType") {
+        Ok(ids) => ids,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+        }
+    };
+
+    // Do not call `ontology_store_ready`: its first-use seed is a write, which
+    // is forbidden for this audit endpoint.
+    use crate::knowledge_graph::ontology_store::OntologyStore;
+    let ontology_store = match OntologyStore::with_shared_store(state.kg_store.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let ontology = match ontology_store.load_definition(ONT_DOMAIN) {
+        Ok(definition) => definition,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    // Unlike `active_type_drafts`, this is intentionally a pure read: expired
+    // drafts are excluded in memory and never cleaned up by a report request.
+    let open_drafts = match kg.list_type_drafts_for_claims(claims) {
+        Ok(drafts) => drafts
+            .into_iter()
+            .filter(|draft| !type_draft_expired(draft))
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let promoted_objects = ontology
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let promoted_links = ontology
+        .link_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let drafted_objects = open_drafts
+        .iter()
+        .flat_map(|draft| {
+            draft
+                .bundle
+                .object_types
+                .iter()
+                .map(|item| item.id.as_str())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let drafted_links = open_drafts
+        .iter()
+        .flat_map(|draft| draft.bundle.link_types.iter().map(|item| item.id.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    let object_types = readiness_items(&required_objects, &promoted_objects, &drafted_objects);
+    let link_types = readiness_items(&required_links, &promoted_links, &drafted_links);
+    let required_total = object_types.len() + link_types.len();
+    let promoted_total = object_types
+        .iter()
+        .chain(link_types.iter())
+        .filter(|item| item["status"] == "promoted")
+        .count();
+    let draft_total = object_types
+        .iter()
+        .chain(link_types.iter())
+        .filter(|item| item["status"] == "draft")
+        .count();
+    let missing = object_types
+        .iter()
+        .chain(link_types.iter())
+        .filter(|item| item["status"] == "missing")
+        .cloned()
+        .collect::<Vec<_>>();
+    let recommendations = missing
+        .iter()
+        .map(|item| {
+            let type_id = item["id"].as_str().unwrap_or_default();
+            json!({
+                "type_id": item["id"],
+                "kind": if required_objects.iter().any(|id| id == type_id) { "object_type" } else { "link_type" },
+                "recommended_next_step": "provide a schema, glossary, DDL, or OpenAPI asset to create a reviewable type draft; explicit human promotion remains required",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    (StatusCode::OK, Json(json!({
+        "domain": ONT_DOMAIN,
+        "read_only": true,
+        "scenario_attach_ready": missing.is_empty() && draft_total == 0,
+        "coverage": {
+            "required": required_total,
+            "promoted": promoted_total,
+            "open_draft": draft_total,
+            "missing": missing.len(),
+            "promoted_percent": if required_total == 0 { 100.0 } else { (promoted_total as f64 / required_total as f64) * 100.0 },
+        },
+        "object_types": object_types,
+        "link_types": link_types,
+        "open_drafts": open_drafts,
+        "gaps": missing,
+        "recommended_draft_assets": recommendations,
+    }))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConstrainedExtractionSource {
+    pub blob_id: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConstrainedExtractionRequest {
+    /// The versioned source text used by an upstream extractor. This first
+    /// slice accepts extraction candidates explicitly so LLM/sidecar selection
+    /// stays outside the trusted graph-write boundary.
+    pub text: String,
+    pub source: ConstrainedExtractionSource,
+    pub extractor: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub candidates: LLMExtractionOutput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagingQuery {
+    pub sparql: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MaterializeExtractionRequest {
+    pub confirm: bool,
+}
+
+/// Optional thresholds for the claims-scoped, read-only slow health loop.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OntologyHealthQuery {
+    /// Object types at or below this production instance count are sparse.
+    #[serde(default = "default_sparse_type_threshold")]
+    pub sparse_type_threshold: u64,
+    /// A non-expired type draft at or above this age is considered stale.
+    #[serde(default = "default_stale_draft_hours")]
+    pub stale_draft_hours: i64,
+}
+
+fn default_sparse_type_threshold() -> u64 {
+    1
+}
+
+fn default_stale_draft_hours() -> i64 {
+    24
+}
+
+/// GET /api/v1/ontology/health
+///
+/// Slow-loop evidence for an authenticated claims scope: canonicalization
+/// rejection rate, quality-gate failures, sparse promoted ObjectTypes, and
+/// stale/expired type drafts. It is strictly read-only: it creates no draft,
+/// never resolves a review, and cannot promote or materialize anything.
+pub(crate) async fn ontology_health_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Query(query): Query<OntologyHealthQuery>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if query.stale_draft_hours < 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "stale_draft_hours must be non-negative"})),
+        )
+            .into_response();
+    }
+    let ontology_store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let ontology = match ontology_store.load_definition(ONT_DOMAIN) {
+        Ok(ontology) => ontology,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match ontology_health::report(
+        &kg,
+        claims,
+        &ontology,
+        query.sparse_type_threshold,
+        query.stale_draft_hours,
+    ) {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+fn extraction_provenance_triples(
+    extraction_id: &str,
+    request: &ConstrainedExtractionRequest,
+    decisions: &[CanonicalizationDecision],
+) -> Result<String, String> {
+    let run = format!("{EXTRACTION_PROVENANCE_NS}run/{extraction_id}");
+    let literal = |value: &str| format!("\"{}\"", sparql_literal(value));
+    let mut triples = vec![format!(
+        "<{run}> <{ns}blobId> {blob} ; <{ns}blobVersion> {version} ; \
+         <{ns}extractor> {extractor} ; <{ns}sourceText> {text} .",
+        ns = EXTRACTION_PROVENANCE_NS,
+        blob = literal(&request.source.blob_id),
+        version = literal(&request.source.version),
+        extractor = literal(&request.extractor),
+        text = literal(&request.text),
+    )];
+    if let Some(model) = &request.model {
+        triples.push(format!(
+            "<{run}> <{ns}model> {model} .",
+            ns = EXTRACTION_PROVENANCE_NS,
+            model = literal(model),
+        ));
+    }
+    for (index, decision) in decisions.iter().enumerate() {
+        let decision_iri = format!("{EXTRACTION_PROVENANCE_NS}decision/{extraction_id}/{index}");
+        let serialized = serde_json::to_string(decision)
+            .map_err(|error| format!("serialize canonicalization decision: {error}"))?;
+        triples.push(format!(
+            "<{run}> <{ns}decision> <{decision_iri}> . \
+             <{decision_iri}> <{ns}json> {serialized} .",
+            ns = EXTRACTION_PROVENANCE_NS,
+            serialized = literal(&serialized),
+        ));
+    }
+    Ok(triples.join("\n"))
+}
+
+/// POST /api/v1/ontology/constrained-extractions
+///
+/// Canonicalizes open extraction candidates solely against the current,
+/// explicitly promoted ObjectType and LinkType definitions, then writes only
+/// accepted candidates and complete provenance to a claims-minted staging
+/// graph. This endpoint cannot select or write the production graph.
+pub(crate) async fn constrained_extraction_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<ConstrainedExtractionRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if request.text.trim().is_empty()
+        || request.source.blob_id.trim().is_empty()
+        || request.source.version.trim().is_empty()
+        || request.extractor.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "text, source.blob_id, source.version, and extractor are required"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = KnowledgeExtractor::validate_extraction(
+        &serde_json::to_string(&request.candidates).unwrap_or_default(),
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+    }
+    let ontology_store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let ontology = match ontology_store.load_definition(ONT_DOMAIN) {
+        Ok(ontology) => ontology,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let canonical = canonicalize(&request.candidates, &ontology);
+    let extraction_id = uuid::Uuid::new_v4().simple().to_string();
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let staging_graph = match kg.staging_graph_iri_for_claims(claims, &extraction_id) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": error}))).into_response()
+        }
+    };
+    let mapped = RdfMapper::map_extraction(&canonical.extraction, &staging_graph);
+    let mut triples = RdfMapper::quads_to_sparql_triples(&mapped.quads);
+    let provenance =
+        match extraction_provenance_triples(&extraction_id, &request, &canonical.decisions) {
+            Ok(triples) => triples,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": error})),
+                )
+                    .into_response()
+            }
+        };
+    if !triples.is_empty() {
+        triples.push('\n');
+    }
+    triples.push_str(&provenance);
+    if let Err(error) = kg.update_staging_for_claims(
+        claims,
+        &extraction_id,
+        &ClaimsGraphUpdate::insert_data(triples),
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    Json(json!({
+        "status": "staged",
+        "extraction_id": extraction_id,
+        "staging_graph": staging_graph,
+        "entities_staged": mapped.entity_count,
+        "relations_staged": mapped.relation_count,
+        "decisions": canonical.decisions,
+        "production_write": false,
+    }))
+    .into_response()
+}
+
+/// GET /api/v1/ontology/constrained-extractions/:id? sparql=...
+///
+/// Reads only the caller's claims-derived staging graph; `GRAPH` clauses are
+/// rejected by the store so callers cannot select another graph.
+pub(crate) async fn constrained_extraction_query_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+    Query(query): Query<StagingQuery>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match kg.query_staging_for_claims(claims, &extraction_id, &query.sparql) {
+        Ok(rows) => Json(json!({"rows": rows})).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/constrained-extractions/:id/quality-gate
+///
+/// Runs the medium-speed supervisory loop only against the caller's
+/// claims-minted staging graph. It persists an immutable report on that same
+/// extraction for review; it never materializes or promotes anything.
+pub(crate) async fn quality_gate_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+    Json(request): Json<QualityGateRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let mut report = match KgQualityGate::evaluate(&kg, claims, &extraction_id, &request, None) {
+        Ok(report) => report,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    if report.deterministic_passed {
+        if let Some(judge_config) = &request.judge {
+            let judge =
+                run_llm_quality_judge(&state, &kg, claims, &extraction_id, judge_config).await;
+            report = KgQualityGate::apply_judge(report, judge);
+        }
+    }
+    let review = PendingExtractionReview {
+        review_id: uuid::Uuid::new_v4().simple().to_string(),
+        extraction_id: extraction_id.clone(),
+        staging_graph: match kg.staging_graph_iri_for_claims(claims, &extraction_id) {
+            Ok(graph) => graph,
+            Err(error) => {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": error}))).into_response()
+            }
+        },
+        gate_status: report.review_status.clone(),
+        report_json: serde_json::to_string(&report).unwrap_or_default(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        decision: "pending".into(),
+    };
+    if let Err(error) = persist_quality_gate_report(&kg, claims, &report) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    if let Err(error) = kg.create_extraction_review_for_claims(claims, &review) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    let status = if report.passed {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (status, Json(json!({ "report": report, "review": review }))).into_response()
+}
+
+async fn run_llm_quality_judge(
+    state: &AppState,
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+    config: &JudgeConfig,
+) -> JudgeReport {
+    use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
+
+    let evidence = match kg.staging_ntriples_for_claims(claims, extraction_id) {
+        Ok(value) => value,
+        Err(error) => return failed_judge_report(format!("read staging evidence: {error}")),
+    };
+    let message = ChatMessage {
+        role: "user".into(),
+        content: ChatContent::Text(format!(
+            "You are a source-grounded KG quality reviewer. Review only this staging evidence. \
+Return strict JSON with verdict (approve|needs_review|reject), rationale, and non-empty \
+source_citations. Do not claim authority to override deterministic policy.\n\n{evidence}"
+        )),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let default_model = state.gateway.default_model();
+    let model = config.model.as_deref().unwrap_or(&default_model);
+    let content = state
+        .gateway
+        .chat_with_model(model, vec![message])
+        .await
+        .ok()
+        .and_then(|response| response.choices.into_iter().next())
+        .and_then(|choice| choice.message.content);
+    match content.and_then(|text| serde_json::from_str::<JudgeReport>(&text).ok()) {
+        Some(report) if !report.source_citations.is_empty() => report,
+        Some(_) => failed_judge_report("Judge returned no source citations".into()),
+        None => failed_judge_report("Judge did not return valid source-grounded JSON".into()),
+    }
+}
+
+fn failed_judge_report(rationale: String) -> JudgeReport {
+    JudgeReport {
+        verdict: JudgeVerdict::Reject,
+        rationale,
+        source_citations: Vec::new(),
+    }
+}
+
+/// GET /api/v1/ontology/extraction-reviews — claims-scoped review queue.
+pub(crate) async fn list_extraction_reviews_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match kg.list_extraction_reviews_for_claims(claims) {
+        Ok(reviews) => Json(json!({"reviews": reviews, "production_write": false})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/extraction-reviews/:id/{approve,reject}
+///
+/// Records external human judgment only. P1.5 owns any future materialization.
+pub(crate) async fn resolve_extraction_review_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path((review_id, decision)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let decision = match decision.as_str() {
+        "approve" => "approved",
+        "reject" => "rejected",
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "unknown review action"})),
+            )
+                .into_response()
+        }
+    };
+    match kg.resolve_extraction_review_for_claims(claims, &review_id, decision) {
+        Ok(()) => Json(json!({
+            "review_id": review_id, "decision": decision, "production_write": false
+        }))
+        .into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response(),
+    }
+}
+
+/// GET /api/v1/ontology/constrained-extractions/:id/review
+///
+/// Returns reports attached to one extraction. Approval/rejection remains a
+/// human/HITL operation; this endpoint deliberately cannot commit staging.
+pub(crate) async fn constrained_extraction_review_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let reports = match quality_gate_reports_for_extraction(&kg, claims, &extraction_id) {
+        Ok(reports) => reports,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    Json(json!({
+        "extraction_id": extraction_id,
+        "quality_gate_reports": reports,
+        "production_write": false,
+    }))
+    .into_response()
+}
+
+fn quality_gate_reports_for_extraction(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+) -> Result<Vec<QualityGateReport>, String> {
+    let query = format!(
+        "SELECT ?report WHERE {{ <{EXTRACTION_PROVENANCE_NS}run/{extraction_id}> \
+         <{EXTRACTION_PROVENANCE_NS}qualityReport> ?report }}"
+    );
+    kg.query_staging_for_claims(claims, extraction_id, &query)
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    row.get("?report")
+                        .and_then(|value| value.as_str())
+                        .and_then(decode_sparql_literal)
+                        .and_then(|json| serde_json::from_str::<QualityGateReport>(&json).ok())
+                })
+                .collect()
+        })
+}
+
+/// Oxigraph's display form keeps RDF literal escapes after the outer quotes
+/// are removed by the generic query serializer. Decode that literal before
+/// parsing the report JSON so persisted gate evidence can govern a later call.
+fn decode_sparql_literal(value: &str) -> Option<String> {
+    serde_json::from_str::<String>(&format!("\"{value}\"")).ok()
+}
+
+/// POST /api/v1/ontology/constrained-extractions/:id/materialize
+///
+/// This is the only staging-to-production path for constrained extractions.
+/// It accepts no client-selected graph and treats the post-write claims-scoped
+/// SPARQL re-read as the success anchor—not an upstream worker or LLM report.
+pub(crate) async fn materialize_constrained_extraction_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(extraction_id): Path<String>,
+    Json(request): Json<MaterializeExtractionRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return unauthorized_isolation_claims().into_response();
+    };
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "materialization requires confirm: true"})),
+        )
+            .into_response();
+    }
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let reports = match quality_gate_reports_for_extraction(&kg, claims, &extraction_id) {
+        Ok(reports) => reports,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    let reviews = match kg.list_extraction_reviews_for_claims(claims) {
+        Ok(reviews) => reviews,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let approved_review = reviews
+        .iter()
+        .find(|review| review.extraction_id == extraction_id && review.decision == "approved");
+    let gate_passed = reports.iter().any(|report| report.passed);
+    let authority = if gate_passed {
+        Some("quality_gate_passed")
+    } else if approved_review.is_some() {
+        Some("recorded_human_override")
+    } else {
+        None
+    };
+    let Some(authority) = authority else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "materialization requires a passed quality gate or a recorded approved human override",
+                "production_write": false,
+            })),
+        )
+            .into_response();
+    };
+
+    let anchor = match kg.materialize_staging_with_anchor_for_claims(claims, &extraction_id) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            emit_materialization_audit(
+                &state,
+                claims,
+                &extraction_id,
+                authority,
+                approved_review.map(|review| review.review_id.as_str()),
+                None,
+                "materialize_failed",
+                Some(&error),
+            )
+            .await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"status": "materialize_failed", "error": error, "production_write": true})),
+            )
+                .into_response();
+        }
+    };
+    let status = if anchor.passed {
+        "materialized"
+    } else {
+        "materialize_failed"
+    };
+    emit_materialization_audit(
+        &state,
+        claims,
+        &extraction_id,
+        authority,
+        approved_review.map(|review| review.review_id.as_str()),
+        Some(&anchor),
+        status,
+        (!anchor.passed).then_some("post-write SPARQL anchor failed"),
+    )
+    .await;
+    let _ = state.kg_store.flush();
+    let http_status = if anchor.passed {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        http_status,
+        Json(json!({
+            "status": status,
+            "extraction_id": extraction_id,
+            "authority": authority,
+            "review_id": approved_review.map(|review| review.review_id.as_str()),
+            "anchor": anchor,
+            "production_write": true,
+        })),
+    )
+        .into_response()
+}
+
+fn persist_quality_gate_report(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    report: &QualityGateReport,
+) -> Result<(), String> {
+    let serialized = serde_json::to_string(report)
+        .map_err(|error| format!("serialize quality gate report: {error}"))?;
+    let run = format!("{EXTRACTION_PROVENANCE_NS}run/{}", report.extraction_id);
+    let triple = format!(
+        "<{run}> <{EXTRACTION_PROVENANCE_NS}qualityReport> \"{}\" .",
+        sparql_literal(&serialized)
+    );
+    kg.update_staging_for_claims(
+        claims,
+        &report.extraction_id,
+        &ClaimsGraphUpdate::insert_data(triple),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CsvTypeDraftRequest {
+    pub csv: String,
+    #[serde(default)]
+    pub object_id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub primary_key: Option<String>,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JsonSchemaTypeDraftRequest {
+    pub schema: Value,
+    #[serde(default)]
+    pub object_id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenApiTypeDraftRequest {
+    pub document: Value,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SqlDdlTypeDraftRequest {
+    pub ddl: String,
+    #[serde(default)]
+    pub links: Vec<DraftLinkInput>,
+}
+
+/// Pre-kernel schema induction input. Candidate terms may come from a human,
+/// an LLM, or a rule engine; this endpoint only turns them into isolated drafts.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SchemaInductionRequest {
+    #[serde(default)]
+    pub candidate_terms: Vec<String>,
+    #[serde(default)]
+    pub documents: Vec<InductionDocument>,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    pub rule_version: String,
+    /// Required when document text is not included. Document bodies are never
+    /// persisted; only these stable source identifiers are retained.
+    #[serde(default)]
+    pub source_document_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromoteTypeDraftRequest {
+    pub confirm: bool,
+    #[serde(default)]
+    pub force_breaking: bool,
+    #[serde(default)]
+    pub audit: Option<BreakingPromotionAuditInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BreakingPromotionAuditInput {
+    /// Human explanation for accepting an incompatible production schema change.
+    pub reason: String,
+    /// Stable external review/change identifier for later investigation.
+    pub ticket: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TypePromotionAudit<'a> {
+    audit_id: String,
+    timestamp: String,
+    draft_id: &'a str,
+    actor_id: &'a str,
+    tenant_id: &'a str,
+    project_id: &'a str,
+    force_breaking: bool,
+    reason: Option<&'a str>,
+    ticket: Option<&'a str>,
+    compatibility_changes: &'a [ontology_draft::CompatibilityChange],
+}
+
+/// Creates a claims-scoped draft only. It never writes to the production
+/// ontology meta graph and intentionally has no ActionType input/output.
+async fn create_type_draft(
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    source: &str,
+    bundle: TypeDraftBundle,
+) -> axum::response::Response {
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let now = chrono::Utc::now();
+    let draft = PendingTypeDraft {
+        draft_id: uuid::Uuid::new_v4().simple().to_string(),
+        source: source.to_string(),
+        bundle,
+        created_at: now.to_rfc3339(),
+        expires_at: (now + chrono::Duration::hours(TYPE_DRAFT_TTL_HOURS)).to_rfc3339(),
+    };
+    match kg.create_type_draft_for_claims(claims, &draft) {
+        Ok(()) => {
+            let _ = state.kg_store.flush();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "status": "draft",
+                    "draft_id": draft.draft_id,
+                    "source": draft.source,
+                    "expires_at": draft.expires_at,
+                    "preview": draft.bundle,
+                    "actions_generated": false,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/type-drafts/from-csv — infer a reviewable object
+/// type from CSV headers. Every property is conservatively a string.
+pub(crate) async fn create_csv_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<CsvTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_csv_headers(
+        &request.csv,
+        request.object_id.as_deref(),
+        request.label.as_deref(),
+        request.primary_key.as_deref(),
+        request.links,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "csv", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-json-schema — infer an ObjectType
+/// from a JSON Schema. Links must be explicit request input; none are inferred.
+pub(crate) async fn create_json_schema_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<JsonSchemaTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_json_schema(
+        &request.schema,
+        request.object_id.as_deref(),
+        request.label.as_deref(),
+        request.links,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "json_schema", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-openapi — create reviewable types
+/// from OpenAPI 3 component schemas. Links must be explicit annotations/input.
+pub(crate) async fn create_openapi_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<OpenApiTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_openapi(&request.document, request.links) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "openapi", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-sql-ddl — create reviewable types
+/// from a supported CREATE TABLE DDL subset. Links require explicit FK evidence.
+pub(crate) async fn create_sql_ddl_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<SqlDdlTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let bundle = match ontology_draft::from_sql_ddl(&request.ddl, request.links) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "sql_ddl", bundle).await
+}
+
+/// POST /api/v1/ontology/type-drafts/from-induction — create pre-kernel,
+/// reviewable schema candidates from terminology and/or corpus documents.
+/// It is draft-only: neither promotion nor ActionType creation is possible.
+pub(crate) async fn create_schema_induction_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<SchemaInductionRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let mut source_document_ids = request.source_document_ids;
+    source_document_ids.extend(request.documents.iter().map(|document| document.id.clone()));
+    source_document_ids.sort();
+    source_document_ids.dedup();
+    if source_document_ids.iter().any(|id| id.trim().is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "source document ids must not be empty"})),
+        )
+            .into_response();
+    }
+    let provenance = TypeDraftProvenance {
+        model_version: request
+            .model_version
+            .filter(|version| !version.trim().is_empty()),
+        rule_version: request.rule_version,
+        source_document_ids,
+    };
+    let bundle = match ontology_draft::induce_from_terms(
+        request.candidate_terms,
+        &request.documents,
+        provenance,
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+    };
+    create_type_draft(&state, claims, "schema_induction", bundle).await
+}
+
+fn type_draft_expired(draft: &PendingTypeDraft) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&draft.expires_at)
+        .map(|expires| expires <= chrono::Utc::now())
+        .unwrap_or(true)
+}
+
+fn active_type_drafts(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+) -> Result<Vec<PendingTypeDraft>, String> {
+    let drafts = kg.list_type_drafts_for_claims(claims)?;
+    Ok(drafts
+        .into_iter()
+        .filter(|draft| {
+            if type_draft_expired(draft) {
+                let _ = kg.delete_type_draft_for_claims(claims, &draft.draft_id);
+                false
+            } else {
+                true
+            }
+        })
+        .collect())
+}
+
+/// GET /api/v1/ontology/type-drafts — caller-only active draft list.
+pub(crate) async fn list_type_drafts_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    match active_type_drafts(&kg, claims) {
+        Ok(drafts) => {
+            let _ = state.kg_store.flush();
+            (StatusCode::OK, Json(json!({"drafts": drafts}))).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/ontology/type-drafts/:draft_id/promote — the only draft path
+/// that writes production metadata. Existing IDs are compatibility-gated before
+/// being replaced, so production schemas cannot be silently broken.
+pub(crate) async fn promote_type_draft_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(draft_id): axum::extract::Path<String>,
+    Json(request): Json<PromoteTypeDraftRequest>,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    if !request.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "promotion requires explicit confirm: true"})),
+        )
+            .into_response();
+    }
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let draft = match active_type_drafts(&kg, claims) {
+        Ok(drafts) => drafts.into_iter().find(|draft| draft.draft_id == draft_id),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let Some(draft) = draft else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "type draft not found", "draft_id": draft_id})),
+        )
+            .into_response();
+    };
+    let store = match ontology_store_ready(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let current = match store.load_definition(ONT_DOMAIN) {
+        Ok(current) => current,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let existing_objects: std::collections::HashSet<_> = current
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    let mut draft_ids = std::collections::HashSet::new();
+    let duplicate_id = draft
+        .bundle
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .chain(draft.bundle.link_types.iter().map(|item| item.id.as_str()))
+        .find(|id| !draft_ids.insert(*id));
+    if let Some(id) = duplicate_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "draft contains duplicate type IDs", "id": id})),
+        )
+            .into_response();
+    }
+    let compatibility_changes = ontology_draft::compatibility_changes(&current, &draft.bundle);
+    let breaking_changes = compatibility_changes
+        .iter()
+        .filter(|change| change.breaking)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !breaking_changes.is_empty() && !request.force_breaking {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "promotion contains breaking ontology changes; retry only with force_breaking: true and audit.reason/audit.ticket",
+                "compatibility_changes": compatibility_changes,
+            })),
+        )
+            .into_response();
+    }
+    let audit_input = request.audit.as_ref();
+    if !breaking_changes.is_empty()
+        && audit_input
+            .is_none_or(|audit| audit.reason.trim().is_empty() || audit.ticket.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "breaking promotion requires non-empty audit.reason and audit.ticket",
+                "compatibility_changes": compatibility_changes,
+            })),
+        )
+            .into_response();
+    }
+    let draft_objects: std::collections::HashSet<_> = draft
+        .bundle
+        .object_types
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    if let Some(link) = draft.bundle.link_types.iter().find(|link| {
+        !(existing_objects.contains(link.source.as_str())
+            || draft_objects.contains(link.source.as_str()))
+            || !(existing_objects.contains(link.target.as_str())
+                || draft_objects.contains(link.target.as_str()))
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "draft link references an unknown object type", "id": link.id})),
+        )
+            .into_response();
+    }
+    for object in &draft.bundle.object_types {
+        if let Err(error) = store.upsert_object_type(ONT_DOMAIN, object) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+        }
+    }
+    for link in &draft.bundle.link_types {
+        if let Err(error) = store.upsert_link_type(ONT_DOMAIN, link) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
+        }
+    }
+    let audit = TypePromotionAudit {
+        audit_id: uuid::Uuid::new_v4().simple().to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        draft_id: &draft.draft_id,
+        actor_id: claims.actor_id(),
+        tenant_id: claims.tenant_id(),
+        project_id: claims.project_id(),
+        force_breaking: request.force_breaking,
+        reason: audit_input.map(|input| input.reason.trim()),
+        ticket: audit_input.map(|input| input.ticket.trim()),
+        compatibility_changes: &compatibility_changes,
+    };
+    let audit_value = match serde_json::to_value(&audit) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("could not serialize promotion audit: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    if let Err(error) = store.record_type_promotion_audit(&audit.audit_id, &audit_value) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    if let Err(error) = kg.delete_type_draft_for_claims(claims, &draft.draft_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    (StatusCode::OK, Json(json!({"status": "promoted", "draft_id": draft.draft_id,
+        "object_type_ids": draft.bundle.object_types.iter().map(|item| &item.id).collect::<Vec<_>>(),
+        "link_type_ids": draft.bundle.link_types.iter().map(|item| &item.id).collect::<Vec<_>>(),
+        "compatibility_changes": compatibility_changes,
+        "audit": audit,
+    }))).into_response()
+}
 
 /// 构造 OntologyStore 并确保已 seed（失败转 500 JSON）。
 fn ontology_store_ready(
@@ -252,6 +1935,9 @@ pub(crate) async fn upsert_action_type_handler(
     if identity.isolation_claims().is_none() {
         return unauthorized_isolation_claims().into_response();
     }
+    if let Err(e) = ontology_guardrails::validate_config(&action.guardrails) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -277,6 +1963,9 @@ pub(crate) async fn update_action_type_handler(
         return unauthorized_isolation_claims().into_response();
     }
     action.id = id;
+    if let Err(e) = ontology_guardrails::validate_config(&action.guardrails) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response();
+    }
     let store = match ontology_store_ready(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -390,6 +2079,137 @@ pub(crate) async fn delete_function_def_handler(
 // 让知识图谱从"只读"变为"可写可执行"：依据 ActionType 做参数校验 + 前置条件检查，
 // 再把 side-effect 以 SPARQL 写回 JWT claims 铸造的命名图。
 const XSD_DECIMAL: &str = "http://www.w3.org/2001/XMLSchema#decimal";
+const ACTION_AUDIT_EVENT: &str = "ACTION_AUDIT";
+const ACTION_AUDIT_SOURCE: &str = "ontology-action-api";
+
+/// A tenant-scoped audit record emitted after an action reaches a durable
+/// decision. Values are sourced exclusively from verified isolation claims.
+#[derive(Debug, Serialize)]
+struct ActionAuditEvent<'a> {
+    tenant_id: &'a str,
+    project_id: &'a str,
+    actor_id: &'a str,
+    action_id: &'a str,
+    staging_id: &'a str,
+    decision: &'a str,
+    violations: &'a [String],
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializationAuditEvent<'a> {
+    tenant_id: &'a str,
+    project_id: &'a str,
+    actor_id: &'a str,
+    extraction_id: &'a str,
+    authority: &'a str,
+    reviewer_id: &'a str,
+    review_id: Option<&'a str>,
+    anchor: Option<&'a MaterializationAnchor>,
+    decision: &'a str,
+    error: Option<&'a str>,
+    timestamp: String,
+}
+
+async fn emit_materialization_audit(
+    state: &AppState,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+    authority: &str,
+    review_id: Option<&str>,
+    anchor: Option<&MaterializationAnchor>,
+    decision: &str,
+    error: Option<&str>,
+) {
+    let event = MaterializationAuditEvent {
+        tenant_id: claims.tenant_id(),
+        project_id: claims.project_id(),
+        actor_id: claims.actor_id(),
+        extraction_id,
+        authority,
+        // The caller who makes the explicit confirm is the accountable human
+        // decision-maker for this write. A prior review id, if any, is linked
+        // separately because legacy review records do not retain actor IDs.
+        reviewer_id: claims.actor_id(),
+        review_id,
+        anchor,
+        decision,
+        error,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let payload = match serde_json::to_string(&event) {
+        Ok(payload) => payload,
+        Err(error) => {
+            error!(
+                extraction_id,
+                decision,
+                %error,
+                "failed to serialize materialization audit event"
+            );
+            return;
+        }
+    };
+    state
+        .core
+        .events
+        .emit(
+            &claims
+                .graph_iri()
+                .unwrap_or_else(|_| "graph://invalid".to_string()),
+            ACTION_AUDIT_EVENT,
+            "ontology-materialization-api",
+            &payload,
+        )
+        .await;
+}
+
+async fn emit_action_audit(
+    state: &AppState,
+    claims: &IsolationClaims,
+    action_id: &str,
+    staging_id: &str,
+    decision: &str,
+    violations: &[String],
+) {
+    let event = ActionAuditEvent {
+        tenant_id: claims.tenant_id(),
+        project_id: claims.project_id(),
+        actor_id: claims.actor_id(),
+        action_id,
+        staging_id,
+        decision,
+        violations,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let payload = match serde_json::to_string(&event) {
+        Ok(payload) => payload,
+        Err(error) => {
+            error!(
+                action_id,
+                staging_id,
+                decision,
+                %error,
+                "failed to serialize action audit event"
+            );
+            return;
+        }
+    };
+    // EventBus emission is intentionally best-effort: its API does not expose
+    // delivery failures, and audit publication must never change an action's
+    // already-determined HTTP outcome.
+    state
+        .core
+        .events
+        .emit(
+            &claims
+                .graph_iri()
+                .unwrap_or_else(|_| "graph://invalid".to_string()),
+            ACTION_AUDIT_EVENT,
+            ACTION_AUDIT_SOURCE,
+            &payload,
+        )
+        .await;
+}
 
 fn unauthorized_isolation_claims() -> (StatusCode, Json<Value>) {
     (
@@ -487,6 +2307,7 @@ fn p_num(params: &serde_json::Map<String, Value>, name: &str) -> Option<f64> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ActionInvokeRequest {
     /// applies_to 对象实例的主键值（动作作用的目标对象）。
     #[serde(default)]
@@ -497,6 +2318,18 @@ pub(crate) struct ActionInvokeRequest {
     /// 仅校验并返回将执行的 SPARQL，不真正写回。
     #[serde(default)]
     pub dry_run: bool,
+    /// `auto` commits immediately unless a future guardrail marks the action
+    /// high-risk. `require_approval` preserves the staging graph for HITL.
+    #[serde(default)]
+    pub commit_strategy: ActionCommitStrategy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActionCommitStrategy {
+    #[default]
+    Auto,
+    RequireApproval,
 }
 
 /// POST /api/v1/ontology/actions/:id/invoke — 动力层执行器
@@ -516,69 +2349,47 @@ const BUILTIN_EXECUTABLE_ACTIONS: &[&str] = &["GenerateRepairOrder"];
 //   3. 对影子图跑 ASK 护栏（三元组数上限 / 谓词命名空间白名单），任一命中即视为违规
 //   4. 通过 → ADD 影子图到生产图 + DROP 影子图（提交）；违规 → DROP 影子图（回滚）
 
-/// 影子图三元组数上限（防单次写回爆量）。
-const SANDBOX_MAX_TRIPLES: usize = 5000;
-/// 允许写回的谓词命名空间前缀白名单（防越权写入无关命名空间）。
-const SANDBOX_ALLOWED_PRED_PREFIXES: &[&str] = &[
-    "https://agentos.ontology/ev/",
-    "http://www.w3.org/2000/01/rdf-schema#",
-    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-];
+#[derive(Debug, Default)]
+struct SandboxGuardrailReport {
+    violations: Vec<String>,
+    /// A relaxed policy is held for approval even when its hard checks pass.
+    high_risk: bool,
+}
 
-/// 护栏后校验：对影子图跑 ASK，返回违规项列表（空=通过）。
-fn sandbox_guardrail_violations(
+fn sandbox_guardrail_report(
     kg: &KnowledgeGraphStore,
     claims: &IsolationClaims,
     staging_id: &str,
-) -> Result<Vec<String>, String> {
-    let mut violations = Vec::new();
-
-    // 护栏1：三元组数上限。
-    let count_q = format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?s ?p ?o }}");
-    let n = kg
-        .query_staging_for_claims(claims, staging_id, &count_q)?
-        .into_iter()
-        .next()
-        .and_then(|row| row.get("?c").and_then(|v| v.as_str().map(String::from)))
-        .and_then(|s| s.parse::<usize>().ok())
-        .ok_or_else(|| "护栏三元组计数查询返回无效结果".to_string())?;
-    if n > SANDBOX_MAX_TRIPLES {
-        violations.push(format!(
-            "写回三元组数 {} 超过上限 {}",
-            n, SANDBOX_MAX_TRIPLES
-        ));
-    }
-
-    // 护栏2：谓词命名空间白名单——存在任一不在白名单前缀内的谓词即违规。
-    let filters: Vec<String> = SANDBOX_ALLOWED_PRED_PREFIXES
-        .iter()
-        .map(|p| format!("STRSTARTS(STR(?p), \"{}\")", p))
-        .collect();
-    let foreign_q = format!(
-        "SELECT ?p WHERE {{ ?s ?p ?o . FILTER(!({allow})) }} LIMIT 1",
-        allow = filters.join(" || ")
-    );
-    let has_foreign = !kg
-        .query_staging_for_claims(claims, staging_id, &foreign_q)?
-        .is_empty();
-    if has_foreign {
-        violations.push("存在越权谓词（不在允许的命名空间白名单内）".to_string());
-    }
-
-    Ok(violations)
+    policy: &ontology_guardrails::EffectiveGuardrails,
+) -> Result<SandboxGuardrailReport, String> {
+    Ok(SandboxGuardrailReport {
+        violations: ontology_guardrails::violations(kg, claims, staging_id, policy)?,
+        high_risk: ontology_guardrails::is_high_risk(policy),
+    })
 }
 
-/// 经影子图提交一批写回语句：写影子图 → 护栏 → 提交/回滚。
-/// 返回 Ok(护栏报告 JSON) 表示已提交；Err((状态码, 消息, 违规列表)) 表示回滚。
+const ACTION_APPROVAL_TTL_HOURS: i64 = 24;
+
+#[derive(Debug)]
+enum StagingCommitOutcome {
+    Committed(Value),
+    Pending(PendingActionApproval),
+}
+
+/// 经影子图提交一批写回语句。默认自动合并；HITL 策略或高风险护栏策略会保留影子图。
 fn commit_via_staging(
     kg: &KnowledgeGraphStore,
     claims: &IsolationClaims,
     statements: &[ClaimsGraphUpdate],
-) -> Result<Value, (StatusCode, String, Vec<String>)> {
+    strategy: ActionCommitStrategy,
+    action_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    guardrails: &ontology_guardrails::EffectiveGuardrails,
+) -> Result<StagingCommitOutcome, (StatusCode, String, Vec<String>, Option<String>)> {
     let staging_id = uuid::Uuid::new_v4().simple().to_string();
     let staging = kg
         .staging_graph_iri_for_claims(claims, &staging_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e, vec![]))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e, vec![], None))?;
 
     // 1. 写入影子图（生产图零改动）。任一失败即清理并报错。
     for stmt in statements {
@@ -588,47 +2399,272 @@ fn commit_via_staging(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("影子图写入失败: {e}"),
                 vec![],
+                Some(staging_id),
             ));
         }
     }
 
     // 2. 护栏后校验。违规即回滚（DROP 影子图），生产图不受影响。
-    let violations = match sandbox_guardrail_violations(kg, claims, &staging_id) {
-        Ok(violations) => violations,
+    let guardrails = match sandbox_guardrail_report(kg, claims, &staging_id, guardrails) {
+        Ok(report) => report,
         Err(e) => {
             let _ = kg.drop_staging_for_claims(claims, &staging_id);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("护栏校验失败，已回滚: {e}"),
                 vec![],
+                Some(staging_id),
             ));
         }
     };
-    if !violations.is_empty() {
+    if !guardrails.violations.is_empty() {
         let _ = kg.drop_staging_for_claims(claims, &staging_id);
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "护栏校验未通过，已回滚（生产图未改动）".to_string(),
-            violations,
+            guardrails.violations,
+            Some(staging_id),
         ));
     }
 
-    // 3. 提交：合并影子图到生产图，再删除影子图。
+    if strategy == ActionCommitStrategy::RequireApproval || guardrails.high_risk {
+        let approval = PendingActionApproval {
+            approval_id: staging_id.clone(),
+            staging_id,
+            staging_graph: staging,
+            action_id: action_id.to_string(),
+            anchor_query: None,
+            created_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS)).to_rfc3339(),
+        };
+        if let Err(e) = kg.create_action_approval_for_claims(claims, &approval) {
+            let _ = kg.drop_staging_for_claims(claims, &approval.staging_id);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("审批记录创建失败，已回滚: {e}"),
+                vec![],
+                Some(approval.staging_id.clone()),
+            ));
+        }
+        return Ok(StagingCommitOutcome::Pending(approval));
+    }
+
+    // 自动提交：合并影子图到生产图，再删除影子图。
     if let Err(e) = kg.commit_staging_for_claims(claims, &staging_id) {
         let _ = kg.drop_staging_for_claims(claims, &staging_id);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("影子图合并到生产图失败: {e}"),
             vec![],
+            Some(staging_id),
         ));
     }
     let _ = kg.drop_staging_for_claims(claims, &staging_id);
 
-    Ok(json!({
+    Ok(StagingCommitOutcome::Committed(json!({
         "sandbox": "staging_graph",
         "staging_graph": staging,
         "guardrails_passed": true,
-    }))
+    })))
+}
+
+fn approval_is_expired(approval: &PendingActionApproval) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&approval.expires_at)
+        .map(|expires_at| expires_at <= chrono::Utc::now())
+        .unwrap_or(true)
+}
+
+fn cleanup_action_approval(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    approval: &PendingActionApproval,
+) {
+    let _ = kg.drop_staging_for_claims(claims, &approval.staging_id);
+    let _ = kg.delete_action_approval_for_claims(claims, &approval.approval_id);
+}
+
+/// GET /api/v1/ontology/action-approvals — pending approvals in the caller's
+/// verified tenant/project scope. Expired approvals are lazily discarded.
+pub(crate) async fn list_action_approvals_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let approvals = match kg.list_action_approvals_for_claims(claims) {
+        Ok(approvals) => approvals,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let active: Vec<_> = approvals
+        .into_iter()
+        .filter(|approval| {
+            if approval_is_expired(approval) {
+                cleanup_action_approval(&kg, claims, approval);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let _ = state.kg_store.flush();
+    (StatusCode::OK, Json(json!({ "approvals": active }))).into_response()
+}
+
+/// POST /api/v1/ontology/action-approvals/:approval_id/approve
+pub(crate) async fn approve_action_approval_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(approval_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    resolve_action_approval(&state, identity, approval_id, true).await
+}
+
+/// POST /api/v1/ontology/action-approvals/:approval_id/reject
+pub(crate) async fn reject_action_approval_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(approval_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    resolve_action_approval(&state, identity, approval_id, false).await
+}
+
+async fn resolve_action_approval(
+    state: &Arc<AppState>,
+    identity: UserIdentity,
+    approval_id: String,
+    approve: bool,
+) -> axum::response::Response {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => return unauthorized_isolation_claims().into_response(),
+    };
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let approval = match kg.list_action_approvals_for_claims(claims) {
+        Ok(approvals) => approvals
+            .into_iter()
+            .find(|approval| approval.approval_id == approval_id),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let Some(approval) = approval else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "approval not found", "approval_id": approval_id })),
+        )
+            .into_response();
+    };
+    if approval_is_expired(&approval) {
+        cleanup_action_approval(&kg, claims, &approval);
+        let _ = state.kg_store.flush();
+        return (
+            StatusCode::GONE,
+            Json(json!({ "error": "approval expired", "approval_id": approval_id })),
+        )
+            .into_response();
+    }
+    if approve {
+        if let Err(e) = kg.commit_staging_for_claims(claims, &approval.staging_id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("approval merge failed: {e}") })),
+            )
+                .into_response();
+        }
+        // Entity-resolution and other supervisory flows supply this query
+        // server-side. A successful ADD is not evidence: re-read the
+        // claims-minted production graph before declaring approval complete.
+        if let Some(anchor_query) = &approval.anchor_query {
+            match kg.query_sparql_for_claims(claims, anchor_query) {
+                Ok(rows) if !rows.is_empty() => {}
+                Ok(_) | Err(_) => {
+                    let _ = state.kg_store.flush();
+                    emit_action_audit(
+                        state,
+                        claims,
+                        &approval.action_id,
+                        &approval.staging_id,
+                        "needs_repair",
+                        &["post_merge_sparql_anchor_failed".into()],
+                    )
+                    .await;
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "needs_repair",
+                            "approval_id": approval.approval_id,
+                            "error": "post-merge SPARQL anchor failed; approval retained for repair",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    if let Err(e) = kg.drop_staging_for_claims(claims, &approval.staging_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("approval staging cleanup failed: {e}") })),
+        )
+            .into_response();
+    }
+    if let Err(e) = kg.delete_action_approval_for_claims(claims, &approval.approval_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("approval metadata cleanup failed: {e}") })),
+        )
+            .into_response();
+    }
+    let _ = state.kg_store.flush();
+    emit_action_audit(
+        state,
+        claims,
+        &approval.action_id,
+        &approval.staging_id,
+        if approve { "approved" } else { "rejected" },
+        &[],
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": if approve { "approved" } else { "rejected" },
+            "approval_id": approval.approval_id,
+            "staging_graph": approval.staging_graph,
+        })),
+    )
+        .into_response()
 }
 
 pub(crate) async fn invoke_action_handler(
@@ -696,14 +2732,16 @@ pub(crate) async fn invoke_action_handler(
     };
 
     // 2. 前置条件 + 3. 组装 side-effect 写回 SPARQL（按动作分派）。
-    let now = chrono::Utc::now().to_rfc3339();
-    let (statements, result_meta) = match build_action_effects(&action_id, &req, &kg, claims, &now)
-    {
-        Ok(v) => v,
-        Err((code, msg)) => return (code, Json(json!({ "error": msg }))),
-    };
+    let now = chrono::Utc::now();
+    let (statements, result_meta) =
+        match build_action_effects(&action_id, &req, &kg, claims, &now.to_rfc3339()) {
+            Ok(v) => v,
+            Err((code, msg)) => return (code, Json(json!({ "error": msg }))),
+        };
 
     if req.dry_run {
+        // dry runs deliberately have no staging graph and therefore no audit
+        // event; they do not produce a state-changing decision to retain.
         return (
             StatusCode::OK,
             Json(json!({
@@ -717,21 +2755,69 @@ pub(crate) async fn invoke_action_handler(
     }
 
     // 4. 数据沙箱写回：先写影子图 → 护栏后校验 → 通过才合并到生产图，失败即回滚。
-    let sandbox = match commit_via_staging(&kg, claims, &statements) {
-        Ok(report) => report,
-        Err((code, msg, violations)) => {
+    let guardrails = match ontology_guardrails::effective_config(&ont, &action) {
+        Ok(guardrails) => guardrails,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    };
+    let outcome = match commit_via_staging(
+        &kg,
+        claims,
+        &statements,
+        req.commit_strategy,
+        &action_id,
+        now,
+        &guardrails,
+    ) {
+        Ok(outcome) => outcome,
+        Err((code, msg, violations, staging_id)) => {
+            if code == StatusCode::UNPROCESSABLE_ENTITY {
+                if let Some(staging_id) = staging_id.as_deref() {
+                    emit_action_audit(
+                        &state,
+                        claims,
+                        &action_id,
+                        staging_id,
+                        "violated",
+                        &violations,
+                    )
+                    .await;
+                }
+            }
             return (
                 code,
                 Json(json!({ "error": msg, "violations": violations })),
-            )
+            );
         }
     };
+    let (status, sandbox, decision, staging_id) = match outcome {
+        StagingCommitOutcome::Committed(report) => {
+            let staging_id = report["staging_graph"]
+                .as_str()
+                .and_then(|graph| graph.rsplit('/').next())
+                .unwrap_or_default()
+                .to_string();
+            ("ok", report, "committed", staging_id)
+        }
+        StagingCommitOutcome::Pending(approval) => (
+            "pending_approval",
+            json!({
+                "sandbox": "staging_graph",
+                "staging_graph": approval.staging_graph,
+                "guardrails_passed": true,
+                "approval_id": approval.approval_id,
+                "expires_at": approval.expires_at,
+            }),
+            "pending",
+            approval.staging_id,
+        ),
+    };
     let _ = state.kg_store.flush();
+    emit_action_audit(&state, claims, &action_id, &staging_id, decision, &[]).await;
 
     (
         StatusCode::OK,
         Json(json!({
-            "status": "ok",
+            "status": status,
             "action": action_id,
             "graph": claims.graph_iri().expect("verified claims were validated"),
             "applied": statements.len(),
@@ -1038,6 +3124,117 @@ mod ontology_crud_tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn readiness_report_is_claims_scoped_read_only_and_identifies_gaps() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_readiness_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let claims =
+            IsolationClaims::from_verified("tenant-a", "repair", "ontology-tester").unwrap();
+        let ontology_store =
+            crate::knowledge_graph::ontology_store::OntologyStore::with_shared_store(
+                state.kg_store.clone(),
+            )
+            .unwrap();
+        ontology_store.ensure_seeded(ONT_DOMAIN).unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        kg.create_type_draft_for_claims(
+            &claims,
+            &PendingTypeDraft {
+                draft_id: "proposed-asset".into(),
+                source: "test".into(),
+                bundle: TypeDraftBundle {
+                    object_types: vec![crate::knowledge_graph::ontology_layer::ObjectType {
+                        id: "ProposedAsset".into(),
+                        iri: crate::knowledge_graph::ontology_layer::ev("ProposedAsset"),
+                        label: "Proposed Asset".into(),
+                        description: "draft".into(),
+                        icon: "Box".into(),
+                        color: "slate".into(),
+                        primary_key: "id".into(),
+                        title_property: "id".into(),
+                        kind: Default::default(),
+                        properties: vec![],
+                    }],
+                    link_types: vec![],
+                    provenance: None,
+                    suggested_links: vec![],
+                    warnings: vec![],
+                },
+                created_at: chrono::Utc::now().to_rfc3339(),
+                expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            },
+        )
+        .unwrap();
+        let before = ontology_store.load_definition(ONT_DOMAIN).unwrap();
+        let drafts_before = kg.list_type_drafts_for_claims(&claims).unwrap();
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/readiness-report",
+                post(ontology_readiness_report_handler),
+            )
+            .with_state(state.clone());
+        let body = json!({
+            "required_object_types": ["Vehicle", "ProposedAsset", "MissingAsset"],
+            "required_link_types": ["triggers"]
+        });
+        let no_claims = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/readiness-report")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(no_claims).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let report = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/ontology/readiness-report")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.status(), StatusCode::OK);
+        let report: Value = serde_json::from_slice(
+            &axum::body::to_bytes(report.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["read_only"], true);
+        assert_eq!(report["scenario_attach_ready"], false);
+        assert_eq!(report["coverage"]["promoted"], 2);
+        assert_eq!(report["coverage"]["open_draft"], 1);
+        assert_eq!(report["coverage"]["missing"], 1);
+        assert!(report["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["id"] == "MissingAsset"));
+        assert_eq!(
+            ontology_store
+                .load_definition(ONT_DOMAIN)
+                .unwrap()
+                .object_types
+                .len(),
+            before.object_types.len()
+        );
+        assert_eq!(
+            kg.list_type_drafts_for_claims(&claims).unwrap().len(),
+            drafts_before.len()
+        );
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     /// 阶段0 无回归：GET /api/v1/ontology/types 改读 Oxigraph 元命名图后，
     /// 响应须与硬编码 ev_repair_ontology() 逐字段一致（首启由 ensure_seeded 幂等 seed）。
     #[tokio::test]
@@ -1082,7 +3279,7 @@ mod ontology_crud_tests {
 
     /// 阶段1 CRUD：新建对象 → GET 可见 → 删除被引用返回 409 → 删链接后可删对象。
     #[tokio::test]
-    async fn test_ontology_object_link_crud() {
+    async fn isolation_contract_ontology_write_requires_jwt_and_uses_claims_scope() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("agentos_ontcrud_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1209,6 +3406,698 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "无引用后应可删");
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn type_draft_csv_requires_claims_and_explicit_human_promotion() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_type_draft_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route("/api/v1/ontology/types", get(ontology_types_handler))
+            .route(
+                "/api/v1/ontology/type-drafts",
+                get(list_type_drafts_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/from-csv",
+                post(create_csv_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        let body = json!({
+            "csv": "asset_id,Display Name,active\nA-1,Inverter,true\n",
+            "object_id": "imported asset",
+            "label": "Imported Asset"
+        });
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-csv")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-csv")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["actions_generated"], false);
+        assert!(created["preview"]["object_types"][0]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|property| property["prop_type"] == "string"));
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let no_confirm = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":false}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(no_confirm).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let promote = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        let promoted = app.clone().oneshot(promote).await.unwrap();
+        let promoted_status = promoted.status();
+        let promoted_body = axum::body::to_bytes(promoted.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted_status,
+            StatusCode::OK,
+            "promotion response: {}",
+            String::from_utf8_lossy(&promoted_body)
+        );
+
+        let types = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["id"] == "ImportedAsset"));
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn breaking_type_draft_promotion_requires_force_and_audit_fields() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_breaking_type_draft_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/type-drafts/from-csv",
+                post(create_csv_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        // The promoted Brand type has country and logo_url. This draft omits
+        // them, exercising the production compatibility gate.
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-csv")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(
+                json!({"csv": "name\nAcme\n", "object_id": "Brand"}).to_string(),
+            ))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let reject = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        let rejected = app.clone().oneshot(reject).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: Value = serde_json::from_slice(
+            &axum::body::to_bytes(rejected.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(rejected["compatibility_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["kind"] == "property_removed"));
+
+        let force = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(
+                r#"{"confirm":true,"force_breaking":true,"audit":{"reason":"source schema retirement","ticket":"ENG-152"}}"#,
+            ))
+            .unwrap();
+        let promoted = app.clone().oneshot(force).await.unwrap();
+        assert_eq!(promoted.status(), StatusCode::OK);
+        let promoted: Value = serde_json::from_slice(
+            &axum::body::to_bytes(promoted.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(promoted["audit"]["actor_id"], "ontology-tester");
+        assert_eq!(promoted["audit"]["ticket"], "ENG-152");
+        assert_eq!(promoted["audit"]["force_breaking"], true);
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn schema_induction_stays_out_of_types_until_explicitly_promoted() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("agentos_induction_draft_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route("/api/v1/ontology/types", get(ontology_types_handler))
+            .route(
+                "/api/v1/ontology/type-drafts/from-induction",
+                post(create_schema_induction_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        let body = json!({
+            "candidate_terms": ["Field Sensor", "record"],
+            "documents": [{
+                "id": "maintenance-handbook-v2",
+                "text": "Field Sensor readings are collected. Field Sensor alerts are reviewed."
+            }],
+            "model_version": "terms-assistant-1",
+            "rule_version": "terminology-v1"
+        });
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-induction")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["source"], "schema_induction");
+        assert_eq!(created["actions_generated"], false);
+        assert_eq!(
+            created["preview"]["provenance"]["model_version"],
+            "terms-assistant-1"
+        );
+        assert_eq!(
+            created["preview"]["provenance"]["rule_version"],
+            "terminology-v1"
+        );
+        assert_eq!(
+            created["preview"]["provenance"]["source_document_ids"][0],
+            "maintenance-handbook-v2"
+        );
+        assert!(created["preview"]["link_types"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let types = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|object| object["id"] != "FieldSensor"));
+
+        let promote = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(promote).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let types = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["id"] == "FieldSensor"));
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn openapi_type_draft_is_claims_scoped_and_promoted_only_after_confirmation() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_openapi_type_draft_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route("/api/v1/ontology/types", get(ontology_types_handler))
+            .route(
+                "/api/v1/ontology/type-drafts/from-openapi",
+                post(create_openapi_type_draft_handler),
+            )
+            .route(
+                "/api/v1/ontology/type-drafts/:draft_id/promote",
+                post(promote_type_draft_handler),
+            )
+            .with_state(state);
+        let body = json!({
+            "document": {
+                "openapi": "3.0.3",
+                "info": {"title": "Asset API", "version": "1"},
+                "components": {
+                    "schemas": {
+                        "ImportedAsset": {
+                            "type": "object",
+                            "required": ["asset_id"],
+                            "properties": {
+                                "asset_id": {"type": "string"},
+                                "active": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-openapi")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/type-drafts/from-openapi")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["source"], "openapi");
+        assert_eq!(created["actions_generated"], false);
+        let draft_id = created["draft_id"].as_str().unwrap();
+
+        let no_confirm = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":false}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(no_confirm).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let promote = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/ontology/type-drafts/{draft_id}/promote"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(promote).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let types = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let types: Value = serde_json::from_slice(
+            &axum::body::to_bytes(types.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(types["object_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["id"] == "ImportedAsset"));
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn constrained_extraction_requires_claims_and_writes_only_staging() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_constrained_extract_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/constrained-extractions",
+                post(constrained_extraction_handler),
+            )
+            .with_state(state.clone());
+        let body = json!({
+            "text": "P0A1 affects the battery system.",
+            "source": {"blob_id": "manual-p0a1", "version": "v1"},
+            "extractor": "test-extractor",
+            "model": "test-model",
+            "candidates": {
+                "nodes": [
+                    {"id": "p0a1", "node_type": "FaultCode", "label": "P0A1", "properties": {}},
+                    {"id": "battery", "node_type": "System", "label": "Battery system", "properties": {}}
+                ],
+                "edges": [
+                    {"source": "p0a1", "target": "battery", "relation": "affectsSystem", "properties": {}}
+                ]
+            }
+        });
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/constrained-extractions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/constrained-extractions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["status"], "staged");
+        assert_eq!(response["production_write"], false);
+        let extraction_id = response["extraction_id"].as_str().unwrap();
+        let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let staging = kg
+            .query_staging_for_claims(&claims, extraction_id, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+            .unwrap();
+        assert!(
+            staging
+                .iter()
+                .any(|row| row["?o"] == "https://agentos.ontology/ev/FaultCode"),
+            "canonical type triple must be present in staging"
+        );
+        assert!(
+            staging
+                .iter()
+                .any(|row| row["?p"] == "https://agentos.ontology/extraction/blobId"),
+            "source blob provenance must be present in staging"
+        );
+        assert!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+                .unwrap()
+                .is_empty(),
+            "constrained extraction must not write the production graph"
+        );
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn materialization_requires_confirmation_claims_and_gate_then_returns_anchor() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "agentos_materialize_extraction_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let token = test_jwt("tenant-a");
+        let mut audits = state.core.events.subscribe();
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/constrained-extractions/:id/quality-gate",
+                post(quality_gate_handler),
+            )
+            .route(
+                "/api/v1/ontology/constrained-extractions/:id/materialize",
+                post(materialize_constrained_extraction_handler),
+            )
+            .with_state(state.clone());
+        let post = |uri: String, token: Option<&str>, body: Value| {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            request
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // Missing verified claims and missing explicit confirmation both fail
+        // before any production graph operation.
+        let no_claims = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/no-claims/materialize".into(),
+                None,
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_claims.status(), StatusCode::UNAUTHORIZED);
+        let no_confirm = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/no-confirm/materialize".into(),
+                Some(&token),
+                json!({"confirm": false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_confirm.status(), StatusCode::BAD_REQUEST);
+
+        kg.update_staging_for_claims(
+            &claims,
+            "blocked",
+            &ClaimsGraphUpdate::insert_data("<urn:blocked> <urn:p> <urn:o> ."),
+        )
+        .unwrap();
+        let failed_gate = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/blocked/quality-gate".into(),
+                Some(&token),
+                json!({"assertions": [{"code": "must_be_empty", "query": "ASK { ?s ?p ?o }"}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(failed_gate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let blocked = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/blocked/materialize".into(),
+                Some(&token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+        assert!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { <urn:blocked> ?p ?o }")
+                .unwrap()
+                .is_empty(),
+            "a failed gate must never materialize staging"
+        );
+
+        kg.update_staging_for_claims(
+            &claims,
+            "approved",
+            &ClaimsGraphUpdate::insert_data("<urn:approved> <urn:p> <urn:o> ."),
+        )
+        .unwrap();
+        let passed_gate = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/approved/quality-gate".into(),
+                Some(&token),
+                json!({"assertions": []}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(passed_gate.status(), StatusCode::OK);
+        assert_eq!(
+            quality_gate_reports_for_extraction(&kg, &claims, "approved")
+                .unwrap()
+                .len(),
+            1,
+            "a passed gate report must be available to materialization"
+        );
+        let materialized = app
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/approved/materialize".into(),
+                Some(&token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        let materialized_status = materialized.status();
+        let materialized_body = axum::body::to_bytes(materialized.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            materialized_status,
+            StatusCode::OK,
+            "materialization response: {}",
+            String::from_utf8_lossy(&materialized_body)
+        );
+        let body: Value = serde_json::from_slice(&materialized_body).unwrap();
+        assert_eq!(body["status"], "materialized");
+        assert_eq!(body["anchor"]["passed"], true);
+        assert!(body["anchor"]["staging_triple_count"].as_u64().is_some());
+        let audit = audits.recv().await.unwrap();
+        assert_eq!(audit.event_type, ACTION_AUDIT_EVENT);
+        let audit: Value = serde_json::from_str(&audit.payload).unwrap();
+        assert_eq!(audit["extraction_id"], "approved");
+        assert_eq!(audit["decision"], "materialized");
+        assert_eq!(audit["anchor"]["passed"], true);
+        assert!(
+            !kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { <urn:approved> ?p ?o }")
+                .unwrap()
+                .is_empty(),
+            "HTTP success requires production evidence from the SPARQL anchor"
+        );
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
@@ -1402,7 +4291,105 @@ mod ontology_crud_tests {
     }
 
     #[tokio::test]
-    async fn tenant_a_invoke_writes_are_invisible_to_tenant_b() {
+    async fn golden_action_dry_run_and_guardrail_contract() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../evals/golden/action-invocation.json"))
+                .expect("golden action fixture must be valid JSON");
+        let dry_run = &fixture["dry_run"];
+        let tmp = std::env::temp_dir().join(format!("agentos_golden_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+
+        let state = make_state(&tmp);
+        let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        kg.update_for_claims(
+            &claims,
+            &ClaimsGraphUpdate::insert_data(format!(
+                "<{}> a <{}> . <{}> a <{}> .",
+                ev_instance_iri("Vehicle", "LVIN123"),
+                ev_term_iri("Vehicle"),
+                ev_instance_iri("FaultCode", "P0A80"),
+                ev_term_iri("FaultCode"),
+            )),
+        )
+        .unwrap();
+
+        let token = test_jwt("tenant-a");
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/actions/:id/invoke",
+                post(invoke_action_handler),
+            )
+            .with_state(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/ontology/actions/{}/invoke",
+                        dry_run["action_id"].as_str().unwrap()
+                    ))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::from(dry_run["request"].to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], dry_run["expected"]["status"]);
+        assert_eq!(body["action"], dry_run["action_id"]);
+        for expected in dry_run["expected"]["sparql_contains"].as_array().unwrap() {
+            assert!(
+                body["sparql"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|statement| statement
+                        .as_str()
+                        .unwrap()
+                        .contains(expected.as_str().unwrap())),
+                "dry run SPARQL is missing {expected}"
+            );
+        }
+        for field in dry_run["expected"]["result_fields"].as_array().unwrap() {
+            assert!(
+                body["result"].get(field.as_str().unwrap()).is_some(),
+                "dry run result is missing {field}"
+            );
+        }
+        assert!(
+            kg.query_sparql_for_claims(
+                &claims,
+                &format!(
+                    "SELECT ?o WHERE {{ ?o a <{}> }}",
+                    ev_term_iri("RepairOrder")
+                ),
+            )
+            .unwrap()
+            .is_empty(),
+            "dry run must not commit a repair order"
+        );
+        assert!(
+            serde_json::from_value::<ActionInvokeRequest>(fixture["guardrail"]["request"].clone())
+                .is_err(),
+            "callers must not override server-owned guardrails"
+        );
+
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_ontology_actions_are_invisible_cross_tenant() {
         let tmp = std::env::temp_dir().join(format!("agentos_ontinvoke_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let state = make_state(&tmp);
@@ -1456,6 +4443,250 @@ mod ontology_crud_tests {
 
         let _ = std::fs::remove_dir_all(tmp);
     }
+
+    #[tokio::test]
+    async fn action_approval_keeps_staging_until_same_scope_approves() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_approval_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state = make_state(&tmp);
+        let claims_a =
+            crate::isolation::IsolationClaims::from_verified("tenant-a", "repair", "tester")
+                .unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let seed = format!(
+            "<{}> a <{}> . <{}> a <{}> .",
+            ev_instance_iri("Vehicle", "LVIN123"),
+            ev_term_iri("Vehicle"),
+            ev_instance_iri("FaultCode", "P0A80"),
+            ev_term_iri("FaultCode"),
+        );
+        kg.update_for_claims(&claims_a, &ClaimsGraphUpdate::insert_data(seed))
+            .unwrap();
+
+        let mut audit_events = state.core.events.subscribe();
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/actions/:id/invoke",
+                post(invoke_action_handler),
+            )
+            .route(
+                "/api/v1/ontology/action-approvals",
+                get(list_action_approvals_handler),
+            )
+            .route(
+                "/api/v1/ontology/action-approvals/:approval_id/approve",
+                post(approve_action_approval_handler),
+            )
+            .route(
+                "/api/v1/ontology/action-approvals/:approval_id/reject",
+                post(reject_action_approval_handler),
+            )
+            .with_state(state);
+        let post = |uri: String, token: &str, body: Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let unauthenticated = axum::http::Request::builder()
+            .uri("/api/v1/ontology/action-approvals")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let unauthenticated_invoke = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/ontology/actions/GenerateRepairOrder/invoke")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "target": "P0A80",
+                    "params": {"vehicle_vin": "LVIN123"}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(unauthenticated_invoke)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            matches!(
+                audit_events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "requests without verified claims must not forge an audit tenant"
+        );
+
+        let auto_commit = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/actions/GenerateRepairOrder/invoke".to_string(),
+                &test_jwt("tenant-a"),
+                json!({
+                    "target": "P0A80",
+                    "params": {"vehicle_vin": "LVIN123"}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(auto_commit.status(), StatusCode::OK);
+        let committed = audit_events.recv().await.unwrap();
+        assert_eq!(committed.event_type, ACTION_AUDIT_EVENT);
+        let committed: Value = serde_json::from_str(&committed.payload).unwrap();
+        assert_eq!(committed["tenant_id"], "tenant-a");
+        assert_eq!(committed["project_id"], "repair");
+        assert_eq!(committed["actor_id"], "ontology-tester");
+        assert_eq!(committed["action_id"], "GenerateRepairOrder");
+        assert_eq!(committed["decision"], "committed");
+        assert!(committed["staging_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(committed["violations"], json!([]));
+        assert!(committed["timestamp"].as_str().is_some());
+
+        let invoke = post(
+            "/api/v1/ontology/actions/GenerateRepairOrder/invoke".to_string(),
+            &test_jwt("tenant-a"),
+            json!({
+                "target": "P0A80",
+                "params": {"vehicle_vin": "LVIN123"},
+                "commit_strategy": "require_approval"
+            }),
+        );
+        let response = app.clone().oneshot(invoke).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], "pending_approval");
+        let approval_id = body["sandbox"]["approval_id"].as_str().unwrap().to_string();
+        let pending: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(pending["decision"], "pending");
+        assert_eq!(pending["staging_id"], approval_id);
+
+        let orders = format!(
+            "SELECT ?o WHERE {{ ?o a <{}> }}",
+            ev_term_iri("RepairOrder")
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims_a, &orders)
+                .unwrap()
+                .len(),
+            1,
+            "require_approval must not alter the production graph"
+        );
+
+        let list = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/action-approvals")
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list_body["approvals"].as_array().unwrap().len(), 1);
+
+        let cross_tenant = app
+            .clone()
+            .oneshot(post(
+                format!("/api/v1/ontology/action-approvals/{approval_id}/approve"),
+                &test_jwt("tenant-b"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+        let approved = app
+            .clone()
+            .oneshot(post(
+                format!("/api/v1/ontology/action-approvals/{approval_id}/approve"),
+                &test_jwt("tenant-a"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(approved["decision"], "approved");
+        assert_eq!(approved["staging_id"], approval_id);
+        assert!(
+            !kg.query_sparql_for_claims(&claims_a, &orders)
+                .unwrap()
+                .is_empty(),
+            "approval must merge the retained staging graph"
+        );
+
+        let reject_invoke = post(
+            "/api/v1/ontology/actions/GenerateRepairOrder/invoke".to_string(),
+            &test_jwt("tenant-a"),
+            json!({
+                "target": "P0A80",
+                "params": {"vehicle_vin": "LVIN123"},
+                "commit_strategy": "require_approval"
+            }),
+        );
+        let response = app.clone().oneshot(reject_invoke).await.unwrap();
+        let reject_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let reject_id = reject_body["sandbox"]["approval_id"].as_str().unwrap();
+        let pending_reject: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(pending_reject["decision"], "pending");
+        assert_eq!(pending_reject["staging_id"], reject_id);
+        let rejected = app
+            .clone()
+            .oneshot(post(
+                format!("/api/v1/ontology/action-approvals/{reject_id}/reject"),
+                &test_jwt("tenant-a"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        let rejected: Value =
+            serde_json::from_str(&audit_events.recv().await.unwrap().payload).unwrap();
+        assert_eq!(rejected["decision"], "rejected");
+        assert_eq!(rejected["staging_id"], reject_id);
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims_a, &orders)
+                .unwrap()
+                .len(),
+            2,
+            "reject must discard staged writes"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 }
 
 /// 动力层执行器（ActionType invoke）单测：参数/前置条件校验 + SPARQL 组装。
@@ -1465,6 +4696,16 @@ mod ontology_action_tests {
     use crate::isolation::IsolationClaims;
     use crate::knowledge_graph::store::KnowledgeGraphStore;
     use oxigraph::store::Store;
+
+    #[test]
+    fn entity_resolution_matcher_is_exact_after_normalization() {
+        assert_eq!(normalized_entity_text("ACME, Inc."), "acmeinc");
+        assert_eq!(normalized_entity_text("ＡＣＭＥ"), "ａｃｍｅ");
+        assert_ne!(
+            normalized_entity_text("Acme Incorporated"),
+            normalized_entity_text("Acme Inc.")
+        );
+    }
 
     fn test_claims(tenant: &str) -> IsolationClaims {
         IsolationClaims::from_verified(tenant, "repair", "tester").unwrap()
@@ -1500,6 +4741,7 @@ mod ontology_action_tests {
             target: target.map(|s| s.to_string()),
             params: params.as_object().cloned().unwrap_or_default(),
             dry_run,
+            commit_strategy: ActionCommitStrategy::Auto,
         }
     }
 
@@ -1583,7 +4825,26 @@ mod ontology_action_tests {
         )
         .unwrap();
 
-        let report = commit_via_staging(&kg, &claims, &stmts).expect("护栏应通过并提交");
+        let ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        let guardrails = ontology_guardrails::effective_config(&ont, action).unwrap();
+        let outcome = commit_via_staging(
+            &kg,
+            &claims,
+            &stmts,
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+            &guardrails,
+        )
+        .expect("护栏应通过并提交");
+        let StagingCommitOutcome::Committed(report) = outcome else {
+            panic!("auto 策略必须直接提交");
+        };
         assert_eq!(report["guardrails_passed"], json!(true));
 
         // claims 图应能查到新建的维修工单类型三元组。
@@ -1633,7 +4894,23 @@ mod ontology_action_tests {
         let foreign = ClaimsGraphUpdate::insert_data(
             "<https://agentos.ontology/ev/X/1> <http://evil.example/pwn> \"x\"",
         );
-        let err = commit_via_staging(&kg, &claims, &[foreign]).unwrap_err();
+        let ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        let guardrails = ontology_guardrails::effective_config(&ont, action).unwrap();
+        let err = commit_via_staging(
+            &kg,
+            &claims,
+            &[foreign],
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+            &guardrails,
+        )
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(err.2.iter().any(|v| v.contains("越权谓词")));
 
@@ -1643,6 +4920,96 @@ mod ontology_action_tests {
             .unwrap()
             .to_string();
         assert_eq!(before, after, "回滚后生产图不应有任何改动");
+    }
+
+    #[test]
+    fn test_action_whitelist_override_rejects_otherwise_allowed_predicate() {
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
+        let mut ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter_mut()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        action.guardrails.allowed_predicate_prefixes =
+            Some(vec!["https://agentos.ontology/ev/prop/".into()]);
+        let action = action.clone();
+        let guardrails = ontology_guardrails::effective_config(&ont, &action).unwrap();
+        let permitted_by_default = ClaimsGraphUpdate::insert_data(
+            "<https://agentos.ontology/ev/X/1> <https://agentos.ontology/ev/custom> \"x\"",
+        );
+        let err = commit_via_staging(
+            &kg,
+            &claims,
+            &[permitted_by_default],
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+            &guardrails,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err
+            .2
+            .iter()
+            .any(|violation| violation.starts_with("predicate_whitelist:")));
+    }
+
+    #[test]
+    fn test_assertion_failure_rolls_back_staging_graph() {
+        let claims = test_claims("tenant-a");
+        let kg = seeded_kg(&claims);
+        let before = kg
+            .query_sparql_for_claims(&claims, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+            .unwrap()[0]["?c"]
+            .clone();
+        let mut ont = crate::knowledge_graph::ontology_layer::ev_repair_ontology();
+        let action = ont
+            .action_types
+            .iter_mut()
+            .find(|action| action.id == "GenerateRepairOrder")
+            .unwrap();
+        action.guardrails.assertions.push(
+            crate::knowledge_graph::ontology_layer::SparqlAskAssertion {
+                code: "no_staging_writes".into(),
+                query: "ASK { ?s ?p ?o }".into(),
+            },
+        );
+        let action = action.clone();
+        let guardrails = ontology_guardrails::effective_config(&ont, &action).unwrap();
+        let write = ClaimsGraphUpdate::insert_data(
+            "<https://agentos.ontology/ev/X/1> <https://agentos.ontology/ev/prop/value> \"x\"",
+        );
+        let err = commit_via_staging(
+            &kg,
+            &claims,
+            &[write],
+            ActionCommitStrategy::Auto,
+            "GenerateRepairOrder",
+            chrono::Utc::now(),
+            &guardrails,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err
+            .2
+            .iter()
+            .any(|violation| violation.starts_with("assertion:no_staging_writes:")));
+        let after = kg
+            .query_sparql_for_claims(&claims, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+            .unwrap()[0]["?c"]
+            .clone();
+        assert_eq!(before, after, "断言失败后生产图不应有任何改动");
+    }
+
+    #[test]
+    fn test_invoke_payload_cannot_override_guardrails() {
+        assert!(serde_json::from_value::<ActionInvokeRequest>(json!({
+            "dry_run": true,
+            "guardrails": { "max_triples": 0 }
+        }))
+        .is_err());
     }
 
     #[test]

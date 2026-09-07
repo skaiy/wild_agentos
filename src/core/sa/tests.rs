@@ -14,6 +14,19 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    #[derive(serde::Deserialize)]
+    struct GoldenAgentCases {
+        cases: Vec<GoldenAgentCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GoldenAgentCase {
+        id: String,
+        input: String,
+        expected_complexity: String,
+        expected_roles: Vec<String>,
+    }
+
     fn make_sa_with_tempdir() -> (SupervisorAgent, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let l0 = Arc::new(
@@ -82,6 +95,34 @@ mod tests {
         let plan = sa.analyze_task("Hello");
         assert_eq!(plan.agent_sequence.len(), 1);
         assert_eq!(plan.agent_sequence[0], AgentRole::Do);
+    }
+
+    #[test]
+    fn golden_agent_plans_follow_heuristic_contract() {
+        let cases: GoldenAgentCases =
+            serde_json::from_str(include_str!("../../../evals/golden/agent-plans.json"))
+                .expect("golden agent fixture must be valid JSON");
+        let (sa, _dir) = make_sa_with_tempdir();
+
+        for case in cases.cases {
+            let plan = sa.analyze_task(&case.input);
+            assert_eq!(
+                format!("{:?}", plan.task_complexity).to_lowercase(),
+                case.expected_complexity,
+                "case {} classified unexpectedly",
+                case.id
+            );
+            let roles: Vec<String> = plan
+                .agent_sequence
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(
+                roles, case.expected_roles,
+                "case {} planned unexpectedly",
+                case.id
+            );
+        }
     }
 
     #[test]

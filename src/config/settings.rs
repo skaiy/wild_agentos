@@ -25,6 +25,46 @@ pub struct Settings {
     pub models: ModelsSettings,
     #[serde(default)]
     pub admin_policies: AdminPolicySettings,
+    #[serde(default)]
+    pub a2a: A2aSettings,
+}
+
+/// Outbound-only A2A transport configuration. This intentionally does not
+/// expose inbound Agent Card or task-serving capabilities.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct A2aSettings {
+    #[serde(default)]
+    pub outbound: A2aOutboundSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct A2aOutboundSettings {
+    /// Master switch; disabled by default so existing deployments make no A2A calls.
+    #[serde(default)]
+    pub enabled: bool,
+    /// A remote A2A HTTP+JSON base URL. The adapter posts to `/message:send`.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Optional service credential for the remote agent. Do not use an end-user JWT here.
+    #[serde(default)]
+    pub bearer_token: String,
+    #[serde(default = "default_a2a_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+impl Default for A2aOutboundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            bearer_token: String::new(),
+            timeout_seconds: default_a2a_timeout_seconds(),
+        }
+    }
+}
+
+fn default_a2a_timeout_seconds() -> u64 {
+    15
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1193,6 +1233,7 @@ impl Default for Settings {
             workspace: WorkspaceSettings::default(),
             models: ModelsSettings::default(),
             admin_policies: AdminPolicySettings::default(),
+            a2a: A2aSettings::default(),
         }
     }
 }
@@ -1265,6 +1306,11 @@ impl Settings {
 
         if self.agents.max_iterations == 0 {
             return Err("agents.max_iterations must be > 0".to_string());
+        }
+        if self.a2a.outbound.enabled && self.a2a.outbound.endpoint.trim().is_empty() {
+            return Err(
+                "a2a.outbound.endpoint must be set when outbound A2A is enabled".to_string(),
+            );
         }
         Ok(())
     }

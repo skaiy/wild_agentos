@@ -143,14 +143,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_claims_are_allowed_when_cap_is_unset() {
+    fn isolation_contract_spend_gate_allows_missing_claims_when_cap_is_unset() {
         let gate = TenantSpendGate::new(None);
 
         assert!(gate.reserve_tool_call(None).is_ok());
     }
 
     #[test]
-    fn missing_claims_are_rejected_when_cap_is_configured() {
+    fn isolation_contract_spend_gate_requires_claims_when_cap_is_configured() {
         let gate = TenantSpendGate::new(Some(1));
 
         assert_eq!(

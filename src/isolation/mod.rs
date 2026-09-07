@@ -29,6 +29,9 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+pub mod diagnose;
+pub mod migrate;
+
 /// Verified tenant, project, and actor identity for a kernel operation.
 ///
 /// Fields intentionally remain private so callers cannot create or alter

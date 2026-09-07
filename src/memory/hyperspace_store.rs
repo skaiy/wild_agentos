@@ -580,6 +580,29 @@ impl HyperspaceStore {
             .collect())
     }
 
+    /// Searches the claims namespace and requires server-owned entry tags.
+    ///
+    /// The engine filter narrows candidates, then the returned payload tags are
+    /// checked again. The latter is a fail-closed guard for engine backends
+    /// that treat a metadata-filter miss as an unfiltered search.
+    pub async fn search_with_claims_and_required_tags(
+        &self,
+        claims: &IsolationClaims,
+        query: &str,
+        required_tags: &[String],
+        limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        let filter = HybridSearchFilter::new().with_must_tags(required_tags.to_vec());
+        let candidate_limit = self.count().await?.min(usize::MAX as u64);
+        Ok(self
+            .search_with_claims(claims, query, &filter, candidate_limit)
+            .await?
+            .into_iter()
+            .filter(|entry| required_tags.iter().all(|tag| entry.tags.contains(tag)))
+            .take(limit as usize)
+            .collect())
+    }
+
     async fn search_with_filter_inner(
         &self,
         query: &str,

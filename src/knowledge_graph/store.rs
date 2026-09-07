@@ -1,11 +1,42 @@
+use oxigraph::model::{GraphNameRef, NamedNodeRef};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::isolation::IsolationClaims;
 
+use super::ontology_draft::TypeDraftBundle;
 use super::rdf_mapper::RdfMapper;
 use super::types::RdfQuad;
+
+/// Environment switch for the deliberately small query-time RDFS segment.
+///
+/// This is opt-in and supports only `rdfs:subClassOf` transitivity and type
+/// propagation. It is intentionally not a general OWL or rules engine.
+pub const LIMITED_RDFS_INFERENCE_ENV: &str = "AGENTOS_LIMITED_RDFS_INFERENCE";
+
+/// Controls whether claims-scoped reads use the small RDFS expansion segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitedRdfsInference {
+    /// Preserve Oxigraph's normal SPARQL evaluation exactly.
+    Disabled,
+    /// Evaluate a query against an ephemeral graph with subclass closure.
+    QueryTime,
+}
+
+impl LimitedRdfsInference {
+    /// Only explicit `1` / `true` values enable the feature; unset and all
+    /// other values preserve the historic behavior.
+    pub fn from_environment() -> Self {
+        match std::env::var(LIMITED_RDFS_INFERENCE_ENV) {
+            Ok(value) if matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true") => {
+                Self::QueryTime
+            }
+            _ => Self::Disabled,
+        }
+    }
+}
 
 pub struct KnowledgeGraphStore {
     store: Arc<Store>,
@@ -18,6 +49,69 @@ pub struct KnowledgeGraphStore {
 pub enum ClaimsGraphUpdate {
     InsertData(String),
     DeleteWhere(String),
+}
+
+/// A human approval that owns one claims-scoped staging graph.
+///
+/// Approval records live in a graph separate from the production data graph,
+/// so queuing an action never makes its domain triples queryable as production
+/// data. The staging graph remains claims-derived and cannot be selected by a
+/// caller.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PendingActionApproval {
+    pub approval_id: String,
+    pub staging_id: String,
+    pub staging_graph: String,
+    pub action_id: String,
+    /// An optional, server-authored scoped SPARQL SELECT that must return at
+    /// least one row after an approved staging graph is materialized.
+    ///
+    /// This supports supervisory workflows whose success evidence is an
+    /// independent graph re-read, rather than a worker/model completion.
+    pub anchor_query: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+/// A claims-scoped human review record for a constrained extraction. Resolving
+/// this record never materializes staging into the production graph.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PendingExtractionReview {
+    pub review_id: String,
+    pub extraction_id: String,
+    pub staging_graph: String,
+    pub gate_status: String,
+    pub report_json: String,
+    pub created_at: String,
+    pub decision: String,
+}
+
+/// Independent, post-write evidence that a staging graph is now observable in
+/// the caller's claims-minted production graph.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MaterializationAnchor {
+    pub staging_triple_count: usize,
+    pub production_triple_count_before: usize,
+    pub production_triple_count_after: usize,
+    pub passed: bool,
+}
+
+const APPROVAL_BASE_IRI: &str = "https://agentos.ontology/action-approval/";
+const APPROVAL_VOCAB_IRI: &str = "https://agentos.ontology/action-approval/";
+const EXTRACTION_REVIEW_BASE_IRI: &str = "https://agentos.ontology/extraction-review/";
+const EXTRACTION_REVIEW_VOCAB_IRI: &str = "https://agentos.ontology/extraction-review/";
+const TYPE_DRAFT_BASE_IRI: &str = "https://agentos.ontology/type-draft/";
+const TYPE_DRAFT_VOCAB_IRI: &str = "https://agentos.ontology/type-draft/";
+
+/// A reviewable type proposal, stored only in the caller's claims scope until
+/// an explicit promotion writes it to the production ontology metadata.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PendingTypeDraft {
+    pub draft_id: String,
+    pub source: String,
+    pub bundle: TypeDraftBundle,
+    pub created_at: String,
+    pub expires_at: String,
 }
 
 impl ClaimsGraphUpdate {
@@ -123,6 +217,67 @@ impl KnowledgeGraphStore {
             .map_err(|e| format!("SPARQL INSERT failed: {}", e))
     }
 
+    /// Upserts KB catalog metadata in the graph minted from verified claims.
+    ///
+    /// The catalog entry subject is derived from the server-generated KB id.
+    /// Neither the caller nor the entry controls the target graph.
+    pub fn upsert_kb_catalog_metadata_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        kb_id: &str,
+        name: &str,
+        kb_type: &str,
+    ) -> Result<(), String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        let subject = Self::kb_catalog_subject(kb_id);
+        let delete = format!(
+            "DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> <https://agentos.ontology/meta/kbName> ?o }} }}"
+        );
+        self.store
+            .update(&delete)
+            .map_err(|e| format!("KB catalog metadata delete failed: {}", e))?;
+        let quads = [
+            RdfQuad {
+                subject: subject.clone(),
+                predicate: "https://agentos.ontology/meta/kbName".to_string(),
+                object: super::types::RdfValue::Literal(name.to_string()),
+                graph: None,
+            },
+            RdfQuad {
+                subject,
+                predicate: "https://agentos.ontology/meta/kbType".to_string(),
+                object: super::types::RdfValue::Literal(kb_type.to_string()),
+                graph: None,
+            },
+        ];
+        self.write_quads_for_claims(claims, &quads)
+    }
+
+    /// Deletes one server-generated KB catalog entry from the claims graph.
+    pub fn delete_kb_catalog_metadata_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        kb_id: &str,
+    ) -> Result<(), String> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+        let subject = Self::kb_catalog_subject(kb_id);
+        let delete = format!("DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> ?p ?o }} }}");
+        self.store
+            .update(&delete)
+            .map_err(|e| format!("KB catalog metadata delete failed: {}", e))
+    }
+
+    fn kb_catalog_subject(kb_id: &str) -> String {
+        format!(
+            "https://agentos.ontology/kb/{}",
+            RdfMapper::sanitize_id(kb_id)
+        )
+    }
+
     /// Executes a SPARQL query exclusively against the graph minted from
     /// verified tenant and project claims.
     ///
@@ -134,6 +289,24 @@ impl KnowledgeGraphStore {
         claims: &IsolationClaims,
         sparql: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        self.query_sparql_for_claims_with_inference(
+            claims,
+            sparql,
+            LimitedRdfsInference::from_environment(),
+        )
+    }
+
+    /// Executes a claims-scoped SPARQL query with an explicit inference mode.
+    ///
+    /// `QueryTime` is useful to callers that need deterministic opt-in without
+    /// mutating process environment. It never writes inferred triples to the
+    /// durable Oxigraph store.
+    pub fn query_sparql_for_claims_with_inference(
+        &self,
+        claims: &IsolationClaims,
+        sparql: &str,
+        inference: LimitedRdfsInference,
+    ) -> Result<Vec<serde_json::Value>, String> {
         if sparql.to_uppercase().contains("GRAPH") {
             return Err(
                 "scoped SPARQL queries must not contain GRAPH; the claims graph is applied automatically"
@@ -143,7 +316,7 @@ impl KnowledgeGraphStore {
         let graph = claims
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {}", e))?;
-        self.query_sparql_in_graph(sparql, Some(&graph))
+        self.query_sparql_in_graph_with_inference(sparql, Some(&graph), inference)
     }
 
     /// Writes a graph-local mutation to a graph minted from verified claims.
@@ -187,6 +360,29 @@ impl KnowledgeGraphStore {
         self.query_sparql_in_graph(sparql, Some(&graph))
     }
 
+    /// Serializes exactly one claims-minted staging graph as N-Triples for a
+    /// validation sidecar. The sidecar never receives another tenant's graph.
+    pub fn staging_ntriples_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<String, String> {
+        let graph = self.staging_graph_iri_for_claims(claims, staging_id)?;
+        let graph_name = NamedNodeRef::new(graph.as_str())
+            .map_err(|e| format!("invalid staging graph IRI: {e}"))?;
+        let mut triples = String::new();
+        for quad in self.store.iter() {
+            let quad = quad.map_err(|e| format!("read staging graph failed: {e}"))?;
+            if quad.graph_name.as_ref() == GraphNameRef::NamedNode(graph_name) {
+                triples.push_str(&format!(
+                    "{} {} {} .\n",
+                    quad.subject, quad.predicate, quad.object
+                ));
+            }
+        }
+        Ok(triples)
+    }
+
     /// Merges the staging graph derived from verified claims into its minted
     /// production graph. Neither graph is caller-selectable.
     pub fn commit_staging_for_claims(
@@ -201,6 +397,34 @@ impl KnowledgeGraphStore {
         self.store
             .update(&format!("ADD SILENT GRAPH <{staging}> TO <{production}>"))
             .map_err(|e| format!("claims-scoped staging merge failed: {}", e))
+    }
+
+    /// Materializes one claims-derived staging graph and independently re-reads
+    /// the production graph through the scoped SPARQL read path. Callers cannot
+    /// supply either graph name. A successful write operation alone is never
+    /// treated as evidence of materialization.
+    pub fn materialize_staging_with_anchor_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<MaterializationAnchor, String> {
+        let staging_triple_count = self.graph_triple_count_for_staging(claims, staging_id)?;
+        if staging_triple_count == 0 {
+            return Err("staging graph has no triples to materialize".into());
+        }
+        let production_triple_count_before = self.graph_triple_count_for_claims(claims)?;
+        self.commit_staging_for_claims(claims, staging_id)?;
+        let production_triple_count_after = self.graph_triple_count_for_claims(claims)?;
+
+        // `ADD` is set-union semantics, so a retry may add no new triples.
+        // The anchor therefore proves that production contains at least the
+        // staged cardinality, rather than requiring a count delta.
+        Ok(MaterializationAnchor {
+            staging_triple_count,
+            production_triple_count_before,
+            production_triple_count_after,
+            passed: production_triple_count_after >= staging_triple_count,
+        })
     }
 
     /// Removes the staging graph derived from verified claims.
@@ -236,6 +460,364 @@ impl KnowledgeGraphStore {
             .graph_iri()
             .map_err(|e| format!("invalid verified graph scope: {}", e))?;
         Ok(format!("{production}/staging/{staging_id}"))
+    }
+
+    fn graph_triple_count_for_claims(&self, claims: &IsolationClaims) -> Result<usize, String> {
+        let rows =
+            self.query_sparql_for_claims(claims, "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }")?;
+        Self::parse_count_result(rows, "production")
+    }
+
+    fn graph_triple_count_for_staging(
+        &self,
+        claims: &IsolationClaims,
+        staging_id: &str,
+    ) -> Result<usize, String> {
+        let rows = self.query_staging_for_claims(
+            claims,
+            staging_id,
+            "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }",
+        )?;
+        Self::parse_count_result(rows, "staging")
+    }
+
+    fn parse_count_result(rows: Vec<serde_json::Value>, scope: &str) -> Result<usize, String> {
+        rows.first()
+            .and_then(|row| row.get("?count"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|count| count.parse::<usize>().ok())
+            .ok_or_else(|| format!("SPARQL {scope} anchor did not return a count"))
+    }
+
+    /// Creates a pending approval record in a dedicated graph derived only
+    /// from verified tenant/project claims.
+    pub fn create_action_approval_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        approval: &PendingActionApproval,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(&approval.approval_id, "approval identifier")?;
+        Self::validate_opaque_id(&approval.staging_id, "staging identifier")?;
+        let expected_staging = self.staging_graph_iri_for_claims(claims, &approval.staging_id)?;
+        if approval.staging_graph != expected_staging {
+            return Err("approval staging graph is not claims-derived".to_string());
+        }
+        let graph = self.approvals_graph_iri_for_claims(claims)?;
+        let subject = format!("{APPROVAL_BASE_IRI}{}", approval.approval_id);
+        let lit = |value: &str| Self::sparql_literal(value);
+        let anchor = approval
+            .anchor_query
+            .as_deref()
+            .map(|query| format!(" ; <{APPROVAL_VOCAB_IRI}anchorQuery> {}", lit(query)))
+            .unwrap_or_default();
+        let update = format!(
+            "INSERT DATA {{ GRAPH <{graph}> {{ \
+             <{subject}> <{vocab}approvalId> {id} ; \
+             <{vocab}stagingId> {staging_id} ; \
+             <{vocab}stagingGraph> {staging_graph} ; \
+             <{vocab}actionId> {action_id}{anchor} ; \
+             <{vocab}createdAt> {created_at} ; \
+             <{vocab}expiresAt> {expires_at} . \
+             }} }}",
+            vocab = APPROVAL_VOCAB_IRI,
+            id = lit(&approval.approval_id),
+            staging_id = lit(&approval.staging_id),
+            staging_graph = lit(&approval.staging_graph),
+            action_id = lit(&approval.action_id),
+            anchor = anchor,
+            created_at = lit(&approval.created_at),
+            expires_at = lit(&approval.expires_at),
+        );
+        self.store
+            .update(&update)
+            .map_err(|e| format!("claims-scoped approval create failed: {e}"))
+    }
+
+    /// Lists pending approvals visible only in the verified claims scope.
+    pub fn list_action_approvals_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<Vec<PendingActionApproval>, String> {
+        let graph = self.approvals_graph_iri_for_claims(claims)?;
+        let query = format!(
+            "SELECT ?id ?staging_id ?staging_graph ?action_id ?anchor_query ?created_at ?expires_at WHERE {{ \
+             GRAPH <{graph}> {{ \
+             ?approval <{vocab}approvalId> ?id ; \
+                 <{vocab}stagingId> ?staging_id ; \
+                 <{vocab}stagingGraph> ?staging_graph ; \
+                 <{vocab}actionId> ?action_id ; \
+                 <{vocab}createdAt> ?created_at ; \
+                 <{vocab}expiresAt> ?expires_at . \
+             OPTIONAL {{ ?approval <{vocab}anchorQuery> ?anchor_query }} \
+             }} }} ORDER BY ?created_at",
+            vocab = APPROVAL_VOCAB_IRI,
+        );
+        self.query_sparql_in_graph(&query, None)?
+            .into_iter()
+            .map(|row| {
+                let get = |name: &str| {
+                    row.get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("approval query missing {name}"))
+                };
+                Ok(PendingActionApproval {
+                    approval_id: get("?id")?,
+                    staging_id: get("?staging_id")?,
+                    staging_graph: get("?staging_graph")?,
+                    action_id: get("?action_id")?,
+                    anchor_query: row
+                        .get("?anchor_query")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    created_at: get("?created_at")?,
+                    expires_at: get("?expires_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Removes the approval metadata after an approve, reject, or TTL expiry.
+    pub fn delete_action_approval_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        approval_id: &str,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(approval_id, "approval identifier")?;
+        let graph = self.approvals_graph_iri_for_claims(claims)?;
+        let subject = format!("{APPROVAL_BASE_IRI}{approval_id}");
+        self.store
+            .update(&format!(
+                "DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> ?p ?o }} }}"
+            ))
+            .map_err(|e| format!("claims-scoped approval cleanup failed: {e}"))
+    }
+
+    fn approvals_graph_iri_for_claims(&self, claims: &IsolationClaims) -> Result<String, String> {
+        let production = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {e}"))?;
+        Ok(format!("{production}/action-approvals"))
+    }
+
+    pub fn create_extraction_review_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        review: &PendingExtractionReview,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(&review.review_id, "review identifier")?;
+        Self::validate_opaque_id(&review.extraction_id, "extraction identifier")?;
+        let expected = self.staging_graph_iri_for_claims(claims, &review.extraction_id)?;
+        if review.staging_graph != expected {
+            return Err("review staging graph is not claims-derived".into());
+        }
+        let graph = self.extraction_reviews_graph_iri_for_claims(claims)?;
+        let subject = format!("{EXTRACTION_REVIEW_BASE_IRI}{}", review.review_id);
+        let lit = |value: &str| Self::sparql_literal(value);
+        self.store
+            .update(&format!(
+                "INSERT DATA {{ GRAPH <{graph}> {{ <{subject}> \
+             <{vocab}reviewId> {id} ; <{vocab}extractionId> {extraction_id} ; \
+             <{vocab}stagingGraph> {staging_graph} ; <{vocab}gateStatus> {gate_status} ; \
+             <{vocab}reportJson> {report_json} ; <{vocab}createdAt> {created_at} ; \
+             <{vocab}decision> {decision} . }} }}",
+                vocab = EXTRACTION_REVIEW_VOCAB_IRI,
+                id = lit(&review.review_id),
+                extraction_id = lit(&review.extraction_id),
+                staging_graph = lit(&review.staging_graph),
+                gate_status = lit(&review.gate_status),
+                report_json = lit(&review.report_json),
+                created_at = lit(&review.created_at),
+                decision = lit(&review.decision),
+            ))
+            .map_err(|e| format!("claims-scoped extraction review create failed: {e}"))
+    }
+
+    pub fn list_extraction_reviews_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<Vec<PendingExtractionReview>, String> {
+        let graph = self.extraction_reviews_graph_iri_for_claims(claims)?;
+        let query = format!(
+            "SELECT ?id ?extraction_id ?staging_graph ?gate_status ?report_json ?created_at ?decision WHERE {{ \
+             GRAPH <{graph}> {{ ?review <{vocab}reviewId> ?id ; \
+             <{vocab}extractionId> ?extraction_id ; <{vocab}stagingGraph> ?staging_graph ; \
+             <{vocab}gateStatus> ?gate_status ; <{vocab}reportJson> ?report_json ; \
+             <{vocab}createdAt> ?created_at ; <{vocab}decision> ?decision . }} }} ORDER BY ?created_at",
+            vocab = EXTRACTION_REVIEW_VOCAB_IRI,
+        );
+        self.query_sparql_in_graph(&query, None)?
+            .into_iter()
+            .map(|row| {
+                let get = |name: &str| {
+                    row.get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("review query missing {name}"))
+                };
+                Ok(PendingExtractionReview {
+                    review_id: get("?id")?,
+                    extraction_id: get("?extraction_id")?,
+                    staging_graph: get("?staging_graph")?,
+                    gate_status: get("?gate_status")?,
+                    report_json: get("?report_json")?,
+                    created_at: get("?created_at")?,
+                    decision: get("?decision")?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn resolve_extraction_review_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        review_id: &str,
+        decision: &str,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(review_id, "review identifier")?;
+        if !matches!(decision, "approved" | "rejected") {
+            return Err("review decision must be approved or rejected".into());
+        }
+        let graph = self.extraction_reviews_graph_iri_for_claims(claims)?;
+        let subject = format!("{EXTRACTION_REVIEW_BASE_IRI}{review_id}");
+        self.store
+            .update(&format!(
+                "DELETE {{ GRAPH <{graph}> {{ <{subject}> <{vocab}decision> ?old }} }} \
+             INSERT {{ GRAPH <{graph}> {{ <{subject}> <{vocab}decision> \"{decision}\" }} }} \
+             WHERE {{ GRAPH <{graph}> {{ <{subject}> <{vocab}decision> ?old }} }}",
+                vocab = EXTRACTION_REVIEW_VOCAB_IRI,
+            ))
+            .map_err(|e| format!("claims-scoped extraction review resolve failed: {e}"))
+    }
+
+    fn extraction_reviews_graph_iri_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<String, String> {
+        Ok(format!(
+            "{}{}",
+            claims
+                .graph_iri()
+                .map_err(|e| format!("invalid verified graph scope: {e}"))?,
+            "/extraction-reviews"
+        ))
+    }
+
+    /// Persists a complete type draft in a dedicated, claims-derived graph.
+    /// The draft JSON is never inserted into the production ontology meta graph.
+    pub fn create_type_draft_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        draft: &PendingTypeDraft,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(&draft.draft_id, "type draft identifier")?;
+        let graph = self.type_drafts_graph_iri_for_claims(claims)?;
+        let subject = format!("{TYPE_DRAFT_BASE_IRI}{}", draft.draft_id);
+        let bundle = serde_json::to_string(&draft.bundle)
+            .map_err(|e| format!("type draft serialization failed: {e}"))?;
+        let lit = |value: &str| Self::sparql_literal(value);
+        self.store
+            .update(&format!(
+                "INSERT DATA {{ GRAPH <{graph}> {{ \
+                 <{subject}> <{vocab}draftId> {id} ; \
+                 <{vocab}source> {source} ; \
+                 <{vocab}bundleJson> {bundle} ; \
+                 <{vocab}createdAt> {created_at} ; \
+                 <{vocab}expiresAt> {expires_at} . }} }}",
+                vocab = TYPE_DRAFT_VOCAB_IRI,
+                id = lit(&draft.draft_id),
+                source = lit(&draft.source),
+                bundle = lit(&bundle),
+                created_at = lit(&draft.created_at),
+                expires_at = lit(&draft.expires_at),
+            ))
+            .map_err(|e| format!("claims-scoped type draft create failed: {e}"))
+    }
+
+    pub fn list_type_drafts_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<Vec<PendingTypeDraft>, String> {
+        let graph = self.type_drafts_graph_iri_for_claims(claims)?;
+        let query = format!(
+            "SELECT ?id ?source ?bundle ?created_at ?expires_at WHERE {{ GRAPH <{graph}> {{ \
+             ?draft <{vocab}draftId> ?id ; <{vocab}source> ?source ; \
+             <{vocab}bundleJson> ?bundle ; <{vocab}createdAt> ?created_at ; \
+             <{vocab}expiresAt> ?expires_at . }} }} ORDER BY ?created_at",
+            vocab = TYPE_DRAFT_VOCAB_IRI,
+        );
+        self.query_sparql_in_graph(&query, None)?
+            .into_iter()
+            .map(|row| {
+                let get = |name: &str| {
+                    row.get(name)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("type draft query missing {name}"))
+                };
+                // Query results have RDF literal delimiters removed but retain
+                // their escapes. Decode that literal layer before parsing the
+                // canonical JSON draft snapshot.
+                let stored_bundle = get("?bundle")?;
+                let bundle_json = serde_json::from_str::<String>(&format!("\"{stored_bundle}\""))
+                    .unwrap_or(stored_bundle);
+                let bundle: TypeDraftBundle = serde_json::from_str(&bundle_json)
+                    .map_err(|e| format!("stored type draft is invalid: {e}"))?;
+                Ok(PendingTypeDraft {
+                    draft_id: get("?id")?,
+                    source: get("?source")?,
+                    bundle,
+                    created_at: get("?created_at")?,
+                    expires_at: get("?expires_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn delete_type_draft_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        draft_id: &str,
+    ) -> Result<(), String> {
+        Self::validate_opaque_id(draft_id, "type draft identifier")?;
+        let graph = self.type_drafts_graph_iri_for_claims(claims)?;
+        let subject = format!("{TYPE_DRAFT_BASE_IRI}{draft_id}");
+        self.store
+            .update(&format!(
+                "DELETE WHERE {{ GRAPH <{graph}> {{ <{subject}> ?p ?o }} }}"
+            ))
+            .map_err(|e| format!("claims-scoped type draft cleanup failed: {e}"))
+    }
+
+    fn type_drafts_graph_iri_for_claims(&self, claims: &IsolationClaims) -> Result<String, String> {
+        let production = claims
+            .graph_iri()
+            .map_err(|e| format!("invalid verified graph scope: {e}"))?;
+        Ok(format!("{production}/ontology-type-drafts"))
+    }
+
+    fn validate_opaque_id(value: &str, kind: &str) -> Result<(), String> {
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(format!(
+                "{kind} must contain only ASCII letters, digits, '-' or '_'"
+            ));
+        }
+        Ok(())
+    }
+
+    fn sparql_literal(value: &str) -> String {
+        format!(
+            "\"{}\"",
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+        )
     }
 
     fn update_in_claims_graph(
@@ -397,6 +979,19 @@ impl KnowledgeGraphStore {
         sparql: &str,
         named_graph: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
+        self.query_sparql_in_graph_with_inference(
+            sparql,
+            named_graph,
+            LimitedRdfsInference::Disabled,
+        )
+    }
+
+    fn query_sparql_in_graph_with_inference(
+        &self,
+        sparql: &str,
+        named_graph: Option<&str>,
+        inference: LimitedRdfsInference,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let final_sparql = match named_graph {
             Some(graph) if !sparql.to_uppercase().contains("GRAPH") => {
                 let g = format!("<{}>", graph);
@@ -405,8 +1000,15 @@ impl KnowledgeGraphStore {
             _ => sparql.to_string(),
         };
 
-        let results = self
-            .store
+        let query_store;
+        let store = match (inference, named_graph) {
+            (LimitedRdfsInference::QueryTime, Some(graph)) => {
+                query_store = self.rdfs_query_store(graph)?;
+                &query_store
+            }
+            _ => self.store.as_ref(),
+        };
+        let results = store
             .query(&final_sparql)
             .map_err(|e| format!("SPARQL query failed: {}", e))?;
 
@@ -453,23 +1055,70 @@ impl KnowledgeGraphStore {
         Ok(values)
     }
 
+    /// Copies only one claims graph into a temporary Oxigraph store and applies
+    /// the bounded RDFS segment there. The source store is never materialized
+    /// or changed.
+    fn rdfs_query_store(&self, graph: &str) -> Result<Store, String> {
+        let graph_name = NamedNodeRef::new(graph)
+            .map_err(|e| format!("invalid graph IRI for RDFS inference: {e}"))?;
+        let temporary = Store::new().map_err(|e| format!("create RDFS query store failed: {e}"))?;
+
+        for quad in self.store.iter() {
+            let quad = quad.map_err(|e| format!("read graph for RDFS inference failed: {e}"))?;
+            if quad.graph_name.as_ref() == GraphNameRef::NamedNode(graph_name) {
+                temporary
+                    .insert(&quad)
+                    .map_err(|e| format!("copy graph for RDFS inference failed: {e}"))?;
+            }
+        }
+
+        // Oxigraph evaluates the property path to a finite closure. Keep this
+        // rule set deliberately tiny: subclass hierarchy closure plus instance
+        // type propagation. No OWL axioms, property rules, or rule files run.
+        let closure = format!(
+            "INSERT {{ GRAPH <{graph}> {{ ?sub <http://www.w3.org/2000/01/rdf-schema#subClassOf> ?super }} }}
+             WHERE {{ GRAPH <{graph}> {{
+               ?sub <http://www.w3.org/2000/01/rdf-schema#subClassOf>+ ?super .
+               FILTER(?sub != ?super)
+             }} }}",
+        );
+        temporary
+            .update(&closure)
+            .map_err(|e| format!("RDFS subclass closure failed: {e}"))?;
+        let type_propagation = format!(
+            "INSERT {{ GRAPH <{graph}> {{ ?instance <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?super }} }}
+             WHERE {{ GRAPH <{graph}> {{
+               ?instance <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?sub .
+               ?sub <http://www.w3.org/2000/01/rdf-schema#subClassOf>+ ?super .
+               FILTER(?sub != ?super)
+             }} }}",
+        );
+        temporary
+            .update(&type_propagation)
+            .map_err(|e| format!("RDFS type propagation failed: {e}"))?;
+        Ok(temporary)
+    }
+
     /// 将不含 GRAPH 子句的 SPARQL 查询包装到指定命名图中。
     /// 通过大括号配对定位 WHERE 块的真实结束位置，使 LIMIT / ORDER BY / GROUP BY
     /// 等尾部求解修饰符保留在 GRAPH 包装之外，避免拼出非法语法。
     fn wrap_in_named_graph(sparql: &str, g: &str) -> String {
         let upper = sparql.to_uppercase();
-        let where_pos = match upper.find("WHERE") {
-            Some(p) => p,
-            None => return format!("SELECT * WHERE {{ GRAPH {} {{ {} }} }}", g, sparql),
+        // SELECT normally has WHERE; ASK may omit it (`ASK { ... }`). Preserve the
+        // query form in both cases instead of turning an ASK into invalid SELECT text.
+        let open_abs = match upper.find("WHERE") {
+            Some(where_pos) => {
+                let after_where = &sparql[where_pos + 5..];
+                match after_where.find('{') {
+                    Some(open_rel) => where_pos + 5 + open_rel,
+                    None => return sparql.to_string(),
+                }
+            }
+            None => match sparql.find('{') {
+                Some(open_pos) => open_pos,
+                None => return sparql.to_string(),
+            },
         };
-
-        // 定位 WHERE 后的第一个 '{'
-        let after_where = &sparql[where_pos + 5..];
-        let open_rel = match after_where.find('{') {
-            Some(p) => p,
-            None => return sparql.to_string(),
-        };
-        let open_abs = where_pos + 5 + open_rel;
 
         // 大括号配对，找到与之匹配的 '}'
         let bytes = sparql.as_bytes();
@@ -1116,6 +1765,76 @@ mod tests {
     }
 
     #[test]
+    fn limited_rdfs_inference_is_opt_in_and_query_time_only() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let animal = "http://example.org/Animal";
+        let mammal = "http://example.org/Mammal";
+        let dog = "http://example.org/Dog";
+        let fido = "http://example.org/fido";
+        let subclass = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+        store
+            .write_quads_for_claims(
+                &claims(),
+                &[
+                    make_quad(dog, subclass, RdfValue::Iri(mammal.into())),
+                    make_quad(mammal, subclass, RdfValue::Iri(animal.into())),
+                    make_quad(fido, RDF_TYPE, RdfValue::Iri(dog.into())),
+                ],
+            )
+            .unwrap();
+
+        let query = format!("SELECT ?instance WHERE {{ ?instance a <{animal}> }}");
+        assert!(
+            store
+                .query_sparql_for_claims_with_inference(
+                    &claims(),
+                    &query,
+                    LimitedRdfsInference::Disabled,
+                )
+                .unwrap()
+                .is_empty(),
+            "default mode must not infer superclass membership"
+        );
+
+        let inferred = store
+            .query_sparql_for_claims_with_inference(
+                &claims(),
+                &query,
+                LimitedRdfsInference::QueryTime,
+            )
+            .unwrap();
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0]["?instance"], fido);
+
+        let subclass_query =
+            format!("SELECT ?super WHERE {{ <{dog}> <{subclass}> ?super }} ORDER BY ?super");
+        let closure = store
+            .query_sparql_for_claims_with_inference(
+                &claims(),
+                &subclass_query,
+                LimitedRdfsInference::QueryTime,
+            )
+            .unwrap();
+        assert_eq!(
+            closure.len(),
+            2,
+            "query-time mode exposes hierarchy closure"
+        );
+
+        assert!(
+            store
+                .query_sparql_for_claims_with_inference(
+                    &claims(),
+                    &query,
+                    LimitedRdfsInference::Disabled,
+                )
+                .unwrap()
+                .is_empty(),
+            "query-time inference must not materialize triples into the source graph"
+        );
+    }
+
+    #[test]
     fn test_incoming_neighbors() {
         let store = KnowledgeGraphStore::new().unwrap();
 
@@ -1206,5 +1925,64 @@ mod tests {
             1,
             "legacy graph:world remains intact"
         );
+    }
+
+    #[test]
+    fn claims_scoped_ask_query_keeps_ask_form() {
+        let query = KnowledgeGraphStore::wrap_in_named_graph(
+            "ASK { ?s ?p ?o }",
+            "<graph://tenant-a/project-a/staging/test>",
+        );
+        assert_eq!(
+            query,
+            "ASK { GRAPH <graph://tenant-a/project-a/staging/test> { ?s ?p ?o } }"
+        );
+    }
+
+    #[test]
+    fn extraction_reviews_are_claims_scoped_and_never_commit_staging() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let tenant_a = claims();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-a", "actor-b").unwrap();
+        let extraction_id = "extract1";
+        let staging_graph = store
+            .staging_graph_iri_for_claims(&tenant_a, extraction_id)
+            .unwrap();
+        store
+            .create_extraction_review_for_claims(
+                &tenant_a,
+                &PendingExtractionReview {
+                    review_id: "review1".into(),
+                    extraction_id: extraction_id.into(),
+                    staging_graph,
+                    gate_status: "pending_review".into(),
+                    report_json: "{}".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    decision: "pending".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_extraction_reviews_for_claims(&tenant_a)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .list_extraction_reviews_for_claims(&tenant_b)
+            .unwrap()
+            .is_empty());
+        store
+            .resolve_extraction_review_for_claims(&tenant_a, "review1", "approved")
+            .unwrap();
+        assert_eq!(
+            store.list_extraction_reviews_for_claims(&tenant_a).unwrap()[0].decision,
+            "approved"
+        );
+        assert!(store
+            .query_sparql_for_claims(&tenant_a, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .is_empty());
     }
 }

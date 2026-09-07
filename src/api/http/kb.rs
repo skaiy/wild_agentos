@@ -3,7 +3,7 @@
 //! 路由仍由 `mod.rs` 的 `build_router` 组装；RAG/Public/OpenAI 见 `chat.rs`；
 //! kg_import/query、图片与模型/embedding 热切换处理器留在 `mod.rs`。
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Multipart, State},
@@ -13,13 +13,110 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
+use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{RdfQuad, RdfValue};
-use crate::memory::hyperspace_store::HybridSearchFilter;
 
 use super::iam::UserIdentity;
 use super::{data_dir, expand_iri, AppState};
+
+const MORPH_KGC_WORKER_ENV: &str = "MORPH_KGC_WORKER";
+const MORPH_KGC_WORKER_TIMEOUT_ENV: &str = "MORPH_KGC_WORKER_TIMEOUT_SECS";
+const MORPH_KGC_DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// A supplied source name is only used below a newly-created worker directory.
+/// RML mappings refer to this basename; rejecting path components prevents an
+/// upload from selecting a host path.
+fn safe_worker_filename(name: &str) -> Result<&str, String> {
+    let path = Path::new(name);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "source filename must be valid UTF-8".to_string())?;
+    if file_name.is_empty()
+        || file_name != name
+        || file_name == "."
+        || file_name == ".."
+        || name.contains('\\')
+    {
+        return Err("source filename must be a basename without path components".to_string());
+    }
+    Ok(file_name)
+}
+
+fn morph_kgc_worker_timeout() -> Duration {
+    let seconds = std::env::var(MORPH_KGC_WORKER_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=600).contains(seconds))
+        .unwrap_or(MORPH_KGC_DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
+
+/// Invokes a separately deployed RML worker. The Rust process neither links
+/// nor imports Morph-KGC; `MORPH_KGC_WORKER` must name an executable trusted
+/// by the operator. The worker contract is documented in scripts/.
+async fn materialize_rml_with_worker(
+    mapping: &[u8],
+    sources: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
+    let worker = std::env::var(MORPH_KGC_WORKER_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "RML worker is not configured; set {MORPH_KGC_WORKER_ENV} to an executable sidecar adapter"
+            )
+        })?;
+    let root = std::env::temp_dir().join(format!("wao-rml-{}", uuid::Uuid::new_v4()));
+    let sources_dir = root.join("sources");
+    let mapping_path = root.join("mapping.ttl");
+    let output_path = root.join("output.nt");
+    std::fs::create_dir_all(&sources_dir)
+        .map_err(|error| format!("create worker directory: {error}"))?;
+    let result = async {
+        std::fs::write(&mapping_path, mapping)
+            .map_err(|error| format!("write mapping: {error}"))?;
+        for (name, bytes) in sources {
+            let name = safe_worker_filename(name)?;
+            std::fs::write(sources_dir.join(name), bytes)
+                .map_err(|error| format!("write source {name}: {error}"))?;
+        }
+        let mut child = tokio::process::Command::new(&worker)
+            .arg("--source-dir")
+            .arg(&sources_dir)
+            .arg("--mapping")
+            .arg(&mapping_path)
+            .arg("--output")
+            .arg(&output_path)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("start RML worker: {error}"))?;
+        let status = tokio::time::timeout(morph_kgc_worker_timeout(), child.wait())
+            .await
+            .map_err(|_| "RML worker timed out".to_string())?
+            .map_err(|error| format!("wait for RML worker: {error}"))?;
+        if !status.success() {
+            return Err(format!("RML worker exited with {status}"));
+        }
+        let output = tokio::fs::read(&output_path)
+            .await
+            .map_err(|error| format!("read RML worker output: {error}"))?;
+        if output.is_empty() {
+            return Err("RML worker produced an empty N-Triples file".to_string());
+        }
+        Ok(output)
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    result
+}
 
 /// 知识库分类的持久化文件路径。
 fn kb_categories_store_path() -> std::path::PathBuf {
@@ -405,20 +502,46 @@ pub struct KnowledgeBaseCreateRequest {
     pub category_id: Option<String>,
 }
 
-/// SPARQL 字面量转义。
-fn sparql_literal(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+/// Catalog entries are visible only within their verified tenant/project scope.
+///
+/// Records without this scope are historical and deliberately remain outside
+/// the claims-scoped catalog rather than being migrated on read.
+fn kb_belongs_to_claims(kb: &Value, claims: &IsolationClaims) -> bool {
+    kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+        && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+}
+
+/// Server-derived filter tag that separates KBs sharing a claims namespace.
+fn kb_vector_tag(kb_id: &str) -> String {
+    format!("kb:{kb_id}")
 }
 
 /// GET /api/v1/kb/bases — 返回全部知识库
 pub(crate) async fn list_knowledge_bases_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
 ) -> impl IntoResponse {
-    let bases = state.knowledge_bases.read().await.clone();
-    Json(json!({ "count": bases.len(), "bases": bases }))
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
+    let bases: Vec<Value> = state
+        .knowledge_bases
+        .read()
+        .await
+        .iter()
+        .filter(|kb| kb_belongs_to_claims(kb, claims))
+        .cloned()
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "count": bases.len(), "bases": bases })),
+    )
 }
 
 /// POST /api/v1/kb/bases — 创建知识库（向量/图），图类型在 oxigraph 落盘命名图元数据
@@ -427,6 +550,15 @@ pub(crate) async fn create_knowledge_base_handler(
     identity: UserIdentity,
     Json(req): Json<KnowledgeBaseCreateRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -456,15 +588,29 @@ pub(crate) async fn create_knowledge_base_handler(
     }
 
     let kb_id = uuid::Uuid::new_v4().hyphenated().to_string();
-    // 图类型：租户隔离命名图 + 落盘元数据三元组（Wild AgentOS 底座）
+    // Graph names are minted from verified claims; request data cannot select
+    // a catalog metadata write target.
     let graph_iri = if req.kb_type == "graph" {
-        let iri = format!("tenant:{}/kb/{}", identity.tenant_id, kb_id);
-        let insert = format!(
-            "INSERT DATA {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> \"{n}\" . <{g}> <https://agentos.ontology/meta/kbType> \"graph\" }} }}",
-            g = iri,
-            n = sparql_literal(&req.name),
-        );
-        if let Err(e) = state.kg_store.update(&insert) {
+        let iri = match claims.graph_iri() {
+            Ok(iri) => iri,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("invalid verified graph scope: {e}") })),
+                )
+            }
+        };
+        let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+            Ok(kg) => kg,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e })),
+                )
+            }
+        };
+        if let Err(e) = kg.upsert_kb_catalog_metadata_for_claims(claims, &kb_id, &req.name, "graph")
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("命名图初始化失败: {e}") })),
@@ -478,7 +624,15 @@ pub(crate) async fn create_knowledge_base_handler(
 
     // 向量类型：分配隔离命名空间，供运行时向量检索按 namespace 过滤。
     let vector_namespace = if req.kb_type == "vector" {
-        format!("vec:tenant/{}/kb/{}", identity.tenant_id, kb_id)
+        match claims.vector_namespace() {
+            Ok(namespace) => namespace,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("invalid verified vector namespace: {e}") })),
+                )
+            }
+        }
     } else {
         String::new()
     };
@@ -490,8 +644,9 @@ pub(crate) async fn create_knowledge_base_handler(
         "category_id": req.category_id.unwrap_or_default(),
         "graph": graph_iri.clone().unwrap_or_default(),
         "vector_namespace": vector_namespace,
-        "tenant_id": identity.tenant_id,
-        "created_by": identity.user_id,
+        "tenant_id": claims.tenant_id(),
+        "project_id": claims.project_id(),
+        "created_by": claims.actor_id(),
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
     let mut guard = state.knowledge_bases.write().await;
@@ -503,39 +658,61 @@ pub(crate) async fn create_knowledge_base_handler(
     )
 }
 
-/// DELETE /api/v1/kb/bases/:id — 删除知识库并持久化（图类型同时清空命名图）
+/// DELETE /api/v1/kb/bases/:id — 删除 claims-scoped 知识库目录条目。
 pub(crate) async fn delete_knowledge_base_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
     let mut guard = state.knowledge_bases.write().await;
     let removed = guard
         .iter()
-        .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        .find(|b| {
+            b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                && kb_belongs_to_claims(b, claims)
+        })
         .cloned();
-    let before = guard.len();
-    guard.retain(|b| b.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
-    if guard.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "knowledge base not found", "id": id })),
-        );
-    }
-    let _ = save_knowledge_bases(&guard);
-    // 图类型：清空命名图三元组
-    if let Some(b) = removed {
-        if let Some(g) = b
-            .get("graph")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            let clear = format!("DELETE WHERE {{ GRAPH <{g}> {{ ?s ?p ?o . }} }}");
-            if let Err(e) = state.kg_store.update(&clear) {
-                tracing::warn!(graph = %g, "KB graph clear skipped: {}", e);
-            }
-            let _ = state.kg_store.flush();
+    let removed = match removed {
+        Some(removed) => removed,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "knowledge base not found", "id": id })),
+            )
         }
+    };
+    if removed.get("kb_type").and_then(Value::as_str) == Some("graph") {
+        let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+            Ok(kg) => kg,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e })),
+                )
+            }
+        };
+        if let Err(e) = kg.delete_kb_catalog_metadata_for_claims(claims, &id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("KB catalog metadata delete failed: {e}") })),
+            );
+        }
+        let _ = state.kg_store.flush();
     }
+    guard.retain(|b| {
+        !(b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+            && kb_belongs_to_claims(b, claims))
+    });
+    let _ = save_knowledge_bases(&guard);
     (
         StatusCode::OK,
         Json(json!({ "status": "deleted", "id": id })),
@@ -553,9 +730,19 @@ pub struct KnowledgeBaseUpdateRequest {
 /// 不改 kb_type/graph/vector_namespace/tenant；图类型改名时同步命名图 kbName 元三元组。
 pub(crate) async fn update_knowledge_base_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<KnowledgeBaseUpdateRequest>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
     // 校验分类存在（若指定非空）
     if let Some(cat_id) = req.category_id.as_deref().filter(|s| !s.is_empty()) {
         let exists = state
@@ -574,10 +761,10 @@ pub(crate) async fn update_knowledge_base_handler(
 
     let (updated, is_graph, graph_iri, name_changed) = {
         let mut guard = state.knowledge_bases.write().await;
-        let kb = match guard
-            .iter_mut()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
-        {
+        let kb = match guard.iter_mut().find(|b| {
+            b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                && kb_belongs_to_claims(b, claims)
+        }) {
             Some(k) => k,
             None => {
                 return (
@@ -619,18 +806,24 @@ pub(crate) async fn update_knowledge_base_handler(
     // 图类型改名：同步命名图 kbName 元三元组
     if is_graph && !graph_iri.is_empty() {
         if let Some(new_name) = name_changed {
-            let sparql = format!(
-                "DELETE {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> ?o }} }} \
-                 INSERT {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> \"{n}\" }} }} \
-                 WHERE {{ OPTIONAL {{ GRAPH <{g}> {{ <{g}> <https://agentos.ontology/meta/kbName> ?o }} }} }}",
-                g = graph_iri,
-                n = sparql_literal(&new_name),
-            );
-            if let Err(e) = state.kg_store.update(&sparql) {
-                tracing::warn!(graph = %graph_iri, "KB rename meta sync skipped: {}", e);
-            } else {
-                let _ = state.kg_store.flush();
+            let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+                Ok(kg) => kg,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": e })),
+                    )
+                }
+            };
+            if let Err(e) =
+                kg.upsert_kb_catalog_metadata_for_claims(claims, &id, &new_name, "graph")
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("KB catalog metadata update failed: {e}") })),
+                );
             }
+            let _ = state.kg_store.flush();
         }
     }
 
@@ -819,7 +1012,7 @@ pub(crate) async fn ingest_knowledge_base_handler(
             Json(json!({ "error": "texts/text 不能为空" })),
         );
     }
-    let tags = Vec::new();
+    let tags = vec![kb_vector_tag(&id)];
     let mut count = 0usize;
     for text in &texts {
         for chunk in chunk_text(text, 500) {
@@ -913,9 +1106,8 @@ pub(crate) async fn search_knowledge_base_handler(
         }
     };
     let limit = req.limit.unwrap_or(5).clamp(1, 20);
-    let filter = HybridSearchFilter::new();
     match store
-        .search_with_claims(claims, &query, &filter, limit)
+        .search_with_claims_and_required_tags(claims, &query, &[kb_vector_tag(&id)], limit)
         .await
     {
         Ok(hits) => {
@@ -1100,7 +1292,7 @@ pub(crate) async fn upload_knowledge_base_handler(
     // 当前仅实现固定长度分块；其余策略降级为 fixed 并在响应标注。
     let applied_strategy = "fixed";
 
-    let base_tags = Vec::new();
+    let base_tags = vec![kb_vector_tag(&id)];
     let blob = state.blob_store.clone();
     let mut file_results: Vec<Value> = Vec::new();
     let mut ledger_entries: Vec<Value> = Vec::new();
@@ -1542,7 +1734,7 @@ async fn run_kb_reindex(
         };
         // ③ 重新分块 embedding 写入。
         let text = String::from_utf8_lossy(&bytes).to_string();
-        let tags = vec![format!("doc:{}", doc_id)];
+        let tags = vec![kb_vector_tag(&id), format!("doc:{}", doc_id)];
         let mut new_iris: Vec<String> = Vec::new();
         let mut err: Option<String> = None;
         for chunk in chunk_text(&text, chunk_size) {
@@ -1767,6 +1959,260 @@ fn kb_quads_from_triples(text: &str) -> Result<Vec<RdfQuad>, String> {
         });
     }
     Ok(quads)
+}
+
+/// POST /api/v1/kb/bases/:id/materialize-rml — materialize RML with an
+/// operator-configured out-of-process worker, then import its N-Triples.
+///
+/// Multipart fields: `mapping` (RML/R2RML), one or more `source` files, and
+/// optional `clear_before`. There is intentionally no graph/named_graph field:
+/// `write_quads_for_claims` mints the target from verified claims.
+pub(crate) async fn materialize_rml_knowledge_base_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(
+                    json!({ "error": "verified isolation claims required for RML materialization" }),
+                ),
+            )
+        }
+    };
+    let kb = {
+        let guard = state.knowledge_bases.read().await;
+        guard
+            .iter()
+            .find(|base| base.get("id").and_then(|value| value.as_str()) == Some(id.as_str()))
+            .cloned()
+    };
+    let Some(kb) = kb else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "knowledge base not found", "id": id })),
+        );
+    };
+    if kb.get("kb_type").and_then(|value| value.as_str()) != Some("graph") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "graph knowledge bases only support RML materialization" })),
+        );
+    }
+
+    let mut mapping: Option<Vec<u8>> = None;
+    let mut sources = Vec::new();
+    let mut clear_before = false;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("multipart parse failed: {error}") })),
+                )
+            }
+        };
+        let field_name = field.name().unwrap_or_default().to_owned();
+        match field_name.as_str() {
+            "clear_before" => match field.text().await {
+                Ok(value) => clear_before = matches!(value.trim(), "true" | "1" | "yes"),
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("read clear_before: {error}") })),
+                    )
+                }
+            },
+            "mapping" => match field.bytes().await {
+                Ok(bytes) if !bytes.is_empty() => mapping = Some(bytes.to_vec()),
+                Ok(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "mapping must not be empty" })),
+                    )
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("read mapping: {error}") })),
+                    )
+                }
+            },
+            "source" => {
+                let filename = match field.file_name() {
+                    Some(filename) => match safe_worker_filename(filename) {
+                        Ok(name) => name.to_owned(),
+                        Err(error) => {
+                            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
+                        }
+                    },
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": "source requires a filename" })),
+                        )
+                    }
+                };
+                match field.bytes().await {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        if sources.iter().any(|(name, _)| name == &filename) {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({ "error": "source filenames must be unique" })),
+                            );
+                        }
+                        sources.push((filename, bytes.to_vec()))
+                    }
+                    Ok(_) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": "source must not be empty" })),
+                        )
+                    }
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": format!("read source: {error}") })),
+                        )
+                    }
+                }
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        json!({ "error": "only mapping, source, and clear_before multipart fields are allowed" }),
+                    ),
+                )
+            }
+        }
+    }
+    let Some(mapping) = mapping else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing mapping multipart field" })),
+        );
+    };
+    if sources.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "at least one source multipart file is required" })),
+        );
+    }
+
+    let output = match materialize_rml_with_worker(&mapping, &sources).await {
+        Ok(output) => output,
+        Err(error) if error.starts_with("RML worker is not configured") => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": error })),
+            )
+        }
+        Err(error) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))),
+    };
+    let mut quads = match kb_quads_from_triples(&String::from_utf8_lossy(&output)) {
+        Ok(quads) => quads,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("invalid N-Triples from RML worker: {error}") })),
+            )
+        }
+    };
+    if quads.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "RML worker produced no triples" })),
+        );
+    }
+
+    let graph_iri = match claims.graph_iri() {
+        Ok(graph) => graph,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("invalid verified graph scope: {error}") })),
+            )
+        }
+    };
+    if clear_before {
+        let clear = format!("DELETE WHERE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o . }} }}");
+        if let Err(error) = state.kg_store.update(&clear) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("clear claims graph: {error}") })),
+            );
+        }
+    }
+
+    let triples_written = quads.len();
+    let run_iri = format!(
+        "https://agentos.ontology/rml-materialization/{}",
+        uuid::Uuid::new_v4()
+    );
+    let mapping_checksum = sha256_hex(&mapping);
+    let source_checksums: Vec<Value> = sources
+        .iter()
+        .map(|(name, bytes)| json!({ "name": name, "sha256": sha256_hex(bytes) }))
+        .collect();
+    quads.push(RdfQuad {
+        subject: run_iri.clone(),
+        predicate: "https://agentos.ontology/meta/mappingChecksum".to_string(),
+        object: RdfValue::Literal(mapping_checksum.clone()),
+        graph: None,
+    });
+    quads.push(RdfQuad {
+        subject: run_iri.clone(),
+        predicate: "https://agentos.ontology/meta/mappingVersion".to_string(),
+        object: RdfValue::Literal(mapping_checksum.clone()),
+        graph: None,
+    });
+    for source in &source_checksums {
+        quads.push(RdfQuad {
+            subject: run_iri.clone(),
+            predicate: "https://agentos.ontology/meta/sourceChecksum".to_string(),
+            object: RdfValue::Literal(source.to_string()),
+            graph: None,
+        });
+    }
+    let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
+        Ok(kg) => kg,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+        }
+    };
+    match kg.write_quads_for_claims(claims, &quads) {
+        Ok(()) => {
+            let _ = state.kg_store.flush();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "materialized",
+                    "format": "ntriples",
+                    "graph": graph_iri,
+                    "triples_written": triples_written,
+                    "provenance_triples_written": quads.len() - triples_written,
+                    "materialization": run_iri,
+                    "mapping_version": mapping_checksum,
+                    "mapping_checksum": mapping_checksum,
+                    "source_checksums": source_checksums,
+                })),
+            )
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        ),
+    }
 }
 
 /// POST /api/v1/kb/bases/:id/import-graph — 图谱库文件导入（multipart）。
@@ -2124,8 +2570,9 @@ mod kb_ingest_tests {
     }
 }
 
+/// CI golden cases selected with `cargo test isolation_contract`.
 #[cfg(test)]
-mod kb_isolation_http_tests {
+mod isolation_contract {
     use super::*;
     use crate::api::http::{api_gov::ApiUsageState, AppState, TEST_ENV_LOCK};
     use crate::core::core_types::{CoreConfig, SemanticCore};
@@ -2136,7 +2583,7 @@ mod kb_isolation_http_tests {
     use axum::{
         body::{to_bytes, Body},
         http::Request,
-        routing::{get, post},
+        routing::{get, post, put},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -2197,12 +2644,16 @@ mod kb_isolation_http_tests {
     }
 
     fn jwt(tenant_id: &str) -> String {
+        jwt_for_scope(tenant_id, None)
+    }
+
+    fn jwt_for_scope(tenant_id: &str, project_id: Option<&str>) -> String {
         encode(
             &Header::default(),
             &super::super::iam::JwtClaims {
                 sub: format!("{tenant_id}-user"),
                 tenant_id: tenant_id.to_string(),
-                project_id: None,
+                project_id: project_id.map(str::to_owned),
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
@@ -2222,7 +2673,154 @@ mod kb_isolation_http_tests {
     }
 
     #[tokio::test]
-    async fn graph_import_and_stats_require_claims_and_isolate_tenants() {
+    async fn isolation_contract_kb_catalog_requires_claims_mints_targets_and_blocks_cross_tenant_writes(
+    ) {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
+        let state = test_state(tmp.path());
+        let app = Router::new()
+            .route(
+                "/kb/bases",
+                get(list_knowledge_bases_handler).post(create_knowledge_base_handler),
+            )
+            .route(
+                "/kb/bases/:id",
+                put(update_knowledge_base_handler).delete(delete_knowledge_base_handler),
+            )
+            .with_state(state.clone());
+
+        let unauthenticated = Request::builder()
+            .method("POST")
+            .uri("/kb/bases")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"private","kb_type":"graph"}"#))
+            .unwrap();
+        assert_eq!(
+            response_json(&app, unauthenticated).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Unknown client graph/namespace inputs cannot override the claims mint.
+        let create = Request::builder()
+            .method("POST").uri("/kb/bases")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"tenant A catalog","kb_type":"graph","graph":"tenant:evil/kb/x","vector_namespace":"vector://evil/project"}"#)).unwrap();
+        let (status, created) = response_json(&app, create).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["base"]["graph"], json!("graph://tenant-a/default"));
+        let kb_id = created["id"].as_str().unwrap().to_string();
+
+        let rename = Request::builder()
+            .method("PUT")
+            .uri(format!("/kb/bases/{kb_id}"))
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"tenant A renamed"}"#))
+            .unwrap();
+        assert_eq!(response_json(&app, rename).await.0, StatusCode::OK);
+        let metadata = state
+            .kg_store
+            .query(
+                "SELECT ?name ?type WHERE { GRAPH <graph://tenant-a/default> {
+                ?s <https://agentos.ontology/meta/kbName> ?name ;
+                   <https://agentos.ontology/meta/kbType> ?type
+            }}",
+            )
+            .unwrap();
+        let oxigraph::sparql::QueryResults::Solutions(metadata) = metadata else {
+            panic!("expected SPARQL solutions");
+        };
+        assert_eq!(
+            metadata.count(),
+            1,
+            "rename must replace only kbName and retain kbType"
+        );
+
+        let list = |tenant: &str| {
+            Request::builder()
+                .uri("/kb/bases")
+                .header("authorization", format!("Bearer {}", jwt(tenant)))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            response_json(&app, list("tenant-a")).await.1["count"],
+            json!(1)
+        );
+        assert_eq!(
+            response_json(&app, list("tenant-b")).await.1["count"],
+            json!(0)
+        );
+
+        let other_tenant_delete = Request::builder()
+            .method("DELETE")
+            .uri(format!("/kb/bases/{kb_id}"))
+            .header("authorization", format!("Bearer {}", jwt("tenant-b")))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            response_json(&app, other_tenant_delete).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let other_tenant_update = Request::builder()
+            .method("PUT")
+            .uri(format!("/kb/bases/{kb_id}"))
+            .header("authorization", format!("Bearer {}", jwt("tenant-b")))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"must not update"}"#))
+            .unwrap();
+        assert_eq!(
+            response_json(&app, other_tenant_update).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let other_project_list = Request::builder()
+            .uri("/kb/bases")
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {}",
+                    jwt_for_scope("tenant-a", Some("other-project"))
+                ),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            response_json(&app, other_project_list).await.1["count"],
+            json!(0)
+        );
+
+        for method in ["PUT", "DELETE"] {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(format!("/kb/bases/{kb_id}"));
+            if method == "PUT" {
+                builder = builder.header("content-type", "application/json");
+            }
+            let body = if method == "PUT" {
+                Body::from(r#"{"name":"must fail"}"#)
+            } else {
+                Body::empty()
+            };
+            assert_eq!(
+                response_json(&app, builder.body(body).unwrap()).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        if let Some(previous_data_dir) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", previous_data_dir);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_graph_read_write_requires_claims_and_uses_minted_graph() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
@@ -2299,13 +2897,116 @@ mod kb_isolation_http_tests {
         assert_eq!(legacy.count(), 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn vector_ingest_and_search_require_claims_and_isolate_tenants() {
+    async fn rml_materialization_requires_claims_and_writes_only_minted_graph() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = tmp.path().join("worker.sh");
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then
+    printf '<https://example.test/asset/A-100> <https://example.test/ontology/name> "Inverter" .\n' > "$2"
+    exit 0
+  fi
+  shift
+done
+exit 2
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let previous_worker = std::env::var_os(MORPH_KGC_WORKER_ENV);
+        std::env::set_var(MORPH_KGC_WORKER_ENV, &worker);
+
+        let state = test_state(tmp.path());
+        state.knowledge_bases.write().await.push(json!({
+            "id": "graph-kb",
+            "kb_type": "graph",
+            "graph": "client:ignored"
+        }));
+        let app = Router::new()
+            .route(
+                "/kb/:id/materialize-rml",
+                post(materialize_rml_knowledge_base_handler),
+            )
+            .route("/kb/:id/stats", get(knowledge_base_stats_handler))
+            .with_state(state.clone());
+        let boundary = "rml-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"mapping\"; filename=\"assets.rml.ttl\"\r\n\r\n@prefix ex: <https://example.test/> .\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"source\"; filename=\"assets.csv\"\r\n\r\nasset_id,name\r\nA-100,Inverter\r\n\
+             --{boundary}--\r\n"
+        );
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/kb/graph-kb/materialize-rml")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+        assert_eq!(
+            response_json(&app, request()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let authenticated = Request::builder()
+            .method("POST")
+            .uri("/kb/graph-kb/materialize-rml")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let (status, response) = response_json(&app, authenticated).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["triples_written"], json!(1));
+        assert_eq!(response["graph"], json!("graph://tenant-a/default"));
+        assert_eq!(response["source_checksums"].as_array().unwrap().len(), 1);
+
+        let stats = Request::builder()
+            .uri("/kb/graph-kb/stats")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(response_json(&app, stats).await.1["triples"], json!(4));
+        let legacy = state
+            .kg_store
+            .query("SELECT ?s WHERE { GRAPH <client:ignored> { ?s ?p ?o } }")
+            .unwrap();
+        let oxigraph::sparql::QueryResults::Solutions(legacy) = legacy else {
+            panic!("expected SPARQL solutions");
+        };
+        assert_eq!(legacy.count(), 0);
+
+        if let Some(worker) = previous_worker {
+            std::env::set_var(MORPH_KGC_WORKER_ENV, worker);
+        } else {
+            std::env::remove_var(MORPH_KGC_WORKER_ENV);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_vector_read_write_requires_claims_and_uses_minted_namespace() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
         state.knowledge_bases.write().await.push(json!({
-            "id": "vector-kb",
+            "id": "vector-kb-a",
+            "kb_type": "vector",
+            "vector_namespace": "tenant:legacy"
+        }));
+        state.knowledge_bases.write().await.push(json!({
+            "id": "vector-kb-b",
             "kb_type": "vector",
             "vector_namespace": "tenant:legacy"
         }));
@@ -2316,7 +3017,7 @@ mod kb_isolation_http_tests {
 
         let unauthenticated = Request::builder()
             .method("POST")
-            .uri("/kb/vector-kb/ingest")
+            .uri("/kb/vector-kb-a/ingest")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"text":"private battery instructions"}"#))
             .unwrap();
@@ -2326,7 +3027,7 @@ mod kb_isolation_http_tests {
         );
         let unauthenticated_search = Request::builder()
             .method("POST")
-            .uri("/kb/vector-kb/search")
+            .uri("/kb/vector-kb-a/search")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"query":"battery instructions"}"#))
             .unwrap();
@@ -2337,28 +3038,39 @@ mod kb_isolation_http_tests {
 
         let ingested = Request::builder()
             .method("POST")
-            .uri("/kb/vector-kb/ingest")
+            .uri("/kb/vector-kb-a/ingest")
             .header("authorization", format!("Bearer {}", jwt("tenant-a")))
             .header("content-type", "application/json")
             .body(Body::from(r#"{"text":"private battery instructions"}"#))
             .unwrap();
         assert_eq!(response_json(&app, ingested).await.0, StatusCode::OK);
 
-        let search = |tenant_id| {
+        let search = |tenant_id, kb_id| {
             Request::builder()
                 .method("POST")
-                .uri("/kb/vector-kb/search")
+                .uri(format!("/kb/{kb_id}/search"))
                 .header("authorization", format!("Bearer {}", jwt(tenant_id)))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"query":"battery instructions"}"#))
                 .unwrap()
         };
         assert_eq!(
-            response_json(&app, search("tenant-a")).await.1["count"],
+            response_json(&app, search("tenant-a", "vector-kb-a"))
+                .await
+                .1["count"],
             json!(1)
         );
         assert_eq!(
-            response_json(&app, search("tenant-b")).await.1["count"],
+            response_json(&app, search("tenant-a", "vector-kb-b"))
+                .await
+                .1["count"],
+            json!(0),
+            "KB B must not retrieve entries ingested into KB A in the same claims namespace"
+        );
+        assert_eq!(
+            response_json(&app, search("tenant-b", "vector-kb-a"))
+                .await
+                .1["count"],
             json!(0)
         );
     }

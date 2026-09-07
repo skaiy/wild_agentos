@@ -2,16 +2,11 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{data_dir, AppState};
+use super::{data_dir, iam::UserIdentity, AppState};
 
 /// MCP 服务器注册表的持久化文件路径。
 fn mcp_servers_store_path() -> std::path::PathBuf {
@@ -36,10 +31,46 @@ pub(crate) fn save_mcp_servers(servers: &[Value]) -> std::io::Result<()> {
     std::fs::write(&path, content)
 }
 
-/// GET /api/v1/mcp/servers — 返回已注册的 MCP 服务器
-pub(crate) async fn list_mcp_servers_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let servers = state.mcp_servers.read().await.clone();
-    Json(json!({ "count": servers.len(), "servers": servers }))
+fn server_is_in_scope(server: &Value, claims: Option<&crate::isolation::IsolationClaims>) -> bool {
+    let Some(claims) = claims else {
+        return false;
+    };
+
+    server.get("tenantId").and_then(Value::as_str) == Some(claims.tenant_id())
+        && server.get("projectId").and_then(Value::as_str) == Some(claims.project_id())
+}
+
+fn missing_isolation_claims() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "verified_isolation_claims_required",
+            "message": "Verified IsolationClaims are required for MCP server catalog access",
+        })),
+    )
+}
+
+/// GET /api/v1/mcp/servers — 返回当前租户/项目已注册的 MCP 服务器。
+///
+/// The HTTP management catalog is fail-closed: public/anonymous identities
+/// cannot enumerate registrations, and legacy unscoped records stay hidden.
+pub(crate) async fn list_mcp_servers_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    if identity.isolation_claims().is_none() {
+        return missing_isolation_claims().into_response();
+    }
+
+    let servers: Vec<Value> = state
+        .mcp_servers
+        .read()
+        .await
+        .iter()
+        .filter(|server| server_is_in_scope(server, identity.isolation_claims()))
+        .cloned()
+        .collect();
+    Json(json!({ "count": servers.len(), "servers": servers })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -53,8 +84,12 @@ pub struct McpServerRegisterRequest {
 /// POST /api/v1/mcp/servers — 注册新的 MCP 服务器
 pub(crate) async fn register_mcp_server_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<McpServerRegisterRequest>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return missing_isolation_claims().into_response();
+    };
     let server = json!({
         "id": uuid::Uuid::new_v4().hyphenated().to_string(),
         "name": req.name,
@@ -62,6 +97,8 @@ pub(crate) async fn register_mcp_server_handler(
         "endpoint": req.endpoint,
         "protocol": req.protocol.unwrap_or_else(|| "sse".to_string()),
         "status": "active",
+        "tenantId": claims.tenant_id(),
+        "projectId": claims.project_id(),
     });
     let id = server["id"].as_str().unwrap_or("").to_string();
     let mut guard = state.mcp_servers.write().await;
@@ -71,4 +108,26 @@ pub(crate) async fn register_mcp_server_handler(
         StatusCode::CREATED,
         Json(json!({ "id": id, "status": "registered" })),
     )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::isolation::IsolationClaims;
+
+    #[test]
+    fn mcp_server_catalog_is_scoped_to_verified_claims() {
+        let server = json!({
+            "name": "tenant-b-server",
+            "tenantId": "tenant-b",
+            "projectId": "project",
+        });
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project", "test-actor").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project", "test-actor").unwrap();
+
+        assert!(!server_is_in_scope(&server, Some(&tenant_a)));
+        assert!(server_is_in_scope(&server, Some(&tenant_b)));
+        assert!(!server_is_in_scope(&server, None));
+    }
 }

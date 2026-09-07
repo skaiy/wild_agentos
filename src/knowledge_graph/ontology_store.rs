@@ -15,11 +15,14 @@ use oxigraph::store::Store;
 use std::sync::Arc;
 
 use super::ontology_layer::{
-    ev_repair_ontology, ActionType, FunctionDef, LinkType, ObjectType, OntologyDefinition,
+    ev_repair_ontology, ActionGuardrailConfig, ActionType, FunctionDef, LinkType, ObjectType,
+    OntologyDefinition,
 };
 
 /// 本体元定义命名图（与实例图 `graph:pack/ev-repair` 隔离）。
 pub const META_GRAPH: &str = "graph:ontology/meta";
+/// Append-only audit graph for explicit type-draft promotion decisions.
+pub const TYPE_PROMOTION_AUDIT_GRAPH: &str = "graph:ontology/type-promotion-audit";
 /// meta 命名空间前缀。
 pub const META_NS: &str = "https://agentos.ontology/meta/";
 /// RDF/RDFS 常量。
@@ -146,6 +149,11 @@ impl OntologyStore {
             RDF_TYPE,
             &format!("{}Domain", META_NS),
         ));
+        triples.push(fmt_lit(
+            &domain_iri,
+            &format!("{}guardrails", META_NS),
+            &serde_json::to_string(&def.guardrails).map_err(|e| e.to_string())?,
+        ));
 
         for (i, o) in def.object_types.iter().enumerate() {
             triples.extend(self.encode_element(
@@ -230,6 +238,7 @@ impl OntologyStore {
     /// 从元命名图读回指定 domain 的完整本体定义（读路径：解析 `meta:json` 快照）。
     /// 按元类分组查询，保证与 seed 输入逐字段一致（Hybrid 读优先 JSON）。
     pub fn load_definition(&self, domain: &str) -> Result<OntologyDefinition, String> {
+        let guardrails = self.load_domain_guardrails(domain)?;
         let object_types = self
             .load_snapshots(MetaKind::ObjectType)?
             .into_iter()
@@ -252,11 +261,59 @@ impl OntologyStore {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(OntologyDefinition {
             domain: domain.to_string(),
+            guardrails,
             object_types,
             link_types,
             action_types,
             functions,
         })
+    }
+
+    /// 读取域级护栏 JSON；旧数据没有该谓词时返回空配置，以保持现有安全默认值。
+    #[allow(deprecated)]
+    pub fn load_domain_guardrails(&self, domain: &str) -> Result<ActionGuardrailConfig, String> {
+        let domain_iri = Self::domain_iri(domain);
+        let q = format!(
+            "SELECT ?json WHERE {{ GRAPH <{g}> {{ <{domain_iri}> <{ns}guardrails> ?json }} }} LIMIT 1",
+            g = META_GRAPH,
+            ns = META_NS,
+        );
+        match self.store.query(&q).map_err(|e| e.to_string())? {
+            QueryResults::Solutions(mut solutions) => match solutions.next() {
+                Some(Ok(solution)) => {
+                    let raw = solution
+                        .get("json")
+                        .map(|term| strip_literal(&term.to_string()))
+                        .ok_or_else(|| "域护栏配置读取失败".to_string())?;
+                    serde_json::from_str(&raw).map_err(|e| format!("域护栏配置无效: {e}"))
+                }
+                Some(Err(e)) => Err(e.to_string()),
+                None => Ok(ActionGuardrailConfig::default()),
+            },
+            _ => Ok(ActionGuardrailConfig::default()),
+        }
+    }
+
+    /// 更新一个域的默认护栏配置。调用者须先通过 HTTP 层的 verified claims 校验。
+    pub fn upsert_domain_guardrails(
+        &self,
+        domain: &str,
+        guardrails: &ActionGuardrailConfig,
+    ) -> Result<(), String> {
+        let domain_iri = Self::domain_iri(domain);
+        let predicate = format!("{}guardrails", META_NS);
+        let value = serde_json::to_string(guardrails).map_err(|e| e.to_string())?;
+        let _ = self.backup_meta_graph();
+        self.store
+            .update(&format!(
+                "DELETE WHERE {{ GRAPH <{g}> {{ <{domain_iri}> <{predicate}> ?o }} }};\
+                 INSERT DATA {{ GRAPH <{g}> {{ <{domain_iri}> <{predicate}> \"{}\" }} }}",
+                Self::escape_literal(&value),
+                g = META_GRAPH,
+            ))
+            .map_err(|e| format!("写入域护栏配置失败: {e}"))?;
+        let _ = self.store.flush();
+        Ok(())
     }
 
     /// 读取某一元类下全部元素的 `meta:json` 快照，按 `meta:order`（数值）稳定排序，
@@ -427,6 +484,37 @@ impl OntologyStore {
         let _ = self.backup_meta_graph();
         let value = serde_json::to_value(link).map_err(|e| e.to_string())?;
         self.write_element(MetaKind::LinkType, &link.id, &link.label, value, domain)
+    }
+
+    /// Persist the server-generated record for every type-draft promotion.
+    ///
+    /// The payload contains verified identity fields and the compatibility
+    /// decision. It is intentionally append-only so forced breaking changes
+    /// remain replayable after the source draft is deleted.
+    pub fn record_type_promotion_audit(
+        &self,
+        audit_id: &str,
+        record: &serde_json::Value,
+    ) -> Result<(), String> {
+        if audit_id.is_empty()
+            || !audit_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("invalid type promotion audit identifier".into());
+        }
+        let subject = format!("{META_NS}type-promotion-audit/{audit_id}");
+        let payload = serde_json::to_string(record)
+            .map_err(|error| format!("could not encode type promotion audit: {error}"))?;
+        let update = format!(
+            "INSERT DATA {{ GRAPH <{TYPE_PROMOTION_AUDIT_GRAPH}> {{ {} }} }}",
+            fmt_lit(&subject, &format!("{META_NS}json"), &payload),
+        );
+        self.store
+            .update(&update)
+            .map_err(|error| format!("type promotion audit write failed: {error}"))?;
+        let _ = self.store.flush();
+        Ok(())
     }
 
     /// 引用完整性：返回引用该 ObjectType 的下游元素描述列表（非空即不可删）。
@@ -635,6 +723,24 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_guardrails_roundtrip() {
+        let store = OntologyStore::new().unwrap();
+        store.ensure_seeded("ev-repair").unwrap();
+        let guardrails = ActionGuardrailConfig {
+            max_triples: Some(12),
+            allowed_predicate_prefixes: Some(vec!["https://example.test/".into()]),
+            assertions: vec![],
+        };
+        store
+            .upsert_domain_guardrails("ev-repair", &guardrails)
+            .unwrap();
+        assert_eq!(
+            store.load_definition("ev-repair").unwrap().guardrails,
+            guardrails
+        );
+    }
+
+    #[test]
     fn test_load_preserves_object_order() {
         let store = OntologyStore::new().unwrap();
         store.ensure_seeded("ev-repair").unwrap();
@@ -748,6 +854,7 @@ mod tests {
             preconditions: vec![],
             side_effects: vec![],
             icon: "Zap".into(),
+            guardrails: ActionGuardrailConfig::default(),
         }
     }
 

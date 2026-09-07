@@ -13,6 +13,7 @@ pub mod tool_groups;
 
 pub mod import_scanner;
 pub mod result_router;
+pub mod sandbox_provider;
 pub mod tool_guard;
 pub mod workspace_monitor;
 

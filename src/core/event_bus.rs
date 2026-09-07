@@ -68,6 +68,9 @@ pub enum EventType {
     HumanApprovalRequired,
     HumanApprovalResult,
 
+    // Auditable ontology action decisions
+    ActionAudit,
+
     // User supplementary input event
     UserSupplementaryInput,
 
@@ -141,6 +144,7 @@ impl EventType {
             EventType::BudgetExceeded => "BUDGET_EXCEEDED",
             EventType::HumanApprovalRequired => "HUMAN_APPROVAL_REQUIRED",
             EventType::HumanApprovalResult => "HUMAN_APPROVAL_RESULT",
+            EventType::ActionAudit => "ACTION_AUDIT",
             EventType::UserSupplementaryInput => "USER_SUPPLEMENTARY_INPUT",
             EventType::BatchAgentRegistered => "BATCH_AGENT_REGISTERED",
             EventType::BatchAgentStarted => "BATCH_AGENT_STARTED",
@@ -206,6 +210,7 @@ impl EventType {
             "BUDGET_EXCEEDED" => EventType::BudgetExceeded,
             "HUMAN_APPROVAL_REQUIRED" => EventType::HumanApprovalRequired,
             "HUMAN_APPROVAL_RESULT" => EventType::HumanApprovalResult,
+            "ACTION_AUDIT" => EventType::ActionAudit,
             "USER_SUPPLEMENTARY_INPUT" => EventType::UserSupplementaryInput,
             "BATCH_AGENT_REGISTERED" => EventType::BatchAgentRegistered,
             "BATCH_AGENT_STARTED" => EventType::BatchAgentStarted,
