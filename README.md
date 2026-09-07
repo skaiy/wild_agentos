@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.3.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.5.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,7 @@ Welcome to the release timeline of **Wild AgentOS**, featuring production-grade 
 
 | Version | Release Date | Key Upgrades & Fused Features |
 |---------|--------------|------------------------------|
+| **v0.5.0** | **2026-09-07** | **Ontology Knowledge Engineering + Graph Engineering**<br>• Completes bounded, claims-scoped constrained extraction, optional Morph-KGC/RML materialization, quality/review supervision, and anchored staging-to-production materialization; no path auto-promotes schema or writes around verified claims.<br>• Adds conservative, approval-held entity-resolution suggestions through a process-isolated GLinker-style sidecar; no auto-merge path is provided.<br>• Freezes ontology KE golden evaluations behind a SHA gate, documents measurement-decay audit policy, and adds a read-only ontology health report for slow-loop review.<br>• Completes OpenAPI/SQL DDL drafts, draft-only schema induction, readiness reporting, and compatibility-gated promotion; companion Admin ontology design studio work remains separate. |
 | **v0.3.0** | **2026-09-05** | **Markets + IdP + Emergent**<br>• Adds a versioned Logic and Skill package market with immutable package versions, claims-scoped access, and explicit install, upgrade, and rollback.<br>• Adds OIDC/JWKS authentication beside local-development HS256, with asymmetric JWT verification and fail-closed issuer, audience, and JWKS validation.<br>• Adds a gated emergent-tool promotion pipeline: generated tools remain untrusted until sandbox/judge gates and required human approval pass.<br>• Adds optional, default-off limited RDFS inference for claims-scoped graph reads; query-time subclass and type expansion never persists inferred triples. |
 | **v0.2.2** | **2026-09-05** | **Artifacts + Sandbox + Bench**<br>• Adds a claims-scoped coding artifact store: immutable metadata is written to the caller’s `IsolationClaims` graph and bytes use a server-minted tenant blob prefix.<br>• Adds an external `SandboxProvider` adapter behind a default-off feature flag; its async path does not hold `MutexGuard` across an `await`.<br>• Adds reproducible private-deployment benchmarks for Oxigraph, redb, and Hyperspace that record measured results without fabricated speedups. |
 | **v0.2.1** | **2026-09-05** | **Ontology Data + Protocols**<br>• Adds claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema; promotion requires authorized human approval.<br>• Adds an inbound MCP tool catalog filtered by `IsolationClaims`, plus explicitly published, gated tenant Skills as MCP tools; kernel Skills remain excluded.<br>• Adds a thin outbound A2A adapter behind a default-off feature flag; it is best-effort and does not add an inbound server or alter the local task lifecycle. See [Outbound A2A adapter](docs/19-a2a-outbound.md). |
@@ -232,6 +233,7 @@ Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxig
 - **v0.2.1 — done:** claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema with authorized approval before promotion; an `IsolationClaims`-filtered inbound MCP catalog; gated tenant Skill publishing as MCP tools; and a default-off, best-effort outbound A2A adapter. See [Outbound A2A adapter](docs/19-a2a-outbound.md).
 - **v0.2.2 — done:** a claims-scoped coding artifact store with `IsolationClaims` graph metadata and a server-minted tenant blob prefix; a default-off external `SandboxProvider` adapter that does not hold `MutexGuard` across an `await`; and reproducible private-deployment benchmarks for Oxigraph, redb, and Hyperspace without fabricated speedups.
 - **v0.3.0 — done:** versioned Logic and Skill package market with immutable versions and explicit install/upgrade/rollback; fail-closed OIDC/JWKS authentication beside local-development HS256; a gated, human-approved emergent-tool promotion pipeline; and default-off limited RDFS query-time inference that never persists inferred triples.
+- **v0.5.0 — done:** the two-track Ontology Knowledge Engineering / Graph Engineering milestone: staging-only constrained extraction and Morph-KGC/RML inputs; `KgQualityGate` and review; anchored, auditable materialization; conservative, approval-held entity-resolution suggestions; frozen golden SHA checks and read-only health reporting; OpenAPI/SQL DDL and induction drafts, readiness reporting, and compatibility-gated promotion. Tenant Skill/Emergent promotion now requires golden SHA verification, named rule review, and audit evidence. The companion Admin ontology design studio is delivered separately.
 
 ---
 
@@ -262,6 +264,8 @@ JSON and Markdown evidence on the target machine.
 - **Evolution Roadmap** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md) (post-v0.1.6 strategy and explicit non-goals)
 - **Private Deployment Benchmark** → [`docs/19-private-deploy-benchmark.md`](docs/19-private-deploy-benchmark.md) (reproducible measured Oxigraph/redb/Hyperspace profile)
 - **Ontology Action Data Sandbox** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md) (staging graph guardrails; not a compute sandbox)
+- **Ontology KE Pipeline** → [`docs/21-ontology-knowledge-engineering-pipeline.md`](docs/21-ontology-knowledge-engineering-pipeline.md) (two-track milestone boundaries and remaining online-automation gaps)
+- **Ontology KE Golden Freeze Policy** → [`docs/22-ontology-ke-golden-freeze-policy.md`](docs/22-ontology-ke-golden-freeze-policy.md) (frozen scorecard and measurement-decay audit)
 - **Design Detail** → [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) · [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)

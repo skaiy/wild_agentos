@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.3.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.5.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,7 @@
 
 | 版本 | 发布日期 | 核心升级与融合特性 |
 |------|----------|-------------------|
+| **v0.5.0** | **2026-09-07** | **本体知识工程 + Graph Engineering**<br>• 完成有边界、claims-scoped 的 constrained extraction、可选 Morph-KGC/RML materialization、质量/审阅监督及带锚点的 staging-to-production materialization；任何路径都不会自动 promote schema，也不会绕过已验证 claims 写入。<br>• 通过进程隔离的 GLinker-style sidecar 新增保守、待审批的 entity-resolution suggestion；不提供 auto-merge 路径。<br>• 冻结本体 KE golden evaluation 并以 SHA gate 保护，记录 measurement-decay audit policy，并提供用于慢速 loop 审查的只读 ontology health report。<br>• 完成 OpenAPI/SQL DDL draft、仅生成 draft 的 schema induction、readiness report 与 compatibility-gated promote；配套 Admin ontology design studio 仍在独立范围内。 |
 | **v0.3.0** | **2026-09-05** | **市场 + IdP + Emergent**<br>• 新增版本化的 Logic 与 Skill package market，package 版本不可变，访问按 claims 隔离，并支持显式 install、upgrade 与 rollback。<br>• 新增与本地开发 HS256 并行的 OIDC/JWKS 身份验证，通过非对称 JWT 验证以及 fail-closed 的 issuer、audience 与 JWKS 校验保护访问。<br>• 新增带 gate 的 emergent-tool promotion pipeline：生成的工具在通过 sandbox/judge gate 和所需人工审批前始终不受信任。<br>• 新增可选且默认关闭的有限 RDFS 推理，用于 claims 作用域 graph read；仅在 query-time 扩展 subclass 和 type，绝不持久化推理三元组。 |
 | **v0.2.2** | **2026-09-05** | **制品 + 沙箱 + 基准**<br>• 新增 claims 作用域的 coding artifact store：不可变元数据写入调用者的 `IsolationClaims` graph，制品字节使用服务端 mint 的 tenant blob 前缀。<br>• 新增默认关闭 feature flag 保护的外部 `SandboxProvider` adapter；其异步路径不会跨 `await` 持有 `MutexGuard`。<br>• 新增面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，记录实测结果且不编造速度提升。 |
 | **v0.2.1** | **2026-09-05** | **本体数据 + 协议**<br>• 新增从 CSV 或 JSON Schema 生成、按 claims 隔离的 ObjectType/LinkType 草稿；必须经获授权人员审批后才能提升。<br>• 新增由 `IsolationClaims` 过滤的入站 MCP 工具目录，以及可显式发布为 MCP 工具的受 gate 租户 Skill；内核 Skill 仍被排除。<br>• 新增默认关闭 feature flag 保护的薄型出站 A2A adapter；它以尽力而为方式工作，不提供入站服务器，也不改变本地任务生命周期。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。 |
@@ -215,6 +216,7 @@ Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，�
 - **v0.2.1 — 已完成：** 从 CSV 或 JSON Schema 生成、按 claims 隔离并需获授权人员审批后才能提升的 ObjectType/LinkType 草稿；由 `IsolationClaims` 过滤的入站 MCP 目录；受 gate 租户 Skill 的 MCP 工具发布；以及默认关闭、尽力而为的薄型出站 A2A adapter。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。
 - **v0.2.2 — 已完成：** claims 作用域 coding artifact store（`IsolationClaims` graph 元数据与服务端 mint 的 tenant blob 前缀）；默认关闭的外部 `SandboxProvider` adapter（不会跨 `await` 持有 `MutexGuard`）；以及面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，不编造速度提升。
 - **v0.3.0 — 已完成：** 具有不可变版本和显式 install/upgrade/rollback 的版本化 Logic 与 Skill package market；与本地开发 HS256 并行、且 fail-closed 的 OIDC/JWKS 身份验证；带 gate 和人工审批的 emergent-tool promotion pipeline；以及默认关闭、仅在 query-time 扩展且绝不持久化推理三元组的有限 RDFS 推理。
+- **v0.5.0 — 已完成：** 双轨本体知识工程 / Graph Engineering 里程碑：只写 staging 的 constrained extraction 与 Morph-KGC/RML 输入；`KgQualityGate` 与审阅；带锚点、可审计的 materialization；保守、待审批的 entity-resolution suggestion；冻结 golden SHA 检查与只读 health reporting；以及 OpenAPI/SQL DDL 与 induction draft、readiness report 和 compatibility-gated promote。租户 Skill/Emergent promotion 现要求 golden SHA 验证、具名规则审阅与 audit evidence。配套 Admin ontology design studio 已独立交付。
 
 ---
 
@@ -240,6 +242,8 @@ Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，�
 - **隔离矩阵** → [`docs/17-isolation-matrix.zh.md`](docs/17-isolation-matrix.zh.md)（CI 验证的 fail-closed 行为；历史键尚未迁移）
 - **演进路线图** → [`docs/18-evolution-roadmap.zh.md`](docs/18-evolution-roadmap.zh.md)（v0.1.6 后战略与明确非目标）
 - **本体 Action 数据沙箱** → [`docs/15-ontology-action-sandbox.zh.md`](docs/15-ontology-action-sandbox.zh.md)（staging graph 护栏，不是计算沙箱）
+- **本体 KE 流水线** → [`docs/21-ontology-knowledge-engineering-pipeline.zh.md`](docs/21-ontology-knowledge-engineering-pipeline.zh.md)（双轨里程碑边界及仍存在的在线自动化缺口）
+- **本体 KE Golden Freeze Policy** → [`docs/22-ontology-ke-golden-freeze-policy.zh.md`](docs/22-ontology-ke-golden-freeze-policy.zh.md)（冻结 scorecard 与 measurement-decay 审计）
 - **设计细节** → [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) · [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) (English)
 - **核心设计理念** → [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) · [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) (English)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)

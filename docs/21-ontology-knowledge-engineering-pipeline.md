@@ -1,23 +1,25 @@
-# 21. Ontology Knowledge Engineering Pipeline (design only)
+# 21. Ontology Knowledge Engineering Pipeline
 
 > *A Chinese version is available in
 > [21-ontology-knowledge-engineering-pipeline.zh.md](21-ontology-knowledge-engineering-pipeline.zh.md).*
 >
-> This is a proposed design, not a release plan or an implementation claim.
+> v0.5.0 completes the bounded Ontology Knowledge Engineering / Graph
+> Engineering milestone documented here. It does not claim a continuous,
+> fully automated corpus-to-graph service.
 > It complements [Knowledge Ingestion](16-knowledge-ingest-import-graph.md),
 > [Ontology Action Data Sandbox](15-ontology-action-sandbox.md), and the
 > [Isolation Contract](17-isolation-contract.md).
 
 ## Status and question answered
 
-**Question:** Do the implemented capabilities and pending pull requests form a
+**Question:** Do the implemented capabilities in v0.5.0 form a
 complete, online, fully automated ontology knowledge-graph engineering
 toolchain?
 
 **Answer: No.**
 
-The current code provides useful ingestion, graph, ontology, staging, and
-human-approval primitives. It does **not** provide an online, fully automatic
+The current code provides bounded ingestion, graph, ontology, staging, quality,
+and human-approval primitives. It does **not** provide an online, fully automatic
 pipeline that extracts ontology-aligned knowledge from a changing corpus,
 validates it, resolves entities, promotes schema, and materializes a governed
 warehouse. The design below describes what would be required to make that
@@ -59,6 +61,8 @@ before a kernel loop can use it as a promoted schema.
 | Extraction primitives | A Code AST extractor and LLM `KnowledgeExtractor` produce open-vocabulary `NodeDef` / `EdgeDef` candidates. |
 | Ontology layer | `ObjectType`, `LinkType`, and `ActionType` model semantic and controlled write concepts. |
 | Type-draft bridge | CSV and JSON Schema can create type drafts; an authorized person must explicitly promote them. |
+| Broader type-draft inputs | OpenAPI and SQL DDL generate claims-scoped drafts; LLM schema induction produces reviewable drafts only. |
+| Readiness and compatibility | The read-only readiness report identifies promoted, draft, and missing requirements; promotion has a compatibility gate and explicit `force_breaking` audit path. |
 | Governed writes | Actions support HITL staging, SPARQL `ASK` guardrails, and `ACTION_AUDIT`. |
 | Optional inference | Limited RDFS query-time expansion is available only when enabled; it is off by default and does not persist inferred triples. |
 | Isolation | `IsolationClaims` determine graph, blob, and vector targets; missing or invalid claims fail closed. Minting a safe target name is **not** historical-data migration. |
@@ -219,7 +223,7 @@ can challenge a result, which evidence is independent, or how conflicting
 objectives are resolved.
 
 Existing WAO staging, HITL approval, `ASK`-before-Judge ordering, and
-`IsolationClaims` already embody parts of this model. v0.5.0 should make them
+`IsolationClaims` already embody parts of this model. v0.5.0 makes them
 explicit supervisory loops rather than treating them only as workflow steps:
 
 | Guardrail | WAO mapping |
@@ -297,15 +301,15 @@ baseline: CSV and JSON Schema generate claims-scoped type drafts, and an
 authorized person must explicitly promote them. Drafts currently do not invent
 `LinkType`s unless they are explicitly supplied.
 
-#### Planned — broader inputs and relationship drafts
+#### Delivered — broader inputs and compatibility-gated drafts
 
-- Extend multi-source schema → type-draft to DDL, OpenAPI, Excel glossaries,
-  and LinkML.
+- OpenAPI and SQL DDL generate claims-scoped type drafts for review.
 - Suggest relationship drafts from explicit FK evidence or co-occurrence, as
   drafts only; no suggestion may create or promote a production `LinkType`
   automatically.
-- Add schema-evolution CI for draft↔promoted diffs, including compatibility
-  checks.
+- Draft promotion applies compatibility checks. A caller may use
+  `force_breaking` only with explicit audit evidence; it does not bypass
+  human confirmation.
 
 #### Shipped — pre-attach ontology readiness report
 
@@ -332,9 +336,9 @@ promote drafts, or write any instance graph. Feed the reported missing items
 into the existing schema/glossary/DDL/OpenAPI-to-draft workflows; promotion
 still requires the separate explicit human-confirmation endpoint.
 
-#### P3 — LLM schema induction, drafts only
+#### Delivered — LLM schema induction, drafts only
 
-- Let LLM-assisted schema induction propose novel object/link concepts as
+- LLM-assisted schema induction proposes novel object/link concepts as
   separately reviewable drafts only.
 - Never auto-promote an ontology draft, and never use schema induction to
   silently create `ActionType`s.
@@ -421,12 +425,12 @@ and skill loops that use a promoted ontology.
 
 #### P2b — frozen extraction evaluation and measurement-decay audit
 
-- Freeze ontology-extraction golden evaluations and Text2KGBench fixtures so
-  extractors or optimizers cannot rewrite their own scorecard.
-- Audit whether metrics, fixtures, and provenance still measure source-grounded
-  ontology quality rather than a decayed proxy.
-- Run the slow ontology-health and extraction-goal review; it may stop or
-  redefine extraction, but never auto-promotes a draft.
+- **Implemented (#145):** ontology-extraction golden evaluations and fixtures
+  are frozen behind a SHA gate, so extractors or optimizers cannot rewrite
+  their own scorecard. The [golden-freeze policy](22-ontology-ke-golden-freeze-policy.md)
+  records the required measurement-decay audit.
+- The slow ontology-health and extraction-goal review may stop or redefine
+  extraction, but never auto-promotes a draft.
 
 #### Implemented slow-loop evidence — ontology health report
 
@@ -452,6 +456,14 @@ does not create a type draft, and cannot resolve a review, materialize
 instances, or promote schema. If a finding warrants a schema proposal, submit
 it explicitly through an existing `/api/v1/ontology/type-drafts/from-*` API and
 use its separate `confirm: true` promotion endpoint after human review.
+
+#### Implemented Skill/Emergent promotion governance
+
+Tenant Skill and emergent-candidate promotion verifies the package-declared
+SHA-256 digest of frozen golden fixtures before evaluation, records a named
+safety/isolation/side-effect rule review, and stores audit evidence with the
+reviewed candidate digest. An optimizer cannot alter its fixture or grant
+itself tenant authority.
 
 ## Non-goals
 
