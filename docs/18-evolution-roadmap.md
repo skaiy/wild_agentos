@@ -158,8 +158,9 @@ automatic end-to-end processing remain outside this completed milestone.
 This planned boundary orchestrates the existing bounded KE loops; it does not
 introduce a second KE stack. Claims-scoped online jobs will process configured
 corpus changes or incremental deltas through existing constrained extraction,
-canonicalization, `KgQualityGate`, optional approval-held entity-resolution
-suggestions, and staging. Default-off, opt-in watchers may enqueue those jobs.
+canonicalization, `KgQualityGate`, required approval-held entity-resolution
+suggestions, and staging. Enabled-by-default watchers enqueue those jobs;
+deployments may explicitly disable their watcher configuration when needed.
 
 The scope requires verified `IsolationClaims`, idempotency, retry/backpressure,
 source-to-decision provenance, and observable job state. It does not silently

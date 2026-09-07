@@ -94,10 +94,11 @@ entity-resolution suggestion、冻结 golden evaluation、ontology-health report
 - 面向已配置 corpus change 或 incremental delta 的 claims-scoped job model，提供 create、
   list、get、cancel（或等价）操作。
 - 一个复用现有
-  extract → canonicalize → quality gate → optional entity-resolution suggestion → staging
+  extract → canonicalize → quality gate → approval-held entity-resolution suggestion → staging
   路径的 runner。它调用现有 constrained-extraction endpoint、`KgQualityGate`、
   staging/review record 与带锚点的 materialization 边界，而不是新增第二套 KE stack。
-- 默认关闭、显式 opt-in 的 scheduled 或 event-driven watcher，将 job 入队。
+- 默认开启的 scheduled 或 event-driven watcher，将 job 入队。部署可在需要时显式关闭其
+  watcher configuration。
 - job state、带 backpressure 的 retry、idempotency，以及串联 source、candidate、gate result
   和 decision 的 provenance。
 - 仅接受已验证的 `IsolationClaims`：未认证或 claims 无效的请求必须 fail closed。测试必须证明
@@ -117,7 +118,7 @@ entity-resolution suggestion、冻结 golden evaluation、ontology-health report
 
 - Claims-Scoped Online Corpus Job API and State Store
 - Idempotent Online Job Runner for Existing KE Primitives
-- Default-Off Corpus Watcher Scheduler and Queueing
+- Default-Enabled Corpus Watcher Scheduler, Queueing, and Explicit Disablement
 - Online Job Provenance, Audit, Retry, and Backpressure Observability
 - Fail-Closed Online Job Isolation and Production-Write CI
 - Companion Admin Job List（本仓库范围外）
@@ -364,8 +365,8 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   SPARQL 回读由服务端生成的 anchor；anchor 缺失时返回 `needs_repair` 且保留记录
   以供修复。GLinker 可仅安装在该 worker 环境；kernel process 不链接 GLinker
   代码、模型权重或 LGPL 组件。任何 LGPL linker 必须保持进程隔离。
-- 编排这些既有原语的 online-job runner 与默认关闭的 watcher 是 v0.6 计划工作；
-  见上文的范围边界。
+- 编排这些既有原语的 online-job runner 与默认开启的 watcher 是 v0.6 计划工作；
+  部署可在需要时显式关闭 watcher configuration。见上文的范围边界。
 
 #### P2b — 冻结提取评测与 measurement-decay 审计
 

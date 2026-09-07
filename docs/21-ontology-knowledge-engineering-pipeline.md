@@ -108,11 +108,12 @@ toolchain until the complete acceptance criteria are demonstrably true.
 - A claims-scoped job model with create, list, get, and cancel (or equivalent)
   operations for configured corpus changes or incremental deltas.
 - A runner that orchestrates the existing
-  extract → canonicalize → quality gate → optional entity-resolution suggestion
+  extract → canonicalize → quality gate → approval-held entity-resolution suggestion
   → staging path. It reuses the existing constrained-extraction endpoints,
   `KgQualityGate`, staging/review records, and anchored materialization
   boundary rather than creating another KE stack.
-- Default-off, opt-in scheduled or event-driven watchers that enqueue jobs.
+- Enabled-by-default scheduled or event-driven watchers that enqueue jobs.
+  Deployments may explicitly disable their watcher configuration when needed.
 - Job state, retry with backpressure, idempotency, and provenance linking
   source, candidates, gate result, and decision.
 - Verified `IsolationClaims` only: unauthenticated or invalid-claims requests
@@ -134,7 +135,7 @@ toolchain until the complete acceptance criteria are demonstrably true.
 
 - Claims-Scoped Online Corpus Job API and State Store
 - Idempotent Online Job Runner for Existing KE Primitives
-- Default-Off Corpus Watcher Scheduler and Queueing
+- Default-Enabled Corpus Watcher Scheduler, Queueing, and Explicit Disablement
 - Online Job Provenance, Audit, Retry, and Backpressure Observability
 - Fail-Closed Online Job Isolation and Production-Write CI
 - Companion Admin Job List (outside this repository)
@@ -447,8 +448,9 @@ and skill loops that use a promoted ontology.
   GLinker is used as an Apache-2.0 pattern and can be installed only in that
   worker environment; no GLinker code, model weights, or LGPL component is
   linked into the kernel process. Any LGPL linker must remain process-isolated.
-- The online-job runner and default-off watcher that schedule these existing
-  primitives are v0.6 planned work; see the scope boundary above.
+- The online-job runner and enabled-by-default watcher that schedule these
+  existing primitives are v0.6 planned work; deployments can explicitly
+  disable watcher configuration when needed. See the scope boundary above.
 
 #### P2b — frozen extraction evaluation and measurement-decay audit
 

@@ -114,9 +114,9 @@ design studio 作为独立交付被记录，不改变本仓库范围。持续在
 
 此计划边界编排既有的、有边界的 KE loop，不新增第二套 KE stack。claims-scoped 的
 online job 将把已配置 corpus change 或 incremental delta 经由既有的 constrained
-extraction、canonicalization、`KgQualityGate`、可选且 approval-held 的
-entity-resolution suggestion 以及 staging 路径处理。默认关闭、显式 opt-in 的 watcher
-可以将这些 job 入队。
+extraction、canonicalization、`KgQualityGate`、必选且 approval-held 的
+entity-resolution suggestion 以及 staging 路径处理。默认开启的 watcher 会将这些 job
+入队；部署可在需要时显式关闭其 watcher configuration。
 
 该范围要求已验证的 `IsolationClaims`、idempotency、retry/backpressure、
 source-to-decision provenance 和可观测 job state。它不静默 promote ontology、不自动
