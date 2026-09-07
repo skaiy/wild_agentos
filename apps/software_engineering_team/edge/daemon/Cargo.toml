@@ -35,7 +35,7 @@ tokio-tungstenite = "0.21"
 futures-util = "0.3"
 
 # JWT
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 
 # Async utilities
 tokio-util = "0.7"

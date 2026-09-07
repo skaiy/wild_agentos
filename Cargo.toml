@@ -54,7 +54,7 @@ base64 = "0.21"
 ring = "0.17"
 
 # IAM / JWT
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # gRPC
 tonic = "0.10"
@@ -118,7 +118,7 @@ tree-sitter-c = "0.23"
 tree-sitter-cpp = "0.23"
 sha2 = "0.10"
 similar = "2.5"
-lru = "0.12"
+lru = "0.18"
 hex = "0.4"
 notify = "6.1"
 notify-debouncer-mini = "0.4"
