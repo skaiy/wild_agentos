@@ -153,6 +153,23 @@ The companion Admin ontology design studio is noted as a separate delivery and
 does not change this repository's scope. Continuous online corpus watching and
 automatic end-to-end processing remain outside this completed milestone.
 
+### v0.6 — planned: Online Corpus Job + Watcher
+
+This planned boundary orchestrates the existing bounded KE loops; it does not
+introduce a second KE stack. Claims-scoped online jobs will process configured
+corpus changes or incremental deltas through existing constrained extraction,
+canonicalization, `KgQualityGate`, optional approval-held entity-resolution
+suggestions, and staging. Default-off, opt-in watchers may enqueue those jobs.
+
+The scope requires verified `IsolationClaims`, idempotency, retry/backpressure,
+source-to-decision provenance, and observable job state. It does not silently
+promote ontology, auto-merge entities, replace Oxigraph/SPARQL, add Cypher or
+Nebula, or mix separate product/business repositories into this tree.
+Materialization remains approval-held and anchored.
+
+See [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
+for the v0.6 boundary and proposed future Issue checklist.
+
 ## Explicit non-goals
 
 1. No category-IV “microkernel OS” or bare-metal OS.
