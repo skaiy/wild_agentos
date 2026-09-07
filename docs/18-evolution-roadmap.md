@@ -129,15 +129,29 @@ Related work: [marketplace](https://github.com/skaiy/wild_agentos/issues/97),
 [emergent tools](https://github.com/skaiy/wild_agentos/issues/99), and
 [limited OWL/rules](https://github.com/skaiy/wild_agentos/issues/100).
 
-### Proposed — dual-track ontology and Graph Engineering
+### v0.5.0 — complete: Ontology Knowledge Engineering + Graph Engineering
 
 [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
-defines two complementary proposed tracks: pre-kernel Ontology Design
-Automation creates reviewable ontology drafts before a business scenario is
-wired into agents; kernel Graph Engineering governs the runtime extract,
-materialize, and skill loops that use a promoted ontology. Neither track
-auto-promotes a production ontology. This is a design, not a released
-milestone or an implementation claim.
+records the completed bounded milestone across two complementary tracks:
+
+- **Pre-kernel Ontology Design Automation:** OpenAPI and SQL DDL create
+  claims-scoped type drafts; schema induction remains draft-only; the
+  readiness report is read-only; and promotion applies compatibility gates with
+  explicit `force_breaking` audit evidence.
+- **Kernel Graph Engineering:** constrained extraction and optional
+  Morph-KGC/RML inputs stage canonicalized, provenance-bearing candidates;
+  `KgQualityGate` supervises quality and review; materialization is anchored
+  and auditable; and entity-resolution suggestions require approval before
+  merge.
+- Frozen ontology KE golden fixtures are SHA-gated, the measurement-decay
+  policy is documented, and the read-only health report supplies slow-loop
+  evidence. Tenant Skill and emergent promotion also require golden SHA
+  verification, named rule review, and audit evidence.
+
+Neither track auto-promotes a production ontology or bypasses verified claims.
+The companion Admin ontology design studio is noted as a separate delivery and
+does not change this repository's scope. Continuous online corpus watching and
+automatic end-to-end processing remain outside this completed milestone.
 
 ## Explicit non-goals
 

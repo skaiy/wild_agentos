@@ -1,6 +1,42 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.3.0`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.5.0`。
+
+## [0.5.0] — 2026-09-07
+
+### Ontology Knowledge Engineering + Graph Engineering
+
+- Completed the bounded, claims-scoped ontology Knowledge Engineering pipeline:
+  constrained extraction and optional Morph-KGC/RML materialization write only
+  to staging; canonicalization uses promoted ontology definitions and retains
+  provenance and mapping decisions.
+- Added the `KgQualityGate` supervisory loop with deterministic SPARQL `ASK`
+  anchors, an opt-in pySHACL sidecar, a compliance-first
+  quality-versus-coverage policy, and a claims-scoped review queue. Failed
+  anchors cannot be overridden by a Judge.
+- Added anchored staging-to-production materialization. It requires verified
+  claims, explicit confirmation, and a passed gate or recorded human approval;
+  the server re-reads production before reporting success and retains staging
+  evidence for audit.
+- Added conservative entity-resolution suggestions using a process-isolated
+  GLinker-style sidecar. Suggestions write `owl:sameAs` and provenance only to
+  staging and require approval; they never auto-merge.
+- Froze ontology KE golden evaluations behind a SHA gate and documented the
+  measurement-decay audit policy. Added the read-only, claims-scoped ontology
+  health report for slow-loop goal review.
+- Added golden-SHA, named rule-review, and audit-evidence requirements to
+  tenant Skill and emergent-candidate promotion.
+- Completed the pre-kernel ontology design path: OpenAPI and SQL DDL
+  type-drafts, draft-only schema induction, a read-only readiness report, and
+  compatibility-gated promotion with explicit `force_breaking` audit evidence.
+  The companion Admin ontology design studio is delivered separately and does
+  not expand this repository's scope.
+- Extended the explicit, offline `isolation-migrate` tool to safely migrate
+  historical local vectors, L0 data, and blobs in addition to named graphs;
+  it validates targets and records audit evidence while retaining sources by
+  default.
+- Production deployments now require OIDC/JWKS authentication and refuse to
+  boot with HS256 or incomplete OIDC configuration.
 
 ## [0.3.0] — 2026-09-05
 

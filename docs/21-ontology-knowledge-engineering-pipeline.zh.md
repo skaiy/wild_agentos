@@ -2,20 +2,21 @@
 
 ---
 
-# 21. 本体知识工程流水线（仅设计）
+# 21. 本体知识工程流水线
 
-> 本文是提案设计，不是发布计划，也不代表已实现。
+> v0.5.0 已完成本文记录的、有边界的本体知识工程 / Graph Engineering 里程碑；
+> 它不代表已有持续、全自动的 corpus-to-graph 服务。
 > 参见[知识摄取](16-knowledge-ingest-import-graph.zh.md)、
 > [本体 Action 数据沙箱](15-ontology-action-sandbox.zh.md) 和
 > [Isolation Contract](17-isolation-contract.zh.md)。
 
 ## 状态与回答的问题
 
-**问题：** 已实现能力加上待合并 PR，是否已经构成完整、在线、全自动的本体知识图谱工程工具链？
+**问题：** v0.5.0 已实现能力是否已经构成完整、在线、全自动的本体知识图谱工程工具链？
 
 **回答：否。**
 
-当前代码提供了有价值的摄取、图谱、本体、暂存和人工审批原语；它**尚未**提供一条在线全自动流水线，用于从持续变化的语料中提取本体对齐知识、验证知识、消解实体、提升 schema，并物化为受治理的知识仓库。以下设计说明了在不削弱现有安全与治理边界的前提下，需要具备哪些能力才能作出这一表述。
+当前代码提供了有边界的摄取、图谱、本体、暂存、质量与人工审批原语；它**尚未**提供一条在线全自动流水线，用于从持续变化的语料中提取本体对齐知识、验证知识、消解实体、提升 schema，并物化为受治理的知识仓库。以下设计说明了在不削弱现有安全与治理边界的前提下，需要具备哪些能力才能作出这一表述。
 
 ## 双轨：前置本体设计与内核 Graph Engineering
 
@@ -51,6 +52,8 @@ schema 使用。
 | 提取原语 | Code AST extractor 与 LLM `KnowledgeExtractor` 产生开放词表的 `NodeDef` / `EdgeDef` 候选。 |
 | 本体层 | `ObjectType`、`LinkType`、`ActionType` 建模语义概念与受控写入概念。 |
 | 类型草稿桥接 | CSV 和 JSON Schema 可以生成 type draft；只有获授权人员显式 promote 后才能生效。 |
+| 更广的 type-draft 输入 | OpenAPI 和 SQL DDL 生成 claims-scoped draft；LLM schema induction 只生成可审阅的 draft。 |
+| 就绪度与兼容性 | 只读 readiness report 标示 promoted、draft 和 missing 的需求；promotion 使用 compatibility gate 并提供显式 `force_breaking` audit path。 |
 | 受治理的写入 | Action 支持 HITL staging、SPARQL `ASK` guardrail 和 `ACTION_AUDIT`。 |
 | 可选推理 | 有限 RDFS query-time 扩展可选且默认关闭；不持久化推理三元组。 |
 | 隔离 | `IsolationClaims` 决定 graph、blob、vector 目标；缺失或无效 claims 必须 fail closed。mint 安全目标名称**不等于**迁移历史数据。 |
@@ -171,7 +174,7 @@ node 和 external judgment。workflow 可以排列步骤，却不能天然表达
 证据独立，以及相互冲突的目标如何解决。
 
 现有 WAO 的 staging、HITL 审批、`ASK`-before-Judge 顺序和 `IsolationClaims` 已经包含
-这个模型的一部分。v0.5.0 应将它们提升为明确的 supervisory loop，而不只视为 workflow
+这个模型的一部分。v0.5.0 已将它们提升为明确的 supervisory loop，而不只视为 workflow
 步骤：
 
 | Guardrail | WAO 映射 |
@@ -235,12 +238,13 @@ staging graph 必须由 claims 派生，并可与 production graph 分开寻址�
 Schema 可生成 claims-scoped type draft，且必须由获授权人员显式 promote。除非明确提供，
 当前 draft 不会自行发明 `LinkType`。
 
-#### 计划中 — 更广输入与关系草稿
+#### 已交付 — 更广输入与带兼容性 gate 的草稿
 
-- 将多源 schema → type-draft 扩展至 DDL、OpenAPI、Excel glossary 和 LinkML。
+- OpenAPI 和 SQL DDL 可生成供审阅的 claims-scoped type draft。
 - 基于明确 FK 证据或 co-occurrence 建议 relationship draft，但仅限 draft；任何建议
   都不得自动创建或 promote 生产 `LinkType`。
-- 为 draft↔promoted diff 增加 schema-evolution CI，包括 compatibility 检查。
+- draft promotion 使用 compatibility check。调用方只能携带明确 audit evidence
+  才能使用 `force_breaking`，且它不绕过人工确认。
 
 #### 已交付 — 场景接入前的本体就绪报告
 
@@ -265,9 +269,9 @@ promote 的本体定义及当前调用方未过期的 type draft，并将每一�
 任何实例图。将报告的缺项交给现有的 schema/glossary/DDL/OpenAPI → draft 工作流；
 promotion 仍必须经单独的显式人工确认接口。
 
-#### P3 — LLM schema induction，仅生成 draft
+#### 已交付 — LLM schema induction，仅生成 draft
 
-- 让 LLM 辅助的 schema induction 将新的 object/link 概念提议为独立、可审阅的 draft，
+- LLM 辅助的 schema induction 将新的 object/link 概念提议为独立、可审阅的 draft，
   且仅限于 draft。
 - 永不自动 promote ontology draft，也绝不让 schema induction 静默创建 `ActionType`。
 - 只有显式人工 promote 后，新 type 才可进入之后的 constrained extraction domain。
@@ -335,11 +339,11 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
 
 #### P2b — 冻结提取评测与 measurement-decay 审计
 
-- 冻结 ontology-extraction golden evaluation 和 Text2KGBench fixture，避免 extractor 或
-  optimizer 改写自己的 scorecard。
-- 审计 metric、fixture 和 provenance 是否仍在衡量以 source 为依据的 ontology quality，
-  而不是已经衰减的 proxy。
-- 运行慢速 ontology-health 与 extraction-goal 审查；它可以停止或重定义 extraction，
+- **已实现（#145）：** ontology-extraction golden evaluation 与 fixture 已由 SHA gate
+  冻结，避免 extractor 或 optimizer 改写自己的 scorecard。
+  [golden-freeze policy](22-ontology-ke-golden-freeze-policy.zh.md) 记录所需的
+  measurement-decay 审计。
+- 慢速 ontology-health 与 extraction-goal 审查可以停止或重定义 extraction，
   但绝不自动 promote draft。
 
 #### 已实现的慢速 loop 证据 — ontology health report
@@ -362,6 +366,13 @@ production，不会创建 type draft，也不能 resolve review、materialize in
 schema。若发现需要 schema proposal，必须显式调用已有的
 `/api/v1/ontology/type-drafts/from-*` API 创建 draft，并在人工审阅后使用其独立的
 `confirm: true` promotion endpoint。
+
+#### 已实现的 Skill/Emergent promotion governance
+
+租户 Skill 与 emergent-candidate promotion 会在评测前验证 package 所声明的冻结 golden
+fixture SHA-256 摘要，记录具名的 safety/isolation/side-effect rule review，并将 audit
+evidence 与已审 candidate digest 一并保存。optimizer 不能改写自己的 fixture，也不能自行
+取得 tenant authority。
 
 ## 非目标
 

@@ -91,12 +91,24 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 
 对应工作项：[市场](https://github.com/skaiy/wild_agentos/issues/97)、[OIDC/IdP](https://github.com/skaiy/wild_agentos/issues/98)、[emergent tools](https://github.com/skaiy/wild_agentos/issues/99)、[有限 OWL/rules](https://github.com/skaiy/wild_agentos/issues/100)。
 
-### 提议 — 本体与 Graph Engineering 双轨
+### v0.5.0 — 已完成：本体知识工程 + Graph Engineering
 
-[本体知识工程流水线](21-ontology-knowledge-engineering-pipeline.zh.md)定义两条互补的
-提议轨道：前置本体层设计自动化在业务场景接入 agent 前创建可审阅的 ontology draft；内核
-Graph Engineering 治理 runtime 中使用 promoted ontology 的 extract、materialize 和 skill
-loop。两条轨道均不自动 promote 生产本体。这是设计，不是已发布里程碑，也不代表已实现。
+[本体知识工程流水线](21-ontology-knowledge-engineering-pipeline.zh.md)记录已完成的、
+由两条互补轨道组成的有边界里程碑：
+
+- **前置本体层设计自动化：** OpenAPI 与 SQL DDL 创建 claims-scoped type draft；schema
+  induction 仍只生成 draft；readiness report 为只读；promotion 使用 compatibility gate
+  并记录显式的 `force_breaking` audit evidence。
+- **内核 Graph Engineering：** constrained extraction 与可选 Morph-KGC/RML 输入将已
+  canonicalize、带 provenance 的候选写入 staging；`KgQualityGate` 监督质量与审阅；
+  materialization 带锚点且可审计；entity-resolution suggestion 必须批准后才能 merge。
+- 冻结的 ontology KE golden fixture 由 SHA gate 保护，measurement-decay policy 已记录，
+  只读 health report 提供 slow-loop evidence。租户 Skill 与 emergent promotion 也要求
+  golden SHA 验证、具名 rule review 和 audit evidence。
+
+两条轨道都不会自动 promote 生产本体，也不会绕过已验证 claims。配套 Admin ontology
+design studio 作为独立交付被记录，不改变本仓库范围。持续在线 corpus watching 与
+自动化端到端处理仍不属于这一已完成里程碑。
 
 ## 明确非目标
 
