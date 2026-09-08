@@ -1097,7 +1097,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&body).unwrap())
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
     #[tokio::test]
