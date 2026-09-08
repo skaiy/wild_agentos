@@ -16,9 +16,26 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::isolation::IsolationClaims;
+use crate::{
+    isolation::IsolationClaims,
+    knowledge_graph::{
+        canonicalizer::{canonicalize, CanonicalizationStatus},
+        ontology_store::OntologyStore,
+        quality_gate::{KgQualityGate, QualityGateRequest},
+        rdf_mapper::RdfMapper,
+        store::{ClaimsGraphUpdate, KnowledgeGraphStore, PendingExtractionReview},
+        types::LLMExtractionOutput,
+    },
+};
 
-use super::{iam::UserIdentity, AppState};
+use super::{
+    iam::UserIdentity,
+    ontology::{
+        create_entity_resolution_suggestion_from_staging, persist_quality_gate_report,
+        ConstrainedExtractionRequest, ConstrainedExtractionSource,
+    },
+    AppState,
+};
 
 const MAX_ERROR_METADATA_BYTES: usize = 1024;
 
@@ -86,6 +103,8 @@ pub(crate) struct CorpusJobLinks {
     pub staged_extraction_ids: Vec<String>,
     #[serde(default)]
     pub review_ids: Vec<String>,
+    #[serde(default)]
+    pub entity_resolution_suggestion_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -107,6 +126,20 @@ pub(crate) struct OnlineCorpusJob {
     pub completed_at: Option<String>,
     pub attempt_summary: CorpusJobAttemptSummary,
     pub links: CorpusJobLinks,
+}
+
+/// The runner accepts upstream extraction candidates but performs the trusted
+/// canonicalization and staging itself. It does not select a graph, promote an
+/// ontology type, or expose materialization.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunOnlineCorpusJobRequest {
+    pub text: String,
+    pub extractor: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub candidates: LLMExtractionOutput,
+    pub quality_gate: QualityGateRequest,
 }
 
 pub(crate) fn load_online_corpus_jobs() -> Vec<OnlineCorpusJob> {
@@ -335,6 +368,290 @@ pub(crate) async fn cancel_online_corpus_job_handler(
     }
 }
 
+/// POST /api/v1/online-corpus-jobs/:id/run
+///
+/// Drives exactly one claims-scoped source version through the established KE
+/// primitives. Completion means that staged evidence and approval-held review
+/// work exist; it deliberately never materializes staging into production.
+pub(crate) async fn run_online_corpus_job_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(job_id): Path<String>,
+    Json(request): Json<RunOnlineCorpusJobRequest>,
+) -> impl IntoResponse {
+    let claims = match claims_or_unauthorized(&identity) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    if request.text.trim().is_empty() || request.extractor.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "text and extractor are required"})),
+        )
+            .into_response();
+    }
+    let job = {
+        let jobs = state.online_corpus_jobs.read().await;
+        match jobs
+            .iter()
+            .find(|job| job.id == job_id && job_is_in_scope(job, claims))
+        {
+            Some(job) => job.clone(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "online corpus job not found"})),
+                )
+                    .into_response()
+            }
+        }
+    };
+    if job.state == OnlineCorpusJobState::AwaitingReview
+        && !job.links.review_ids.is_empty()
+        && !job.links.entity_resolution_suggestion_ids.is_empty()
+    {
+        return Json(json!({"job": job, "reused": true, "production_write": false, "materialization_status": "not_materialized"})).into_response();
+    }
+    if job.state.is_terminal() || matches!(job.state, OnlineCorpusJobState::AwaitingReview) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "online corpus job cannot be run from its current state"})),
+        )
+            .into_response();
+    }
+    if job.state == OnlineCorpusJobState::Queued {
+        if let Err(error) = transition_job_for_claims(
+            &state.online_corpus_jobs,
+            claims,
+            &job_id,
+            OnlineCorpusJobState::Running,
+            None,
+        )
+        .await
+        {
+            return job_transition_response(error);
+        }
+    }
+
+    let execution = run_job_ke_primitives(&state, claims, &job, &request).await;
+    match execution {
+        Ok(links) => {
+            if let Err(error) =
+                record_job_links_for_claims(&state.online_corpus_jobs, claims, &job_id, links).await
+            {
+                return job_transition_response(error);
+            }
+            match transition_job_for_claims(
+                &state.online_corpus_jobs,
+                claims,
+                &job_id,
+                OnlineCorpusJobState::AwaitingReview,
+                None,
+            )
+            .await
+            {
+                Ok(job) => Json(json!({
+                    "job": job, "reused": false, "production_write": false,
+                    "materialization_status": "not_materialized",
+                    "status": "awaiting_review",
+                }))
+                .into_response(),
+                Err(error) => job_transition_response(error),
+            }
+        }
+        Err(error) => match transition_job_for_claims(
+            &state.online_corpus_jobs,
+            claims,
+            &job_id,
+            OnlineCorpusJobState::Failed,
+            Some(&error),
+        )
+        .await
+        {
+            Ok(job) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "job": job, "error": error, "production_write": false,
+                    "materialization_status": "not_materialized",
+                })),
+            )
+                .into_response(),
+            Err(transition_error) => job_transition_response(transition_error),
+        },
+    }
+}
+
+async fn run_job_ke_primitives(
+    state: &AppState,
+    claims: &IsolationClaims,
+    job: &OnlineCorpusJob,
+    request: &RunOnlineCorpusJobRequest,
+) -> Result<CorpusJobLinks, String> {
+    let extraction_id = job.id.clone();
+    let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone())?;
+    let ontology_store = OntologyStore::with_shared_store(state.kg_store.clone())?;
+    ontology_store.ensure_seeded("ev-repair")?;
+    let ontology = ontology_store.load_definition("ev-repair")?;
+    let canonical = canonicalize(&request.candidates, &ontology);
+
+    let staging_graph = kg.staging_graph_iri_for_claims(claims, &extraction_id)?;
+    let mapped = RdfMapper::map_extraction(&canonical.extraction, &staging_graph);
+    let decisions = serde_json::to_string(&canonical.decisions)
+        .map_err(|error| format!("serialize canonicalization provenance: {error}"))?;
+    let provenance = format!(
+        "<https://agentos.ontology/extraction/run/{extraction_id}> \
+         <https://agentos.ontology/extraction/blobId> \"{}\" ; \
+         <https://agentos.ontology/extraction/blobVersion> \"{}\" ; \
+         <https://agentos.ontology/extraction/extractor> \"{}\" ; \
+         <https://agentos.ontology/extraction/sourceText> \"{}\" ; \
+         <https://agentos.ontology/extraction/canonicalizationDecisions> \"{}\" .",
+        sparql_literal(&job.source.id),
+        sparql_literal(&job.source.version),
+        sparql_literal(&request.extractor),
+        sparql_literal(&request.text),
+        sparql_literal(&decisions),
+    );
+    let mut triples = RdfMapper::quads_to_sparql_triples(&mapped.quads);
+    if !triples.is_empty() {
+        triples.push('\n');
+    }
+    triples.push_str(&provenance);
+    kg.update_staging_for_claims(
+        claims,
+        &extraction_id,
+        &ClaimsGraphUpdate::insert_data(triples),
+    )?;
+
+    let existing_review = kg
+        .list_extraction_reviews_for_claims(claims)?
+        .into_iter()
+        .find(|review| review.extraction_id == extraction_id);
+    let (review, gate_passed) = match existing_review {
+        Some(review) => {
+            let report = serde_json::from_str::<
+                crate::knowledge_graph::quality_gate::QualityGateReport,
+            >(&review.report_json)
+            .map_err(|error| format!("stored quality gate report is invalid: {error}"))?;
+            (review, report.passed)
+        }
+        None => {
+            let report =
+                KgQualityGate::evaluate(&kg, claims, &extraction_id, &request.quality_gate, None)?;
+            persist_quality_gate_report(&kg, claims, &report)?;
+            let review = PendingExtractionReview {
+                review_id: uuid::Uuid::new_v4().simple().to_string(),
+                extraction_id: extraction_id.clone(),
+                staging_graph,
+                gate_status: report.review_status.clone(),
+                report_json: serde_json::to_string(&report)
+                    .map_err(|error| format!("serialize gate report: {error}"))?,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decision: "pending".into(),
+            };
+            kg.create_extraction_review_for_claims(claims, &review)?;
+            (review, report.passed)
+        }
+    };
+
+    let mut suggestion_ids = Vec::new();
+    for node in &canonical.extraction.nodes {
+        let source_iri = format!("iri://entity/{}", RdfMapper::sanitize_id(&node.id));
+        let existing = kg
+            .list_action_approvals_for_claims(claims)?
+            .into_iter()
+            .find(|approval| {
+                approval.action_id == "entity-resolution"
+                    && approval
+                        .anchor_query
+                        .as_deref()
+                        .is_some_and(|query| query.contains(&source_iri))
+            })
+            .map(|approval| approval.approval_id);
+        let suggestion = match existing {
+            Some(approval_id) => approval_id,
+            None => create_entity_resolution_suggestion_from_staging(
+                &kg,
+                claims,
+                &extraction_id,
+                &source_iri,
+                &node.label,
+            )?
+            .ok_or_else(|| format!("entity resolution uncertain for staged mention {}", node.id))?,
+        };
+        suggestion_ids.push(suggestion);
+    }
+    if suggestion_ids.is_empty() {
+        return Err(
+            "canonicalization produced no eligible entities for required entity resolution".into(),
+        );
+    }
+    if !gate_passed {
+        return Err("quality gate blocked the staged extraction".into());
+    }
+    if canonical
+        .decisions
+        .iter()
+        .any(|d| d.status == CanonicalizationStatus::NeedsReview)
+    {
+        return Err("canonicalization ambiguity requires review".into());
+    }
+    let _ = state.kg_store.flush();
+    Ok(CorpusJobLinks {
+        staged_extraction_ids: vec![extraction_id],
+        review_ids: vec![review.review_id],
+        entity_resolution_suggestion_ids: suggestion_ids,
+    })
+}
+
+fn sparql_literal(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+async fn record_job_links_for_claims(
+    store: &OnlineCorpusJobStore,
+    claims: &IsolationClaims,
+    job_id: &str,
+    links: CorpusJobLinks,
+) -> Result<(), JobTransitionError> {
+    let mut jobs = store.write().await;
+    let Some(index) = jobs
+        .iter()
+        .position(|job| job.id == job_id && job_is_in_scope(job, claims))
+    else {
+        return Err(JobTransitionError::NotFound);
+    };
+    let mut next = jobs.clone();
+    next[index].links = links;
+    next[index].updated_at = chrono::Utc::now().to_rfc3339();
+    save_online_corpus_jobs(&next).map_err(JobTransitionError::Persistence)?;
+    *jobs = next;
+    Ok(())
+}
+
+fn job_transition_response(error: JobTransitionError) -> Response {
+    match error {
+        JobTransitionError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "online corpus job not found"})),
+        )
+            .into_response(),
+        JobTransitionError::IllegalTransition => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "online corpus job cannot transition to requested state"})),
+        )
+            .into_response(),
+        JobTransitionError::Persistence(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("persist online corpus job: {error}")})),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum JobTransitionError {
     NotFound,
@@ -464,6 +781,10 @@ mod tests {
             .route(
                 "/api/v1/online-corpus-jobs/:id/cancel",
                 post(cancel_online_corpus_job_handler),
+            )
+            .route(
+                "/api/v1/online-corpus-jobs/:id/run",
+                post(run_online_corpus_job_handler),
             )
             .with_state(state)
     }
@@ -700,6 +1021,133 @@ mod tests {
             .await,
             Err(JobTransitionError::IllegalTransition)
         );
+        std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn runner_requires_er_suggestions_and_never_materializes_production() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        let sidecar = temp.path().join("er-sidecar.sh");
+        std::fs::write(
+            &sidecar,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"target_iri\":\"iri://entity/existing-alice\",\"score\":1.0,\"evidence\":[\"exact\"]}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("AGENTOS_KG_GLINKER_COMMAND", &sidecar);
+
+        let state = test_state();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "service").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        kg.update_for_claims(
+            &claims,
+            &ClaimsGraphUpdate::insert_data(
+                "<iri://entity/existing-alice> <http://www.w3.org/2000/01/rdf-schema#label> \"Alice\" .",
+            ),
+        )
+        .unwrap();
+        let before = kg
+            .query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
+        let router = router(state.clone());
+        let jwt = token("tenant-a", "project-a");
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/v1/online-corpus-jobs",
+            json!({"source": {"id": "docs", "version": "v1"}, "idempotency_key": "docs-v1"}),
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["job"]["id"].as_str().unwrap();
+        let run_payload = json!({
+            "text": "Alice is a fault code",
+            "extractor": "test-extractor",
+            "candidates": {
+                "nodes": [{"id": "new-alice", "node_type": "FaultCode", "label": "Alice", "properties": {}}],
+                "edges": []
+            },
+            "quality_gate": {
+                "assertions": [{"code": "no_violation", "query": "ASK { FILTER(false) }"}],
+                "policy_version": "test/v1",
+                "arbitration": "compliance"
+            }
+        });
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{id}/run"),
+            run_payload.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before,
+            "an unauthenticated runner call must fail closed without production writes"
+        );
+        let (status, ran) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{id}/run"),
+            run_payload.clone(),
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ran["job"]["state"], "awaiting_review");
+        assert_eq!(
+            ran["job"]["links"]["entity_resolution_suggestion_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "required ER suggestion must be recorded before a job reaches review"
+        );
+        assert_eq!(
+            kg.list_action_approvals_for_claims(&claims).unwrap().len(),
+            1,
+            "ER output must remain approval-held"
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before,
+            "runner success must not write the production graph"
+        );
+        let (status, replay) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{id}/run"),
+            run_payload,
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["reused"], true);
+        assert_eq!(
+            kg.list_action_approvals_for_claims(&claims).unwrap().len(),
+            1,
+            "idempotent replay must not create a second ER suggestion"
+        );
+
+        std::env::remove_var("AGENTOS_KG_GLINKER_COMMAND");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
         std::env::remove_var("AGENTOS_DATA_DIR");
     }
 }

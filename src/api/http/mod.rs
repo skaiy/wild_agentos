@@ -82,20 +82,18 @@ use mcp_skills::{
 use ontology::{
     approve_action_approval_handler, constrained_extraction_handler,
     constrained_extraction_query_handler, constrained_extraction_review_handler,
-    create_entity_resolution_suggestion_handler,
-    create_csv_type_draft_handler, create_json_schema_type_draft_handler,
-    create_openapi_type_draft_handler, create_schema_induction_type_draft_handler,
-    create_sql_ddl_type_draft_handler, delete_action_type_handler, delete_function_def_handler,
-    delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
-    invoke_action_handler, list_action_approvals_handler, list_extraction_reviews_handler,
-    materialize_constrained_extraction_handler, ontology_readiness_report_handler,
-    ontology_health_handler, ontology_types_handler, list_type_drafts_handler,
-    promote_type_draft_handler,
+    create_csv_type_draft_handler, create_entity_resolution_suggestion_handler,
+    create_json_schema_type_draft_handler, create_openapi_type_draft_handler,
+    create_schema_induction_type_draft_handler, create_sql_ddl_type_draft_handler,
+    delete_action_type_handler, delete_function_def_handler, delete_link_type_handler,
+    delete_object_type_handler, domain_guardrails_handler, invoke_action_handler,
+    list_action_approvals_handler, list_extraction_reviews_handler, list_type_drafts_handler,
+    materialize_constrained_extraction_handler, ontology_health_handler,
+    ontology_readiness_report_handler, ontology_types_handler, promote_type_draft_handler,
     quality_gate_handler, reject_action_approval_handler, resolve_extraction_review_handler,
-    update_action_type_handler,
-    update_domain_guardrails_handler, update_function_def_handler, update_link_type_handler,
-    update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
-    upsert_link_type_handler, upsert_object_type_handler,
+    update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
+    update_link_type_handler, update_object_type_handler, upsert_action_type_handler,
+    upsert_function_def_handler, upsert_link_type_handler, upsert_object_type_handler,
 };
 use runtime::{health_handler, metrics_handler, unified_stats_handler};
 use skills::{
@@ -121,7 +119,11 @@ use core_ops::{
     list_blackboard_tasks_handler, read_node_handler, stream_batch_events_handler,
     write_node_handler,
 };
-use corpus_jobs::{cancel_online_corpus_job_handler, create_online_corpus_job_handler, get_online_corpus_job_handler, list_online_corpus_jobs_handler, load_online_corpus_jobs};
+use corpus_jobs::{
+    cancel_online_corpus_job_handler, create_online_corpus_job_handler,
+    get_online_corpus_job_handler, list_online_corpus_jobs_handler, load_online_corpus_jobs,
+    run_online_corpus_job_handler,
+};
 use models::{
     activate_embedding_handler, image_raw_handler, provider_models_handler, test_model_handler,
     upload_image_handler, IMAGE_UPLOAD_MAX_BYTES,
@@ -306,6 +308,10 @@ pub fn build_router(
         .route(
             "/api/v1/online-corpus-jobs/:id/cancel",
             post(cancel_online_corpus_job_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/:id/run",
+            post(run_online_corpus_job_handler),
         )
         .route(
             "/api/v1/artifacts",
