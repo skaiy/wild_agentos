@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::Stream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::api::http::SharedVectorStore;
@@ -63,10 +64,18 @@ pub struct AgentOSService {
     batch_manager: Arc<tokio::sync::Mutex<Option<BatchAgentManager>>>,
     /// Skill graph store for background maintenance (archive + re-index)
     skill_graph: Option<Arc<SkillGraphStore>>,
+    shutdown: CancellationToken,
 }
 
 impl AgentOSService {
     pub fn new(settings: Settings) -> Result<Self, String> {
+        Self::new_with_shutdown(settings, CancellationToken::new())
+    }
+
+    pub fn new_with_shutdown(
+        settings: Settings,
+        shutdown: CancellationToken,
+    ) -> Result<Self, String> {
         let gateway = Arc::new(
             UnifiedGateway::new(&settings.gateway)
                 .map_err(|e| format!("Gateway init failed: {}", e))?,
@@ -143,7 +152,7 @@ impl AgentOSService {
 
         let eb_checkpoint = event_bus.clone();
         let cp_clone = checkpoints.clone();
-        eb_checkpoint.spawn_consumer(
+        eb_checkpoint.spawn_consumer_with_shutdown(
             vec!["CYCLE_STARTED".to_string(), "CYCLE_COMPLETED".to_string()],
             move |event| {
                 let cp = cp_clone.clone();
@@ -161,10 +170,11 @@ impl AgentOSService {
                     }
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_5w2h = event_bus.clone();
-        eb_5w2h.spawn_consumer(
+        eb_5w2h.spawn_consumer_with_shutdown(
             vec![
                 "DEADLINE_APPROACHING".to_string(),
                 "BUDGET_EXCEEDED".to_string(),
@@ -179,12 +189,13 @@ impl AgentOSService {
                     );
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_invalidate = event_bus.clone();
         let l0_inv = l0.clone();
         let bb_inv = blackboard.clone();
-        eb_invalidate.spawn_consumer(
+        eb_invalidate.spawn_consumer_with_shutdown(
             vec![
                 "MEMORY_INVALIDATE".to_string(),
                 "CACHE_INVALIDATE".to_string(),
@@ -201,12 +212,13 @@ impl AgentOSService {
                     let _ = (l0, bb);
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_prefetch = event_bus.clone();
         let bb_prefetch = blackboard.clone();
         let proj_prefetch = projection.clone();
-        eb_prefetch.spawn_consumer(
+        eb_prefetch.spawn_consumer_with_shutdown(
             vec![
                 "MEMORY_PREFETCH".to_string(),
                 "PREFETCH_REQUEST".to_string(),
@@ -223,10 +235,11 @@ impl AgentOSService {
                     let _ = (bb, proj);
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_tasks = event_bus.clone();
-        eb_tasks.spawn_consumer(
+        eb_tasks.spawn_consumer_with_shutdown(
             vec![
                 "TASK_STARTED".to_string(),
                 "TASK_COMPLETED".to_string(),
@@ -253,6 +266,7 @@ impl AgentOSService {
                     }
                 }
             },
+            shutdown.clone(),
         );
 
         // ── BatchAgent manager (sync register, async start) ──
@@ -305,6 +319,7 @@ impl AgentOSService {
             execution_states: Arc::new(RwLock::new(HashMap::new())),
             batch_manager: Arc::new(tokio::sync::Mutex::new(Some(batch_mgr))),
             skill_graph: Some(skill_graph),
+            shutdown,
         };
 
         Ok(s)
@@ -372,6 +387,7 @@ impl AgentOSService {
             task_executor,
             Some(self.batch_manager.clone()),
             self.settings.online_corpus_watchers.clone(),
+            self.shutdown.clone(),
         )
     }
 
@@ -532,13 +548,34 @@ impl AgentOSService {
         }
         drop(guard);
 
+        let batch_manager = self.batch_manager.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            let mut guard = batch_manager.lock().await;
+            if let Some(ref mut manager) = *guard {
+                if let Err(error) = manager.stop(None).await {
+                    tracing::warn!(?error, "BatchAgent system did not stop cleanly");
+                } else {
+                    tracing::info!("BatchAgent system stopped for shutdown");
+                }
+            }
+        });
+
         // ── Background maintenance: archive + re-index every 30 minutes ──
         if let Some(ref sg) = self.skill_graph {
             let sg_clone = sg.clone();
+            let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            tracing::info!("background maintenance stopped");
+                            return;
+                        }
+                        _ = interval.tick() => {}
+                    }
 
                     // Archive cold skills (L2→L0, last_used > 48 hours ago)
                     let cutoff = chrono::Utc::now() - chrono::Duration::hours(48);
@@ -1133,9 +1170,12 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
 
         let tx_clone = tx.clone();
         let states_clone = states.clone();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             loop {
-                match event_rx.recv().await {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = event_rx.recv() => match result {
                     Ok(event) => {
                         if event.task_iri != task_iri_clone {
                             continue;
@@ -1153,6 +1193,7 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    },
                 }
             }
         });
@@ -1163,6 +1204,7 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         let task_iri_for_task = task_iri.clone();
         let _tx_for_task = tx.clone();
         let event_bus_for_task = self.event_bus.clone();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             let mut sa = {
@@ -1181,7 +1223,16 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
 
             emitter.emit_phase_change("idle", "plan", "PA", "Task started");
 
-            match sa.process_task(&prompt, &task_iri_for_task).await {
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!(task_iri = %task_iri_for_task, "gRPC task cancelled during shutdown");
+                    let mut states = states.write().await;
+                    states.remove(&task_iri_for_task);
+                    return;
+                }
+                result = sa.process_task(&prompt, &task_iri_for_task) => result,
+            };
+            match result {
                 Ok(result) => {
                     emitter.emit_completion(&result.status, &result.summary, result.output.clone());
                 }
