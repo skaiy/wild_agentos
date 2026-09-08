@@ -23,7 +23,7 @@ use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
 use crate::memory::l2_blackboard::QueryFilter;
 
-use super::iam::UserIdentity;
+use super::iam::{AuthMethod, UserIdentity};
 use super::AppState;
 
 #[derive(Deserialize)]
@@ -62,8 +62,12 @@ pub struct KgQueryRequest {
 
 pub(crate) async fn write_node_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<NodeWriteRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_core_write(&state, &identity, &req.task_iri).await {
+        return response;
+    }
     match state
         .core
         .write_node(&req.task_iri, &req.json_ld, None, req.created_by.as_deref())
@@ -119,12 +123,23 @@ pub(crate) async fn read_node_handler(
 
 pub(crate) async fn emit_event_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    let task_iri = payload
+    let Some(task_iri) = payload
         .get("task_iri")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .filter(|task_iri| !task_iri.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "task_iri is required"})),
+        )
+            .into_response();
+    };
+    if let Err(response) = authorize_core_write(&state, &identity, task_iri).await {
+        return response;
+    }
     let event_type = payload
         .get("event_type")
         .and_then(|v| v.as_str())
@@ -138,6 +153,69 @@ pub(crate) async fn emit_event_handler(
         .emit_event(task_iri, event_type, source, &payload.to_string())
         .await;
     Json(json!({"event_id": event_id, "status": "emitted"}))
+}
+
+/// Authorize writes to a task-scoped blackboard/event stream.
+///
+/// A platform DA must still be a verified JWT identity. All other callers must
+/// have verified isolation claims matching the task's persisted scope. Missing
+/// or legacy task scope is deliberately denied rather than inferred from a
+/// request body.
+async fn authorize_core_write(
+    state: &AppState,
+    identity: &UserIdentity,
+    task_iri: &str,
+) -> Result<(), axum::response::Response> {
+    if identity.auth_method == AuthMethod::Jwt && identity.has_role("DA") {
+        return Ok(());
+    }
+
+    let Some(claims) = identity.isolation_claims() else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims required for core writes"})),
+        )
+            .into_response());
+    };
+
+    let task = match state.core.read_node(task_iri).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "task not found"})),
+            )
+                .into_response())
+        }
+        Err(error) => {
+            tracing::warn!(%task_iri, "failed to read task scope: {}", error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to verify task scope"})),
+            )
+                .into_response());
+        }
+    };
+    let task_scope: Value = match serde_json::from_str(&task.json_ld) {
+        Ok(scope) => scope,
+        Err(_) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "task has no verified isolation scope"})),
+            )
+                .into_response())
+        }
+    };
+    let in_scope = task_scope.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+        && task_scope.get("project_id").and_then(Value::as_str) == Some(claims.project_id());
+    if !in_scope {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "task is outside the verified isolation scope"})),
+        )
+            .into_response());
+    }
+    Ok(())
 }
 
 pub(crate) async fn stream_batch_events_handler(
@@ -467,5 +545,241 @@ pub(crate) async fn kg_query_handler(
             })),
         ),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    use super::{emit_event_handler, write_node_handler};
+    use crate::{
+        api::http::{iam::JwtClaims, ApiUsageState, AppState, TEST_ENV_LOCK},
+        core::core_types::{CoreConfig, SemanticCore},
+        gateway::unified_gateway::UnifiedGateway,
+        tools::prompt_registry::PromptRegistry,
+    };
+
+    fn test_gateway() -> UnifiedGateway {
+        UnifiedGateway::new(&crate::config::GatewaySettings {
+            base_url: "http://localhost".into(),
+            api_key: String::new(),
+            default_model: "test-model".into(),
+            timeout_seconds: 30,
+            max_retries: 1,
+            retry_base_ms: 500,
+            use_responses_api: false,
+            model_mapping: Default::default(),
+        })
+        .unwrap()
+    }
+
+    fn test_state(tmp: &std::path::Path) -> Arc<AppState> {
+        let core = Arc::new(
+            SemanticCore::new(CoreConfig {
+                max_node_size: 1024,
+                max_projection_size: 2048,
+                l0_storage_path: tmp.join("l0").display().to_string(),
+                event_buffer_size: 10,
+                enable_metrics: false,
+                eviction_config: None,
+            })
+            .unwrap(),
+        );
+        Arc::new(AppState {
+            core,
+            gateway: Arc::new(test_gateway()),
+            kg_store: Arc::new(oxigraph::store::Store::new().unwrap()),
+            config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
+            agents_info: json!({}),
+            mcp_servers: Arc::new(tokio::sync::RwLock::new(vec![])),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![])),
+            prompts: Arc::new(PromptRegistry::new()),
+            kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            blob_store: None,
+            task_executor: None,
+            batch_manager: None,
+            api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
+        })
+    }
+
+    fn jwt(tenant_id: &str, project_id: &str, roles: Vec<&str>) -> String {
+        encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "test-user".into(),
+                tenant_id: tenant_id.into(),
+                project_id: Some(project_id.into()),
+                roles: roles.into_iter().map(str::to_owned).collect(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+        )
+        .unwrap()
+    }
+
+    async fn response_status(router: &Router, request: Request<Body>) -> StatusCode {
+        router.clone().oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn core_write_routes_require_claims_and_reject_cross_scope() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let task_iri = "iri://task/test-scope";
+        state
+            .core
+            .blackboard
+            .write_node(
+                task_iri,
+                &json!({
+                    "@id": task_iri,
+                    "@type": "Task",
+                    "tenant_id": "tenant-a",
+                    "project_id": "project-a",
+                })
+                .to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/nodes", post(write_node_handler))
+            .route("/api/v1/events", post(emit_event_handler))
+            .with_state(state.clone());
+
+        for (uri, body) in [
+            (
+                "/api/v1/nodes",
+                json!({"task_iri": task_iri, "json_ld": "{\"@type\":\"Note\"}"}),
+            ),
+            (
+                "/api/v1/events",
+                json!({"task_iri": task_iri, "event_type": "CUSTOM"}),
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            assert_eq!(
+                response_status(&router, request).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        for (tenant, project) in [("tenant-b", "project-a"), ("tenant-a", "project-b")] {
+            for (uri, body) in [
+                (
+                    "/api/v1/nodes",
+                    json!({"task_iri": task_iri, "json_ld": "{\"@type\":\"Note\"}"}),
+                ),
+                (
+                    "/api/v1/events",
+                    json!({"task_iri": task_iri, "event_type": "CUSTOM"}),
+                ),
+            ] {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", jwt(tenant, project, vec![])),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                assert_eq!(
+                    response_status(&router, request).await,
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+
+        let node_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/nodes")
+            .header(
+                "authorization",
+                format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"task_iri": task_iri, "json_ld": "{\"@type\":\"Note\"}"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            response_status(&router, node_request).await,
+            StatusCode::CREATED
+        );
+
+        let event_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/events")
+            .header(
+                "authorization",
+                format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"task_iri": task_iri, "event_type": "CUSTOM"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            response_status(&router, event_request).await,
+            StatusCode::OK
+        );
+
+        let da_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/events")
+            .header(
+                "authorization",
+                format!("Bearer {}", jwt("tenant-b", "project-a", vec!["DA"])),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"task_iri": task_iri, "event_type": "PLATFORM_AUDIT"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(response_status(&router, da_request).await, StatusCode::OK);
+
+        let missing_task = Request::builder()
+            .method("POST")
+            .uri("/api/v1/events")
+            .header(
+                "authorization",
+                format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"event_type": "CUSTOM"}).to_string()))
+            .unwrap();
+        let response = router.oneshot(missing_task).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "task_iri is required");
     }
 }
