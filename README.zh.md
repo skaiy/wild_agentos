@@ -88,6 +88,13 @@ materialize production data。这些操作仍然需要显式人工治理并保�
 
 ## 版本亮点
 
+版本号表示 capability milestone，而不是按日历连续编号。GitHub 不存在
+`v0.4.0` tag 或独立 release：其中的 production hardening 工作通过已合并的
+[historical-key migration](https://github.com/skaiy/wild_agentos/issues/130) 与
+[production OIDC](https://github.com/skaiy/wild_agentos/issues/131) 交付，配套的
+Admin operations 则独立跟踪。它在后续 changelog entry 中概述，而不应被表示为
+release row。
+
 | 版本 | 日期 | 亮点 |
 |---|---:|---|
 | **v0.6.0** | 2026-09-08 | 已认证、claims-scoped online corpus job metadata 与 manual staging runner；默认开启、仅入队的 configured-version watcher；idempotency、有上限 provenance、observability、retry/backpressure 与 fail-closed production-write CI。 |

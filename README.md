@@ -93,6 +93,13 @@ separately; they are not part of this repository.
 
 ## Release highlights
 
+Release numbers identify capability milestones, not a calendar-sequential
+series. There is no `v0.4.0` GitHub tag or standalone release: its production
+hardening work landed through merged [historical-key migration](https://github.com/skaiy/wild_agentos/issues/130)
+and [production OIDC](https://github.com/skaiy/wild_agentos/issues/131) work,
+with companion Admin operations tracked separately. It is summarized in later
+changelog entries rather than represented as a release row.
+
 | Version | Date | Highlights |
 |---|---:|---|
 | **v0.6.0** | 2026-09-08 | Authenticated, claims-scoped online corpus job metadata and manual staging runner; default-enabled configured-version watchers that enqueue only; idempotency, bounded provenance, observability, retry/backpressure, and fail-closed production-write CI. |
