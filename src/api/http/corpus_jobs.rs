@@ -1097,11 +1097,11 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&body).unwrap())
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
     #[tokio::test]
-    async fn corpus_jobs_fail_closed_and_are_claims_scoped() {
+    async fn isolation_contract_online_corpus_jobs_fail_closed_and_are_claims_scoped() {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1130,9 +1130,19 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let invalid_scope = token("tenant/a", "project-a");
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/v1/online-corpus-jobs",
+            payload.clone(),
+            Some(&invalid_scope),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
             load_online_corpus_jobs().is_empty(),
-            "unverified calls must not persist a job"
+            "missing or invalid claims must not persist a job"
         );
 
         let tenant_a = token("tenant-a", "project-a");
@@ -1147,6 +1157,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let id = created["job"]["id"].as_str().unwrap();
+        for (method, uri) in [
+            ("GET", "/api/v1/online-corpus-jobs".to_string()),
+            ("GET", format!("/api/v1/online-corpus-jobs/{id}")),
+            ("POST", format!("/api/v1/online-corpus-jobs/{id}/cancel")),
+        ] {
+            let (status, _) = request(&router, method, &uri, json!({}), None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require verified claims"
+            );
+        }
+        assert_eq!(
+            load_online_corpus_jobs()[0].state,
+            OnlineCorpusJobState::Queued,
+            "unauthenticated reads and cancellation must not transition a job"
+        );
         let (status, reused) = request(
             &router,
             "POST",
@@ -1403,7 +1430,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_requires_er_suggestions_and_never_materializes_production() {
+    async fn isolation_contract_online_corpus_runner_requires_claims_and_never_materializes_production(
+    ) {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1425,6 +1453,8 @@ mod tests {
 
         let state = test_state();
         let claims = IsolationClaims::from_verified("tenant-a", "project-a", "service").unwrap();
+        let other_claims =
+            IsolationClaims::from_verified("tenant-b", "project-a", "service").unwrap();
         let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
         kg.update_for_claims(
             &claims,
@@ -1437,8 +1467,13 @@ mod tests {
             .query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
             .unwrap()
             .len();
+        let other_before = kg
+            .query_sparql_for_claims(&other_claims, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
         let router = router(state.clone());
         let jwt = token("tenant-a", "project-a");
+        let other_jwt = token("tenant-b", "project-a");
         let (status, created) = request(
             &router,
             "POST",
@@ -1471,12 +1506,51 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{id}/run"),
+            run_payload.clone(),
+            Some("invalid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{id}/run"),
+            run_payload.clone(),
+            Some(&other_jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let mut crafted_payload = run_payload.clone();
+        crafted_payload["production_graph"] = json!("graph://tenant-b/project-a");
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{id}/run"),
+            crafted_payload,
+            Some(&jwt),
+        )
+        .await;
+        assert!(
+            status.is_client_error(),
+            "client graph targets must be rejected rather than accepted"
+        );
         assert_eq!(
             kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
                 .unwrap()
                 .len(),
             before,
-            "an unauthenticated runner call must fail closed without production writes"
+            "failed runner calls must fail closed without production writes"
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&other_claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            other_before,
+            "cross-scope runner calls and crafted payloads must not redirect writes"
         );
         let (status, ran) = request(
             &router,
@@ -1521,11 +1595,18 @@ mod tests {
             before,
             "runner success must not write the production graph"
         );
+        assert_eq!(
+            kg.query_sparql_for_claims(&other_claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            other_before,
+            "runner success must not write another tenant's production graph"
+        );
         let (status, replay) = request(
             &router,
             "POST",
             &format!("/api/v1/online-corpus-jobs/{id}/run"),
-            run_payload,
+            run_payload.clone(),
             Some(&jwt),
         )
         .await;
@@ -1535,6 +1616,56 @@ mod tests {
             kg.list_action_approvals_for_claims(&claims).unwrap().len(),
             1,
             "idempotent replay must not create a second ER suggestion"
+        );
+
+        // A transient runner failure is retried from queued state; it must not
+        // make a production write or turn the retry into a privileged success.
+        let (status, retry_job) = request(
+            &router,
+            "POST",
+            "/api/v1/online-corpus-jobs",
+            json!({"source": {"id": "retry-docs", "version": "v1"}}),
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let retry_id = retry_job["job"]["id"].as_str().unwrap();
+        std::env::remove_var("AGENTOS_KG_GLINKER_COMMAND");
+        let (status, retry) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{retry_id}/run"),
+            run_payload.clone(),
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry["job"]["state"], "queued");
+        assert_eq!(retry["retry_scheduled"], true);
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before,
+            "a failed runner attempt must not write the production graph"
+        );
+        std::env::set_var("AGENTOS_KG_GLINKER_COMMAND", &sidecar);
+        let (status, retried) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{retry_id}/run"),
+            run_payload,
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retried["job"]["state"], "awaiting_review");
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before,
+            "a retried runner must still stage and await approval rather than materialize"
         );
 
         std::env::remove_var("AGENTOS_KG_GLINKER_COMMAND");

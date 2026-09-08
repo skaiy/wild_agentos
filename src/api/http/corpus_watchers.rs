@@ -326,18 +326,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchers_deduplicate_within_scope_but_not_across_scopes() {
+    async fn isolation_contract_watchers_are_claims_scoped_and_never_run_or_materialize_jobs() {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", temp.path());
         let store = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let kg = crate::knowledge_graph::store::KnowledgeGraphStore::new().unwrap();
+        let tenant_a =
+            IsolationClaims::from_verified("tenant-a", "project-a", "watcher-service").unwrap();
+        let tenant_b =
+            IsolationClaims::from_verified("tenant-b", "project-a", "watcher-service").unwrap();
+        kg.update_for_claims(
+            &tenant_a,
+            &crate::knowledge_graph::store::ClaimsGraphUpdate::insert_data(
+                "<urn:tenant-a> <urn:p> <urn:o> .",
+            ),
+        )
+        .unwrap();
+        let before_a = kg
+            .query_sparql_for_claims(&tenant_a, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
+        let before_b = kg
+            .query_sparql_for_claims(&tenant_b, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
+        std::fs::write(
+            watcher_cursors_path(),
+            r#"[{"registration_id":"watch-a","tenant_id":"tenant-b","project_id":"project-a","source_id":"docs","source_version":"v1"}]"#,
+        )
+        .unwrap();
         let settings = OnlineCorpusWatcherSettings {
             registrations: vec![
                 registration_for_scope("watch-a", "docs", "v1", "tenant-a", "project-a"),
                 registration_for_scope("watch-b", "docs", "v1", "tenant-a", "project-a"),
                 registration_for_scope("watch-c", "docs", "v1", "tenant-b", "project-a"),
+                registration_for_scope("invalid", "docs", "v1", "tenant/a", "project-a"),
             ],
             ..Default::default()
         };
@@ -345,10 +371,37 @@ mod tests {
         let report = tick_online_corpus_watchers(&store, &settings).await;
         assert_eq!(report.enqueued, 2);
         assert_eq!(report.reused, 1);
+        assert_eq!(report.invalid, 1, "unsafe watcher scope must fail closed");
         let jobs = store.read().await;
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().any(|job| job.tenant_id == "tenant-a"));
         assert!(jobs.iter().any(|job| job.tenant_id == "tenant-b"));
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.tenant_id == "tenant-a")
+                .count(),
+            1,
+            "a forged cross-tenant cursor must not suppress or redirect a scoped enqueue"
+        );
+        assert!(
+            jobs.iter()
+                .all(|job| job.state == OnlineCorpusJobState::Queued),
+            "watchers may enqueue only; they must never invoke a runner"
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&tenant_a, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before_a,
+            "watcher queueing must not write the production graph"
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&tenant_b, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before_b,
+            "a watcher must not write another tenant's production graph"
+        );
         std::env::remove_var("AGENTOS_DATA_DIR");
     }
 

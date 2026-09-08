@@ -42,6 +42,10 @@ jobs:
       run: cargo build --workspace --verbose
     - name: Run isolation contract golden suite
       run: cargo test --workspace isolation_contract --verbose
+    - name: Run online corpus fail-closed isolation gate
+      run: cargo test --workspace isolation_contract_online_corpus --verbose
+    - name: Run materialization production-write gate
+      run: cargo test --workspace isolation_contract_materialization --verbose
     - name: Run functional golden evaluation suite
       run: ./scripts/test_golden.sh
     # Record-only: shared CI hardware is not a stable performance baseline.
