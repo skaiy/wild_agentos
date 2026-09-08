@@ -170,7 +170,7 @@ pub struct AppState {
     pub api_usage: Arc<ApiUsageState>,
     /// Claims-scoped online corpus orchestration metadata. Jobs never select a
     /// production graph; later runners use this state store plus staged APIs.
-    pub online_corpus_jobs: corpus_jobs::OnlineCorpusJobStore,
+    pub(crate) online_corpus_jobs: corpus_jobs::OnlineCorpusJobStore,
 }
 /// 流式任务执行规格：由 HTTP 流处理器构造并传入执行器。
 #[derive(Clone)]
