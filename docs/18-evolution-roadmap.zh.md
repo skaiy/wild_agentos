@@ -110,20 +110,21 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 design studio 作为独立交付被记录，不改变本仓库范围。持续在线 corpus watching 与
 自动化端到端处理仍不属于这一已完成里程碑。
 
-### v0.6 — 计划：Online Corpus Job + Watcher
+### v0.6.0 — 已完成：Online Corpus Job + Watcher
 
-此计划边界编排既有的、有边界的 KE loop，不新增第二套 KE stack。claims-scoped 的
-online job 将把已配置 corpus change 或 incremental delta 经由既有的 constrained
-extraction、canonicalization、`KgQualityGate`、必选且 approval-held 的
+这一已交付能力编排既有的、有边界的 KE loop，不新增第二套 KE stack。已认证且
+claims-scoped 的 online job 会将已配置 corpus change 或 incremental delta 经由既有的
+constrained extraction、canonicalization、`KgQualityGate`、必选且 approval-held 的
 entity-resolution suggestion 以及 staging 路径处理。默认开启的 watcher 会将这些 job
 入队；部署可在需要时显式关闭其 watcher configuration。
 
-该范围要求已验证的 `IsolationClaims`、idempotency、retry/backpressure、
-source-to-decision provenance 和可观测 job state。它不静默 promote ontology、不自动
-merge entity、不替换 Oxigraph/SPARQL、不加入 Cypher 或 Nebula，也不将独立 product/business
-repository 混入此代码树。materialization 仍保持 approval-held 和 anchored。
+Job 保留有上限的 provenance 和可观测、claims-scoped 的状态，并提供 idempotency 与
+retry/backpressure。fail-closed CI 证明未认证、无效、跨 scope 或失败路径不能写入
+production 数据。它不静默 promote ontology、不自动 merge entity、不替换
+Oxigraph/SPARQL、不加入 Cypher 或 Nebula，也不将独立 product/business repository 混入
+此代码树。materialization 仍保持 approval-held 和 anchored。配套 Admin job list 已独立交付。
 
-v0.6 边界及拟议的未来 Issue 清单见
+已交付的边界与配置见
 [本体知识工程流水线](21-ontology-knowledge-engineering-pipeline.zh.md)。
 
 ## 明确非目标
