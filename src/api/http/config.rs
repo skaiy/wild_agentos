@@ -669,7 +669,7 @@ mod tests {
                     roles: roles.into_iter().map(str::to_string).collect(),
                     exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 },
-                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+                &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
             )
             .unwrap()
         };

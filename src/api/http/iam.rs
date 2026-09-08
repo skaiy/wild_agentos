@@ -167,9 +167,20 @@ fn auth_strict() -> bool {
 }
 
 const DEFAULT_HS256_SECRET: &str = "agentos-dev-secret-change-in-prod";
+#[cfg(test)]
+const TEST_HS256_SECRET: &str = "test-hs256-secret-at-least-32-bytes-long";
 
 fn jwt_secret() -> String {
-    std::env::var("AGENTOS_JWT_SECRET").unwrap_or_else(|_| DEFAULT_HS256_SECRET.to_string())
+    std::env::var("AGENTOS_JWT_SECRET").unwrap_or_else(|_| {
+        #[cfg(test)]
+        {
+            TEST_HS256_SECRET.to_string()
+        }
+        #[cfg(not(test))]
+        {
+            DEFAULT_HS256_SECRET.to_string()
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,7 +546,7 @@ mod tests {
                 roles: vec!["DA".to_string()],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
         let (mut parts, _) = Request::builder()
@@ -578,7 +589,7 @@ mod tests {
                 tenant_id: "acme".to_string(),
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
 
@@ -604,7 +615,7 @@ mod tests {
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
 
@@ -632,7 +643,7 @@ mod tests {
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
 
@@ -666,7 +677,7 @@ mod tests {
                     roles: vec![],
                     exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 },
-                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+                &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
             )
             .unwrap();
 
