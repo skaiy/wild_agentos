@@ -46,18 +46,21 @@ Safe-name minting is not a migration of historical data; see the
 | Interfaces | HTTP/SSE and gRPC; inbound MCP publishing and optional outbound A2A |
 | Governance | Ontology staging, deterministic checks, review/approval records, and audit events |
 
-## v0.6.0: Online corpus jobs and watchers
+## v0.6.0: Online corpus job orchestration
 
-v0.6.0 delivers authenticated, claims-scoped online corpus jobs for configured
-corpus changes and incremental deltas. Enabled-by-default watchers enqueue work
-through the same idempotent path; deployments can explicitly disable watcher
-polling and enqueueing without deleting retained jobs, cursors, reviews, or
-audit records.
+v0.6.0 delivers authenticated, claims-scoped online corpus job metadata and
+orchestration. Enabled-by-default watchers poll configured source-version
+registrations and enqueue one idempotent job for each unseen version.
+Deployments can explicitly disable this polling and enqueueing without deleting
+retained jobs, cursors, reviews, or audit records. Watchers do not fetch a
+source URI, compute content deltas, or run jobs themselves.
 
-The runner follows the bounded KE flow:
+An authenticated caller runs a queued job by supplying its text, extractor,
+extraction candidates, and quality-gate request. The manual runner then follows
+the bounded KE flow:
 
 ```text
-extract → canonicalize → quality gate → approval-held entity-resolution suggestion → staging
+caller-supplied candidates → canonicalize → stage → quality gate → approval-held entity-resolution suggestion → awaiting review
 ```
 
 It retains bounded provenance and scoped observability for source versions and
@@ -79,7 +82,7 @@ human-governed and auditable.
 | **Identity** | OIDC/JWKS verification for production deployments, with fail-closed issuer, audience, and JWKS validation. Local-development HS256 remains a separate development mode. |
 | **Ontology KE / GE** | Claims-scoped type drafts from CSV, JSON Schema, OpenAPI, and SQL DDL; draft-only schema induction; constrained extraction and canonicalization; `KgQualityGate`; review; anchored materialization; frozen golden evaluations; and read-only ontology health evidence. |
 | **HITL and audit** | Approval-held Action staging with merge/discard and TTL handling, SPARQL `ASK` guardrails, high-risk approval hooks, and `ACTION_AUDIT` events. Entity-resolution suggestions are conservative, staged, and never auto-merged. |
-| **Online corpus operations** | Idempotent create/list/get/cancel/run jobs, default-on watchers, retry/backpressure, bounded provenance, and claims-scoped observability. |
+| **Online corpus operations** | JSON-persisted, claims-scoped create/list/get/cancel jobs; a manual staging runner; default-on configured-version polling that enqueues but does not execute jobs; retry/backpressure, bounded provenance, and claims-scoped observability. |
 | **Markets and promotion** | A versioned Logic and Skill package catalog with immutable versions, claims-scoped visibility, and explicit install/upgrade/rollback records. Tenant Skill and emergent promotion use gates, golden SHA verification, rule review, audit evidence, and required human approval. Package installation does not yet register Skills in the process-global registry. |
 | **Interoperability** | An inbound MCP catalog filtered by `IsolationClaims`; explicitly published, gated tenant Skills can be MCP tools. A thin outbound A2A adapter is feature-flagged off by default and is best-effort only. |
 | **Knowledge and retrieval** | Oxigraph RDF/SPARQL named graphs, claims-scoped graph and vector ingestion/retrieval, and an embedded Hyperspace HNSW vector engine. Optional limited RDFS query-time expansion is disabled by default and never persists inferred triples. |
@@ -92,7 +95,7 @@ separately; they are not part of this repository.
 
 | Version | Date | Highlights |
 |---|---:|---|
-| **v0.6.0** | 2026-09-08 | Authenticated, claims-scoped online corpus jobs; default-enabled watchers; idempotency, bounded provenance, observability, retry/backpressure, and fail-closed production-write CI. |
+| **v0.6.0** | 2026-09-08 | Authenticated, claims-scoped online corpus job metadata and manual staging runner; default-enabled configured-version watchers that enqueue only; idempotency, bounded provenance, observability, retry/backpressure, and fail-closed production-write CI. |
 | **v0.5.0** | 2026-09-07 | Bounded ontology Knowledge Engineering and Graph Engineering: staging-only constrained extraction, quality/review, anchored materialization, approval-held ER suggestions, golden SHA gates, health reporting, and compatibility-gated ontology design. |
 | **v0.3.0** | 2026-09-05 | Immutable-version Logic and Skill markets; OIDC/JWKS; gated emergent-tool promotion; optional default-off query-time RDFS expansion. |
 | **v0.2.2** | 2026-09-05 | Claims-scoped artifact store, default-off external sandbox adapter, and reproducible private-deployment benchmarks. |
@@ -127,6 +130,7 @@ Wild AgentOS keeps the semantic and governance boundaries explicit:
 ```bash
 git clone https://github.com/skaiy/wild_agentos.git
 cd wild_agentos
+# Install Protocol Buffers' protoc compiler before building.
 cargo build --workspace
 cargo test --workspace
 ```

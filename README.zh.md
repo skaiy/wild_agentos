@@ -44,17 +44,19 @@ Wild AgentOS 是一个以 Rust 构建的**语义内核 AgentOS**。它以 PDCA
 | 接口 | HTTP/SSE 与 gRPC；inbound MCP publishing 和 optional outbound A2A |
 | 治理 | Ontology staging、deterministic check、review/approval record 与 audit event |
 
-## v0.6.0：Online corpus job 与 watcher
+## v0.6.0：Online corpus job orchestration
 
-v0.6.0 为已配置的 corpus 变更和增量 delta 提供已认证、claims-scoped 的
-online corpus job。默认开启的 watcher 通过同一幂等路径入队；部署可以
-显式关闭 watcher 的 polling 与 enqueueing，而不会删除保留的 job、cursor、
-review 或 audit record。
+v0.6.0 交付已认证、claims-scoped 的 online corpus job metadata 与
+orchestration。默认开启的 watcher 对已配置 source-version registration
+进行 polling，并为每个未出现过的 version 入队一个幂等 job。部署可以显式关闭
+这项 polling 与 enqueueing，而不会删除保留的 job、cursor、review 或 audit
+record。watcher 不会 fetch source URI、计算 content delta，也不会自行运行 job。
 
-runner 遵循有边界的 KE 流程：
+已认证 caller 需要提供 text、extractor、extraction candidate 与 quality-gate
+request 来运行 queued job。随后 manual runner 遵循有边界的 KE 流程：
 
 ```text
-extract → canonicalize → quality gate → 保持待审批的 entity-resolution suggestion → staging
+caller-supplied candidate → canonicalize → stage → quality gate → 保持待审批的 entity-resolution suggestion → awaiting review
 ```
 
 它保留有上限的 provenance 和按 scope 隔离的 observability，覆盖 source
@@ -75,7 +77,7 @@ materialize production data。这些操作仍然需要显式人工治理并保�
 | **身份认证** | 面向生产部署的 OIDC/JWKS 验证，对 issuer、audience 和 JWKS 进行 fail-closed 校验。本地开发 HS256 是独立的 development mode。 |
 | **本体 KE / GE** | 从 CSV、JSON Schema、OpenAPI 和 SQL DDL 生成 claims-scoped type draft；仅生成 draft 的 schema induction；constrained extraction 与 canonicalization；`KgQualityGate`；review；anchored materialization；冻结 golden evaluation；只读 ontology health evidence。 |
 | **HITL 与审计** | 支持 approval-held Action staging、merge/discard 和 TTL；SPARQL `ASK` guardrail、高风险审批 hook 与 `ACTION_AUDIT` event。entity-resolution suggestion 保守、写入 staging，绝不 auto-merge。 |
-| **Online corpus 运行** | 幂等 create/list/get/cancel/run job、默认开启 watcher、retry/backpressure、有上限 provenance 及 claims-scoped observability。 |
+| **Online corpus 运行** | JSON-persisted、claims-scoped create/list/get/cancel job；manual staging runner；默认开启、仅入队不执行 job 的 configured-version polling；retry/backpressure、有上限 provenance 及 claims-scoped observability。 |
 | **Market 与 promote** | 带不可变版本、claims-scoped visibility 以及显式 install/upgrade/rollback record 的 Logic 和 Skill package catalog。tenant Skill 和 emergent promotion 使用 gate、golden SHA verification、rule review、audit evidence 和所需人工审批。package installation 尚不会把 Skill 注册到 process-global registry。 |
 | **互操作性** | 由 `IsolationClaims` 过滤的 inbound MCP catalog；显式发布且通过 gate 的 tenant Skill 可成为 MCP tool。薄型 outbound A2A adapter 默认由 feature flag 关闭，仅以 best-effort 方式运行。 |
 | **知识与检索** | Oxigraph RDF/SPARQL named graph、claims-scoped graph/vector ingest 与 retrieval，以及内嵌 Hyperspace HNSW vector engine。有限 RDFS query-time expansion 默认关闭，绝不持久化 inferred triple。 |
@@ -88,7 +90,7 @@ materialize production data。这些操作仍然需要显式人工治理并保�
 
 | 版本 | 日期 | 亮点 |
 |---|---:|---|
-| **v0.6.0** | 2026-09-08 | 已认证、claims-scoped online corpus job；默认开启 watcher；idempotency、有上限 provenance、observability、retry/backpressure 与 fail-closed production-write CI。 |
+| **v0.6.0** | 2026-09-08 | 已认证、claims-scoped online corpus job metadata 与 manual staging runner；默认开启、仅入队的 configured-version watcher；idempotency、有上限 provenance、observability、retry/backpressure 与 fail-closed production-write CI。 |
 | **v0.5.0** | 2026-09-07 | 有边界的本体 Knowledge Engineering 与 Graph Engineering：仅写 staging 的 constrained extraction、quality/review、anchored materialization、待审批 ER suggestion、golden SHA gate、health reporting 和 compatibility-gated ontology design。 |
 | **v0.3.0** | 2026-09-05 | 具不可变版本的 Logic 与 Skill market；OIDC/JWKS；受 gate 的 emergent-tool promotion；可选、默认关闭的 query-time RDFS expansion。 |
 | **v0.2.2** | 2026-09-05 | claims-scoped artifact store、默认关闭的 external sandbox adapter 和可复现 private-deployment benchmark。 |
@@ -121,6 +123,7 @@ Wild AgentOS 明确区分语义与治理边界：
 ```bash
 git clone https://github.com/skaiy/wild_agentos.git
 cd wild_agentos
+# 构建前安装 Protocol Buffers 的 protoc compiler。
 cargo build --workspace
 cargo test --workspace
 ```
