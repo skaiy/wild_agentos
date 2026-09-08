@@ -365,20 +365,22 @@ pub(crate) async fn transition_job_for_claims(
         return Err(JobTransitionError::IllegalTransition);
     }
     let mut next = jobs.clone();
-    let job = &mut next[index];
     let now = chrono::Utc::now().to_rfc3339();
-    job.state = next_state;
-    job.updated_at = now.clone();
-    if next_state == OnlineCorpusJobState::Running {
-        job.started_at = Some(now);
-        job.attempt_summary.attempts = job.attempt_summary.attempts.saturating_add(1);
+    {
+        let job = &mut next[index];
+        job.state = next_state;
+        job.updated_at = now.clone();
+        if next_state == OnlineCorpusJobState::Running {
+            job.started_at = Some(now.clone());
+            job.attempt_summary.attempts = job.attempt_summary.attempts.saturating_add(1);
+        }
+        if next_state.is_terminal() {
+            job.completed_at = Some(now);
+        }
+        job.attempt_summary.latest_error = latest_error.map(bounded_error_metadata);
     }
-    if next_state.is_terminal() {
-        job.completed_at = Some(now);
-    }
-    job.attempt_summary.latest_error = latest_error.map(bounded_error_metadata);
+    let updated = next[index].clone();
     save_online_corpus_jobs(&next).map_err(JobTransitionError::Persistence)?;
-    let updated = job.clone();
     *jobs = next;
     Ok(updated)
 }
