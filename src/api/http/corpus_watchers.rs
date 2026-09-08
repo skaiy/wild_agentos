@@ -229,6 +229,23 @@ mod tests {
         }
     }
 
+    fn registration_for_scope(
+        id: &str,
+        source_id: &str,
+        version: &str,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> OnlineCorpusWatcherRegistration {
+        OnlineCorpusWatcherRegistration {
+            id: id.into(),
+            source_id: source_id.into(),
+            source_version: version.into(),
+            tenant_id: tenant_id.into(),
+            project_id: project_id.into(),
+            ..registration(version)
+        }
+    }
+
     #[tokio::test]
     async fn watchers_default_on_enqueue_once_and_survive_restart() {
         let _lock = TEST_ENV_LOCK
@@ -304,6 +321,57 @@ mod tests {
             1
         );
         assert_eq!(store.read().await.len(), 2);
+        std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn watchers_deduplicate_within_scope_but_not_across_scopes() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+        let store = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let settings = OnlineCorpusWatcherSettings {
+            registrations: vec![
+                registration_for_scope("watch-a", "docs", "v1", "tenant-a", "project-a"),
+                registration_for_scope("watch-b", "docs", "v1", "tenant-a", "project-a"),
+                registration_for_scope("watch-c", "docs", "v1", "tenant-b", "project-a"),
+            ],
+            ..Default::default()
+        };
+
+        let report = tick_online_corpus_watchers(&store, &settings).await;
+        assert_eq!(report.enqueued, 2);
+        assert_eq!(report.reused, 1);
+        let jobs = store.read().await;
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().any(|job| job.tenant_id == "tenant-a"));
+        assert!(jobs.iter().any(|job| job.tenant_id == "tenant-b"));
+        std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn queue_capacity_defers_new_watcher_jobs_without_advancing_cursor() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+        let store = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let settings = OnlineCorpusWatcherSettings {
+            queue_capacity: 1,
+            registrations: vec![
+                registration_for_scope("watch-a", "docs", "v1", "tenant-a", "project-a"),
+                registration_for_scope("watch-b", "handbook", "v1", "tenant-a", "project-a"),
+            ],
+            ..Default::default()
+        };
+
+        let report = tick_online_corpus_watchers(&store, &settings).await;
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.saturated, 1);
+        assert_eq!(store.read().await.len(), 1);
         std::env::remove_var("AGENTOS_DATA_DIR");
     }
 }
