@@ -25,7 +25,8 @@ OIDC 模式必须配置 `AGENTOS_OIDC_JWKS_URL`、
 `AGENTOS_OIDC_ISSUER` 和 `AGENTOS_OIDC_AUDIENCE`；issuer 与 audience 是必填，
 且只接受非对称 OIDC 算法。JWKS 从配置 endpoint 获取，短时缓存，遇到未知 key ID
 会刷新一次。默认 `hs256` 模式用 `AGENTOS_JWT_SECRET` 验证，保留给本地开发。
-启动时会拒绝不完整的 OIDC 配置；OIDC/JWKS 配置错误、缺少 key、签名无效、
+HS256 启动时必须显式配置非默认值、且至少 32 字节的安全随机 secret。启动时会拒绝
+不完整的 OIDC 配置；OIDC/JWKS 配置错误、缺少 key、签名无效、
 issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS URL；
 仅本地开发与测试 fixture 可以使用 loopback HTTP，生产环境绝不允许。
 
