@@ -257,6 +257,7 @@ fn default_code_lang(content: &str) -> String {
     out
 }
 
+#[allow(clippy::useless_transmute)]
 fn markdown_to_owned_lines(content: &str) -> Vec<Line<'static>> {
     let prepared = default_code_lang(content);
     let text = tui_markdown::from_str(&prepared);
@@ -354,6 +355,7 @@ fn pad_to_width(s: &str, width: usize) -> String {
 /// Split a single Line into multiple Lines at display-width boundaries so that
 /// ratatui's Paragraph wrapping does not need to add extra visual rows (which
 /// would break the 1:1 mapping between line_map entries and screen rows).
+#[allow(clippy::needless_range_loop)]
 fn prewrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
     struct Chunk {
         text: String,
@@ -559,6 +561,7 @@ fn agent_id_to_role(agent_id: &str) -> &str {
 }
 
 /// Return phase only for major-phase events (SA/PA/DA/CA/AA).
+#[allow(clippy::if_same_then_else)]
 fn detect_phase(et: &str) -> Option<String> {
     if et == "TASK_START" || et.contains("CYCLE_STARTED") || et.contains("SA_STARTED") {
         Some("SA".into())
@@ -1659,6 +1662,7 @@ impl App {
     /// Format an event bus event into a clean human-readable message for the
     /// messages panel. Returns `(role, summary_text, optional_full_raw)` or
     /// `None` if the event should be silently consumed.
+    #[allow(clippy::redundant_guards)]
     fn format_ui_message(
         &self,
         event_type: &str,

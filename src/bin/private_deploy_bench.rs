@@ -141,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(deprecated)]
 fn bench_oxigraph(dir: &Path, records: usize) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
     let store = Store::open(dir)?;
     let graph = NamedNode::new("urn:wild-agentos:bench")?;
