@@ -152,7 +152,7 @@ impl AgentOSService {
 
         let eb_checkpoint = event_bus.clone();
         let cp_clone = checkpoints.clone();
-        eb_checkpoint.spawn_consumer(
+        eb_checkpoint.spawn_consumer_with_shutdown(
             vec!["CYCLE_STARTED".to_string(), "CYCLE_COMPLETED".to_string()],
             move |event| {
                 let cp = cp_clone.clone();
@@ -170,10 +170,11 @@ impl AgentOSService {
                     }
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_5w2h = event_bus.clone();
-        eb_5w2h.spawn_consumer(
+        eb_5w2h.spawn_consumer_with_shutdown(
             vec![
                 "DEADLINE_APPROACHING".to_string(),
                 "BUDGET_EXCEEDED".to_string(),
@@ -188,12 +189,13 @@ impl AgentOSService {
                     );
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_invalidate = event_bus.clone();
         let l0_inv = l0.clone();
         let bb_inv = blackboard.clone();
-        eb_invalidate.spawn_consumer(
+        eb_invalidate.spawn_consumer_with_shutdown(
             vec![
                 "MEMORY_INVALIDATE".to_string(),
                 "CACHE_INVALIDATE".to_string(),
@@ -210,12 +212,13 @@ impl AgentOSService {
                     let _ = (l0, bb);
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_prefetch = event_bus.clone();
         let bb_prefetch = blackboard.clone();
         let proj_prefetch = projection.clone();
-        eb_prefetch.spawn_consumer(
+        eb_prefetch.spawn_consumer_with_shutdown(
             vec![
                 "MEMORY_PREFETCH".to_string(),
                 "PREFETCH_REQUEST".to_string(),
@@ -232,10 +235,11 @@ impl AgentOSService {
                     let _ = (bb, proj);
                 }
             },
+            shutdown.clone(),
         );
 
         let eb_tasks = event_bus.clone();
-        eb_tasks.spawn_consumer(
+        eb_tasks.spawn_consumer_with_shutdown(
             vec![
                 "TASK_STARTED".to_string(),
                 "TASK_COMPLETED".to_string(),
@@ -262,6 +266,7 @@ impl AgentOSService {
                     }
                 }
             },
+            shutdown.clone(),
         );
 
         // ── BatchAgent manager (sync register, async start) ──
