@@ -435,7 +435,10 @@ pub(crate) async fn kg_import_handler(
         ),
         Err(e) => {
             tracing::warn!(error = %e, "KG import failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
         }
     }
 }

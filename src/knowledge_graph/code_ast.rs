@@ -209,7 +209,9 @@ impl CodeAstExtractor {
             .map_err(|e| format!("invalid verified graph scope: {e}"))?;
         let result =
             Self::extract_from_source_with_hash(&source, &lang, path, &graph, &current_hash)?;
-        store.write_quads_for_claims(claims, &result.quads)?;
+        store
+            .write_quads_for_claims(claims, &result.quads)
+            .map_err(|error| error.to_string())?;
 
         if is_update {
             Ok(IncrementalResult::Updated {

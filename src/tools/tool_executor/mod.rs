@@ -96,7 +96,7 @@ type ToolFn =
 /// Individual built-ins still supply their detailed failure text internally;
 /// this type prevents those implementation details from becoming the public
 /// error API and lets callers distinguish a missing tool from its failure.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq, serde::Serialize)]
 pub enum ToolExecutionError {
     #[error("tool not found: {name}")]
     NotFound { name: String },
@@ -1193,11 +1193,7 @@ impl ToolExecutor {
         self.micro_tool_contexts.read().keys().cloned().collect()
     }
 
-    pub async fn execute(
-        &self,
-        name: &str,
-        input: Value,
-    ) -> Result<Value, ToolExecutionError> {
+    pub async fn execute(&self, name: &str, input: Value) -> Result<Value, ToolExecutionError> {
         self.execute_with_claims(name, input, None).await
     }
 
@@ -1212,11 +1208,7 @@ impl ToolExecutor {
             .await
     }
 
-    async fn execute_inner(
-        &self,
-        name: &str,
-        input: Value,
-    ) -> Result<Value, ToolExecutionError> {
+    async fn execute_inner(&self, name: &str, input: Value) -> Result<Value, ToolExecutionError> {
         let input_str = input.to_string();
 
         if let Some(ref policy) = self.permission_policy {
@@ -1264,12 +1256,12 @@ impl ToolExecutor {
         debug!(tool = %name, "Executing tool");
 
         // Execute and capture result for post-hooks
-        let result = handler(input).await.map_err(|message| {
-            ToolExecutionError::ExecutionFailed {
+        let result = handler(input)
+            .await
+            .map_err(|message| ToolExecutionError::ExecutionFailed {
                 name: name.to_string(),
                 message,
-            }
-        });
+            });
 
         // Post-tool-use hook
         if let Some(ref runner) = self.hook_runner {
@@ -1285,7 +1277,7 @@ impl ToolExecutor {
                     }
                 }
                 Err(e) => {
-                    let _ = runner.run_post_tool_use_failure(name, &input_str, e);
+                    let _ = runner.run_post_tool_use_failure(name, &input_str, &e.to_string());
                 }
             }
         }

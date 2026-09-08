@@ -15,7 +15,7 @@ use super::types::RdfQuad;
 ///
 /// Store internals retain detailed operation context in `message`, while API
 /// edges can map invalid caller input separately from unavailable storage.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Serialize)]
 pub enum KnowledgeGraphError {
     #[error("knowledge graph initialization failed: {message}")]
     Initialization { message: String },
@@ -281,6 +281,7 @@ impl KnowledgeGraphStore {
             },
         ];
         self.write_quads_for_claims(claims, &quads)
+            .map_err(|error| error.to_string())
     }
 
     /// Deletes one server-generated KB catalog entry from the claims graph.
@@ -492,8 +493,12 @@ impl KnowledgeGraphStore {
     }
 
     fn graph_triple_count_for_claims(&self, claims: &IsolationClaims) -> Result<usize, String> {
-        let rows =
-            self.query_sparql_for_claims(claims, "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }")?;
+        let rows = self
+            .query_sparql_for_claims(
+                claims,
+                "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }",
+            )
+            .map_err(|error| error.to_string())?;
         Self::parse_count_result(rows, "production")
     }
 
@@ -1243,6 +1248,7 @@ impl KnowledgeGraphStore {
                 type_filter, escaped
             ),
         )
+        .map_err(|error| error.to_string())
     }
 
     pub fn get_neighbors(
@@ -1337,7 +1343,10 @@ impl KnowledgeGraphStore {
             for node_id in &current_level {
                 let node = format!("<{}>", node_id);
                 let out_sparql = format!("SELECT ?p ?o WHERE {{ {} ?p ?o . }}", node);
-                for row in self.query_sparql_for_claims(claims, &out_sparql)? {
+                for row in self
+                    .query_sparql_for_claims(claims, &out_sparql)
+                    .map_err(|error| error.to_string())?
+                {
                     if let (Some(pred), Some(obj)) = (
                         row.get("?p").and_then(|v| v.as_str()),
                         row.get("?o").and_then(|v| v.as_str()),
@@ -1354,7 +1363,10 @@ impl KnowledgeGraphStore {
                 }
 
                 let in_sparql = format!("SELECT ?s ?p WHERE {{ ?s ?p {} . }}", node);
-                for row in self.query_sparql_for_claims(claims, &in_sparql)? {
+                for row in self
+                    .query_sparql_for_claims(claims, &in_sparql)
+                    .map_err(|error| error.to_string())?
+                {
                     if let (Some(subj), Some(pred)) = (
                         row.get("?s").and_then(|v| v.as_str()),
                         row.get("?p").and_then(|v| v.as_str()),

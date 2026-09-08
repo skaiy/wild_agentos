@@ -719,7 +719,8 @@ async fn run_job_ke_primitives(
     request: &RunOnlineCorpusJobRequest,
 ) -> Result<CorpusJobLinks, String> {
     let extraction_id = job.id.clone();
-    let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone())?;
+    let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone())
+        .map_err(|error| error.to_string())?;
     let ontology_store = OntologyStore::with_shared_store(state.kg_store.clone())?;
     ontology_store.ensure_seeded("ev-repair")?;
     let ontology = ontology_store.load_definition("ev-repair")?;
