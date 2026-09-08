@@ -3,7 +3,7 @@
 
 <img src="assets/logo_transparent.png" width="120" alt="Wild AgentOS Logo" />
 
-**A Rust semantic-kernel AgentOS for governed multi-agent systems**
+**A governed operating system for teams that run multiple AI agents**
 
 [![Star on GitHub](https://img.shields.io/github/stars/skaiy/wild_agentos?style=flat)](https://github.com/skaiy/wild_agentos)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
@@ -24,111 +24,95 @@
 
 ## What is Wild AgentOS?
 
-Wild AgentOS is a **semantic-kernel AgentOS** built in Rust. It orchestrates
-multi-agent work through PDCA loops and combines an Oxigraph RDF/SPARQL
-semantic graph, Hyperspace vector storage, and governed ontology knowledge
-engineering.
+Wild AgentOS is a **governed operating system for multi-agent work**, built in
+Rust (a systems programming language). It helps teams coordinate AI agents through PDCA (Plan, Do, Check, Act),
+share knowledge, and keep an auditable record of work and decisions.
 
-Its security boundary is verified JWT **`IsolationClaims`**: claims mint graph
-and vector targets for a tenant and project, plus tenant-scoped blob prefixes
-and L0 paths. Claims-scoped storage paths fail closed when claims are absent or
-invalid.
-Safe-name minting is not a migration of historical data; see the
-[Isolation Contract](docs/17-isolation-contract.md).
+It is designed around tenant and project boundaries. A verified JWT (an
+identity token) carries tenant/project isolation claims (`IsolationClaims`).
+The system uses those claims to select the caller's graph, vector, file, and
+work-record storage. Missing or invalid identity means access is refused; a
+caller cannot select another tenant's storage. This applies to the
+claims-scoped interfaces, not every legacy HTTP endpoint. The naming scheme
+does not migrate historical data—see the [Isolation Contract](docs/17-isolation-contract.md).
 
-## Core stack
+## What you get
 
-| Component | Implementation |
-|---|---|
-| Agent coordination | Rust PDCA orchestration, EventBus, and task/runtime services |
-| Semantic graph | Oxigraph RDF store with SPARQL 1.1 and claims-derived named graphs |
-| Vector retrieval | Embedded `hyperspace-engine` HNSW store with configurable embedding services |
-| Isolation and identity | `IsolationClaims`, JWT verification, and production OIDC/JWKS validation |
-| Interfaces | HTTP/SSE and gRPC; inbound MCP publishing and optional outbound A2A |
-| Governance | Ontology staging, deterministic checks, review/approval records, and audit events |
+- **Coordinated work:** Rust-based PDCA workflows, task services, and an event
+  audit trail for multi-agent Plan/Do/Check/Act work.
+- **Shared knowledge and retrieval:** an Oxigraph knowledge graph (a structured
+  store) queried with SPARQL, plus embedded vector retrieval for finding
+  relevant information.
+- **Controlled knowledge changes:** drafts from CSV, JSON Schema, OpenAPI, and
+  SQL DDL can be checked, placed in a staging area, reviewed, and—when
+  approved—written to production data. Drafts never become official
+  definitions automatically.
+- **Human oversight and evidence:** high-risk or approval-held Actions require
+  a decision; low-risk Actions can commit only when their policy permits it.
+  The system records checks, reviews, audit events, and read-back evidence.
+  Entity-resolution suggestions (whether two records are the same entity) are
+  staged and never merged automatically.
+- **Identity and integrations:** production uses OIDC/JWKS identity validation;
+  local development has a separate development signing mode. gRPC is available
+  for service-to-service communication, and MCP (Model Context Protocol) can
+  expose explicitly published, tenant-scoped Skills. The outbound A2A adapter
+  is optional, off by default, and best-effort only.
+- **Governed packages:** Logic and Skill packages have immutable versions,
+  tenant-scoped visibility, and recorded install, upgrade, and rollback steps.
+  Promotion requires defined gates, review evidence, and human approval.
 
-## v0.6.0: Online corpus job orchestration
+The companion Admin control-plane and online-job-list user interfaces are
+separate products and are not in this repository.
 
-v0.6.0 delivers authenticated, claims-scoped online corpus job metadata and
-orchestration. Enabled-by-default watchers poll configured source-version
-registrations and enqueue one idempotent job for each unseen version.
-Deployments can explicitly disable this polling and enqueueing without deleting
-retained jobs, cursors, reviews, or audit records. Watchers do not fetch a
-source URI, compute content deltas, or run jobs themselves.
+## v0.6: Online corpus jobs, with people in control
 
-An authenticated caller runs a queued job by supplying its text, extractor,
-extraction candidates, and quality-gate request. The manual runner then follows
-the bounded KE flow:
+v0.6.0 adds authenticated online-corpus jobs within the same tenant/project
+boundary. Watchers are enabled by default but only watch configured source
+versions and place one job in the queue for each new version. A deployment can
+turn that polling and queueing off without deleting retained jobs, cursors,
+reviews, or audit records. Watchers do not fetch source URLs, calculate content
+changes, or run jobs.
 
-```text
-caller-supplied candidates → canonicalize → stage → quality gate → approval-held entity-resolution suggestion → awaiting review
-```
+An authenticated person or service manually runs a queued job with supplied
+text, extraction method, candidates, and a quality-check request. The job standardizes
+the candidates, keeps their evidence in a staging area, runs checks, creates an
+approval-held entity-resolution suggestion, and then awaits review.
 
-It retains bounded provenance and scoped observability for source versions and
-content digests, canonicalization, quality/review, ER suggestions, saturation,
-retries, and job state. Transient sidecar failures retry at most three times;
-validation, authentication, and policy failures are terminal. Fail-closed CI
-also covers the online job, runner, watcher, and production-write paths.
+The system keeps limited source-tracing and operational records, including
+source versions, content digests, checks, review status, retries, capacity
+pressure, and job state. Temporary sidecar failures retry at most three times;
+identity, validation, and policy failures stop the job. CI verifies that failed,
+invalid, cross-boundary, or unauthenticated paths cannot write production data.
 
-Jobs stage evidence. They do not automatically merge entities, promote an
-ontology, or materialize production data. Those operations remain explicitly
-human-governed and auditable.
-
-## Shipped capabilities
-
-| Area | What is available |
-|---|---|
-| **PDCA orchestration** | Rust coordination and lifecycle primitives for multi-agent Plan/Do/Check/Act workflows, with EventBus audit signals and persisted L0 envelopes. |
-| **Claims isolation** | Verified JWT `IsolationClaims` mint tenant/project graph and vector targets plus tenant blob prefixes and L0 paths; scoped HTTP and runtime graph/vector paths fail closed. |
-| **Identity** | OIDC/JWKS verification for production deployments, with fail-closed issuer, audience, and JWKS validation. Local-development HS256 remains a separate development mode. |
-| **Ontology KE / GE** | Claims-scoped type drafts from CSV, JSON Schema, OpenAPI, and SQL DDL; draft-only schema induction; constrained extraction and canonicalization; `KgQualityGate`; review; anchored materialization; frozen golden evaluations; and read-only ontology health evidence. |
-| **HITL and audit** | Configurable Action staging: low-risk actions may auto-commit after guardrails, while approval-held or high-risk actions use merge/discard and TTL handling. SPARQL `ASK` guardrails, high-risk approval hooks, and `ACTION_AUDIT` events provide audit evidence. Entity-resolution suggestions are conservative, staged, and never auto-merged. |
-| **Online corpus operations** | JSON-persisted, claims-scoped create/list/get/cancel jobs; a manual staging runner; default-enabled configured-version polling that enqueues but does not execute jobs. The shipped configuration has no watcher registrations until a deployment adds trusted ones. Retry/backpressure, bounded provenance, and claims-scoped observability are included. |
-| **Markets and promotion** | A versioned Logic and Skill package catalog with immutable versions, claims-scoped visibility, and explicit install/upgrade/rollback records. Tenant Skill and emergent promotion use gates, golden SHA verification, rule review, audit evidence, and required human approval. Package installation does not yet register Skills in the process-global registry. |
-| **Interoperability** | An inbound MCP catalog filtered by `IsolationClaims`; explicitly published, gated tenant Skills can be MCP tools. A thin outbound A2A adapter is feature-flagged off by default and is best-effort only. |
-| **Knowledge and retrieval** | Oxigraph RDF/SPARQL named graphs, claims-scoped graph and vector ingestion/retrieval, and an embedded Hyperspace HNSW vector engine. Optional limited RDFS query-time expansion is disabled by default and never persists inferred triples. |
-| **Artifacts and sandboxing** | Claims-scoped coding-artifact metadata and server-minted blob prefixes; a contract-only external `SandboxProvider` HTTP adapter behind a default-off feature flag, not yet wired into the agent/tool runtime. |
-
-The companion Admin control-plane and online-job-list surfaces are delivered
-separately; they are not part of this repository.
+Crucially, these jobs do **not** automatically merge entities, make an ontology
+official, or write staged results to production. Those are explicit,
+human-governed, auditable decisions.
 
 ## Release highlights
 
-| Version | Date | Highlights |
+| Version | Date | Business summary |
 |---|---:|---|
-| **v0.6.0** | 2026-09-08 | Authenticated, claims-scoped online corpus job metadata and manual staging runner; default-enabled configured-version watchers that enqueue only; idempotency, bounded provenance, observability, retry/backpressure, and fail-closed production-write CI. |
-| **v0.5.0** | 2026-09-07 | Bounded ontology Knowledge Engineering and Graph Engineering: staging-only constrained extraction, quality/review, anchored materialization, approval-held ER suggestions, golden SHA gates, health reporting, and compatibility-gated ontology design. |
-| **v0.3.0** | 2026-09-05 | Immutable-version Logic and Skill markets; OIDC/JWKS; gated emergent-tool promotion; optional default-off query-time RDFS expansion. |
-| **v0.2.2** | 2026-09-05 | Claims-scoped artifact store, default-off external sandbox adapter, and reproducible private-deployment benchmarks. |
-| **v0.2.1** | 2026-09-05 | Claims-scoped ontology type drafts, filtered inbound MCP catalog, gated Skill-as-MCP publishing, and default-off outbound A2A. |
-| **v0.2.0** | 2026-09-05 | Skill package verification, golden checks, gated tenant publishing, and Rust CI golden evaluations. |
-| **v0.1.8** | 2026-09-04 | Ontology Action HITL staging, guardrails, SPARQL assertions, and event audit. |
-| **v0.1.6–v0.1.7** | 2026-09-04 | `IsolationClaims`, fail-closed scoped paths, isolation diagnosis/matrix/CI, and explicit historical-key migration tooling. |
-| **v0.1.5** | 2026-08-18 | Causal reasoning, a unified graph backend, graph features, snapshot timeline, and Skill Center CRUD with system Skill guards. |
+| **v0.6.0** | 2026-09-08 | Authenticated online-corpus job records, manual staging runner, queue-only watchers, bounded source tracing and operational records, retry/capacity controls, and CI-proven production-write isolation. |
+| **v0.5.0** | 2026-09-07 | Governed knowledge-engineering flow: staged extraction, quality and review, approval-held identity suggestions, evidence, health reporting, and compatibility-gated ontology design. |
+| **v0.3.0** | 2026-09-05 | Versioned Logic and Skill packages, production identity validation, human-gated emerging tools, and optional read-time knowledge expansion. |
+| **v0.2.0–v0.2.2** | 2026-09-05 | Package verification and publishing controls, scoped knowledge drafts and integrations, artifact storage, an optional external sandbox adapter, and reproducible deployment benchmarks. |
+| **v0.1.5–v0.1.8** | 2026-08-18–2026-09-04 | Causal analysis, graph and memory foundations, Action review and audit controls, and tenant/project isolation with diagnosis and migration tooling. |
 
 See the full [changelog](CHANGELOG.md).
 
-## Architecture and governance
+## How governance works
 
-Wild AgentOS keeps the semantic and governance boundaries explicit:
-
-- **Semantic foundation:** Oxigraph RDF/SPARQL and named graphs remain the
-  knowledge-graph store and query layer.
-- **Governed ontology writes:** extracted candidates are canonicalized against
-  promoted ontology definitions, verified, staged, and reviewed. Schema drafts
-  never auto-promote.
-- **Human authority:** entity merges are approval-held; ontology promotion and
-  KE materialization require explicit confirmation and governed gates. Action
-  staging can instead auto-commit only for policies that do not require
-  approval.
-- **Independent evidence:** deterministic SPARQL/SHACL checks, frozen golden
-  fixtures, audit records, and post-materialization re-reads prevent an LLM or
-  worker completion report from being treated as success evidence. pySHACL is
-  optional in the KE quality gate; Action guardrails use SPARQL checks.
-- **Isolation by construction:** callers cannot choose scoped storage targets;
-  verified claims select server-minted targets, and cross-scope or failed paths
-  cannot write production through the claims-scoped interfaces. This does not
-  make every legacy HTTP endpoint claims-scoped.
+- **Knowledge stays explainable:** Oxigraph stores the knowledge graph; SPARQL
+  is the query language used to inspect it. Separate knowledge-graph areas keep
+  tenant/project data distinct.
+- **Changes require the right decision:** candidates are standardized against
+  approved definitions, checked, staged, and reviewed. Production promotion and
+  writing production data require explicit governed steps.
+- **Evidence is independent:** deterministic checks, frozen reference cases,
+  audit records, and production read-backs mean a model or worker saying
+  “complete” is not treated as proof.
+- **Access is contained:** verified tenant/project claims choose the storage
+  boundary, so claims-scoped interfaces do not write across boundaries.
 
 ## Build from source
 
