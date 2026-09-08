@@ -6,6 +6,9 @@
 
 use std::ffi::OsString;
 
+#[cfg(test)]
+use std::ffi::OsStr;
+
 const SENSITIVE_EXACT_KEYS: &[&str] = &[
     "AGENTOS_JWT_SECRET",
     "AWS_ACCESS_KEY_ID",
