@@ -548,6 +548,20 @@ impl AgentOSService {
         }
         drop(guard);
 
+        let batch_manager = self.batch_manager.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            let mut guard = batch_manager.lock().await;
+            if let Some(ref mut manager) = *guard {
+                if let Err(error) = manager.stop(None).await {
+                    tracing::warn!(?error, "BatchAgent system did not stop cleanly");
+                } else {
+                    tracing::info!("BatchAgent system stopped for shutdown");
+                }
+            }
+        });
+
         // ── Background maintenance: archive + re-index every 30 minutes ──
         if let Some(ref sg) = self.skill_graph {
             let sg_clone = sg.clone();
