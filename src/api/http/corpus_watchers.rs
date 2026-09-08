@@ -353,6 +353,11 @@ mod tests {
             .query_sparql_for_claims(&tenant_b, "SELECT ?s WHERE { ?s ?p ?o }")
             .unwrap()
             .len();
+        std::fs::write(
+            watcher_cursors_path(),
+            r#"[{"registration_id":"watch-a","tenant_id":"tenant-b","project_id":"project-a","source_id":"docs","source_version":"v1"}]"#,
+        )
+        .unwrap();
         let settings = OnlineCorpusWatcherSettings {
             registrations: vec![
                 registration_for_scope("watch-a", "docs", "v1", "tenant-a", "project-a"),
@@ -371,6 +376,13 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().any(|job| job.tenant_id == "tenant-a"));
         assert!(jobs.iter().any(|job| job.tenant_id == "tenant-b"));
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.tenant_id == "tenant-a")
+                .count(),
+            1,
+            "a forged cross-tenant cursor must not suppress or redirect a scoped enqueue"
+        );
         assert!(
             jobs.iter()
                 .all(|job| job.state == OnlineCorpusJobState::Queued),

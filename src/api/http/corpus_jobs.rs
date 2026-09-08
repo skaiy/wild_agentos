@@ -1618,6 +1618,56 @@ mod tests {
             "idempotent replay must not create a second ER suggestion"
         );
 
+        // A transient runner failure is retried from queued state; it must not
+        // make a production write or turn the retry into a privileged success.
+        let (status, retry_job) = request(
+            &router,
+            "POST",
+            "/api/v1/online-corpus-jobs",
+            json!({"source": {"id": "retry-docs", "version": "v1"}}),
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let retry_id = retry_job["job"]["id"].as_str().unwrap();
+        std::env::remove_var("AGENTOS_KG_GLINKER_COMMAND");
+        let (status, retry) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{retry_id}/run"),
+            run_payload.clone(),
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry["job"]["state"], "queued");
+        assert_eq!(retry["retry_scheduled"], true);
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before,
+            "a failed runner attempt must not write the production graph"
+        );
+        std::env::set_var("AGENTOS_KG_GLINKER_COMMAND", &sidecar);
+        let (status, retried) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{retry_id}/run"),
+            run_payload,
+            Some(&jwt),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(retried["job"]["state"], "awaiting_review");
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before,
+            "a retried runner must still stage and await approval rather than materialize"
+        );
+
         std::env::remove_var("AGENTOS_KG_GLINKER_COMMAND");
         std::env::remove_var("AGENTOS_AUTH_STRICT");
         std::env::remove_var("AGENTOS_DATA_DIR");

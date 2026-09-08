@@ -4154,6 +4154,24 @@ mod ontology_crud_tests {
                 "ER and review boundaries must reject missing claims before reading or writing"
             );
         }
+        for request in [
+            post(
+                "/api/v1/ontology/entity-resolution/suggestions".into(),
+                Some(&test_jwt("tenant/a")),
+                json!({"source_iri": "urn:source", "mention": "Source"}),
+            ),
+            post(
+                "/api/v1/ontology/extraction-reviews/review-1/approve".into(),
+                Some(&test_jwt("tenant/a")),
+                json!({}),
+            ),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "ER and review boundaries must reject invalid claims"
+            );
+        }
         let no_confirm = app
             .clone()
             .oneshot(post(
@@ -4221,6 +4239,46 @@ mod ontology_crud_tests {
             other_production_before,
             "a client path extraction id cannot materialize into another tenant graph"
         );
+        kg.update_for_claims(
+            &claims,
+            &ClaimsGraphUpdate::insert_data(
+                "<urn:cross-source> <http://www.w3.org/2000/01/rdf-schema#label> \"Source\" .",
+            ),
+        )
+        .unwrap();
+        let cross_scope_er = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/entity-resolution/suggestions".into(),
+                Some(&other_token),
+                json!({"source_iri": "urn:cross-source", "mention": "Source"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_scope_er.status(), StatusCode::NOT_FOUND);
+        kg.create_extraction_review_for_claims(
+            &claims,
+            &PendingExtractionReview {
+                review_id: "review-1".into(),
+                extraction_id: "blocked".into(),
+                staging_graph: kg.staging_graph_iri_for_claims(&claims, "blocked").unwrap(),
+                gate_status: "blocked".into(),
+                report_json: "{}".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decision: "pending".into(),
+            },
+        )
+        .unwrap();
+        let cross_scope_review = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/extraction-reviews/review-1/approve".into(),
+                Some(&other_token),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_scope_review.status(), StatusCode::BAD_REQUEST);
 
         kg.update_staging_for_claims(
             &claims,
@@ -4279,6 +4337,44 @@ mod ontology_crud_tests {
                 .is_empty(),
             "HTTP success requires production evidence from the SPARQL anchor"
         );
+        kg.update_staging_for_claims(
+            &claims,
+            "human-override",
+            &ClaimsGraphUpdate::insert_data("<urn:human-override> <urn:p> <urn:o> ."),
+        )
+        .unwrap();
+        kg.create_extraction_review_for_claims(
+            &claims,
+            &PendingExtractionReview {
+                review_id: "human-override-review".into(),
+                extraction_id: "human-override".into(),
+                staging_graph: kg
+                    .staging_graph_iri_for_claims(&claims, "human-override")
+                    .unwrap(),
+                gate_status: "failed".into(),
+                report_json: "{}".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decision: "approved".into(),
+            },
+        )
+        .unwrap();
+        let override_materialized = app
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/human-override/materialize".into(),
+                Some(&token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(override_materialized.status(), StatusCode::OK);
+        let override_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(override_materialized.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(override_body["authority"], "recorded_human_override");
+        assert_eq!(override_body["anchor"]["passed"], true);
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
