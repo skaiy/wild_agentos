@@ -148,7 +148,12 @@ pub(crate) async fn stream_batch_events_handler(
 
     let stream = async_stream::stream! {
         loop {
-            match rx.recv().await {
+            tokio::select! {
+                _ = state.shutdown.cancelled() => {
+                    tracing::info!("batch SSE stream closed during shutdown");
+                    break;
+                }
+                result = rx.recv() => match result {
                 Ok(event) => {
                     if !event.event_type.starts_with("BATCH_") {
                         continue;
@@ -171,6 +176,7 @@ pub(crate) async fn stream_batch_events_handler(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                },
             }
         }
     };
