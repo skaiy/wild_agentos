@@ -318,7 +318,13 @@ fn append_audit_event(
 }
 
 fn classify_job_error(error: &str) -> CorpusJobErrorClassification {
-    if error.contains("quality gate blocked")
+    if error.starts_with("entity resolution requires AGENTOS_KG_GLINKER_COMMAND")
+        || error.starts_with("start entity-resolution sidecar")
+        || error.starts_with("wait for entity-resolution sidecar")
+        || error.starts_with("entity-resolution sidecar failed")
+    {
+        CorpusJobErrorClassification::Transient
+    } else if error.contains("quality gate blocked")
         || error.contains("canonicalization ambiguity")
         || error.contains("entity resolution uncertain")
     {
@@ -327,11 +333,6 @@ fn classify_job_error(error: &str) -> CorpusJobErrorClassification {
         CorpusJobErrorClassification::Validation
     } else if error.contains("unauthorized") || error.contains("verified JWT") {
         CorpusJobErrorClassification::Authorization
-    } else if error.starts_with("start entity-resolution sidecar")
-        || error.starts_with("wait for entity-resolution sidecar")
-        || error.starts_with("entity-resolution sidecar failed")
-    {
-        CorpusJobErrorClassification::Transient
     } else {
         CorpusJobErrorClassification::Internal
     }
@@ -1405,6 +1406,12 @@ mod tests {
         assert_eq!(
             classify_job_error("quality gate blocked the staged extraction"),
             CorpusJobErrorClassification::Policy
+        );
+        assert_eq!(
+            classify_job_error(
+                "entity resolution requires AGENTOS_KG_GLINKER_COMMAND configured as one executable path"
+            ),
+            CorpusJobErrorClassification::Transient
         );
         std::env::remove_var("AGENTOS_DATA_DIR");
     }
