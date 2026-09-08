@@ -522,31 +522,62 @@ async fn run_job_ke_primitives(
         &ClaimsGraphUpdate::insert_data(triples),
     )?;
 
-    let report = KgQualityGate::evaluate(&kg, claims, &extraction_id, &request.quality_gate, None)?;
-    persist_quality_gate_report(&kg, claims, &report)?;
-    let review = PendingExtractionReview {
-        review_id: uuid::Uuid::new_v4().simple().to_string(),
-        extraction_id: extraction_id.clone(),
-        staging_graph,
-        gate_status: report.review_status.clone(),
-        report_json: serde_json::to_string(&report)
-            .map_err(|error| format!("serialize gate report: {error}"))?,
-        created_at: chrono::Utc::now().to_rfc3339(),
-        decision: "pending".into(),
+    let existing_review = kg
+        .list_extraction_reviews_for_claims(claims)?
+        .into_iter()
+        .find(|review| review.extraction_id == extraction_id);
+    let (review, gate_passed) = match existing_review {
+        Some(review) => {
+            let report = serde_json::from_str::<
+                crate::knowledge_graph::quality_gate::QualityGateReport,
+            >(&review.report_json)
+            .map_err(|error| format!("stored quality gate report is invalid: {error}"))?;
+            (review, report.passed)
+        }
+        None => {
+            let report =
+                KgQualityGate::evaluate(&kg, claims, &extraction_id, &request.quality_gate, None)?;
+            persist_quality_gate_report(&kg, claims, &report)?;
+            let review = PendingExtractionReview {
+                review_id: uuid::Uuid::new_v4().simple().to_string(),
+                extraction_id: extraction_id.clone(),
+                staging_graph,
+                gate_status: report.review_status.clone(),
+                report_json: serde_json::to_string(&report)
+                    .map_err(|error| format!("serialize gate report: {error}"))?,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decision: "pending".into(),
+            };
+            kg.create_extraction_review_for_claims(claims, &review)?;
+            (review, report.passed)
+        }
     };
-    kg.create_extraction_review_for_claims(claims, &review)?;
 
     let mut suggestion_ids = Vec::new();
     for node in &canonical.extraction.nodes {
         let source_iri = format!("iri://entity/{}", RdfMapper::sanitize_id(&node.id));
-        let suggestion = create_entity_resolution_suggestion_from_staging(
-            &kg,
-            claims,
-            &extraction_id,
-            &source_iri,
-            &node.label,
-        )?
-        .ok_or_else(|| format!("entity resolution uncertain for staged mention {}", node.id))?;
+        let existing = kg
+            .list_action_approvals_for_claims(claims)?
+            .into_iter()
+            .find(|approval| {
+                approval.action_id == "entity-resolution"
+                    && approval
+                        .anchor_query
+                        .as_deref()
+                        .is_some_and(|query| query.contains(&source_iri))
+            })
+            .map(|approval| approval.approval_id);
+        let suggestion = match existing {
+            Some(approval_id) => approval_id,
+            None => create_entity_resolution_suggestion_from_staging(
+                &kg,
+                claims,
+                &extraction_id,
+                &source_iri,
+                &node.label,
+            )?
+            .ok_or_else(|| format!("entity resolution uncertain for staged mention {}", node.id))?,
+        };
         suggestion_ids.push(suggestion);
     }
     if suggestion_ids.is_empty() {
@@ -554,7 +585,7 @@ async fn run_job_ke_primitives(
             "canonicalization produced no eligible entities for required entity resolution".into(),
         );
     }
-    if !report.passed {
+    if !gate_passed {
         return Err("quality gate blocked the staged extraction".into());
     }
     if canonical
@@ -1063,15 +1094,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ran["job"]["state"], "awaiting_review");
-        assert_eq!(ran["job"]["links"]["entity_resolution_suggestion_ids"].as_array().unwrap().len(), 1,
-            "required ER suggestion must be recorded before a job reaches review");
+        assert_eq!(
+            ran["job"]["links"]["entity_resolution_suggestion_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "required ER suggestion must be recorded before a job reaches review"
+        );
         assert_eq!(
             kg.list_action_approvals_for_claims(&claims).unwrap().len(),
             1,
             "ER output must remain approval-held"
         );
         assert_eq!(
-            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }").unwrap().len(),
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
             before,
             "runner success must not write the production graph"
         );
@@ -1085,8 +1124,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(replay["reused"], true);
-        assert_eq!(kg.list_action_approvals_for_claims(&claims).unwrap().len(), 1,
-            "idempotent replay must not create a second ER suggestion");
+        assert_eq!(
+            kg.list_action_approvals_for_claims(&claims).unwrap().len(),
+            1,
+            "idempotent replay must not create a second ER suggestion"
+        );
 
         std::env::remove_var("AGENTOS_KG_GLINKER_COMMAND");
         std::env::remove_var("AGENTOS_AUTH_STRICT");
