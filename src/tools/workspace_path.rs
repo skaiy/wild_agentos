@@ -59,10 +59,11 @@ fn canonicalize_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
     loop {
         match current.canonicalize() {
             Ok(canonical) => {
+                let mut resolved = canonical;
                 for segment in suffix.iter().rev() {
-                    current = canonical.join(segment);
+                    resolved.push(segment);
                 }
-                return Ok(current);
+                return Ok(resolved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let Some(name) = current.file_name() else {
