@@ -808,9 +808,11 @@ fn sql_property_type(sql_type: &str) -> PropertyType {
         PropertyType::Number
     } else if sql_type.contains("BOOL") {
         PropertyType::Boolean
-    } else if sql_type.contains("TIMESTAMP") || sql_type == "DATETIME" {
-        PropertyType::DateTime
-    } else if sql_type == "DATE" || sql_type == "TIME" {
+    } else if sql_type.contains("TIMESTAMP")
+        || sql_type == "DATETIME"
+        || sql_type == "DATE"
+        || sql_type == "TIME"
+    {
         PropertyType::DateTime
     } else {
         PropertyType::String

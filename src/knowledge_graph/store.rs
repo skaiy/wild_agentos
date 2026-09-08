@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use oxigraph::model::{GraphNameRef, NamedNodeRef};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;

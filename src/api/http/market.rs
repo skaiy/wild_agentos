@@ -188,6 +188,7 @@ fn split_semver_core(value: &str) -> (&str, Option<&str>) {
         .map_or((value, None), |(core, pre)| (core, Some(pre)))
 }
 
+#[allow(clippy::result_large_err)]
 fn claims_or_unauthorized(
     identity: &UserIdentity,
 ) -> Result<&crate::isolation::IsolationClaims, axum::response::Response> {
@@ -344,6 +345,7 @@ pub(crate) async fn list_packages_handler(
     Json(json!({"count": packages.len(), "packages": packages})).into_response()
 }
 
+#[allow(clippy::result_large_err)]
 fn select_visible_package(
     name: &str,
     version: &str,

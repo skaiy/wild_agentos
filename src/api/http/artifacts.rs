@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    blob::BlobStore,
     isolation::IsolationClaims,
     knowledge_graph::{
         store::KnowledgeGraphStore,

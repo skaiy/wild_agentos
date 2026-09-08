@@ -31,10 +31,7 @@ use crate::{
 
 use super::{
     iam::UserIdentity,
-    ontology::{
-        create_entity_resolution_suggestion_from_staging, persist_quality_gate_report,
-        ConstrainedExtractionRequest, ConstrainedExtractionSource,
-    },
+    ontology::{create_entity_resolution_suggestion_from_staging, persist_quality_gate_report},
     AppState,
 };
 
@@ -221,6 +218,7 @@ fn save_online_corpus_jobs(jobs: &[OnlineCorpusJob]) -> Result<(), String> {
     std::fs::rename(&temporary, &path).map_err(|error| error.to_string())
 }
 
+#[allow(clippy::result_large_err)]
 fn claims_or_unauthorized(identity: &UserIdentity) -> Result<&IsolationClaims, Response> {
     identity.isolation_claims().ok_or_else(|| {
         (

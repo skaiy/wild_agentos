@@ -2211,6 +2211,7 @@ struct MaterializationAuditEvent<'a> {
     timestamp: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_materialization_audit(
     state: &AppState,
     claims: &IsolationClaims,

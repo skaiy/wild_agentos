@@ -321,8 +321,8 @@ fn width_truncate(s: &str, max_width: usize) -> String {
         let gw = g.width();
         if w + gw > max_width {
             // Only add ellipsis if it fits — avoids terminal auto-wrap on overflow
-            if w + 1 <= max_width {
-                out.push_str("…");
+            if w < max_width {
+                out.push('…');
             }
             break;
         }
@@ -723,10 +723,9 @@ impl App {
             timeline_pending: 0,
         };
 
-        let welcome = format!(
-            "## Agent OS Programming Console\n\
-             \nCommands: `/help` for help  |  `Esc` to quit",
-        );
+        let welcome = "## Agent OS Programming Console\n\
+             \nCommands: `/help` for help  |  `Esc` to quit"
+            .to_string();
         app.messages.push(Message {
             role: MessageRole::System,
             content: welcome,
@@ -1096,10 +1095,8 @@ impl App {
             return;
         }
         if let Some(msg) = self.messages.get(msg_idx) {
-            if msg.can_expand {
-                if !self.expanded.remove(&msg_idx) {
-                    self.expanded.insert(msg_idx);
-                }
+            if msg.can_expand && !self.expanded.remove(&msg_idx) {
+                self.expanded.insert(msg_idx);
             }
         }
     }
@@ -1179,7 +1176,7 @@ impl App {
                         .skip(1)
                         .find(|(_, ch)| ch.is_whitespace())
                         .map(|(idx, _)| idx)
-                        .or_else(|| if before.is_empty() { None } else { Some(0) })
+                        .or(if before.is_empty() { None } else { Some(0) })
                     {
                         let end = Self::next_char_boundary(before, pos);
                         self.input.drain(end..self.cursor_position);
@@ -2540,7 +2537,7 @@ fn strip_ansi_escapes(s: &str) -> String {
                             match ci.next() {
                                 Some((off, '\x07')) => break off + 1,
                                 Some((off, '\x1b')) => {
-                                    if ci.next().map_or(false, |(_, c2)| c2 == '\\') {
+                                    if ci.next().is_some_and(|(_, c2)| c2 == '\\') {
                                         break off + 2;
                                     }
                                 }
@@ -2556,7 +2553,7 @@ fn strip_ansi_escapes(s: &str) -> String {
                         let skip = loop {
                             match ci.next() {
                                 Some((off, '\x1b')) => {
-                                    if ci.next().map_or(false, |(_, c2)| c2 == '\\') {
+                                    if ci.next().is_some_and(|(_, c2)| c2 == '\\') {
                                         break off + 2;
                                     }
                                 }

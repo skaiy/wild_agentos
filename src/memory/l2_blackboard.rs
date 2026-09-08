@@ -2041,7 +2041,7 @@ impl PermissionMatrix {
     ) {
         self.permissions
             .entry(agent_role.to_string())
-            .or_insert_with(DashMap::new)
+            .or_default()
             .insert(graph_name.to_string(), permissions);
     }
 

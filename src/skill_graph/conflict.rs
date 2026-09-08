@@ -387,6 +387,7 @@ impl ConflictDetectionEngine {
         None
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn has_cycle(
         &self,
         skill: &SkillGraphNode,
