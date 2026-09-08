@@ -3106,6 +3106,7 @@ mod ontology_crud_tests {
             api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
         })
     }
 
