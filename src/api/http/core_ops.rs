@@ -647,6 +647,13 @@ mod tests {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
         let task_iri = "iri://task/test-scope";
@@ -691,6 +698,20 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         }
+
+        let invalid_bearer = Request::builder()
+            .method("POST")
+            .uri("/api/v1/events")
+            .header("authorization", "Bearer invalid-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"task_iri": task_iri, "event_type": "CUSTOM"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            response_status(&router, invalid_bearer).await,
+            StatusCode::UNAUTHORIZED
+        );
 
         for (tenant, project) in [("tenant-b", "project-a"), ("tenant-a", "project-b")] {
             for (uri, body) in [
@@ -784,5 +805,14 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"], "task_iri is required");
+
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+        match previous_jwt_secret {
+            Some(value) => std::env::set_var("AGENTOS_JWT_SECRET", value),
+            None => std::env::remove_var("AGENTOS_JWT_SECRET"),
+        }
     }
 }
