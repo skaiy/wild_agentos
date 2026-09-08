@@ -10,6 +10,7 @@ use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{OnlineCorpusWatcherRegistration, OnlineCorpusWatcherSettings},
@@ -186,29 +187,34 @@ pub(crate) async fn tick_online_corpus_watchers(
     report
 }
 
-/// Start the bounded periodic scheduler only when there is work configured.
+/// Run the bounded periodic scheduler until the process runtime is cancelled.
 /// No task exists for an explicitly disabled watcher deployment.
-pub(crate) fn start_online_corpus_watcher_scheduler(
+pub(crate) async fn run_online_corpus_watcher_scheduler(
     store: OnlineCorpusJobStore,
     settings: OnlineCorpusWatcherSettings,
+    shutdown: CancellationToken,
 ) {
     if !settings.enabled || settings.registrations.is_empty() {
         return;
     }
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(settings.poll_interval_seconds));
-        loop {
-            interval.tick().await;
-            let report = tick_online_corpus_watchers(&store, &settings).await;
-            if report.saturated > 0 || report.invalid > 0 {
-                tracing::warn!(
-                    ?report,
-                    "online corpus watcher tick completed with deferred registrations"
-                );
+    let mut interval = tokio::time::interval(Duration::from_secs(settings.poll_interval_seconds));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("online corpus watcher scheduler stopped");
+                return;
+            }
+            _ = interval.tick() => {
+                let report = tick_online_corpus_watchers(&store, &settings).await;
+                if report.saturated > 0 || report.invalid > 0 {
+                    tracing::warn!(
+                        ?report,
+                        "online corpus watcher tick completed with deferred registrations"
+                    );
+                }
             }
         }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -427,5 +433,26 @@ mod tests {
         assert_eq!(report.saturated, 1);
         assert_eq!(store.read().await.len(), 1);
         std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn scheduler_stops_when_runtime_is_cancelled() {
+        let store = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            run_online_corpus_watcher_scheduler(
+                store,
+                OnlineCorpusWatcherSettings {
+                    registrations: vec![registration("v1")],
+                    ..Default::default()
+                },
+                shutdown,
+            ),
+        )
+        .await
+        .expect("cancelled scheduler should exit promptly");
     }
 }

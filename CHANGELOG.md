@@ -1,6 +1,29 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.5.0`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.6.0`。
+
+## [0.6.0] — 2026-09-08
+
+### Online Corpus Job + Watcher
+
+- Added authenticated, claims-scoped online corpus jobs for configured corpus
+  changes and incremental deltas, with idempotent create, list, get, cancel,
+  and runner paths.
+- Added enabled-by-default corpus watchers that enqueue work through the same
+  idempotent path. Deployments can explicitly disable watcher polling and
+  enqueueing without deleting jobs, cursors, reviews, or audit records.
+- The runner now requires entity-resolution suggestions and retains them for
+  explicit approval; it stages evidence and never auto-merges entities,
+  promotes ontology, or materializes production data.
+- Added bounded provenance and observability for source versions and content
+  digests, canonicalization, quality/review, ER suggestions, queue saturation,
+  retries, and job state. Transient sidecar failures retry at most three times;
+  validation, authentication, and policy failures are terminal.
+- Added fail-closed isolation and production-write CI coverage for online jobs,
+  runners, and watchers. Unauthenticated, invalid, cross-scope, and failed
+  paths cannot write production data.
+- The companion Admin online-corpus job list is delivered separately and does
+  not expand this repository's scope.
 
 ## [0.5.0] — 2026-09-07
 

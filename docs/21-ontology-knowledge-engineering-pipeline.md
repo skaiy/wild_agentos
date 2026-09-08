@@ -101,9 +101,9 @@ sidecar failures retry at most three attempts; validation, authentication, and
 policy failures are terminal. Watchers remain enabled by default and emit
 saturation signals without logging corpus payloads or credentials.
 
-### v0.6 scope — planned online corpus job + watcher
+### v0.6 delivered scope — online corpus job + watcher
 
-**In**
+**Delivered**
 
 - A claims-scoped job model with create, list, get, and cancel (or equivalent)
   operations for configured corpus changes or incremental deltas.
@@ -126,19 +126,13 @@ saturation signals without logging corpus payloads or credentials.
   merge; materialization remains approval-held and anchored.
 - Replacing Oxigraph/SPARQL, adding Cypher or Nebula, or reimplementing
   `KgQualityGate`, Morph-KGC/RML, golden freeze, or the Admin design studio.
-- Claiming “fully online automated with governance” before every acceptance
-  criterion below is proven. v0.6 may close criterion 1 and the watcher gap
-  while human authority over promotion and materialization remains intact.
+- Claiming “fully online automated with governance” merely from job completion;
+  human authority over promotion and materialization remains intact.
 - Mixing separate product or business repositories into this tree.
 
-**Proposed future Issue checklist (titles only; do not file yet)**
-
-- Claims-Scoped Online Corpus Job API and State Store
-- Idempotent Online Job Runner for Existing KE Primitives
-- Default-Enabled Corpus Watcher Scheduler, Queueing, and Explicit Disablement
-- Online Job Provenance, Audit, Retry, and Backpressure Observability
-- Fail-Closed Online Job Isolation and Production-Write CI
-- Companion Admin Job List (outside this repository)
+The delivery closes the online-job, idempotent-runner, default-enabled watcher,
+provenance/observability, and fail-closed isolation CI work. The companion
+Admin job list is delivered separately.
 
 ## Public best-practice signals
 
@@ -448,9 +442,9 @@ and skill loops that use a promoted ontology.
   GLinker is used as an Apache-2.0 pattern and can be installed only in that
   worker environment; no GLinker code, model weights, or LGPL component is
   linked into the kernel process. Any LGPL linker must remain process-isolated.
-- The online-job runner and enabled-by-default watcher that schedule these
-  existing primitives are v0.6 planned work; deployments can explicitly
-  disable watcher configuration when needed. See the scope boundary above.
+- v0.6 delivers the online-job runner and enabled-by-default watcher that
+  schedule these existing primitives. Deployments can explicitly disable
+  watcher configuration when needed. See the delivered scope above.
 
 #### v0.6 — online corpus watcher configuration
 

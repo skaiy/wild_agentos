@@ -6,7 +6,7 @@
  *   2. X-Identity: base64(JSON)            —— 开发/测试模拟身份
  *   3. 匿名（user_id="anonymous"）         —— 无凭据回退
  *
- * AGENTOS_AUTH_MODE=hs256（默认）使用 AGENTOS_JWT_SECRET，仅限本地开发；
+ * AGENTOS_AUTH_MODE=hs256（默认）使用显式配置的 AGENTOS_JWT_SECRET，仅限本地开发；
  * AGENTOS_ENV=production 强制要求 AGENTOS_AUTH_MODE=oidc 和完整的
  * OIDC issuer/audience/JWKS 配置。
  * AGENTOS_AUTH_STRICT=true 强制执行角色校验，并拒绝 X-Identity（默认 false，
@@ -116,10 +116,20 @@ impl<S: Send + Sync> FromRequestParts<S> for UserIdentity {
         // 1. JWT Bearer
         if let Some(auth) = parts.headers.get("authorization") {
             if let Ok(val) = auth.to_str() {
-                if let Some(token) = val.strip_prefix("Bearer ") {
-                    if let Some(identity) = verify_jwt(token).await {
-                        return Ok(identity);
+                let mut credentials = val.split_ascii_whitespace();
+                if credentials
+                    .next()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+                {
+                    if let Some(token) = credentials.next().filter(|token| !token.is_empty()) {
+                        if let Some(identity) = verify_jwt(token).await {
+                            return Ok(identity);
+                        }
                     }
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        "Bearer token verification failed".to_string(),
+                    ));
                 }
             }
         }
@@ -156,9 +166,21 @@ fn auth_strict() -> bool {
     std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true")
 }
 
+const DEFAULT_HS256_SECRET: &str = "agentos-dev-secret-change-in-prod";
+#[cfg(test)]
+const TEST_HS256_SECRET: &str = "test-hs256-secret-at-least-32-bytes-long";
+
 fn jwt_secret() -> String {
-    std::env::var("AGENTOS_JWT_SECRET")
-        .unwrap_or_else(|_| "agentos-dev-secret-change-in-prod".to_string())
+    std::env::var("AGENTOS_JWT_SECRET").unwrap_or_else(|_| {
+        #[cfg(test)]
+        {
+            TEST_HS256_SECRET.to_string()
+        }
+        #[cfg(not(test))]
+        {
+            DEFAULT_HS256_SECRET.to_string()
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,9 +216,26 @@ pub fn validate_startup_auth_configuration() -> Result<(), String> {
             "AGENTOS_AUTH_MODE=oidc is required when AGENTOS_ENV=production; HS256 is limited to local development"
                 .to_string(),
         ),
-        AuthMode::Hs256 => Ok(()),
+        AuthMode::Hs256 => validate_hs256_secret(),
         AuthMode::Oidc => oidc_config().map(|_| ()),
     }
+}
+
+fn validate_hs256_secret() -> Result<(), String> {
+    let secret = required_env("AGENTOS_JWT_SECRET")?;
+    if secret == DEFAULT_HS256_SECRET {
+        return Err(
+            "AGENTOS_JWT_SECRET must be explicitly set to a non-default, randomly generated secret for HS256 authentication"
+                .to_string(),
+        );
+    }
+    if secret.len() < 32 {
+        return Err(
+            "AGENTOS_JWT_SECRET must be at least 32 bytes of securely generated secret material for HS256 authentication"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +441,7 @@ mod tests {
 
     use super::{
         validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims, UserIdentity,
+        DEFAULT_HS256_SECRET,
     };
     use crate::api::http::TEST_ENV_LOCK;
 
@@ -423,6 +463,23 @@ mod tests {
         assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
 
         restore_strict_mode(previous);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_does_not_fall_back_to_x_identity() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let forged = STANDARD.encode(r#"{"user_id":"attacker","tenant_id":"evil"}"#);
+        let (mut parts, _) = Request::builder()
+            .header("authorization", "Bearer invalid.jwt.token")
+            .header("x-identity", forged)
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let rejection = UserIdentity::from_request_parts(&mut parts, &())
+            .await
+            .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -489,7 +546,7 @@ mod tests {
                 roles: vec!["DA".to_string()],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
         let (mut parts, _) = Request::builder()
@@ -532,7 +589,7 @@ mod tests {
                 tenant_id: "acme".to_string(),
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
 
@@ -558,7 +615,7 @@ mod tests {
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
 
@@ -586,7 +643,7 @@ mod tests {
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap();
 
@@ -620,7 +677,7 @@ mod tests {
                     roles: vec![],
                     exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 },
-                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+                &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
             )
             .unwrap();
 
@@ -635,16 +692,51 @@ mod tests {
     #[test]
     fn production_profile_rejects_hs256_before_startup() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<_> = ["AGENTOS_ENV", "AGENTOS_AUTH_MODE"]
+        let saved: Vec<_> = ["AGENTOS_ENV", "AGENTOS_AUTH_MODE", "AGENTOS_JWT_SECRET"]
             .into_iter()
             .map(|name| (name, std::env::var_os(name)))
             .collect();
         std::env::set_var("AGENTOS_ENV", "production");
         std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "a-test-secret-that-is-not-used-in-production",
+        );
 
         let error = validate_startup_auth_configuration().unwrap_err();
         assert!(error.contains("AGENTOS_AUTH_MODE=oidc"));
         assert!(error.contains("HS256"));
+
+        for (name, value) in saved {
+            restore_env(name, value);
+        }
+    }
+
+    #[test]
+    fn hs256_startup_rejects_missing_or_default_secret() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = ["AGENTOS_ENV", "AGENTOS_AUTH_MODE", "AGENTOS_JWT_SECRET"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::remove_var("AGENTOS_ENV");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        std::env::remove_var("AGENTOS_JWT_SECRET");
+        assert!(validate_startup_auth_configuration()
+            .unwrap_err()
+            .contains("AGENTOS_JWT_SECRET"));
+
+        std::env::set_var("AGENTOS_JWT_SECRET", DEFAULT_HS256_SECRET);
+        assert!(validate_startup_auth_configuration()
+            .unwrap_err()
+            .contains("non-default"));
+
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "a-test-secret-that-is-not-used-in-production",
+        );
+        assert!(validate_startup_auth_configuration().is_ok());
 
         for (name, value) in saved {
             restore_env(name, value);

@@ -3,18 +3,18 @@
 
 <img src="assets/logo_transparent.png" width="120" alt="Wild AgentOS Logo" />
 
-**工业级 AI 智能体操作系统 · Rust 构建**  [![Star on GitHub](https://img.shields.io/github/stars/skaiy/wild_agentos?style=flat)](https://github.com/skaiy/wild_agentos)
+**面向受治理多智能体协作的操作系统**
 
-
+[![Star on GitHub](https://img.shields.io/github/stars/skaiy/wild_agentos?style=flat)](https://github.com/skaiy/wild_agentos)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.5.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.6.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
-[**中文**] · [**English**](README.md) · [**设计细节 →**](docs/13-DESIGN_DETAIL.zh.md)
+[**中文**](README.zh.md) · [**English**](README.md) · [**设计细节 →**](docs/13-DESIGN_DETAIL.zh.md)
 
 <img src="assets/github-readme.png" alt="Wild AgentOS" width="100%" />
 
@@ -22,265 +22,158 @@
 
 ---
 
-## 🎉 版本发布历史与说明
-
-欢迎查阅 **Wild AgentOS** 的版本演进历史。平台提供生产级安全网关、部分租户范围的存储接线，以及先进的智能体认知操作系统内核。当前隔离边界和未迁移的历史键请参阅 [隔离契约](docs/17-isolation-contract.zh.md)。
-
-| 版本 | 发布日期 | 核心升级与融合特性 |
-|------|----------|-------------------|
-| **v0.5.0** | **2026-09-07** | **本体知识工程 + Graph Engineering**<br>• 完成有边界、claims-scoped 的 constrained extraction、可选 Morph-KGC/RML materialization、质量/审阅监督及带锚点的 staging-to-production materialization；任何路径都不会自动 promote schema，也不会绕过已验证 claims 写入。<br>• 通过进程隔离的 GLinker-style sidecar 新增保守、待审批的 entity-resolution suggestion；不提供 auto-merge 路径。<br>• 冻结本体 KE golden evaluation 并以 SHA gate 保护，记录 measurement-decay audit policy，并提供用于慢速 loop 审查的只读 ontology health report。<br>• 完成 OpenAPI/SQL DDL draft、仅生成 draft 的 schema induction、readiness report 与 compatibility-gated promote；配套 Admin ontology design studio 仍在独立范围内。 |
-| **v0.3.0** | **2026-09-05** | **市场 + IdP + Emergent**<br>• 新增版本化的 Logic 与 Skill package market，package 版本不可变，访问按 claims 隔离，并支持显式 install、upgrade 与 rollback。<br>• 新增与本地开发 HS256 并行的 OIDC/JWKS 身份验证，通过非对称 JWT 验证以及 fail-closed 的 issuer、audience 与 JWKS 校验保护访问。<br>• 新增带 gate 的 emergent-tool promotion pipeline：生成的工具在通过 sandbox/judge gate 和所需人工审批前始终不受信任。<br>• 新增可选且默认关闭的有限 RDFS 推理，用于 claims 作用域 graph read；仅在 query-time 扩展 subclass 和 type，绝不持久化推理三元组。 |
-| **v0.2.2** | **2026-09-05** | **制品 + 沙箱 + 基准**<br>• 新增 claims 作用域的 coding artifact store：不可变元数据写入调用者的 `IsolationClaims` graph，制品字节使用服务端 mint 的 tenant blob 前缀。<br>• 新增默认关闭 feature flag 保护的外部 `SandboxProvider` adapter；其异步路径不会跨 `await` 持有 `MutexGuard`。<br>• 新增面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，记录实测结果且不编造速度提升。 |
-| **v0.2.1** | **2026-09-05** | **本体数据 + 协议**<br>• 新增从 CSV 或 JSON Schema 生成、按 claims 隔离的 ObjectType/LinkType 草稿；必须经获授权人员审批后才能提升。<br>• 新增由 `IsolationClaims` 过滤的入站 MCP 工具目录，以及可显式发布为 MCP 工具的受 gate 租户 Skill；内核 Skill 仍被排除。<br>• 新增默认关闭 feature flag 保护的薄型出站 A2A adapter；它以尽力而为方式工作，不提供入站服务器，也不改变本地任务生命周期。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。 |
-| **v0.2.0** | **2026-09-05** | **控制平面 + Skill CI**<br>• 新增 Skill package 格式与 CI gate：包含 package 验证和 golden input/output 检查，Judge hook 默认关闭。<br>• 通过的 package 可经受控 tenant 发布通道发布；失败 fixture 会被拦截。<br>• 通过 `scripts/test_golden.sh` 在 Rust CI 中新增 Agent 计划、Skill Markdown 和 Action 调用的 golden evals。<br>• 配套 Admin #16 已在独立仓库交付五屏控制平面骨架；本次发布不改变该仓库的范围。 |
-| **v0.1.8** | **2026-09-04** | **本体 Action 人工审批闭环（HITL）**<br>• 新增可配置 `commit_strategy`：Action 可自动提交或保留待审批，并提供 merge/discard API 与 TTL 到期处理。<br>• 新增可配置护栏、SPARQL `ASK` 断言和用于审批敏感操作的 `high_risk` hook。<br>• 通过事件总线发布 committed、pending、approved、rejected、violated 等结果的 `ACTION_AUDIT` 事件；详见[本体 Action 数据沙箱](docs/15-ontology-action-sandbox.md)。 |
-| **v0.1.7** | **2026-09-04** | **隔离证明与评测**<br>• 新增只读 `isolation-diagnose` CLI、面向客户的[隔离矩阵](docs/17-isolation-matrix.md)，以及 fail-closed `isolation_contract` CI 覆盖。<br>• 新增可选且显式的 `isolation-migrate`；绝不静默使用 `UNION`，也不宣称历史键已迁移。 |
-| **v0.1.6** | **2026-09-04** | **隔离与加固**<br>• 经验证 JWT 租户/项目声明现在负责铸造图、Blob、向量和 L0 目标；HTTP KG、本体、知识库、chat RAG 以及运行时图/向量工具均按声明隔离，缺少声明时拒绝访问。<br>• 新建用户 Agent 会写入经验证范围；公共 API Key chat 明确不使用租户 RAG。<br>• 新增可选 `AGENTOS_TENANT_TOOL_CALL_CAP`、MCP 行为披露、bash 子进程环境清理、工具 schema 强制校验和 PDCA L0 envelope。<br>• 详见[隔离契约](docs/17-isolation-contract.zh.md)；历史键未迁移。 |
-| **v0.1.5** | **2026-08-18** | **认知因果引擎与图治理升级**<br>• **Causal Engine 因果引擎**：新增独立因果分析子系统 `CausalEngine`、`FusionEngine`、`CausalStore` 和类型化的 `CausalFactor`。支持智能体运行的因果推理与多因素融合分析，用于根因识别、故障链传播以及决策因果图谱构建。<br>• **统一图存储后端 (Unified Graph)**：将原零散图读写接口收敛为单一、高性能的 `GraphBackend`。<br>• **图特征计算与相似度**：支持对认知快照进行度中心性、PageRank 等图特征向量计算，并比对计算认知相似度。<br>• **快照时间线 (Snapshot Timeline)**：会话级定点历史恢复与基于 diff 的版本差异回滚。<br>• **技能中心 CRUD 与系统守卫**：支持应用级（`skill://`）技能的新建、详情解析（含 Input/Output Schema）、编辑与删除；对系统级（`iri://`）内置技能执行严格的 **403 只读保护**。 |
-| **v0.1.4** | **2026-07-06** | **统一模型注册中心与向量热桥接**<br>• **三合一收敛**：原「大模型网关」「向量/Embedding」「模型资源」Tab 合并收敛为单一的**模型注册中心**，实现统一管理。<br>• **自动拉取型号**：支持调用外部 `/v1/models` 并根据名称关键词自动对文本、VL、向量等型号进行模态预判。<br>• **向量服务热桥接**：在模型页面直接将型号「设为生效向量」，实现免重启热切换向量库并自动后台重建索引。 |
-| **v0.1.3** | **2026-07-06** | **多模态 (VL) 支持与 Agent 多模型能力挂载**<br>• **多模态智能网关**：支持对 `ChatContent` 中包含的文本与图片（Base64/URL）进行解析，自动路由至多模态大模型。<br>• **能力槽多模型挂载**：支持在 Agent 中挂载不同的型号到对应的功能槽（例如 chat 槽挂载 DeepSeek，vision 槽挂载 Gemini）。 |
-| **v0.1.2** | **2026-07-05** | **知识库多源摄取与统一知识包**<br>• **两阶段数据摄取**：支持向量库多文件上传自动分块与图谱库结构化三元组（CSV/N-Triples）上传到命名图。<br>• **统一知识包挂载**：下线原单值图谱绑定，统一升级为多知识包挂载（`knowledge_pack_ids`），存量数据自动幂等迁移。<br>• **隔离状态**：本条发布说明不代表当前活键已经迁移；请参阅隔离契约。 |
-| **v0.1.1** | **2026-07-04** | **调用方 API 密钥治理中心与 Agent 一键发布**<br>• **密钥治理中心**：上线「调用方 Client + 密钥」管理面，支持配额限制、安全审计、Token 限制 and 权限 scope 控制。<br>• **OpenAI 兼容网关**：提供一键发布 Agent 按钮，直接生成兼容 OpenAI 格式的调用 URL (`/v1/chat/completions`) 与命令行示例，支持 SSE 流式返回。 |
-| **v0.1.0** | **2026-07-01** | **首个版本发布 —— 核心系统引擎与 Hyperspace 向量存储**<br>• **HyperspaceEngine 向量引擎**：嵌入式 HNSW 向量数据库，支持 WAL 与 Poincaré/Lorentz 多维空间度量。<br>• **技能图谱与四层记忆**：5W2H 语义技能图谱，带 MESI 一致性协议的 L0-L3 分层记忆缓存。<br>• **工作区监控器**：实时文件监控与 10 种主动感知触发器。 |
-
----
-
 ## 什么是 Wild AgentOS？
 
-一个 **基于 Rust 构建的 AI 智能体操作系统**，通过 PDCA 循环编排多智能体，实现协调、可审计和自我改进的系统。
+Wild AgentOS 是一个面向**多智能体协作治理**的操作系统，以 Rust（系统编程语言）构建。它用
+PDCA（计划、执行、检查、改进）组织智能体工作，帮助团队共享知识，并保留工作过程和
+决策的审计记录。
 
-> "我们不只构建智能体；我们构建**驾驭集体智能的基础设施**。"
+系统以租户和项目为安全边界。经过验证的 JWT（身份令牌）携带租户/项目隔离凭证
+`IsolationClaims`，系统据此划定调用方可用的知识图谱、向量、文件和工作记录存储范围。
+缺少或无效凭证即拒绝访问，调用方也不能指定其他租户的存储范围。此保证适用于已接入
+隔离凭证的接口，并不代表每个历史 HTTP 接口都已隔离。系统划定新的存储名称，不等于
+迁移历史数据；详见[隔离契约](docs/17-isolation-contract.zh.md)。
 
-### 核心技术栈
+## 你能获得什么
 
-| 层级 | 技术 | 职责 |
-|------|------|------|
-| **核心编排** (Rust) | `PDCA 循环` · `5W2H 本体` · `事件总线` | 智能体编排与生命周期管理 |
-| **技能图谱** | `RDF` · `6 种链接类型` · `18 模块` | 动态认知网络 |
-| **记忆系统** | `L0 redb` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI 一致性` | 带预取的分层记忆 |
-| **知识图谱** | `Oxigraph RDF` · `SPARQL 1.1` · `代码 AST` · `命名图` | 跨子系统统一存储 |
-| **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean` · `混合搜索` | 嵌入式向量嵌入引擎 |
-| **Wild Code TUI** | `ratatui` · `crossterm` · `MCP` · `断点恢复` | 终端 AI 编程助手 |
-| **数据总线** | `JSON-LD 1.1` · `@id/@type/@context` · `命名图` | 通用互操作层 |
-| **网关** | `gRPC` · `HTTP (兼容 OpenAI)` · `MCP` | 生产级接口 |
-| **感知引擎** | `10 种触发器` · `异常去重` · `5W2H 约束检查` | 主动监控 |
-| **智能体工作流** | `PA/DA/CA` · `工具系统` · `检查点` · `追踪操作` | 多智能体执行 |
+- **协同执行：** 基于 Rust 的 PDCA 工作流、任务服务和事件审计，支持多个智能体围绕
+  计划、执行、检查和改进协作。
+- **共享知识与检索：** 使用 Oxigraph 知识图谱（结构化知识存储）和 SPARQL 查询语言，
+  并提供内嵌向量检索，帮助找到相关信息。
+- **受控的知识变更：** 可从 CSV、JSON Schema、OpenAPI 和 SQL DDL 生成草稿，经过
+  检查、写入暂存区和人工审核后，才可按审批流程写入生产数据。草稿不会自动成为正式定义。
+- **人工把关与可追溯性：** 高风险或待审批的操作必须由人决定；低风险操作也只能在其
+  策略允许且通过护栏时自动提交。系统记录检查、审核、事件审计和回读证据。实体消歧
+  （判断两条记录是否指向同一实体）只会给出暂存建议，绝不自动合并。
+- **身份与集成：** 生产环境使用 OIDC/JWKS 进行身份校验；本地开发使用独立的开发用签名
+  模式。gRPC 用于服务间通信；MCP（Model Context Protocol，模型上下文协议）可将
+  经明确发布、按租户隔离的 Skill 作为工具提供。出站 A2A 适配器可选、默认关闭，且仅
+  提供尽力而为的能力。
+- **受治理的软件包：** Logic 和 Skill 软件包采用不可变版本、按租户可见，并记录安装、
+  升级和回滚。正式上线需通过既定检查、审核证据和人工审批。
 
----
+## v0.6：在线语料任务，始终由人把关
 
-## 🔧 亮点速览
+v0.6.0 新增了在同一租户/项目边界内运行的、已认证的在线语料任务。监视器默认开启，
+但只检查已配置的数据源版本，并为每个新版本向队列加入一个任务。部署可关闭这项轮询
+和入队，而不会删除已有任务、游标、审核或审计记录。监视器不会抓取来源 URL、计算内容
+变化，也不会自行运行任务。
 
-### 1. HyperspaceEngine — 嵌入式向量引擎
-生产级空间记忆引擎，支持 **运行时可选度量空间**（Poincaré、Cosine、Euclidean、Lorentz）。内置 **HNSW 近似最近邻搜索**、CRC32 校验的**预写日志（WAL）**（3 种同步模式）、**切线空间剪枝**（优化 Poincaré 球搜索）、JSON-LD 元数据索引（RoaringBitmap 位图过滤器）以及双空间**混合搜索**（文本 × 结构）。独立 crate，零外部向量数据库依赖。
+已认证的人员或服务可手动运行队列中的任务，并提供文本、提取方法、提取候选项和质量检查请求。
+任务会规范化候选项，将相应证据放入暂存区，执行检查，生成一条待审批的实体消歧建议，然后
+等待审核。
 
-### 2. 技能图谱认知网络
-动态内存认知网络，**6 种语义链接类型**（前置依赖、组合、关联、替代、扩展、泛化）。核心能力包括：基于图谱拓扑的 **Poincaré 结构嵌入**（前置依赖深度 + 标签域指纹）；**超图组合**——一等公民 `Hyperedge` 与 `CompositionType`（顺序、并行、条件、可选、回退）；**图算法**（PageRank、介数中心性、标签传播社区发现、DFS 前置链、Tarjan SCC 环检测）；**因果故障分析**与根因推断；**形式化不变式验证**（6 项检查：无环、链接可达、组合可达、无废弃前置依赖、5W2H 有效、安全等级有效）；**时序版本管理**与快照回滚。
+系统保留有上限的来源追溯和运行可观测记录，包括来源版本、内容摘要、检查结果、审核
+状态、重试、容量压力和任务状态。临时的辅助服务故障最多重试三次；身份、校验或策略
+失败会直接停止任务。CI 已验证失败、无效、跨边界或未认证的路径不能写入生产数据。
 
-### 3. 泛化 PDCA — 7 级自适应执行
-通过 5W2H 元数据动态选择 7 级复杂度（L0 即时 → L5 递归 → L6 应急）。同一引擎同时处理即时查询与数周工程项目——无需僵硬的固定流程。**PA/DA/CA 智能体角色**，基于模板的提示词构建。
+最重要的是，这些任务**不会**自动合并实体、将本体正式上线，或将暂存结果写入生产数据。
+这些都必须经过明确的人工治理决策，并保留审计记录。
 
-### 4. 语义技能发现引擎
-`SkillDiscoveryEngine` 包装 `HyperspaceStore` 实现基于向量的语义技能搜索。`suggest_links()` 从 Jaccard 标签重叠优雅降级到余弦相似度搜索。内置 BFS 路径发现（`find_skill_chain()`）、组合树构建（`get_skill_tree()`）和冲突检测。
+## 已交付能力
 
-### 5. CPU 缓存记忆 — 4 层结构 + MESI 一致性
-业界首创将 CPU 缓存一致性协议应用于多智能体记忆系统。**L0** redb 磁盘 KV + HyperspaceEngine 向量 → **L1** 会话上下文 → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL 投影缓存。智能预取引擎降低 90% 感知延迟。解决上下文爆炸与并发智能体间的共享内存不一致问题。
+| 领域 | 业务说明 |
+|---|---|
+| **PDCA 协同** | 以 Rust 实现的 PDCA 工作流、任务服务和事件审计，支持多智能体按计划、执行、检查、改进协作。 |
+| **租户/项目隔离** | 已验证的 JWT `IsolationClaims` 划定知识图谱、向量、文件和工作记录的存储范围；缺少或无效凭证即拒绝访问。 |
+| **身份认证** | 生产环境使用 OIDC/JWKS 身份校验；本地开发使用独立的开发用签名模式。 |
+| **知识工程** | 从 CSV、JSON Schema、OpenAPI 和 SQL DDL 生成按范围隔离的类型草稿；支持受限提取、规范化、质量检查、审核、带锚点的生产写入、冻结参考评测和只读健康证据。 |
+| **人工审核与审计** | 低风险操作仅在策略允许且通过护栏时自动提交；高风险或待审批操作使用审批、合并/丢弃和到期处理。SPARQL `ASK` 检查、审批钩子和 `ACTION_AUDIT` 事件提供审计证据；实体消歧建议绝不自动合并。 |
+| **在线语料运行** | 支持按隔离范围创建、查看、取消任务，以及手动暂存执行。默认开启的已配置版本轮询只负责入队，不执行任务；仓库默认配置没有监视器注册项，需由部署添加可信来源。包含重试、容量控制、有限来源追溯和按范围隔离的运行记录。 |
+| **软件包与上线** | Logic 和 Skill 软件包版本不可变、按租户可见，并记录安装、升级和回滚。租户 Skill 和新兴工具正式上线需通过检查、参考 SHA 校验、规则审核、审计证据和人工审批。安装软件包尚不会将 Skill 注册到进程全局目录。 |
+| **互操作性** | `IsolationClaims` 会过滤入站 MCP 工具目录；经过门控并明确发布的租户 Skill 可作为 MCP 工具。轻量出站 A2A 适配器默认关闭，且仅提供尽力而为的能力。 |
+| **知识与检索** | Oxigraph RDF/SPARQL 知识图谱、按隔离范围的数据写入和检索，以及内嵌 Hyperspace HNSW 向量检索。可选的 RDFS 查询时扩展默认关闭，且不会写入推导结果。 |
+| **制品与沙箱** | 按隔离范围保存的编程制品元数据与系统划定的文件前缀；外部 `SandboxProvider` HTTP 适配器默认关闭，当前仅定义对接契约，尚未接入智能体/工具运行时。 |
 
-### 6. JSON-LD 通用数据总线 — W3C 标准互操作
-`@context` 鸭子类型消除技能间的字段名冲突。`@id` 实现零成本跨智能体实体合并。`@graph` 命名图支持跨子系统无锁并行写入。将互操作难题变为即插即用。
+配套的 Admin control-plane 和 online-job-list surface 已独立交付，不属于本
+仓库。
 
-### 7. 自进化技能图谱 — 自主学习
-AA 智能体每次任务完成后自动创建**知识片段**和新语义链接。`/learn`/`/reduce` 机制实现自主技能获取与归并。`BootstrapEngine` 从文件系统摄取 Markdown 格式技能。
+## 版本亮点
 
-### 8. 通用知识图谱 — 统一认知骨干
-所有子系统（技能、记忆、任务、代码知识）共享同一 **Oxigraph RDF 存储**，通过命名图隔离，支持跨子系统 SPARQL 联合查询。tree-sitter 解析的代码 AST 自动转为 RDF 三元组。`SkillGraphStore` **双向 SPARQL 同步**确保认知图与语义存储实时一致。
+| 版本 | 日期 | 业务说明 |
+|---|---:|---|
+| **v0.6.0** | 2026-09-08 | 已认证的在线语料任务记录、手动暂存执行器、仅入队的监视器、有限的来源追溯和运行记录、重试与容量控制，以及由 CI 验证的生产写入隔离。 |
+| **v0.5.0** | 2026-09-07 | 受治理的知识工程流程：暂存提取、质量检查和审核、待审批的实体消歧建议、审计证据、健康报告和兼容性门控的本体设计。 |
+| **v0.3.0** | 2026-09-05 | 版本化的 Logic 和 Skill 软件包、生产身份校验、人工门控的新兴工具，以及可选的查询时知识扩展。 |
+| **v0.2.0–v0.2.2** | 2026-09-05 | 软件包校验和发布控制、隔离的知识草稿与集成、制品存储、可选的外部沙箱适配器，以及可复现的部署基准。 |
+| **v0.1.5–v0.1.8** | 2026-08-18–2026-09-04 | 因果分析、图谱和记忆基础能力、操作审核与审计控制，以及带诊断和迁移工具的租户/项目隔离。 |
 
-### 9. 5W2H 维度级审计 — 精准回滚
-CA 独立审计 7 个维度。What/Why 失败 → 重新分析。How/Where 失败 → 重新规划。When/HowMuch 失败 → 条件通过。告别黑盒"通过/不通过"——精确定位问题根因。
+完整版本记录请参阅 [changelog](CHANGELOG.md)。
 
-### 10. 主动感知引擎 — 防患于未然
-10 种执行触发器，60 秒异常去重窗口。监控截止时间违规、预算超支（>80% Token）、角色不匹配、环境冲突。**工作区监控器**实时检测文件创建/修改/删除。必要时自动升级到人工处理。
+## 治理如何落地
 
-### 11. 微工具系统 — 驾驭大型输出
-结果 >8KB 时自动生成可对话的微工具（如"search_in_results"）。将 50KB+ 的笨重输出转变为 LLM 上下文中可交互、可查询的产物。
+- **知识可解释：** Oxigraph 保存知识图谱，SPARQL 是查询它的语言；不同的知识图谱区域
+  用于区分租户/项目数据。
+- **变更需要正确的决策：** 候选内容会依据已批准的定义规范化、检查、暂存和审核；正式
+  上线或写入生产数据必须经过明确的受治理步骤。
+- **证据独立保存：** 确定性检查、冻结的参考用例、审计记录和写入后的回读，确保不会只
+  因模型或工作进程声称“已完成”就视为成功。
+- **访问范围可控：** 经验证的租户/项目隔离凭证决定存储范围，因此已接入该机制的接口
+  不会跨边界写入数据。
 
-### 12. MCP 集成 — 一个协议连接一切
-标准 **Model Context Protocol** 连接 GitHub、Slack、Jira 等任意 MCP 兼容服务器。运行时动态发现工具。支持 HTTP SSE 和 stdio 两种传输模式，通过可重复 `--mcp-server` CLI 标志配置。
-
-### 13. 检查点与恢复 — 崩溃不丢上下文
-关键执行点保存会话快照，崩溃后完整恢复上下文零丢失。`--resume <task_iri>` 和 `--list-checkpoints` 命令提供显式会话管理。支持数小时/数天的长任务执行及事后回放调试。
-
-### 14. Center + Edge 联邦 — 本地自治，全局编排
-Go Center 负责工作流编排（Temporal）、项目管理、智能体注册。Rust Edge 运行本地 LLM 执行与 Docker 沙箱。VS Code 插件提供实时开发者感知。无单点故障。
-
----
-
-## 🖥️ Wild Code — 终端 AI 编程助手
-
-**Wild Code** 是一款基于终端的 AI 编程助手（`ratatui` TUI），将如野智能体操作系统 Wild AgentOS的知识图谱与智能体编排能力直接带入命令行——无需 IDE。
-
-**功能特性：**
-- 交互式 TUI，支持 **Markdown 渲染**（`tui-markdown`）和 **Mermaid 图表**
-- **MCP 服务器集成**，通过 `--mcp-server` 和 `--mcp-server-stdio` 标志
-- **检查点恢复**：`--resume <task_iri>` 和 `--list-checkpoints`
-- **多模型后端**：DeepSeek、兼容 OpenAI 的 API
-- **PDCA 工作流执行**：规划/执行/检查/行动完整周期
-- **可配置**：工作区、最大迭代次数、最大 PDCA 周期、日志级别
-
-![Wild Code 演示](assets/screenshot.gif)
-
-![知识图谱实战](assets/wild_code_kg.JPG)
-*知识图谱可视化——实时实体关系、代码结构理解、基于 Oxigraph RDF 的跨子系统感知*
-
-![编程任务完成](assets/wild_code.JPG)
-*任务完成界面——AI 智能体成功分析并解决编程任务，全程可追溯*
-
----
-
-## 🚀 快速开始
-
-### 直接下载 — Wild Code
-
-无需任何依赖。下载、解压、直接运行：
-
-| 平台 | 下载 |
-|------|------|
-| Linux (x86_64, musl) | [`wildcode-x86_64-unknown-linux-musl.tar.gz`](https://github.com/skaiy/wild_agentos/releases) (~15 MB) |
-| Linux (aarch64, musl) | [`wildcode-aarch64-unknown-linux-musl.tar.gz`](https://github.com/skaiy/wild_agentos/releases) (~14 MB) |
-| macOS (Apple Silicon) | [`wildcode-aarch64-apple-darwin.tar.gz`](https://github.com/skaiy/wild_agentos/releases) (~13 MB) |
-| Windows (x86_64) | [`wildcode-x86_64-pc-windows-msvc.zip`](https://github.com/skaiy/wild_agentos/releases) (~12 MB) |
-
-```bash
-# Linux / macOS
-tar xzf wildcode-*.tar.gz
-./wildcode --help
-
-# Windows (PowerShell)
-Expand-Archive wildcode-x86_64-pc-windows-msvc.zip .
-.\wildcode.exe --help
-```
-
-> 所有 Linux 版本均为**全静态链接**（musl），无需任何运行时依赖。
-
-设置 API 密钥后即可使用：
-
-```bash
-export DEEPSEEK_API_KEY="sk-..."        # Linux / macOS
-# 或
-set DEEPSEEK_API_KEY="sk-..."           # Windows (cmd)
-# 或
-$env:DEEPSEEK_API_KEY="sk-..."          # Windows (PowerShell)
-
-# 也可使用任意兼容 OpenAI 的服务：
-export AGENT_OS_GATEWAY_API_KEY="sk-..."
-export AGENT_OS_GATEWAY_BASE_URL="https://your-endpoint/v1"
-
-# Web search 工具（基于 Exa 搜索引擎）：
-# 从 https://exa.ai/docs/reference/team-management/get-api-key 免费获取 API Key
-# 未设置时自动降级为 DuckDuckGo 模式，但国内 DuckDuckGo 不好用，不推荐国内使用
-export EXA_API_KEY="your-exa-api-key"
-
-# 启动交互式会话
-./wildcode
-
-# 或单次执行任务
-./wildcode "解释 Rust 的借用检查器工作原理"
-
-# 附接 MCP 服务器
-./wildcode --mcp-server chrome=http://localhost:3000/sse
-
-# 从检查点恢复
-./wildcode --resume task:abc123
-```
-
-### 从源码构建
+## 从源码构建
 
 ```bash
 git clone https://github.com/skaiy/wild_agentos.git
-cd Wild_AgentOS
-
-# 编译 wildcode 二进制（release，约 51 MB）
-cargo build -p wild-code-cli --release
-./target/release/wildcode --help
+cd wild_agentos
+# 构建前安装 Protocol Buffers 的 protoc compiler。
+cargo build --workspace
+cargo test --workspace
 ```
 
----
+## 本地运行
 
-## 🗺️ 路线图
-
-Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，结合 Oxigraph RDF/SPARQL、Hyperspace、`IsolationClaims` 命名契约和本体 Action 的**数据**沙箱。它不是裸机微内核 OS，也不追求完整复刻某个专有平台；不以 Nebula/Cypher 替换 Oxigraph，不混合其他业务/产品仓库或产品边界到本开源树，且 mint 名称不等于迁移历史数据。详见[演进路线图](docs/18-evolution-roadmap.zh.md)和[隔离契约](docs/17-isolation-contract.zh.md)。
-
-- **v0.1.6 — 已完成：** JWT `IsolationClaims` 为 graph/blob/vector/L0 mint 目标；相关 HTTP 路径 fail closed；历史键尚未迁移。
-- **v0.1.7 — 已完成：** 区分 minted 与历史键的只读诊断 CLI、客户可读隔离矩阵、fail-closed 黄金 CI，以及禁止静默 `UNION` 的可选显式迁移。
-- **v0.1.8 — 已完成：** 可保留待审批的 Action staging、merge/discard API 与 TTL、可配置护栏和 SPARQL 断言，以及 `ACTION_AUDIT` 事件总线审计。
-- **v0.2.0 — 已完成：** Skill package 验证、golden 检查、默认关闭的 Judge hook 和受控 tenant 发布；Rust CI 中的 Agent/Skill/Action golden evals；配套 Admin #16 已在独立仓库交付五屏控制平面骨架。
-- **v0.2.1 — 已完成：** 从 CSV 或 JSON Schema 生成、按 claims 隔离并需获授权人员审批后才能提升的 ObjectType/LinkType 草稿；由 `IsolationClaims` 过滤的入站 MCP 目录；受 gate 租户 Skill 的 MCP 工具发布；以及默认关闭、尽力而为的薄型出站 A2A adapter。详见[出站 A2A 适配器](docs/19-a2a-outbound.md)。
-- **v0.2.2 — 已完成：** claims 作用域 coding artifact store（`IsolationClaims` graph 元数据与服务端 mint 的 tenant blob 前缀）；默认关闭的外部 `SandboxProvider` adapter（不会跨 `await` 持有 `MutexGuard`）；以及面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，不编造速度提升。
-- **v0.3.0 — 已完成：** 具有不可变版本和显式 install/upgrade/rollback 的版本化 Logic 与 Skill package market；与本地开发 HS256 并行、且 fail-closed 的 OIDC/JWKS 身份验证；带 gate 和人工审批的 emergent-tool promotion pipeline；以及默认关闭、仅在 query-time 扩展且绝不持久化推理三元组的有限 RDFS 推理。
-- **v0.5.0 — 已完成：** 双轨本体知识工程 / Graph Engineering 里程碑：只写 staging 的 constrained extraction 与 Morph-KGC/RML 输入；`KgQualityGate` 与审阅；带锚点、可审计的 materialization；保守、待审批的 entity-resolution suggestion；冻结 golden SHA 检查与只读 health reporting；以及 OpenAPI/SQL DDL 与 induction draft、readiness report 和 compatibility-gated promote。租户 Skill/Emergent promotion 现要求 golden SHA 验证、具名规则审阅与 audit evidence。配套 Admin ontology design studio 已独立交付。
-- **v0.6 — 计划：** 已认证、claims-scoped 的 online corpus job 与默认开启的 corpus watcher 将以 idempotency、retry/backpressure、provenance 和可观测 job state 编排既有 KE 原语，包括必选且 approval-held 的 entity-resolution suggestion。部署可在需要时显式关闭 watcher configuration；production ontology promote、entity-resolution merge 和 materialization 仍由人工治理。
-
----
-
-## 📊 性能目标
-
-| 操作 | 延迟 | 吞吐量 |
-|------|------|--------|
-| L2 节点写入 (Oxigraph) | ~2ms | 500 ops/sec |
-| L3 SPARQL 投影 | ~15ms | 66 ops/sec |
-| L0 redb KV 读取 | ~1ms | 1000 ops/sec |
-| Hyperspace HNSW 搜索（万级向量） | ~1ms | 1000 qps |
-| Poincaré 嵌入（4 维） | ~50µs | — |
-| Agent ReAct 单轮 | 1-5s | 0.2-1 turns/sec |
-| 空闲内存 | ~200MB | 随任务扩展 |
-
----
-
-## 📚 文档
-
-- **记忆系统** → [`docs/03-memory-system.md`](docs/03-memory-system.md)（L0 redb · HyperspaceEngine · Oxigraph SPARQL）
-- **知识摄取与 import-graph** → [`docs/16-knowledge-ingest-import-graph.zh.md`](docs/16-knowledge-ingest-import-graph.zh.md)（upload / ingest / 命名图隔离 · embedding 可换 · Oxigraph/hyperspace 固定）
-- **隔离契约** → [`docs/17-isolation-contract.zh.md`](docs/17-isolation-contract.zh.md)（可信 claims、命名与未迁移历史键）
-- **隔离矩阵** → [`docs/17-isolation-matrix.zh.md`](docs/17-isolation-matrix.zh.md)（CI 验证的 fail-closed 行为；历史键尚未迁移）
-- **演进路线图** → [`docs/18-evolution-roadmap.zh.md`](docs/18-evolution-roadmap.zh.md)（v0.1.6 后战略与明确非目标）
-- **本体 Action 数据沙箱** → [`docs/15-ontology-action-sandbox.zh.md`](docs/15-ontology-action-sandbox.zh.md)（staging graph 护栏，不是计算沙箱）
-- **本体 KE 流水线** → [`docs/21-ontology-knowledge-engineering-pipeline.zh.md`](docs/21-ontology-knowledge-engineering-pipeline.zh.md)（双轨里程碑边界及仍存在的在线自动化缺口）
-- **本体 KE Golden Freeze Policy** → [`docs/22-ontology-ke-golden-freeze-policy.zh.md`](docs/22-ontology-ke-golden-freeze-policy.zh.md)（冻结 scorecard 与 measurement-decay 审计）
-- **设计细节** → [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) · [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) (English)
-- **核心设计理念** → [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) · [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) (English)
-- **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
-
----
-
-## 🤝 参与贡献
-
-欢迎社区贡献！
-
-- **🐛 报告 Bug**：[GitHub Issues](https://github.com/skaiy/wild_agentos/issues)
-- **💡 提出想法**：[GitHub Discussions](https://github.com/skaiy/wild_agentos/discussions)
-- **🔀 提交 PR**：Fork → 功能分支 → PR 至 `main`
+默认 binary 启动 HTTP/SSE server（端口 `8080`）与 gRPC（端口 `50051`）。在
+checkout 根目录使用提供的 `config.yaml` 启动：
 
 ```bash
-git checkout -b feat/my-feature
-# 进行你的修改
-cargo fmt && cargo clippy  # 保持代码整洁
-cargo test                 # 确保一切正常
-git commit -am '添加我的功能'
-git push origin feat/my-feature
+cargo run --bin wild-agent-os-core
 ```
 
-所有贡献者应遵守我们的[行为准则](docs/CODE_OF_CONDUCT.zh.md)。
+使用 LLM-backed feature 前需配置 LLM gateway。仓库内的 config 保留空的
+gateway credential；deployment credential 应始终存放在 version control
+之外。生产环境请设置 `AGENTOS_ENV=production`，并配置[隔离契约](docs/17-isolation-contract.zh.md)
+所述必需 OIDC/JWKS environment value。server 会拒绝 production HS256
+configuration。
 
----
+## 文档
 
-## 📄 许可证
+- [演进路线图](docs/18-evolution-roadmap.zh.md) — 已交付里程碑、边界与明确非目标
+- [隔离契约](docs/17-isolation-contract.zh.md) — verified claims、fail-closed
+  storage target 与 historical-key status
+- [隔离矩阵](docs/17-isolation-matrix.zh.md) — 经 CI 验证的 isolation behavior
+- [本体 KE 流水线](docs/21-ontology-knowledge-engineering-pipeline.zh.md) —
+  online corpus job/watcher 与 KE governance boundary
+- [本体 Action 数据沙箱](docs/15-ontology-action-sandbox.zh.md) — HITL staging、
+  guardrail 与 audit
+- [本体 KE Golden Freeze Policy](docs/22-ontology-ke-golden-freeze-policy.zh.md)
+- [Outbound A2A adapter](docs/19-a2a-outbound.md)
+- [Private-deployment benchmark](docs/19-private-deploy-benchmark.md)
+- [设计细节](docs/13-DESIGN_DETAIL.zh.md)
 
-Wild AgentOS 采用双许可模式：
+## 参与贡献
 
-- **社区版** —— [GNU AGPL v3.0](LICENSE)（另见 [NOTICE](NOTICE)）。若通过网络对外提供修改后的版本，AGPLv3 第 13 条要求你向使用者提供完整的对应源代码。
-- **商业版** —— 无法遵守 AGPLv3 的商业使用需单独获取商业授权，详见 [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)。
+- 在 [GitHub Issues](https://github.com/skaiy/wild_agentos/issues) 报告问题。
+- 在 [GitHub Discussions](https://github.com/skaiy/wild_agentos/discussions) 提出建议。
+- 向 `main` 提交 pull request。
 
-商业授权咨询请联系 **diaoguoliang@gmail.com**。
+提交前请运行相关检查：
 
-参与贡献需签署[贡献者许可协议（CLA）](CLA.md)，首次提交 PR 时由 CLA Assistant 自动引导完成。
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+```
+
+## 许可证
+
+Wild AgentOS 采用双许可：
+
+- **Community Edition** — [GNU AGPL v3.0](LICENSE)（参见 [NOTICE](NOTICE)）。
+- **Commercial Edition** — 无法遵守 AGPLv3 的商业使用需要单独获取商业授权；
+  详见 [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)。
+
+商业授权请联系 **diaoguoliang@gmail.com**。参与贡献需签署
+[Contributor License Agreement](CLA.md)。
 
 版权所有 (c) 2026 skaiy (diaoguoliang@gmail.com)。
