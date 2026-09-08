@@ -572,6 +572,8 @@ mod tests {
         tools::prompt_registry::PromptRegistry,
     };
 
+    const TEST_JWT_SECRET: &[u8] = b"test-hs256-secret-at-least-32-bytes-long";
+
     fn test_gateway() -> UnifiedGateway {
         UnifiedGateway::new(&crate::config::GatewaySettings {
             base_url: "http://localhost".into(),
@@ -633,7 +635,7 @@ mod tests {
                 roles: roles.into_iter().map(str::to_owned).collect(),
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+            &EncodingKey::from_secret(TEST_JWT_SECRET),
         )
         .unwrap()
     }
