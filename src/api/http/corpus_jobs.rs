@@ -318,7 +318,13 @@ fn append_audit_event(
 }
 
 fn classify_job_error(error: &str) -> CorpusJobErrorClassification {
-    if error.contains("quality gate blocked")
+    if error.starts_with("entity resolution requires AGENTOS_KG_GLINKER_COMMAND")
+        || error.starts_with("start entity-resolution sidecar")
+        || error.starts_with("wait for entity-resolution sidecar")
+        || error.starts_with("entity-resolution sidecar failed")
+    {
+        CorpusJobErrorClassification::Transient
+    } else if error.contains("quality gate blocked")
         || error.contains("canonicalization ambiguity")
         || error.contains("entity resolution uncertain")
     {
@@ -327,11 +333,6 @@ fn classify_job_error(error: &str) -> CorpusJobErrorClassification {
         CorpusJobErrorClassification::Validation
     } else if error.contains("unauthorized") || error.contains("verified JWT") {
         CorpusJobErrorClassification::Authorization
-    } else if error.starts_with("start entity-resolution sidecar")
-        || error.starts_with("wait for entity-resolution sidecar")
-        || error.starts_with("entity-resolution sidecar failed")
-    {
-        CorpusJobErrorClassification::Transient
     } else {
         CorpusJobErrorClassification::Internal
     }
@@ -760,10 +761,22 @@ async fn run_job_ke_primitives(
         .find(|review| review.extraction_id == extraction_id);
     let (review, gate_passed) = match existing_review {
         Some(review) => {
-            let report = serde_json::from_str::<
+            let report = match serde_json::from_str::<
                 crate::knowledge_graph::quality_gate::QualityGateReport,
             >(&review.report_json)
-            .map_err(|error| format!("stored quality gate report is invalid: {error}"))?;
+            {
+                Ok(report) => report,
+                Err(first_error) => {
+                    let Some(decoded) = decode_sparql_literal(&review.report_json) else {
+                        return Err(format!(
+                            "stored quality gate report is invalid: {first_error}"
+                        ));
+                    };
+                    serde_json::from_str(&decoded).map_err(|error| {
+                        format!("stored quality gate report is invalid: {error}")
+                    })?
+                }
+            };
             (review, report.passed)
         }
         None => {
@@ -788,28 +801,18 @@ async fn run_job_ke_primitives(
     let mut suggestion_ids = Vec::new();
     for node in &canonical.extraction.nodes {
         let source_iri = format!("iri://entity/{}", RdfMapper::sanitize_id(&node.id));
-        let existing = kg
-            .list_action_approvals_for_claims(claims)?
-            .into_iter()
-            .find(|approval| {
-                approval.action_id == "entity-resolution"
-                    && approval
-                        .anchor_query
-                        .as_deref()
-                        .is_some_and(|query| query.contains(&source_iri))
-            })
-            .map(|approval| approval.approval_id);
-        let suggestion = match existing {
-            Some(approval_id) => approval_id,
-            None => create_entity_resolution_suggestion_from_staging(
-                &kg,
-                claims,
-                &extraction_id,
-                &source_iri,
-                &node.label,
-            )?
-            .ok_or_else(|| format!("entity resolution uncertain for staged mention {}", node.id))?,
-        };
+        // Entity-resolution evidence is tied to this staged extraction.
+        // Reusing an approval from a prior job would bypass the sidecar for
+        // this run, including when the sidecar is unavailable. Require the
+        // sidecar to produce a fresh, approval-held suggestion instead.
+        let suggestion = create_entity_resolution_suggestion_from_staging(
+            &kg,
+            claims,
+            &extraction_id,
+            &source_iri,
+            &node.label,
+        )?
+        .ok_or_else(|| format!("entity resolution uncertain for staged mention {}", node.id))?;
         suggestion_ids.push(suggestion);
     }
     if suggestion_ids.is_empty() {
@@ -850,6 +853,10 @@ fn sparql_literal(value: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+fn decode_sparql_literal(value: &str) -> Option<String> {
+    serde_json::from_str::<String>(&format!("\"{value}\"")).ok()
 }
 
 async fn record_job_links_for_claims(
@@ -1415,6 +1422,12 @@ mod tests {
         assert_eq!(
             classify_job_error("quality gate blocked the staged extraction"),
             CorpusJobErrorClassification::Policy
+        );
+        assert_eq!(
+            classify_job_error(
+                "entity resolution requires AGENTOS_KG_GLINKER_COMMAND configured as one executable path"
+            ),
+            CorpusJobErrorClassification::Transient
         );
         std::env::remove_var("AGENTOS_DATA_DIR");
     }
