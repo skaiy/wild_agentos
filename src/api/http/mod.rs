@@ -186,6 +186,9 @@ pub struct TaskExecSpec {
     pub task_iri: String,
     pub include_thought: bool,
     pub include_tool_calls: bool,
+    /// Cancel this task's execution, for example when its request timeout
+    /// expires. This remains distinct from the process-wide shutdown token.
+    pub cancellation: tokio_util::sync::CancellationToken,
     /// Claims minted by the verified HTTP authentication boundary. Absent
     /// claims deliberately leave L0 writes on the legacy read-only path.
     pub isolation_claims: Option<crate::isolation::IsolationClaims>,

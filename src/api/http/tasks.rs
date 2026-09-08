@@ -119,10 +119,39 @@ pub(crate) async fn stream_task_handler(
                 task_iri: task_iri.clone(),
                 include_thought: req.include_thought.unwrap_or(true),
                 include_tool_calls: req.include_tool_calls.unwrap_or(true),
+                cancellation: tokio_util::sync::CancellationToken::new(),
                 isolation_claims: identity.isolation_claims().cloned(),
             };
+            let task_iri = spec.task_iri.clone();
+            let cancellation = spec.cancellation.clone();
+            let task_events = event_bus.clone();
             tokio::spawn(async move {
-                executor.execute(spec).await;
+                let execution = tokio::spawn(async move {
+                    executor.execute(spec).await;
+                });
+
+                if let Err(error) = execution.await {
+                    cancellation.cancel();
+                    tracing::error!(
+                        task_iri = %task_iri,
+                        cancelled = error.is_cancelled(),
+                        panic = error.is_panic(),
+                        error = %error,
+                        "HTTP task executor terminated unexpectedly"
+                    );
+                    task_events
+                        .emit(
+                            &task_iri,
+                            "TASK_FAILED",
+                            "http",
+                            &json!({
+                                "status": "failed",
+                                "summary": format!("task executor terminated unexpectedly: {error}"),
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                }
             });
         }
         None => {
