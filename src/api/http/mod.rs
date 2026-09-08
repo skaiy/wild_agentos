@@ -125,7 +125,7 @@ use corpus_jobs::{
     get_online_corpus_job_handler, list_online_corpus_jobs_handler, load_online_corpus_jobs,
     online_corpus_job_observability_handler, run_online_corpus_job_handler,
 };
-use corpus_watchers::start_online_corpus_watcher_scheduler;
+use corpus_watchers::run_online_corpus_watcher_scheduler;
 use models::{
     activate_embedding_handler, image_raw_handler, provider_models_handler, test_model_handler,
     upload_image_handler, IMAGE_UPLOAD_MAX_BYTES,
@@ -178,6 +178,8 @@ pub struct AppState {
     /// Configured queue capacity used only for claims-scoped saturation
     /// observability; it does not grant any worker production-write authority.
     pub(crate) online_corpus_queue_capacity: usize,
+    /// Process-wide cancellation propagated by the runtime supervisor.
+    pub(crate) shutdown: tokio_util::sync::CancellationToken,
 }
 /// 流式任务执行规格：由 HTTP 流处理器构造并传入执行器。
 #[derive(Clone)]
@@ -250,6 +252,7 @@ pub fn build_router(
     task_executor: Option<Arc<dyn TaskExecutor>>,
     batch_manager: Option<SharedBatchManager>,
     online_corpus_watchers: crate::config::OnlineCorpusWatcherSettings,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Router {
     // 启动时加载用户态注册的技能并重新注册到内存技能表（默认技能由 SemanticCore 播种）。
     for skill in load_user_skills() {
@@ -289,8 +292,13 @@ pub fn build_router(
         api_usage: Arc::new(ApiUsageState::default()),
         online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(load_online_corpus_jobs())),
         online_corpus_queue_capacity: online_corpus_watchers.queue_capacity,
+        shutdown: shutdown.clone(),
     });
-    start_online_corpus_watcher_scheduler(state.online_corpus_jobs.clone(), online_corpus_watchers);
+    tokio::spawn(run_online_corpus_watcher_scheduler(
+        state.online_corpus_jobs.clone(),
+        online_corpus_watchers,
+        shutdown,
+    ));
 
     // 启动首灌：把持久化的 models 注册表灌入 gateway，使进程启动即按多 provider 生效。
     hot_reload_models(&state);
