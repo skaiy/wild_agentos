@@ -76,11 +76,13 @@ pub(crate) async fn write_node_handler(
         Ok(node_iri) => (
             StatusCode::CREATED,
             Json(json!({"node_iri": node_iri, "accepted": true})),
-        ),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"accepted": false, "error": e.to_string()})),
-        ),
+        )
+            .into_response(),
     }
 }
 
@@ -152,7 +154,7 @@ pub(crate) async fn emit_event_handler(
         .core
         .emit_event(task_iri, event_type, source, &payload.to_string())
         .await;
-    Json(json!({"event_id": event_id, "status": "emitted"}))
+    Json(json!({"event_id": event_id, "status": "emitted"})).into_response()
 }
 
 /// Authorize writes to a task-scoped blackboard/event stream.
