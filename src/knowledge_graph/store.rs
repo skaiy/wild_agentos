@@ -3,12 +3,32 @@ use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use thiserror::Error;
 
 use crate::isolation::IsolationClaims;
 
 use super::ontology_draft::TypeDraftBundle;
 use super::rdf_mapper::RdfMapper;
 use super::types::RdfQuad;
+
+/// Stable error contract for the knowledge-graph storage boundary.
+///
+/// Store internals retain detailed operation context in `message`, while API
+/// edges can map invalid caller input separately from unavailable storage.
+#[derive(Debug, Error)]
+pub enum KnowledgeGraphError {
+    #[error("knowledge graph initialization failed: {message}")]
+    Initialization { message: String },
+
+    #[error("knowledge graph scope is invalid: {message}")]
+    InvalidScope { message: String },
+
+    #[error("knowledge graph query failed: {message}")]
+    Query { message: String },
+
+    #[error("knowledge graph update failed: {message}")]
+    Update { message: String },
+}
 
 /// Environment switch for the deliberately small query-time RDFS segment.
 ///
@@ -134,15 +154,17 @@ impl ClaimsGraphUpdate {
 
 impl KnowledgeGraphStore {
     /// Create KG Store using a unified shared Oxigraph Store
-    pub fn with_shared_store(store: Arc<Store>) -> Result<Self, String> {
+    pub fn with_shared_store(store: Arc<Store>) -> Result<Self, KnowledgeGraphError> {
         Ok(Self {
             store,
             default_graph: "graph:world".to_string(),
         })
     }
 
-    pub fn new() -> Result<Self, String> {
-        let store = Store::new().map_err(|e| format!("failed to create Oxigraph Store: {}", e))?;
+    pub fn new() -> Result<Self, KnowledgeGraphError> {
+        let store = Store::new().map_err(|e| KnowledgeGraphError::Initialization {
+            message: e.to_string(),
+        })?;
         Ok(Self {
             store: Arc::new(store),
             default_graph: "graph:world".to_string(),
@@ -165,8 +187,10 @@ impl KnowledgeGraphStore {
         })
     }
 
-    pub fn with_graph(graph_name: &str) -> Result<Self, String> {
-        let store = Store::new().map_err(|e| format!("failed to create Oxigraph Store: {}", e))?;
+    pub fn with_graph(graph_name: &str) -> Result<Self, KnowledgeGraphError> {
+        let store = Store::new().map_err(|e| KnowledgeGraphError::Initialization {
+            message: e.to_string(),
+        })?;
         Ok(Self {
             store: Arc::new(store),
             default_graph: graph_name.to_string(),
@@ -204,17 +228,21 @@ impl KnowledgeGraphStore {
         &self,
         claims: &IsolationClaims,
         quads: &[RdfQuad],
-    ) -> Result<(), String> {
+    ) -> Result<(), KnowledgeGraphError> {
         let graph = claims
             .graph_iri()
-            .map_err(|e| format!("invalid verified graph scope: {}", e))?;
+            .map_err(|e| KnowledgeGraphError::InvalidScope {
+                message: e.to_string(),
+            })?;
         if quads.is_empty() {
             return Ok(());
         }
         let sparql = RdfMapper::quads_to_sparql_insert(quads, &graph);
         self.store
             .update(&sparql)
-            .map_err(|e| format!("SPARQL INSERT failed: {}", e))
+            .map_err(|e| KnowledgeGraphError::Update {
+                message: format!("SPARQL INSERT failed: {e}"),
+            })
     }
 
     /// Upserts KB catalog metadata in the graph minted from verified claims.
@@ -288,12 +316,13 @@ impl KnowledgeGraphStore {
         &self,
         claims: &IsolationClaims,
         sparql: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    ) -> Result<Vec<serde_json::Value>, KnowledgeGraphError> {
         self.query_sparql_for_claims_with_inference(
             claims,
             sparql,
             LimitedRdfsInference::from_environment(),
         )
+        .map_err(|message| KnowledgeGraphError::Query { message })
     }
 
     /// Executes a claims-scoped SPARQL query with an explicit inference mode.

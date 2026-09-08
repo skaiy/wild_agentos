@@ -229,10 +229,28 @@ mod tests {
             ] {
                 let error = executor.execute(tool, input).await.unwrap_err();
                 assert!(
-                    error.contains("verified isolation claims"),
+                    error.to_string().contains("verified isolation claims"),
                     "{tool} must explicitly reject missing claims: {error}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn missing_tool_returns_typed_boundary_error() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let error = executor
+                .execute("not_registered", json!({}))
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                ToolExecutionError::NotFound {
+                    name: "not_registered".to_string(),
+                }
+            );
         });
     }
 
