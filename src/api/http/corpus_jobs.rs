@@ -761,10 +761,22 @@ async fn run_job_ke_primitives(
         .find(|review| review.extraction_id == extraction_id);
     let (review, gate_passed) = match existing_review {
         Some(review) => {
-            let report = serde_json::from_str::<
+            let report = match serde_json::from_str::<
                 crate::knowledge_graph::quality_gate::QualityGateReport,
             >(&review.report_json)
-            .map_err(|error| format!("stored quality gate report is invalid: {error}"))?;
+            {
+                Ok(report) => report,
+                Err(first_error) => {
+                    let Some(decoded) = decode_sparql_literal(&review.report_json) else {
+                        return Err(format!(
+                            "stored quality gate report is invalid: {first_error}"
+                        ));
+                    };
+                    serde_json::from_str(&decoded).map_err(|error| {
+                        format!("stored quality gate report is invalid: {error}")
+                    })?
+                }
+            };
             (review, report.passed)
         }
         None => {
@@ -841,6 +853,10 @@ fn sparql_literal(value: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+fn decode_sparql_literal(value: &str) -> Option<String> {
+    serde_json::from_str::<String>(&format!("\"{value}\"")).ok()
 }
 
 async fn record_job_links_for_claims(
