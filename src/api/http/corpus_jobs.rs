@@ -1606,7 +1606,7 @@ mod tests {
             &router,
             "POST",
             &format!("/api/v1/online-corpus-jobs/{id}/run"),
-            run_payload,
+            run_payload.clone(),
             Some(&jwt),
         )
         .await;
