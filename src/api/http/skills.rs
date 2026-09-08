@@ -949,6 +949,7 @@ mod tests {
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
             online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
         })
     }
 

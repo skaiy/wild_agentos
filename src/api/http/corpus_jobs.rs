@@ -15,6 +15,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     isolation::IsolationClaims,
@@ -38,6 +39,8 @@ use super::{
 };
 
 const MAX_ERROR_METADATA_BYTES: usize = 1024;
+const MAX_AUDIT_EVENTS: usize = 64;
+const MAX_RETRY_ATTEMPTS: u32 = 3;
 
 pub(crate) type OnlineCorpusJobStore = Arc<tokio::sync::RwLock<Vec<OnlineCorpusJob>>>;
 
@@ -56,6 +59,9 @@ pub(crate) struct CreateOnlineCorpusJobRequest {
     pub source: CorpusSource,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Trusted scheduler-only provenance. HTTP input cannot set this field.
+    #[serde(default, skip_deserializing)]
+    pub watcher_id: Option<String>,
 }
 
 /// Result of a trusted enqueue operation shared by the authenticated HTTP
@@ -87,7 +93,11 @@ impl OnlineCorpusJobState {
             (Self::Queued, Self::Running | Self::Cancelled)
                 | (
                     Self::Running,
-                    Self::AwaitingReview | Self::Succeeded | Self::Failed | Self::Cancelled
+                    Self::Queued
+                        | Self::AwaitingReview
+                        | Self::Succeeded
+                        | Self::Failed
+                        | Self::Cancelled
                 )
                 | (
                     Self::AwaitingReview,
@@ -101,11 +111,49 @@ impl OnlineCorpusJobState {
 pub(crate) struct CorpusJobAttemptSummary {
     pub attempts: u32,
     #[serde(default)]
+    pub retries: u32,
+    #[serde(default)]
+    pub max_attempts: u32,
+    #[serde(default)]
     pub latest_error: Option<String>,
+    #[serde(default)]
+    pub latest_error_classification: Option<CorpusJobErrorClassification>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CorpusJobErrorClassification {
+    Transient,
+    Validation,
+    Authorization,
+    Policy,
+    Internal,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CorpusJobAuditEvent {
+    pub at: String,
+    pub event: String,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub error_classification: Option<CorpusJobErrorClassification>,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub(crate) struct CorpusJobLinks {
+    #[serde(default)]
+    pub source_content_sha256: Option<String>,
+    #[serde(default)]
+    pub extractor: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub canonicalization_decision_count: usize,
+    #[serde(default)]
+    pub quality_gate_report_persisted: bool,
     #[serde(default)]
     pub staged_extraction_ids: Vec<String>,
     #[serde(default)]
@@ -133,6 +181,8 @@ pub(crate) struct OnlineCorpusJob {
     pub completed_at: Option<String>,
     pub attempt_summary: CorpusJobAttemptSummary,
     pub links: CorpusJobLinks,
+    #[serde(default)]
+    pub audit_events: Vec<CorpusJobAuditEvent>,
 }
 
 /// The runner accepts upstream extraction candidates but performs the trusted
@@ -198,13 +248,13 @@ fn valid_nonempty(value: &str, field: &str) -> Result<(), String> {
 fn validate_create_request(request: &CreateOnlineCorpusJobRequest) -> Result<(), String> {
     valid_nonempty(&request.source.id, "source.id")?;
     valid_nonempty(&request.source.version, "source.version")?;
-    if request
-        .source
-        .uri
-        .as_ref()
-        .is_some_and(|uri| uri.len() > 2048)
-    {
-        return Err("source.uri exceeds 2048 characters".to_string());
+    if request.source.uri.as_ref().is_some_and(|uri| {
+        uri.len() > 2048
+            || uri
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest.contains('@'))
+    }) {
+        return Err("source.uri exceeds 2048 characters or includes credentials".to_string());
     }
     if let Some(key) = &request.idempotency_key {
         valid_nonempty(key, "idempotency_key")?;
@@ -221,6 +271,74 @@ fn bounded_error_metadata(error: &str) -> String {
         end -= 1;
     }
     format!("{}…", &error[..end])
+}
+
+fn sanitize_metadata(value: &str) -> String {
+    let without_lines = value.replace(['\n', '\r'], " ");
+    let redacted = without_lines
+        .split_whitespace()
+        .map(|part| {
+            if part.contains("://")
+                && part
+                    .split_once("://")
+                    .is_some_and(|(_, rest)| rest.contains('@'))
+            {
+                "<redacted-url>"
+            } else if part.contains("token=")
+                || part.contains("api_key=")
+                || part.contains("password=")
+            {
+                "<redacted-secret>"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    bounded_error_metadata(&redacted)
+}
+
+fn append_audit_event(
+    job: &mut OnlineCorpusJob,
+    event: impl Into<String>,
+    detail: Option<&str>,
+    error_classification: Option<CorpusJobErrorClassification>,
+) {
+    job.audit_events.push(CorpusJobAuditEvent {
+        at: chrono::Utc::now().to_rfc3339(),
+        event: event.into(),
+        attempt: job.attempt_summary.attempts,
+        error_classification,
+        detail: detail.map(sanitize_metadata),
+    });
+    if job.audit_events.len() > MAX_AUDIT_EVENTS {
+        job.audit_events
+            .drain(..job.audit_events.len() - MAX_AUDIT_EVENTS);
+    }
+}
+
+fn classify_job_error(error: &str) -> CorpusJobErrorClassification {
+    if error.contains("quality gate blocked")
+        || error.contains("canonicalization ambiguity")
+        || error.contains("entity resolution uncertain")
+    {
+        CorpusJobErrorClassification::Policy
+    } else if error.contains("required") || error.contains("must be") || error.contains("invalid") {
+        CorpusJobErrorClassification::Validation
+    } else if error.contains("unauthorized") || error.contains("verified JWT") {
+        CorpusJobErrorClassification::Authorization
+    } else if error.starts_with("start entity-resolution sidecar")
+        || error.starts_with("wait for entity-resolution sidecar")
+        || error.starts_with("entity-resolution sidecar failed")
+    {
+        CorpusJobErrorClassification::Transient
+    } else {
+        CorpusJobErrorClassification::Internal
+    }
+}
+
+fn is_retryable(classification: CorpusJobErrorClassification) -> bool {
+    classification == CorpusJobErrorClassification::Transient
 }
 
 fn public_job(job: &OnlineCorpusJob, reused: bool) -> Value {
@@ -272,17 +390,80 @@ pub(crate) async fn enqueue_online_corpus_job(
         actor_id: claims.actor_id().to_owned(),
         state: OnlineCorpusJobState::Queued,
         created_at: now.clone(),
-        updated_at: now,
+        updated_at: now.clone(),
         started_at: None,
         completed_at: None,
-        attempt_summary: CorpusJobAttemptSummary::default(),
+        attempt_summary: CorpusJobAttemptSummary {
+            max_attempts: MAX_RETRY_ATTEMPTS,
+            ..Default::default()
+        },
         links: CorpusJobLinks::default(),
+        audit_events: vec![CorpusJobAuditEvent {
+            at: now,
+            event: if request.watcher_id.is_some() {
+                "watcher_enqueued".into()
+            } else {
+                "queued".into()
+            },
+            attempt: 0,
+            error_classification: None,
+            detail: request
+                .watcher_id
+                .as_deref()
+                .map(|watcher_id| format!("watcher_id={watcher_id}; cursor=source_version"))
+                .or_else(|| Some("job accepted".into())),
+        }],
     };
     let mut next = jobs.clone();
     next.push(job.clone());
     save_online_corpus_jobs(&next)?;
     *jobs = next;
     Ok(EnqueuedOnlineCorpusJob { job, reused: false })
+}
+
+/// GET /api/v1/online-corpus-jobs/observability
+///
+/// Claims-scoped operational counters. Corpus payloads and other scopes are
+/// never returned; queue capacity is supplied by the process configuration.
+pub(crate) async fn online_corpus_job_observability_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let claims = match claims_or_unauthorized(&identity) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    let jobs = state.online_corpus_jobs.read().await;
+    let scoped: Vec<_> = jobs
+        .iter()
+        .filter(|job| job_is_in_scope(job, claims))
+        .collect();
+    let queued = scoped
+        .iter()
+        .filter(|job| job.state == OnlineCorpusJobState::Queued)
+        .count();
+    let active = scoped
+        .iter()
+        .filter(|job| job.state == OnlineCorpusJobState::Running)
+        .count();
+    let retries: u32 = scoped.iter().map(|job| job.attempt_summary.retries).sum();
+    let failed = scoped
+        .iter()
+        .filter(|job| job.state == OnlineCorpusJobState::Failed)
+        .count();
+    Json(json!({
+        "queue_depth": queued,
+        "active_work": active,
+        "retry_count": retries,
+        "terminal_failures": failed,
+        "queue_capacity": state.online_corpus_queue_capacity,
+        "saturated": queued >= state.online_corpus_queue_capacity,
+        "oldest_queued_at": scoped.iter()
+            .filter(|job| job.state == OnlineCorpusJobState::Queued)
+            .map(|job| job.created_at.as_str()).min(),
+        "production_write": false,
+    }))
+    .into_response()
 }
 
 /// POST /api/v1/online-corpus-jobs
@@ -489,25 +670,44 @@ pub(crate) async fn run_online_corpus_job_handler(
                 Err(error) => job_transition_response(error),
             }
         }
-        Err(error) => match transition_job_for_claims(
-            &state.online_corpus_jobs,
-            claims,
-            &job_id,
-            OnlineCorpusJobState::Failed,
-            Some(&error),
-        )
-        .await
-        {
-            Ok(job) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "job": job, "error": error, "production_write": false,
-                    "materialization_status": "not_materialized",
-                })),
+        Err(error) => {
+            let classification = classify_job_error(&error);
+            // `job` is the pre-run snapshot, so include the attempt that just
+            // transitioned to Running before deciding whether it may be queued.
+            let retryable = is_retryable(classification)
+                && job.attempt_summary.attempts.saturating_add(1) < MAX_RETRY_ATTEMPTS;
+            let next_state = if retryable {
+                OnlineCorpusJobState::Queued
+            } else {
+                OnlineCorpusJobState::Failed
+            };
+            match transition_job_for_claims(
+                &state.online_corpus_jobs,
+                claims,
+                &job_id,
+                next_state,
+                Some(&error),
             )
-                .into_response(),
-            Err(transition_error) => job_transition_response(transition_error),
-        },
+            .await
+            {
+                Ok(job) => (
+                    if retryable {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    },
+                    Json(json!({
+                        "job": job, "error": sanitize_metadata(&error),
+                        "error_classification": classification,
+                        "retry_scheduled": retryable,
+                        "production_write": false,
+                        "materialization_status": "not_materialized",
+                    })),
+                )
+                    .into_response(),
+                Err(transition_error) => job_transition_response(transition_error),
+            }
+        }
     }
 }
 
@@ -533,12 +733,14 @@ async fn run_job_ke_primitives(
          <https://agentos.ontology/extraction/blobId> \"{}\" ; \
          <https://agentos.ontology/extraction/blobVersion> \"{}\" ; \
          <https://agentos.ontology/extraction/extractor> \"{}\" ; \
-         <https://agentos.ontology/extraction/sourceText> \"{}\" ; \
+         <https://agentos.ontology/extraction/model> \"{}\" ; \
+         <https://agentos.ontology/extraction/sourceContentSha256> \"{}\" ; \
          <https://agentos.ontology/extraction/canonicalizationDecisions> \"{}\" .",
         sparql_literal(&job.source.id),
         sparql_literal(&job.source.version),
         sparql_literal(&request.extractor),
-        sparql_literal(&request.text),
+        sparql_literal(request.model.as_deref().unwrap_or("unspecified")),
+        sha256_hex(&request.text),
         sparql_literal(&decisions),
     );
     let mut triples = RdfMapper::quads_to_sparql_triples(&mapped.quads);
@@ -627,10 +829,19 @@ async fn run_job_ke_primitives(
     }
     let _ = state.kg_store.flush();
     Ok(CorpusJobLinks {
+        source_content_sha256: Some(sha256_hex(&request.text)),
+        extractor: Some(request.extractor.clone()),
+        model: request.model.clone(),
+        canonicalization_decision_count: canonical.decisions.len(),
+        quality_gate_report_persisted: true,
         staged_extraction_ids: vec![extraction_id],
         review_ids: vec![review.review_id],
         entity_resolution_suggestion_ids: suggestion_ids,
     })
+}
+
+fn sha256_hex(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 fn sparql_literal(value: &str) -> String {
@@ -657,6 +868,12 @@ async fn record_job_links_for_claims(
     let mut next = jobs.clone();
     next[index].links = links;
     next[index].updated_at = chrono::Utc::now().to_rfc3339();
+    append_audit_event(
+        &mut next[index],
+        "provenance_recorded",
+        Some("canonicalization, quality gate, ER suggestions, and staging linked"),
+        None,
+    );
     save_online_corpus_jobs(&next).map_err(JobTransitionError::Persistence)?;
     *jobs = next;
     Ok(())
@@ -724,7 +941,25 @@ pub(crate) async fn transition_job_for_claims(
         if next_state.is_terminal() {
             job.completed_at = Some(now);
         }
-        job.attempt_summary.latest_error = latest_error.map(bounded_error_metadata);
+        job.attempt_summary.latest_error = latest_error.map(sanitize_metadata);
+        job.attempt_summary.latest_error_classification = latest_error.map(classify_job_error);
+        if next_state == OnlineCorpusJobState::Queued && latest_error.is_some() {
+            job.attempt_summary.retries = job.attempt_summary.retries.saturating_add(1);
+        }
+        append_audit_event(
+            job,
+            match next_state {
+                OnlineCorpusJobState::Queued if latest_error.is_some() => "retry_queued",
+                OnlineCorpusJobState::Queued => "queued",
+                OnlineCorpusJobState::Running => "running",
+                OnlineCorpusJobState::AwaitingReview => "awaiting_review",
+                OnlineCorpusJobState::Succeeded => "succeeded",
+                OnlineCorpusJobState::Failed => "failed",
+                OnlineCorpusJobState::Cancelled => "cancelled",
+            },
+            latest_error,
+            latest_error.map(classify_job_error),
+        );
     }
     let updated = next[index].clone();
     save_online_corpus_jobs(&next).map_err(JobTransitionError::Persistence)?;
@@ -795,6 +1030,7 @@ mod tests {
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
             online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
         })
     }
 
@@ -807,6 +1043,10 @@ mod tests {
             .route(
                 "/api/v1/online-corpus-jobs/:id",
                 get(get_online_corpus_job_handler),
+            )
+            .route(
+                "/api/v1/online-corpus-jobs/observability",
+                get(online_corpus_job_observability_handler),
             )
             .route(
                 "/api/v1/online-corpus-jobs/:id/cancel",
@@ -929,6 +1169,27 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(listed["count"], 0);
+        let (status, hidden_observability) = request(
+            &router,
+            "GET",
+            "/api/v1/online-corpus-jobs/observability",
+            json!({}),
+            Some(&tenant_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hidden_observability["queue_depth"], 0);
+        let (status, observability) = request(
+            &router,
+            "GET",
+            "/api/v1/online-corpus-jobs/observability",
+            json!({}),
+            Some(&tenant_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(observability["queue_depth"], 1);
+        assert_eq!(observability["queue_capacity"], 10);
         let (status, _) = request(
             &router,
             "GET",
@@ -1000,6 +1261,7 @@ mod tests {
             completed_at: None,
             attempt_summary: CorpusJobAttemptSummary::default(),
             links: CorpusJobLinks::default(),
+            audit_events: vec![],
         };
         let store = Arc::new(tokio::sync::RwLock::new(vec![job]));
 
@@ -1052,6 +1314,90 @@ mod tests {
             Err(JobTransitionError::IllegalTransition)
         );
         std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn transient_failures_have_bounded_retries_and_auditable_attempts() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let store = Arc::new(tokio::sync::RwLock::new(vec![OnlineCorpusJob {
+            id: "retry-job".into(),
+            source: CorpusSource {
+                id: "corpus".into(),
+                version: "v1".into(),
+                uri: None,
+            },
+            idempotency_key: None,
+            request_id: "request".into(),
+            tenant_id: claims.tenant_id().into(),
+            project_id: claims.project_id().into(),
+            actor_id: claims.actor_id().into(),
+            state: OnlineCorpusJobState::Queued,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            started_at: None,
+            completed_at: None,
+            attempt_summary: CorpusJobAttemptSummary {
+                max_attempts: MAX_RETRY_ATTEMPTS,
+                ..Default::default()
+            },
+            links: CorpusJobLinks::default(),
+            audit_events: vec![],
+        }]));
+
+        for attempt in 1..=MAX_RETRY_ATTEMPTS {
+            let running = transition_job_for_claims(
+                &store,
+                &claims,
+                "retry-job",
+                OnlineCorpusJobState::Running,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(running.attempt_summary.attempts, attempt);
+            let next = if attempt < MAX_RETRY_ATTEMPTS {
+                OnlineCorpusJobState::Queued
+            } else {
+                OnlineCorpusJobState::Failed
+            };
+            transition_job_for_claims(
+                &store,
+                &claims,
+                "retry-job",
+                next,
+                Some("start entity-resolution sidecar: temporary outage token=secret"),
+            )
+            .await
+            .unwrap();
+        }
+        let job = store.read().await[0].clone();
+        assert_eq!(job.state, OnlineCorpusJobState::Failed);
+        assert_eq!(job.attempt_summary.retries, MAX_RETRY_ATTEMPTS - 1);
+        assert_eq!(
+            job.attempt_summary.latest_error_classification,
+            Some(CorpusJobErrorClassification::Transient)
+        );
+        assert!(!job.attempt_summary.latest_error.unwrap().contains("secret"));
+        assert_eq!(
+            classify_job_error("quality gate blocked the staged extraction"),
+            CorpusJobErrorClassification::Policy
+        );
+        std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[test]
+    fn provenance_metadata_redacts_payloads_and_credentials() {
+        assert_eq!(sha256_hex("raw corpus text").len(), 64);
+        assert!(!sanitize_metadata("raw corpus text token=do-not-store").contains("do-not-store"));
+        assert_eq!(
+            sanitize_metadata("fetch https://user:password@example.test/corpus"),
+            "fetch <redacted-url>"
+        );
     }
 
     #[tokio::test]
@@ -1140,6 +1486,19 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ran["job"]["state"], "awaiting_review");
+        assert_eq!(
+            ran["job"]["links"]["source_content_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64,
+            "provenance retains a content digest rather than raw corpus text"
+        );
+        assert!(ran["job"]["audit_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "provenance_recorded"));
         assert_eq!(
             ran["job"]["links"]["entity_resolution_suggestion_ids"]
                 .as_array()

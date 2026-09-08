@@ -71,21 +71,19 @@ schema 使用。
 这些工作改进隔离、认证或运维；但没有提供连续 corpus-to-graph 服务所需的、已认证且
 claims-scoped 的在线 job 与 watcher 编排。
 
-### 明确缺口
+### v0.6 online job 与 watcher 交付
 
-v0.5.0 已完成此前在此列出的有边界原语：将 constrained extraction 与
+v0.6 在 v0.5.0 已交付的有边界原语之上完成 claims-scoped 的在线编排：将 constrained extraction 与
 canonicalization 写入 staging、`KgQualityGate`、带锚点的 materialization、待审批的
 entity-resolution suggestion、冻结 golden evaluation、ontology-health reporting、
 仅生成 draft 的 schema induction，以及 schema-evolution compatibility check。
 
-仍缺少：
-
-1. 一条已认证、claims-scoped 的 online corpus-to-graph job pipeline，用 idempotency、
-   retry/backpressure、provenance 和可观测 job state 端到端调用这些原语（验收标准 1）；以及
-2. 将这些 job 入队的定时或 event-driven corpus watcher。
-
-因此，在完整验收标准均得到可证明的满足之前，上文对于*完全*在线自动化工具链的回答仍是
-**否**。
+Job 保留有上限且 claims-scoped 的 audit trail，串联 source version、内容摘要（不保存
+source text）、canonicalization decision count、quality gate/review、ER suggestion 与
+staging。`GET /api/v1/online-corpus-jobs/observability` 仅公开当前 scope 的 queue depth、
+active work、retry count、最早 queued 时间和 saturation。transient sidecar failure 最多重试
+三次；validation、authentication 与 policy failure 会终止。Watcher 仍默认开启，并在不记录
+corpus payload 或 credential 的前提下发出 saturation signal。
 
 ### v0.6 范围 — 计划中的 online corpus job + watcher
 

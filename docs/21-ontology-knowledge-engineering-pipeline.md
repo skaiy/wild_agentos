@@ -83,23 +83,23 @@ These changes improve isolation, authentication, or operations. They do not
 provide the authenticated, claims-scoped online job and watcher orchestration
 required for a continuous corpus-to-graph service.
 
-### Explicit gaps
+### v0.6 online job and watcher delivery
 
-v0.5.0 closed the bounded primitives previously listed here: constrained
+v0.6 completes the claims-scoped online orchestration over the bounded
+primitives delivered in v0.5.0: constrained
 extraction and canonicalization to staging, `KgQualityGate`, anchored
 materialization, approval-held entity-resolution suggestions, frozen golden
 evaluation, ontology-health reporting, draft-only schema induction, and
 schema-evolution compatibility checks.
 
-What remains is:
-
-1. an authenticated, claims-scoped online corpus-to-graph job pipeline that
-   invokes those primitives end-to-end with idempotency, retry/backpressure,
-   provenance, and observable job state (acceptance criterion 1); and
-2. scheduled or event-driven corpus watchers that enqueue those jobs.
-
-This leaves the answer above as **No** for a *fully* online, automated
-toolchain until the complete acceptance criteria are demonstrably true.
+Jobs retain a bounded, claims-scoped audit trail linking source version,
+content digest (not source text), canonicalization decision count, quality
+gate/review, ER suggestions, and staging. `GET
+/api/v1/online-corpus-jobs/observability` exposes only scoped queue depth,
+active work, retry counts, oldest queued timestamp, and saturation. Transient
+sidecar failures retry at most three attempts; validation, authentication, and
+policy failures are terminal. Watchers remain enabled by default and emit
+saturation signals without logging corpus payloads or credentials.
 
 ### v0.6 scope — planned online corpus job + watcher
 
