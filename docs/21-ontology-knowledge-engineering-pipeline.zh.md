@@ -368,6 +368,39 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
 - 编排这些既有原语的 online-job runner 与默认开启的 watcher 是 v0.6 计划工作；
   部署可在需要时显式关闭 watcher configuration。见上文的范围边界。
 
+#### v0.6 — online corpus watcher 配置
+
+`online_corpus_watchers.enabled` 的默认值为 **true**。在 `config.yaml`、
+`data/config_override.json` 中将其设为 `false`，或设置等效环境配置
+`AGENT_OS_ONLINE_CORPUS_WATCHERS_ENABLED=false`，即可停止所有 watcher 的轮询和
+入队。配置优先级遵循标准运行期顺序：环境变量覆盖
+`data/config_override.json`，后者覆盖 `config.yaml`；没有任何配置设置该字段时，
+watcher 保持启用。禁用不会删除 job、cursor、review 或 audit record。
+
+注册项是由部署控制的可信配置，必须指定 `id`、`source_id`、不可变的
+`source_version`、`tenant_id`、`project_id` 和 `actor_id`。`source_version` 的变化
+是轮询信号。scheduler 只有在普通的 claims-scoped、幂等 job-create 路径接受该版本后
+才持久化 cursor，因此 restart/retry 或重新启用都不会创建第二个逻辑 job。由于 watcher
+配置不包含 extraction text 或 candidate，job 保持 queued，等待经认证的 `/run` runner
+路径处理。该 runner 仍会将 candidate 写入 staging、将 ER suggestion 保持为待批准状态，
+且绝不会自动 materialize 或 promote。
+
+```yaml
+online_corpus_watchers:
+  enabled: true # 显式设为 false 会禁用所有轮询和入队。
+  poll_interval_seconds: 60
+  max_concurrent_polls: 4
+  queue_capacity: 100
+  registrations:
+    - id: "handbook"
+      source_id: "handbook"
+      source_version: "2026-09-08T00:00:00Z"
+      source_uri: "https://corpus.example.invalid/handbook"
+      tenant_id: "tenant-example"
+      project_id: "project-example"
+      actor_id: "watcher-service"
+```
+
 #### P2b — 冻结提取评测与 measurement-decay 审计
 
 - **已实现（#145）：** ontology-extraction golden evaluation 与 fixture 已由 SHA gate

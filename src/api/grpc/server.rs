@@ -371,6 +371,7 @@ impl AgentOSService {
             self.vector_store.clone(),
             task_executor,
             Some(self.batch_manager.clone()),
+            self.settings.online_corpus_watchers.clone(),
         )
     }
 
@@ -480,6 +481,14 @@ impl AgentOSService {
                 "max_debounce_wait_ms": self.settings.workspace.max_debounce_wait_ms,
                 "content_store_max_bytes": self.settings.workspace.content_store_max_bytes,
                 "content_cache_capacity": self.settings.workspace.content_cache_capacity,
+            },
+            "online_corpus_watchers": {
+                "enabled": self.settings.online_corpus_watchers.enabled,
+                "registration_count": self.settings.online_corpus_watchers.registrations.len(),
+                "poll_interval_seconds": self.settings.online_corpus_watchers.poll_interval_seconds,
+                "max_concurrent_polls": self.settings.online_corpus_watchers.max_concurrent_polls,
+                "queue_capacity": self.settings.online_corpus_watchers.queue_capacity,
+                "runner_invoked_by_watcher": false,
             },
             "sandbox": crate::tools::builtin::sandbox::sandbox_runtime_snapshot(),
             "verify_first": crate::core::sa::verify_first_runtime_snapshot(),

@@ -452,6 +452,42 @@ and skill loops that use a promoted ontology.
   existing primitives are v0.6 planned work; deployments can explicitly
   disable watcher configuration when needed. See the scope boundary above.
 
+#### v0.6 — online corpus watcher configuration
+
+`online_corpus_watchers.enabled` is **true by default**. Set it to `false`
+in `config.yaml`, `data/config_override.json`, or the equivalent
+`AGENT_OS_ONLINE_CORPUS_WATCHERS_ENABLED=false` environment configuration to
+stop all watcher polling and enqueueing. Configuration precedence is the
+standard runtime order: environment overrides `data/config_override.json`,
+which overrides `config.yaml`; if none sets this field, watchers remain
+enabled. Disabling does not delete jobs, cursors, reviews, or audit records.
+
+Registrations are deployment-controlled trusted configuration and must name
+`id`, `source_id`, immutable `source_version`, `tenant_id`, `project_id`, and
+`actor_id`. A change in `source_version` is the polling signal. The scheduler
+persists a cursor only after the normal claims-scoped, idempotent job-create
+path accepts that version, so restart/retry and re-enablement do not create a
+second logical job. Jobs are left queued for the authenticated `/run` runner
+path because watcher configuration contains no extraction text or candidates.
+That runner still stages candidates, holds ER suggestions for approval, and
+never materializes or promotes automatically.
+
+```yaml
+online_corpus_watchers:
+  enabled: true # Explicit false disables all polling/enqueueing.
+  poll_interval_seconds: 60
+  max_concurrent_polls: 4
+  queue_capacity: 100
+  registrations:
+    - id: "handbook"
+      source_id: "handbook"
+      source_version: "2026-09-08T00:00:00Z"
+      source_uri: "https://corpus.example.invalid/handbook"
+      tenant_id: "tenant-example"
+      project_id: "project-example"
+      actor_id: "watcher-service"
+```
+
 #### P2b — frozen extraction evaluation and measurement-decay audit
 
 - **Implemented (#145):** ontology-extraction golden evaluations and fixtures
