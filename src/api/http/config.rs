@@ -608,7 +608,7 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
 
-        let response = router.oneshot(req).await.unwrap();
+        let response = router.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         // 读取 body 并解析 JSON
