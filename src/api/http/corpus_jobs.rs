@@ -1084,6 +1084,22 @@ mod tests {
                 "arbitration": "compliance"
             }
         });
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/v1/online-corpus-jobs/{id}/run"),
+            run_payload.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            before,
+            "an unauthenticated runner call must fail closed without production writes"
+        );
         let (status, ran) = request(
             &router,
             "POST",
