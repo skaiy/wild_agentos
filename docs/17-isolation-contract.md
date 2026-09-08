@@ -30,7 +30,9 @@ selected. OIDC mode requires
 accepts only asymmetric OIDC algorithms. JWKS are retrieved from the configured
 endpoint, cached briefly, and refreshed once for an unknown key ID. The default
 `hs256` mode validates with `AGENTOS_JWT_SECRET` and is retained for local
-development only. Startup refuses incomplete OIDC configuration, and OIDC/JWKS
+development only. HS256 startup requires an explicitly configured, non-default
+secret with at least 32 bytes of securely generated key material. Startup refuses
+incomplete OIDC configuration, and OIDC/JWKS
 configuration errors, missing keys, invalid signatures, and invalid
 issuer/audience all fail closed. Unverified requests have no claims and cannot
 use the claims-scoped graph or blob paths. The JWKS URL must be a valid HTTPS
