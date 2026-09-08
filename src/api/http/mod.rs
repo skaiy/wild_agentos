@@ -186,6 +186,9 @@ pub struct TaskExecSpec {
     pub task_iri: String,
     pub include_thought: bool,
     pub include_tool_calls: bool,
+    /// Cancel this task's execution, for example when its request timeout
+    /// expires. This remains distinct from the process-wide shutdown token.
+    pub cancellation: tokio_util::sync::CancellationToken,
     /// Claims minted by the verified HTTP authentication boundary. Absent
     /// claims deliberately leave L0 writes on the legacy read-only path.
     pub isolation_claims: Option<crate::isolation::IsolationClaims>,
@@ -789,7 +792,7 @@ mod tests {
                     roles: vec!["DA".to_string()],
                     exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 },
-                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+                &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
             )
             .unwrap()
         };

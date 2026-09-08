@@ -15,10 +15,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: legacy data directory migration skipped: {}", e);
     }
 
-    let settings = Settings::load().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config ({}), using defaults", e);
-        Settings::default()
-    });
+    let settings = match Settings::load() {
+        Ok(settings) => settings,
+        Err(error) if Settings::development_config_fallback_enabled() => {
+            eprintln!(
+                "Development configuration fallback enabled; failed to load configuration ({error}), using defaults"
+            );
+            Settings::default()
+        }
+        Err(error) => {
+            eprintln!("Configuration load error: {error}");
+            eprintln!(
+                "Refusing to start with defaults. Fix the configuration, or explicitly set \
+                 AGENT_OS_CONFIG_PROFILE=development or AGENT_OS_ALLOW_DEFAULT_CONFIG=true \
+                 for local development."
+            );
+            std::process::exit(1);
+        }
+    };
 
     let _logging_guard = init_logging(&settings.logging);
 

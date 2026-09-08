@@ -807,7 +807,31 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             _ => None,
         };
 
-        match sa.process_task(&spec.prompt, &spec.task_iri).await {
+        let cancellation = spec.cancellation.clone();
+        let execution = if self.settings.agents.timeout_seconds > 0 {
+            let timeout = std::time::Duration::from_secs(self.settings.agents.timeout_seconds);
+            tokio::select! {
+                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
+                _ = tokio::time::sleep(timeout) => {
+                    cancellation.cancel();
+                    Err(crate::CoreError::Internal {
+                        message: format!("task execution timed out after {} seconds", timeout.as_secs()),
+                    })
+                }
+                _ = cancellation.cancelled() => Err(crate::CoreError::Internal {
+                    message: "task execution cancelled".to_string(),
+                }),
+            }
+        } else {
+            tokio::select! {
+                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
+                _ = cancellation.cancelled() => Err(crate::CoreError::Internal {
+                    message: "task execution cancelled".to_string(),
+                }),
+            }
+        };
+
+        match execution {
             Ok(result) => {
                 emitter.emit_completion(&result.status, &result.summary, result.output.clone());
                 if let Some(client) = &a2a_client {

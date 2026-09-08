@@ -1305,7 +1305,31 @@ fn config_override_path() -> std::path::PathBuf {
         .join("config_override.json")
 }
 
+fn development_config_fallback_enabled(
+    profile: Option<&str>,
+    allow_defaults: Option<&str>,
+) -> bool {
+    profile.is_some_and(|value| value.eq_ignore_ascii_case("development"))
+        || allow_defaults.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+}
+
 impl Settings {
+    /// Whether an explicitly marked development process may start with defaults
+    /// when its configuration cannot be loaded. Production always fails closed.
+    pub fn development_config_fallback_enabled() -> bool {
+        development_config_fallback_enabled(
+            std::env::var("AGENT_OS_CONFIG_PROFILE").ok().as_deref(),
+            std::env::var("AGENT_OS_ALLOW_DEFAULT_CONFIG")
+                .ok()
+                .as_deref(),
+        )
+    }
+
     pub fn load() -> Result<Self, ConfigError> {
         let config = Config::builder()
             .add_source(config::File::with_name("config").required(false))
@@ -1388,6 +1412,25 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_fallback_requires_explicit_development_opt_in() {
+        assert!(!development_config_fallback_enabled(None, None));
+        assert!(development_config_fallback_enabled(
+            Some("development"),
+            None
+        ));
+        assert!(development_config_fallback_enabled(
+            Some("DEVELOPMENT"),
+            None
+        ));
+        assert!(development_config_fallback_enabled(None, Some("true")));
+        assert!(development_config_fallback_enabled(None, Some("1")));
+        assert!(!development_config_fallback_enabled(
+            Some("production"),
+            Some("false")
+        ));
+    }
 
     #[test]
     fn test_logging_settings_test_default() {

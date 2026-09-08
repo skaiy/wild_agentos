@@ -126,6 +126,16 @@ cargo test --workspace
 
 ## Run locally
 
+### Runtime configuration
+
+The server fails closed and exits non-zero if `config.yaml`, the runtime
+override, or configuration environment variables cannot be parsed. For local
+development only, explicitly opt into defaults with
+`AGENT_OS_CONFIG_PROFILE=development` or `AGENT_OS_ALLOW_DEFAULT_CONFIG=true`;
+do not set either in production.
+
+---
+
 The default binary starts the HTTP/SSE server on port `8080` and gRPC on
 `50051`. Start it from a checkout with the provided `config.yaml`:
 
