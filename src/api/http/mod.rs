@@ -33,6 +33,7 @@ pub mod chat;
 pub mod config;
 pub mod core_ops;
 pub mod corpus_jobs;
+pub mod corpus_watchers;
 pub mod guard;
 pub mod kb;
 pub mod market;
@@ -124,6 +125,7 @@ use corpus_jobs::{
     get_online_corpus_job_handler, list_online_corpus_jobs_handler, load_online_corpus_jobs,
     run_online_corpus_job_handler,
 };
+use corpus_watchers::start_online_corpus_watcher_scheduler;
 use models::{
     activate_embedding_handler, image_raw_handler, provider_models_handler, test_model_handler,
     upload_image_handler, IMAGE_UPLOAD_MAX_BYTES,
@@ -241,6 +243,7 @@ pub fn build_router(
     vector_store: SharedVectorStore,
     task_executor: Option<Arc<dyn TaskExecutor>>,
     batch_manager: Option<SharedBatchManager>,
+    online_corpus_watchers: crate::config::OnlineCorpusWatcherSettings,
 ) -> Router {
     // 启动时加载用户态注册的技能并重新注册到内存技能表（默认技能由 SemanticCore 播种）。
     for skill in load_user_skills() {
@@ -280,6 +283,7 @@ pub fn build_router(
         api_usage: Arc::new(ApiUsageState::default()),
         online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(load_online_corpus_jobs())),
     });
+    start_online_corpus_watcher_scheduler(state.online_corpus_jobs.clone(), online_corpus_watchers);
 
     // 启动首灌：把持久化的 models 注册表灌入 gateway，使进程启动即按多 provider 生效。
     hot_reload_models(&state);

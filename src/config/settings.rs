@@ -27,6 +27,65 @@ pub struct Settings {
     pub admin_policies: AdminPolicySettings,
     #[serde(default)]
     pub a2a: A2aSettings,
+    #[serde(default)]
+    pub online_corpus_watchers: OnlineCorpusWatcherSettings,
+}
+
+/// Deploy-time registrations for the claims-scoped online corpus job watcher.
+///
+/// Watchers are enabled unless this section explicitly sets `enabled: false`.
+/// Each registration supplies a stable source version; changing that version
+/// makes one new job eligible for the registration's declared claims scope.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OnlineCorpusWatcherSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_watcher_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    #[serde(default = "default_watcher_max_concurrent_polls")]
+    pub max_concurrent_polls: usize,
+    #[serde(default = "default_watcher_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default)]
+    pub registrations: Vec<OnlineCorpusWatcherRegistration>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OnlineCorpusWatcherRegistration {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub source_id: String,
+    pub source_version: String,
+    #[serde(default)]
+    pub source_uri: Option<String>,
+    pub tenant_id: String,
+    pub project_id: String,
+    pub actor_id: String,
+}
+
+impl Default for OnlineCorpusWatcherSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_seconds: default_watcher_poll_interval_seconds(),
+            max_concurrent_polls: default_watcher_max_concurrent_polls(),
+            queue_capacity: default_watcher_queue_capacity(),
+            registrations: Vec::new(),
+        }
+    }
+}
+
+fn default_watcher_poll_interval_seconds() -> u64 {
+    60
+}
+
+fn default_watcher_max_concurrent_polls() -> usize {
+    4
+}
+
+fn default_watcher_queue_capacity() -> usize {
+    100
 }
 
 /// Outbound-only A2A transport configuration. This intentionally does not
@@ -1234,6 +1293,7 @@ impl Default for Settings {
             models: ModelsSettings::default(),
             admin_policies: AdminPolicySettings::default(),
             a2a: A2aSettings::default(),
+            online_corpus_watchers: OnlineCorpusWatcherSettings::default(),
         }
     }
 }
@@ -1310,6 +1370,15 @@ impl Settings {
         if self.a2a.outbound.enabled && self.a2a.outbound.endpoint.trim().is_empty() {
             return Err(
                 "a2a.outbound.endpoint must be set when outbound A2A is enabled".to_string(),
+            );
+        }
+        if self.online_corpus_watchers.poll_interval_seconds == 0
+            || self.online_corpus_watchers.max_concurrent_polls == 0
+            || self.online_corpus_watchers.queue_capacity == 0
+        {
+            return Err(
+                "online_corpus_watchers poll_interval_seconds, max_concurrent_polls, and queue_capacity must be > 0"
+                    .to_string(),
             );
         }
         Ok(())
@@ -1506,6 +1575,17 @@ mod tests {
         let settings: GatewaySettings = cfg.try_deserialize().unwrap();
         // 未配置时默认走 chat completions,保持向后兼容
         assert!(!settings.use_responses_api);
+    }
+
+    #[test]
+    fn online_corpus_watchers_are_enabled_by_default_and_can_be_disabled() {
+        let defaults: OnlineCorpusWatcherSettings = serde_json::from_str("{}").unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.poll_interval_seconds, 60);
+
+        let disabled: OnlineCorpusWatcherSettings =
+            serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!disabled.enabled);
     }
 
     #[test]

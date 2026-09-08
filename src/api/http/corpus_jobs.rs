@@ -58,6 +58,13 @@ pub(crate) struct CreateOnlineCorpusJobRequest {
     pub idempotency_key: Option<String>,
 }
 
+/// Result of a trusted enqueue operation shared by the authenticated HTTP
+/// handler and the deployment-configured watcher scheduler.
+pub(crate) struct EnqueuedOnlineCorpusJob {
+    pub job: OnlineCorpusJob,
+    pub reused: bool,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OnlineCorpusJobState {
@@ -225,37 +232,32 @@ fn public_job(job: &OnlineCorpusJob, reused: bool) -> Value {
     })
 }
 
-/// POST /api/v1/online-corpus-jobs
+/// Persist one claims-scoped job or return its existing idempotent equivalent.
 ///
-/// Creates queued orchestration metadata only. Idempotency is scoped to the
-/// verified tenant/project and conflicts if a key is reused for another source.
-pub(crate) async fn create_online_corpus_job_handler(
-    State(state): State<Arc<AppState>>,
-    identity: UserIdentity,
-    Json(request): Json<CreateOnlineCorpusJobRequest>,
-) -> impl IntoResponse {
-    let claims = match claims_or_unauthorized(&identity) {
-        Ok(claims) => claims,
-        Err(response) => return response,
-    };
-    if let Err(error) = validate_create_request(&request) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response();
-    }
-
-    let mut jobs = state.online_corpus_jobs.write().await;
+/// The caller is responsible for establishing `claims`: HTTP derives them from
+/// a verified JWT, while watchers derive them only from an explicit deployment
+/// registration. This function never selects a graph or writes production data.
+pub(crate) async fn enqueue_online_corpus_job(
+    store: &OnlineCorpusJobStore,
+    claims: &IsolationClaims,
+    request: CreateOnlineCorpusJobRequest,
+) -> Result<EnqueuedOnlineCorpusJob, String> {
+    validate_create_request(&request)?;
+    let mut jobs = store.write().await;
     if let Some(key) = request.idempotency_key.as_deref() {
         if let Some(existing) = jobs
             .iter()
             .find(|job| job_is_in_scope(job, claims) && job.idempotency_key.as_deref() == Some(key))
         {
             if existing.source == request.source {
-                return (StatusCode::OK, Json(public_job(existing, true))).into_response();
+                return Ok(EnqueuedOnlineCorpusJob {
+                    job: existing.clone(),
+                    reused: true,
+                });
             }
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "idempotency_key is already bound to another source in this scope"})),
-            )
-                .into_response();
+            return Err(
+                "idempotency_key is already bound to another source in this scope".to_string(),
+            );
         }
     }
 
@@ -278,15 +280,43 @@ pub(crate) async fn create_online_corpus_job_handler(
     };
     let mut next = jobs.clone();
     next.push(job.clone());
-    if let Err(error) = save_online_corpus_jobs(&next) {
-        return (
+    save_online_corpus_jobs(&next)?;
+    *jobs = next;
+    Ok(EnqueuedOnlineCorpusJob { job, reused: false })
+}
+
+/// POST /api/v1/online-corpus-jobs
+///
+/// Creates queued orchestration metadata only. Idempotency is scoped to the
+/// verified tenant/project and conflicts if a key is reused for another source.
+pub(crate) async fn create_online_corpus_job_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Json(request): Json<CreateOnlineCorpusJobRequest>,
+) -> impl IntoResponse {
+    let claims = match claims_or_unauthorized(&identity) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    match enqueue_online_corpus_job(&state.online_corpus_jobs, claims, request).await {
+        Ok(enqueued) if enqueued.reused => {
+            (StatusCode::OK, Json(public_job(&enqueued.job, true))).into_response()
+        }
+        Ok(enqueued) => {
+            (StatusCode::CREATED, Json(public_job(&enqueued.job, false))).into_response()
+        }
+        Err(error) if error.contains("idempotency_key is already bound") => {
+            (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response()
+        }
+        Err(error) if error.contains("required") || error.contains("exceeds") => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+        }
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("persist online corpus job: {error}")})),
         )
-            .into_response();
+            .into_response(),
     }
-    *jobs = next;
-    (StatusCode::CREATED, Json(public_job(&job, false))).into_response()
 }
 
 /// GET /api/v1/online-corpus-jobs

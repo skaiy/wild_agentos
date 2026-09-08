@@ -21,6 +21,18 @@ a2a:
     bearer_token: ""
     timeout_seconds: 15
 
+# Online corpus watchers are enabled by default. Set enabled: false to prevent
+# polling and enqueueing without deleting existing jobs or audit state.
+# Registrations are intentionally empty until a deployment declares a trusted,
+# claims-scoped source version. Updating source_version queues one new job;
+# the existing authenticated runner endpoint processes that queued job.
+online_corpus_watchers:
+  enabled: true
+  poll_interval_seconds: 60
+  max_concurrent_polls: 4
+  queue_capacity: 100
+  registrations: []
+
 workspace:
   root: ""
   watch_enabled: true
