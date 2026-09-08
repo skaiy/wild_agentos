@@ -2014,6 +2014,9 @@ pub(super) async fn execute_knowledge_extract_code(
     if file_path.is_empty() {
         return Err("file_path parameter cannot be empty".to_string());
     }
+    let file_path = canonicalize_workspace_path(&file_path)?
+        .to_string_lossy()
+        .into_owned();
     // `named_graph` is intentionally ignored; claims select the graph.
     let graph = claims
         .graph_iri()
@@ -2103,8 +2106,8 @@ mod tests {
         let path = file.path().to_string_lossy().to_string();
         std::fs::write(&path, "expected").unwrap();
 
-        assert!(verify_file_write_effect(&path, "expected").is_ok());
-        assert!(verify_file_write_effect(&path, "different").is_err());
+        assert!(verify_file_write_effect(file.path(), "expected").is_ok());
+        assert!(verify_file_write_effect(file.path(), "different").is_err());
     }
 
     #[test]
