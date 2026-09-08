@@ -31,6 +31,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Check namespace consistency
       run: ./scripts/check_namespace.sh
     # build.rs compiles the gRPC protos via tonic-build, which needs protoc.
@@ -38,6 +40,10 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - name: Cache Cargo artifacts
       uses: Swatinem/rust-cache@v2
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Lint workspace
+      run: cargo clippy --workspace -- -D warnings
     - name: Build
       run: cargo build --workspace --verbose
     - name: Run isolation contract golden suite
@@ -59,6 +65,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Install protoc
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - name: Cache Cargo artifacts

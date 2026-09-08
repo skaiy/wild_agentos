@@ -256,9 +256,7 @@ impl WatchEngine {
                         if path.is_dir()
                             && !Self::is_path_excluded(&path.to_string_lossy(), &exclude)
                         {
-                            let _ = debouncer
-                                .watcher()
-                                .watch(path, RecursiveMode::NonRecursive);
+                            let _ = debouncer.watcher().watch(path, RecursiveMode::NonRecursive);
                             for dir in walkdir::WalkDir::new(path)
                                 .min_depth(1)
                                 .max_depth(1)
