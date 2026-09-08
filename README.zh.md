@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.5.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.6.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -28,6 +28,7 @@
 
 | 版本 | 发布日期 | 核心升级与融合特性 |
 |------|----------|-------------------|
+| **v0.6.0** | **2026-09-08** | **Online Corpus Job + Watcher**<br>• 新增面向已配置变更或增量的、已认证且 claims-scoped、幂等的 online corpus job，以及默认开启的 watcher；部署可显式关闭 watcher 的轮询和入队。<br>• runner 要求 entity-resolution suggestion 保持待审批状态，只将证据写入 staging，绝不自动合并实体、promote ontology 或 materialize production 数据。<br>• 新增有上限的 provenance 与按 scope 隔离的 observability，覆盖 job state、retry、saturation、source version/content digest、canonicalization、quality/review 和 ER suggestion；transient sidecar failure 最多重试三次。<br>• 为 online job、runner 和 watcher 新增 fail-closed isolation 与 production-write CI。配套 Admin job list 已独立交付。 |
 | **v0.5.0** | **2026-09-07** | **本体知识工程 + Graph Engineering**<br>• 完成有边界、claims-scoped 的 constrained extraction、可选 Morph-KGC/RML materialization、质量/审阅监督及带锚点的 staging-to-production materialization；任何路径都不会自动 promote schema，也不会绕过已验证 claims 写入。<br>• 通过进程隔离的 GLinker-style sidecar 新增保守、待审批的 entity-resolution suggestion；不提供 auto-merge 路径。<br>• 冻结本体 KE golden evaluation 并以 SHA gate 保护，记录 measurement-decay audit policy，并提供用于慢速 loop 审查的只读 ontology health report。<br>• 完成 OpenAPI/SQL DDL draft、仅生成 draft 的 schema induction、readiness report 与 compatibility-gated promote；配套 Admin ontology design studio 仍在独立范围内。 |
 | **v0.3.0** | **2026-09-05** | **市场 + IdP + Emergent**<br>• 新增版本化的 Logic 与 Skill package market，package 版本不可变，访问按 claims 隔离，并支持显式 install、upgrade 与 rollback。<br>• 新增与本地开发 HS256 并行的 OIDC/JWKS 身份验证，通过非对称 JWT 验证以及 fail-closed 的 issuer、audience 与 JWKS 校验保护访问。<br>• 新增带 gate 的 emergent-tool promotion pipeline：生成的工具在通过 sandbox/judge gate 和所需人工审批前始终不受信任。<br>• 新增可选且默认关闭的有限 RDFS 推理，用于 claims 作用域 graph read；仅在 query-time 扩展 subclass 和 type，绝不持久化推理三元组。 |
 | **v0.2.2** | **2026-09-05** | **制品 + 沙箱 + 基准**<br>• 新增 claims 作用域的 coding artifact store：不可变元数据写入调用者的 `IsolationClaims` graph，制品字节使用服务端 mint 的 tenant blob 前缀。<br>• 新增默认关闭 feature flag 保护的外部 `SandboxProvider` adapter；其异步路径不会跨 `await` 持有 `MutexGuard`。<br>• 新增面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，记录实测结果且不编造速度提升。 |
@@ -217,7 +218,7 @@ Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，�
 - **v0.2.2 — 已完成：** claims 作用域 coding artifact store（`IsolationClaims` graph 元数据与服务端 mint 的 tenant blob 前缀）；默认关闭的外部 `SandboxProvider` adapter（不会跨 `await` 持有 `MutexGuard`）；以及面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，不编造速度提升。
 - **v0.3.0 — 已完成：** 具有不可变版本和显式 install/upgrade/rollback 的版本化 Logic 与 Skill package market；与本地开发 HS256 并行、且 fail-closed 的 OIDC/JWKS 身份验证；带 gate 和人工审批的 emergent-tool promotion pipeline；以及默认关闭、仅在 query-time 扩展且绝不持久化推理三元组的有限 RDFS 推理。
 - **v0.5.0 — 已完成：** 双轨本体知识工程 / Graph Engineering 里程碑：只写 staging 的 constrained extraction 与 Morph-KGC/RML 输入；`KgQualityGate` 与审阅；带锚点、可审计的 materialization；保守、待审批的 entity-resolution suggestion；冻结 golden SHA 检查与只读 health reporting；以及 OpenAPI/SQL DDL 与 induction draft、readiness report 和 compatibility-gated promote。租户 Skill/Emergent promotion 现要求 golden SHA 验证、具名规则审阅与 audit evidence。配套 Admin ontology design studio 已独立交付。
-- **v0.6 — 计划：** 已认证、claims-scoped 的 online corpus job 与默认开启的 corpus watcher 将以 idempotency、retry/backpressure、provenance 和可观测 job state 编排既有 KE 原语，包括必选且 approval-held 的 entity-resolution suggestion。部署可在需要时显式关闭 watcher configuration；production ontology promote、entity-resolution merge 和 materialization 仍由人工治理。
+- **v0.6.0 — 已完成：** 已认证、claims-scoped 的 online corpus job 与默认开启的 corpus watcher 已通过 idempotency、retry/backpressure、provenance 和可观测 job state 编排既有 KE 原语。部署可显式关闭 watcher configuration。runner 要求 entity-resolution suggestion 保持待审批状态，并将证据写入 staging；production ontology promote、entity-resolution merge 和 materialization 仍由人工治理。fail-closed isolation CI 证明未认证、无效、跨 scope 或失败路径不能经由 online job、runner 或 watcher 写入 production。配套 Admin job list 已独立交付。
 
 ---
 
