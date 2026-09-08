@@ -4051,7 +4051,7 @@ mod ontology_crud_tests {
     }
 
     #[tokio::test]
-    async fn materialization_requires_confirmation_claims_and_gate_then_returns_anchor() {
+    async fn isolation_contract_materialization_requires_claims_confirmation_gate_and_anchor() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!(
             "agentos_materialize_extraction_{}",
@@ -4061,8 +4061,18 @@ mod ontology_crud_tests {
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         let state = make_state(&tmp);
         let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let other_claims = IsolationClaims::from_verified("tenant-b", "repair", "tester").unwrap();
         let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
         let token = test_jwt("tenant-a");
+        let other_token = test_jwt("tenant-b");
+        let production_before = kg
+            .query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
+        let other_production_before = kg
+            .query_sparql_for_claims(&other_claims, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
         let mut audits = state.core.events.subscribe();
         let app = Router::new()
             .route(
@@ -4072,6 +4082,18 @@ mod ontology_crud_tests {
             .route(
                 "/api/v1/ontology/constrained-extractions/:id/materialize",
                 post(materialize_constrained_extraction_handler),
+            )
+            .route(
+                "/api/v1/ontology/entity-resolution/suggestions",
+                post(create_entity_resolution_suggestion_handler),
+            )
+            .route(
+                "/api/v1/ontology/extraction-reviews",
+                get(list_extraction_reviews_handler),
+            )
+            .route(
+                "/api/v1/ontology/extraction-reviews/:id/:decision",
+                post(resolve_extraction_review_handler),
             )
             .with_state(state.clone());
         let post = |uri: String, token: Option<&str>, body: Value| {
@@ -4099,6 +4121,39 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(no_claims.status(), StatusCode::UNAUTHORIZED);
+        let invalid_claims = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/no-claims/materialize".into(),
+                Some(&test_jwt("tenant/a")),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_claims.status(), StatusCode::UNAUTHORIZED);
+        for request in [
+            post(
+                "/api/v1/ontology/entity-resolution/suggestions".into(),
+                None,
+                json!({"source_iri": "urn:source", "mention": "Source"}),
+            ),
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/ontology/extraction-reviews")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            post(
+                "/api/v1/ontology/extraction-reviews/review-1/approve".into(),
+                None,
+                json!({}),
+            ),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "ER and review boundaries must reject missing claims before reading or writing"
+            );
+        }
         let no_confirm = app
             .clone()
             .oneshot(post(
@@ -4126,6 +4181,16 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(failed_gate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let cross_scope = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/blocked/materialize".into(),
+                Some(&other_token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_scope.status(), StatusCode::CONFLICT);
         let blocked = app
             .clone()
             .oneshot(post(
@@ -4141,6 +4206,20 @@ mod ontology_crud_tests {
                 .unwrap()
                 .is_empty(),
             "a failed gate must never materialize staging"
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            production_before,
+            "missing, invalid, blocked, and cross-scope materialization must not write production"
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&other_claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            other_production_before,
+            "a client path extraction id cannot materialize into another tenant graph"
         );
 
         kg.update_staging_for_claims(

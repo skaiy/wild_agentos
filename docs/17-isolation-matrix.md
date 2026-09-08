@@ -12,6 +12,13 @@ Run the same golden suite as CI:
 cargo test --workspace isolation_contract --verbose
 ```
 
+The online corpus gates are also run as explicit CI steps:
+
+```bash
+cargo test --workspace isolation_contract_online_corpus --verbose
+cargo test --workspace isolation_contract_materialization --verbose
+```
+
 ## Verified behavior
 
 | Area | Customer-visible boundary | CI golden test |
@@ -21,6 +28,9 @@ cargo test --workspace isolation_contract --verbose
 | Knowledge-base vector | Vector ingest and search reject requests without verified claims (`401`). Ingest and search use the claims-minted vector namespace, and other tenants cannot retrieve the data. | `api::http::kb::isolation_contract::isolation_contract_vector_read_write_requires_claims_and_uses_minted_namespace` |
 | Coding artifacts | Patch, run-transcript, and reproduce-script upload/list/download operations require verified claims. Bytes live below the tenant blob prefix and metadata is visible only in the caller's claims graph. | `api::http::artifacts::tests::claims_scoped_artifact_metadata_and_bytes_are_tenant_isolated`; `api::http::artifacts::tests::artifacts_reject_missing_verified_claims` |
 | Ontology | Ontology writes and action invocation reject requests without verified JWT claims (`401`). Action writes are visible in the verified tenant's graph only. | `api::http::ontology::ontology_crud_tests::isolation_contract_ontology_write_requires_jwt_and_uses_claims_scope`; `api::http::ontology::ontology_crud_tests::isolation_contract_ontology_actions_are_invisible_cross_tenant` |
+| Online corpus jobs and runner | Create, list, read, cancel, and run require verified claims. Invalid claims cannot create or transition a job; a different tenant cannot read, cancel, or run it. Client-supplied production graph fields are rejected, and runner success stages evidence plus an approval-held ER suggestion without writing either production graph. | `api::http::corpus_jobs::tests::isolation_contract_online_corpus_jobs_fail_closed_and_are_claims_scoped`; `api::http::corpus_jobs::tests::isolation_contract_online_corpus_runner_requires_claims_and_never_materializes_production` |
+| Online corpus watchers | Deploy-time watcher registrations are converted to verified claims before queueing. Unsafe scopes are rejected, deduplication remains tenant/project scoped, and every accepted watcher job remains queued; watchers never run, promote, merge, or materialize production data. | `api::http::corpus_watchers::tests::isolation_contract_watchers_are_claims_scoped_and_never_run_or_materialize_jobs` |
+| Constrained extraction materialization | Materialization requires verified claims, `confirm: true`, a passed gate or a recorded approved human override, then a claims-scoped post-write anchor and audit. Missing, invalid, blocked, and cross-scope requests leave both production graphs unchanged. | `api::http::ontology::ontology_crud_tests::isolation_contract_materialization_requires_claims_confirmation_gate_and_anchor` |
 | Runtime graph and vector tools | Calls without verified claims return an explicit error, rather than an empty successful result. Tool-supplied `graph`, `named_graph`, and `namespace` values are ignored; claims mint the target. | `tools::tool_executor::tests::isolation_contract_graph_and_vector_tools_fail_closed_without_claims`; `tools::tool_executor::tests::isolation_contract_graph_tools_use_claims_scope_and_ignore_tool_supplied_graphs` |
 | Internal agent chat RAG | Chat without verified identity returns `401`, not an empty RAG success. Retrieval and agent access are constrained to the tenant/project minted from JWT claims; client retrieval targets are ignored. | `api::http::chat::tests::isolation_contract_chat_without_verified_identity_returns_unauthorized_not_empty_success`; `api::http::chat::tests::isolation_contract_chat_retrieval_isolates_tenants_and_ignores_client_targets`; `api::http::chat::tests::isolation_contract_chat_rejects_cross_tenant_agent_access` |
 | Public API-key chat | Public API-key chat has no tenant claims and performs no tenant graph or vector RAG. | `api::http::chat::tests::isolation_contract_public_api_key_chat_performs_no_tenant_rag` |
