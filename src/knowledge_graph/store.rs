@@ -680,6 +680,13 @@ impl KnowledgeGraphStore {
         }
         let graph = self.extraction_reviews_graph_iri_for_claims(claims)?;
         let subject = format!("{EXTRACTION_REVIEW_BASE_IRI}{review_id}");
+        if !self
+            .list_extraction_reviews_for_claims(claims)?
+            .iter()
+            .any(|review| review.review_id == review_id)
+        {
+            return Err("extraction review not found in claims scope".into());
+        }
         self.store
             .update(&format!(
                 "DELETE {{ GRAPH <{graph}> {{ <{subject}> <{vocab}decision> ?old }} }} \

@@ -788,28 +788,18 @@ async fn run_job_ke_primitives(
     let mut suggestion_ids = Vec::new();
     for node in &canonical.extraction.nodes {
         let source_iri = format!("iri://entity/{}", RdfMapper::sanitize_id(&node.id));
-        let existing = kg
-            .list_action_approvals_for_claims(claims)?
-            .into_iter()
-            .find(|approval| {
-                approval.action_id == "entity-resolution"
-                    && approval
-                        .anchor_query
-                        .as_deref()
-                        .is_some_and(|query| query.contains(&source_iri))
-            })
-            .map(|approval| approval.approval_id);
-        let suggestion = match existing {
-            Some(approval_id) => approval_id,
-            None => create_entity_resolution_suggestion_from_staging(
-                &kg,
-                claims,
-                &extraction_id,
-                &source_iri,
-                &node.label,
-            )?
-            .ok_or_else(|| format!("entity resolution uncertain for staged mention {}", node.id))?,
-        };
+        // Entity-resolution evidence is tied to this staged extraction.
+        // Reusing an approval from a prior job would bypass the sidecar for
+        // this run, including when the sidecar is unavailable. Require the
+        // sidecar to produce a fresh, approval-held suggestion instead.
+        let suggestion = create_entity_resolution_suggestion_from_staging(
+            &kg,
+            claims,
+            &extraction_id,
+            &source_iri,
+            &node.label,
+        )?
+        .ok_or_else(|| format!("entity resolution uncertain for staged mention {}", node.id))?;
         suggestion_ids.push(suggestion);
     }
     if suggestion_ids.is_empty() {
