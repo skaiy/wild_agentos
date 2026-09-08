@@ -296,11 +296,42 @@ mod tests {
                     security_context(),
                     &advertised,
                 )
-                .await
-                .unwrap();
-            assert_eq!(bash["exit_code"], 0);
-            assert_eq!(bash["stdout"], "advertised");
+                .await;
+            if crate::tools::builtin::sandbox::unshare_available() {
+                let bash = bash.unwrap();
+                assert_eq!(bash["exit_code"], 0);
+                assert_eq!(bash["stdout"], "advertised");
+            } else {
+                assert!(bash
+                    .unwrap_err()
+                    .contains("active workspace sandbox is required"));
+            }
             std::fs::remove_file(path).unwrap();
+        });
+    }
+
+    #[test]
+    fn file_tools_reject_lexical_and_symlink_workspace_escapes() {
+        rt().block_on(async {
+            let outside = tempfile::tempdir().unwrap();
+            let workspace = std::env::current_dir().unwrap();
+            let link = workspace.join(format!("escape-link-{}", uuid::Uuid::new_v4()));
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+            for input in [
+                json!({"path": "../issue-193-escape.txt"}),
+                json!({"path": link.join("secret.txt")}),
+            ] {
+                let error = super::super::builtins::execute_file_read(input)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("outside the allowed workspace"),
+                    "unexpected error: {error}"
+                );
+            }
+
+            std::fs::remove_file(link).unwrap();
         });
     }
 
@@ -468,6 +499,9 @@ mod tests {
     #[test]
     fn test_bash_self_protect_pkill_excludes_own_pid() {
         rt().block_on(async {
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
             // `pkill -f <our own cmdline fragment>` must NOT kill this test
             // process (the agent itself). The wrapper resolves targets via
             // pgrep and filters out the agent PID.
@@ -488,11 +522,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_bash_self_protect_pkill_still_kills_real_target() {
+    fn test_bash_sandbox_cannot_kill_host_processes() {
         rt().block_on(async {
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
             use std::process::Command;
-            // Spawn a real background sleep; pkill -f on a unique marker
-            // must still terminate it (protection only filters the agent).
+            // Spawn a host process. The default PID namespace sandbox must
+            // prevent a tool command from discovering or terminating it.
             let marker = format!("real_target_marker_{}", std::process::id());
             // Keep the marker in the live process argv (portable; no `exec -a`).
             let mut child = Command::new("bash")
@@ -506,20 +543,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                result["exit_code"], 0,
-                "pkill should find the target: {:?}",
-                result
+                result["exit_code"], 1,
+                "sandbox must not see host target: {result:?}"
             );
-            // The child must be gone shortly after.
-            for _ in 0..50 {
-                if let Ok(Some(status)) = child.try_wait() {
-                    assert!(!status.success() || status.code() != Some(0));
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "sandbox must not kill host process"
+            );
             let _ = child.kill();
-            panic!("target process was not killed");
         });
     }
 
@@ -527,6 +558,9 @@ mod tests {
     #[test]
     fn test_bash_self_protect_killall_excludes_own_pid() {
         rt().block_on(async {
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
             let self_pid = std::process::id();
             // killall matches by process name; our unique name is not a real
             // process, so exit 1 (nothing found) proves the wrapper didn't
@@ -543,6 +577,9 @@ mod tests {
     #[test]
     fn test_bash_self_protect_plain_command_unchanged() {
         rt().block_on(async {
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
             let result = super::super::builtins::execute_bash(json!({"command": "printf ok"}))
                 .await
                 .unwrap();
@@ -554,6 +591,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_bash_child_does_not_inherit_parent_secret() {
+        if !crate::tools::builtin::sandbox::unshare_available() {
+            return;
+        }
         const SECRET_KEY: &str = "AGENTOS_CHILD_ENV_TEST_SECRET";
         std::env::set_var(SECRET_KEY, "parent-only-secret");
 
@@ -577,6 +617,9 @@ mod tests {
     #[test]
     fn test_bash_sandbox_status_reported() {
         rt().block_on(async {
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
             let result = super::super::builtins::execute_bash(json!({
                 "command": "printf hi",
                 "dangerouslyDisableSandbox": false,
@@ -596,21 +639,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_bash_sandbox_disabled_when_requested() {
+    fn test_bash_rejects_disabled_sandbox_request() {
         rt().block_on(async {
-            let result = super::super::builtins::execute_bash(json!({
+            let error = super::super::builtins::execute_bash(json!({
                 "command": "printf hi",
                 "dangerouslyDisableSandbox": true,
             }))
             .await
-            .unwrap();
-            assert_eq!(result["exit_code"], 0);
-            let status = &result["sandbox_status"];
-            assert_eq!(
-                status["enabled"], false,
-                "sandbox must be disabled: {:?}",
-                result
+            .unwrap_err();
+            assert!(
+                error.contains("active workspace sandbox is required"),
+                "unexpected error: {error}"
             );
+        });
+    }
+
+    #[test]
+    fn bash_policy_rejects_unavailable_sandbox() {
+        let error = super::super::builtins::require_active_bash_sandbox(
+            &crate::tools::builtin::sandbox::SandboxStatus::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("active workspace sandbox is required"));
+    }
+
+    #[test]
+    fn powershell_fails_closed_without_a_sandbox_launcher() {
+        rt().block_on(async {
+            let error = super::super::builtins::execute_powershell(json!({
+                "command": "Write-Output unsafe",
+            }))
+            .await
+            .unwrap_err();
+            assert!(error.contains("no active workspace sandbox"));
         });
     }
 
@@ -618,9 +679,10 @@ mod tests {
     #[test]
     fn test_bash_sandbox_unshare_launcher_active() {
         rt().block_on(async {
-            // Sandbox is opt-in: with explicit enablement and namespace
-            // restrictions the command must run inside the unshare sandbox
-            // (or fall back gracefully on hosts without unshare).
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
+            // The default shell requires namespace isolation.
             let result = super::super::builtins::execute_bash(json!({
                 "command": "printf isolated",
                 "dangerouslyDisableSandbox": false,
@@ -641,6 +703,9 @@ mod tests {
     #[test]
     fn test_bash_run_in_background_returns_task_id() {
         rt().block_on(async {
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
             let result = super::super::builtins::execute_bash(json!({
                 "command": "sleep 5",
                 "run_in_background": true,
@@ -660,6 +725,9 @@ mod tests {
     #[test]
     fn test_bash_output_truncated_at_16k() {
         rt().block_on(async {
+            if !crate::tools::builtin::sandbox::unshare_available() {
+                return;
+            }
             let result = super::super::builtins::execute_bash(json!({
                 "command": "head -c 30000 /dev/zero | tr '\\0' 'a'",
             }))
