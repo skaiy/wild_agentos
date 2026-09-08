@@ -125,32 +125,41 @@ pub(crate) async fn stream_task_handler(
             let task_iri = spec.task_iri.clone();
             let cancellation = spec.cancellation.clone();
             let task_events = event_bus.clone();
+            let shutdown = state.shutdown.clone();
             tokio::spawn(async move {
                 let execution = tokio::spawn(async move {
                     executor.execute(spec).await;
                 });
 
-                if let Err(error) = execution.await {
-                    cancellation.cancel();
-                    tracing::error!(
-                        task_iri = %task_iri,
-                        cancelled = error.is_cancelled(),
-                        panic = error.is_panic(),
-                        error = %error,
-                        "HTTP task executor terminated unexpectedly"
-                    );
-                    task_events
-                        .emit(
-                            &task_iri,
-                            "TASK_FAILED",
-                            "http",
-                            &json!({
-                                "status": "failed",
-                                "summary": format!("task executor terminated unexpectedly: {error}"),
-                            })
-                            .to_string(),
-                        )
-                        .await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        cancellation.cancel();
+                        tracing::info!(task_iri = %task_iri, "HTTP task cancelled during shutdown");
+                    }
+                    result = execution => {
+                        if let Err(error) = result {
+                            cancellation.cancel();
+                            tracing::error!(
+                                task_iri = %task_iri,
+                                cancelled = error.is_cancelled(),
+                                panic = error.is_panic(),
+                                error = %error,
+                                "HTTP task executor terminated unexpectedly"
+                            );
+                            task_events
+                                .emit(
+                                    &task_iri,
+                                    "TASK_FAILED",
+                                    "http",
+                                    &json!({
+                                        "status": "failed",
+                                        "summary": format!("task executor terminated unexpectedly: {error}"),
+                                    })
+                                    .to_string(),
+                                )
+                                .await;
+                        }
+                    }
                 }
             });
         }
@@ -178,7 +187,12 @@ pub(crate) async fn stream_task_handler(
         }).to_string()));
 
         loop {
-            match rx.recv().await {
+            tokio::select! {
+                _ = state.shutdown.cancelled() => {
+                    tracing::info!(task_iri = %task_iri_clone, "SSE stream closed during shutdown");
+                    break;
+                }
+                result = rx.recv() => match result {
                 Ok(event) => {
                     if event.task_iri != task_iri_clone {
                         continue;
@@ -198,6 +212,7 @@ pub(crate) async fn stream_task_handler(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     continue;
                 }
+                },
             }
         }
     };
