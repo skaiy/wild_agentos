@@ -85,9 +85,9 @@ active work、retry count、最早 queued 时间和 saturation。transient sidec
 三次；validation、authentication 与 policy failure 会终止。Watcher 仍默认开启，并在不记录
 corpus payload 或 credential 的前提下发出 saturation signal。
 
-### v0.6 范围 — 计划中的 online corpus job + watcher
+### v0.6 已交付范围 — online corpus job + watcher
 
-**纳入范围**
+**已交付**
 
 - 面向已配置 corpus change 或 incremental delta 的 claims-scoped job model，提供 create、
   list、get、cancel（或等价）操作。
@@ -108,18 +108,12 @@ corpus payload 或 credential 的前提下发出 saturation signal。
   approval-held 并保持 anchored。
 - 替换 Oxigraph/SPARQL、加入 Cypher 或 Nebula，或重做 `KgQualityGate`、Morph-KGC/RML、
   golden freeze 或 Admin design studio。
-- 在以下全部验收标准得到证明前，宣称“fully online automated with governance”。v0.6 可关闭
-  标准 1 和 watcher 缺口，同时仍保留人工对 promote 与 materialize 的权威。
+- 仅凭 job 完成就宣称“fully online automated with governance”；人工对 promote 与
+  materialize 的权威仍然保留。
 - 将独立 product 或 business repository 混入此代码树。
 
-**拟议的未来 Issue 清单（仅标题；暂不创建）**
-
-- Claims-Scoped Online Corpus Job API and State Store
-- Idempotent Online Job Runner for Existing KE Primitives
-- Default-Enabled Corpus Watcher Scheduler, Queueing, and Explicit Disablement
-- Online Job Provenance, Audit, Retry, and Backpressure Observability
-- Fail-Closed Online Job Isolation and Production-Write CI
-- Companion Admin Job List（本仓库范围外）
+本次交付完成 online-job、idempotent runner、默认开启 watcher、provenance/observability
+与 fail-closed isolation CI。配套 Admin job list 已独立交付。
 
 ## 公开最佳实践信号
 
@@ -363,8 +357,8 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   SPARQL 回读由服务端生成的 anchor；anchor 缺失时返回 `needs_repair` 且保留记录
   以供修复。GLinker 可仅安装在该 worker 环境；kernel process 不链接 GLinker
   代码、模型权重或 LGPL 组件。任何 LGPL linker 必须保持进程隔离。
-- 编排这些既有原语的 online-job runner 与默认开启的 watcher 是 v0.6 计划工作；
-  部署可在需要时显式关闭 watcher configuration。见上文的范围边界。
+- v0.6 已交付编排这些既有原语的 online-job runner 与默认开启的 watcher；
+  部署可在需要时显式关闭 watcher configuration。见上文的已交付范围。
 
 #### v0.6 — online corpus watcher 配置
 
