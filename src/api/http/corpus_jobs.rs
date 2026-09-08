@@ -288,7 +288,7 @@ fn sanitize_metadata(value: &str) -> String {
                 || part.contains("api_key=")
                 || part.contains("password=")
             {
-                "<redacted-secret>"
+                "<redacted>"
             } else {
                 part
             }
@@ -1382,7 +1382,9 @@ mod tests {
             job.attempt_summary.latest_error_classification,
             Some(CorpusJobErrorClassification::Transient)
         );
-        assert!(!job.attempt_summary.latest_error.unwrap().contains("secret"));
+        let latest_error = job.attempt_summary.latest_error.unwrap();
+        assert!(!latest_error.contains("secret"));
+        assert!(latest_error.contains("<redacted>"));
         assert_eq!(
             classify_job_error("quality gate blocked the staged extraction"),
             CorpusJobErrorClassification::Policy
