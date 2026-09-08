@@ -5,19 +5,68 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::memory::hyperspace_store::HyperspaceStore;
 
+use super::iam::{AuthMethod, UserIdentity};
 use super::kb::spawn_reindex_all_vector_kbs;
 use super::runtime::live_runtime_hardening_fields;
 use super::{data_dir, AppState};
+
+/// Validated request schema for the configuration write surface.
+///
+/// The settings document remains extensible for the non-gateway sections, but
+/// gateway is typed because it controls the credentials used by the shared LLM
+/// gateway.  This prevents a typo or arbitrary top-level JSON from silently
+/// becoming persistent configuration.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConfigUpdateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway: Option<GatewayConfigPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admin_policies: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayConfigPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    /// Accepted for runtime hot update only. It is deliberately omitted from
+    /// config_override.json; configure a durable key through the deployment
+    /// secret/environment instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_base_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    use_responses_api: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_mapping: Option<HashMap<String, String>>,
+    /// UI-only state, ignored when persisting or applying the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_configured: Option<bool>,
+}
+
+impl ConfigUpdateRequest {
+    fn into_patch(self) -> Value {
+        serde_json::to_value(self).expect("configuration DTO is serializable")
+    }
+}
 
 /// 运行期配置覆盖文件路径；由 PUT /api/v1/config 写入，启动时被 Settings::load() 作为
 /// 高于 config.yaml 的来源读取。路径与 Settings::load 中的 "data/config_override" 保持一致。
@@ -26,7 +75,7 @@ fn config_override_path() -> std::path::PathBuf {
 }
 
 /// 将网关配置持久化到运行期覆盖文件，重启后由 Settings::load() 生效。
-/// 将持久化所有字段（包括 api_key），保留覆盖文件其余段落。
+/// Gateway API keys are runtime-only and never written to this file.
 pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
     let path = config_override_path();
     if let Some(parent) = path.parent() {
@@ -41,19 +90,14 @@ pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
         let mut clean = gateway_patch.clone();
         // api_key_configured 仅用于前端展示，不是 GatewaySettings 字段。
         clean.remove("api_key_configured");
-        // 不持久化空 api_key，避免覆盖 config.yaml 中已配置的密钥。
-        if clean
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.is_empty())
-            .unwrap_or(false)
-        {
-            clean.remove("api_key");
-        }
+        // Credentials are supplied through the process secret/environment.
+        // Never keep a new key, or a legacy key from a prior override, on disk.
+        clean.remove("api_key");
 
         if let Some(obj) = root.as_object_mut() {
             let existing_gateway = obj.entry("gateway").or_insert(json!({}));
             if let Some(existing_gw_obj) = existing_gateway.as_object_mut() {
+                existing_gw_obj.remove("api_key");
                 for (k, v) in clean {
                     existing_gw_obj.insert(k, v);
                 }
@@ -182,8 +226,24 @@ pub(crate) async fn config_handler(State(state): State<Arc<AppState>>) -> impl I
 /// Body: { "gateway": { "base_url": "...", "api_key": "...", "default_model": "...", ... } }
 pub(crate) async fn update_config_handler(
     State(state): State<Arc<AppState>>,
-    Json(patch): Json<Value>,
+    identity: UserIdentity,
+    Json(request): Json<ConfigUpdateRequest>,
 ) -> impl IntoResponse {
+    if identity.auth_method != AuthMethod::Jwt || identity.isolation_claims().is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "unauthorized",
+                "message": "a verified JWT is required to update configuration",
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
+    let patch = request.into_patch();
+
     if let Err(error) = save_config_override(&patch) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -438,18 +498,20 @@ pub(crate) async fn hot_reload_embedding(
     Ok((old_dim.unwrap_or(0), new_dim, dim_changed, reindex_queued))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use tower::ServiceExt; // oneshot
 
+    use super::super::api_gov::ApiUsageState;
+    use super::super::iam::JwtClaims;
+    use crate::api::http::TEST_ENV_LOCK;
     use crate::gateway::unified_gateway::UnifiedGateway;
     use crate::tools::prompt_registry::PromptRegistry;
-    use super::super::api_gov::ApiUsageState;
 
     /// 构造一个最小可用的 UnifiedGateway（不触网，仅满足 AppState 依赖）。
     fn test_gateway() -> UnifiedGateway {
@@ -468,6 +530,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_config_handler_returns_sanitized_config() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
         // 构造一个包含 api_key 的测试配置
         let test_config = json!({
             "version": "0.1.0-test",
@@ -493,6 +558,8 @@ mod tests {
 
         let tmp = std::env::temp_dir().join(format!("agentos_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
         let test_core_config = CoreConfig {
             max_node_size: 1024,
             max_projection_size: 2048,
@@ -530,7 +597,10 @@ mod tests {
 
         // 构造 Router 并发起 GET /api/v1/config 请求
         let router = Router::new()
-            .route("/api/v1/config", get(config_handler))
+            .route(
+                "/api/v1/config",
+                get(config_handler).put(update_config_handler),
+            )
             .with_state(state);
 
         let req = axum::http::Request::builder()
@@ -566,7 +636,94 @@ mod tests {
         assert!(config_res["memory_scheduler"]["wired"].is_boolean());
         assert!(config_res["embedding_health"]["provider"].is_string());
 
+        let put_config = |token: Option<String>, body: Value| {
+            let mut request = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            request
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let anonymous = router
+            .clone()
+            .oneshot(put_config(
+                None,
+                json!({"gateway": {"base_url": "https://blocked.example"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let token_for = |roles: Vec<&str>| {
+            encode(
+                &Header::default(),
+                &JwtClaims {
+                    sub: "config-test".to_string(),
+                    tenant_id: "test-tenant".to_string(),
+                    project_id: None,
+                    roles: roles.into_iter().map(str::to_string).collect(),
+                    exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                },
+                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            )
+            .unwrap()
+        };
+        let unknown_field = router
+            .clone()
+            .oneshot(put_config(
+                Some(token_for(vec!["DA"])),
+                json!({"gateway": {"base_url": "https://blocked.example"}, "unexpected": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let non_da = router
+            .clone()
+            .oneshot(put_config(
+                Some(token_for(vec!["PA"])),
+                json!({"gateway": {"base_url": "https://blocked.example"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(non_da.status(), StatusCode::FORBIDDEN);
+
+        let secret_value = "test-only-gateway-key";
+        let updated = router
+            .oneshot(put_config(
+                Some(token_for(vec!["DA"])),
+                json!({
+                    "gateway": {
+                        "base_url": "https://configured.example",
+                        "api_key": secret_value
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let override_contents = std::fs::read_to_string(tmp.join("config_override.json")).unwrap();
+        assert!(!override_contents.contains(secret_value));
+        assert!(
+            !override_contents.contains("\"api_key\""),
+            "gateway api_key must never persist in config_override.json"
+        );
+
         // 清理
+        if let Some(value) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", value);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
+        if let Some(value) = previous_auth_mode {
+            std::env::set_var("AGENTOS_AUTH_MODE", value);
+        } else {
+            std::env::remove_var("AGENTOS_AUTH_MODE");
+        }
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
