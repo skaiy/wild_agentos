@@ -444,7 +444,7 @@ mod tests {
                         .and_then(|e| e.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    Err(e) => e,
+                    Err(e) => e.to_string(),
                 };
                 assert!(
                     !err.contains("no registered executable skill")
