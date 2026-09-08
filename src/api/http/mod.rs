@@ -123,7 +123,7 @@ use core_ops::{
 use corpus_jobs::{
     cancel_online_corpus_job_handler, create_online_corpus_job_handler,
     get_online_corpus_job_handler, list_online_corpus_jobs_handler, load_online_corpus_jobs,
-    run_online_corpus_job_handler,
+    online_corpus_job_observability_handler, run_online_corpus_job_handler,
 };
 use corpus_watchers::start_online_corpus_watcher_scheduler;
 use models::{
@@ -175,6 +175,9 @@ pub struct AppState {
     /// Claims-scoped online corpus orchestration metadata. Jobs never select a
     /// production graph; later runners use this state store plus staged APIs.
     pub(crate) online_corpus_jobs: corpus_jobs::OnlineCorpusJobStore,
+    /// Configured queue capacity used only for claims-scoped saturation
+    /// observability; it does not grant any worker production-write authority.
+    pub(crate) online_corpus_queue_capacity: usize,
 }
 /// 流式任务执行规格：由 HTTP 流处理器构造并传入执行器。
 #[derive(Clone)]
@@ -282,6 +285,7 @@ pub fn build_router(
         api_keys: Arc::new(tokio::sync::RwLock::new(api_gov::load_api_keys())),
         api_usage: Arc::new(ApiUsageState::default()),
         online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(load_online_corpus_jobs())),
+        online_corpus_queue_capacity: online_corpus_watchers.queue_capacity,
     });
     start_online_corpus_watcher_scheduler(state.online_corpus_jobs.clone(), online_corpus_watchers);
 
@@ -304,6 +308,10 @@ pub fn build_router(
         .route(
             "/api/v1/online-corpus-jobs",
             get(list_online_corpus_jobs_handler).post(create_online_corpus_job_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/observability",
+            get(online_corpus_job_observability_handler),
         )
         .route(
             "/api/v1/online-corpus-jobs/:id",
@@ -738,6 +746,7 @@ mod tests {
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
             online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
         });
 
         let router = Router::new()

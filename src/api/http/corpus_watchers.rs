@@ -161,6 +161,7 @@ pub(crate) async fn tick_online_corpus_watchers(
                 uri: registration.source_uri.clone(),
             },
             idempotency_key: Some(watcher_idempotency_key(registration)),
+            watcher_id: Some(registration.id.clone()),
         };
         match enqueue_online_corpus_job(store, &claims, request).await {
             Ok(result) => {
