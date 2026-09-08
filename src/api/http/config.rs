@@ -524,6 +524,7 @@ mod tests {
             api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
         });
 
         // 构造 Router 并发起 GET /api/v1/config 请求

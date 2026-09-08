@@ -32,6 +32,7 @@ pub mod artifacts;
 pub mod chat;
 pub mod config;
 pub mod core_ops;
+pub mod corpus_jobs;
 pub mod guard;
 pub mod kb;
 pub mod market;
@@ -120,6 +121,7 @@ use core_ops::{
     list_blackboard_tasks_handler, read_node_handler, stream_batch_events_handler,
     write_node_handler,
 };
+use corpus_jobs::{cancel_online_corpus_job_handler, create_online_corpus_job_handler, get_online_corpus_job_handler, list_online_corpus_jobs_handler, load_online_corpus_jobs};
 use models::{
     activate_embedding_handler, image_raw_handler, provider_models_handler, test_model_handler,
     upload_image_handler, IMAGE_UPLOAD_MAX_BYTES,
@@ -166,6 +168,9 @@ pub struct AppState {
     pub api_keys: Arc<tokio::sync::RwLock<Vec<ApiKey>>>,
     /// 进程内限流/配额/并发用量状态（对外调用面）。
     pub api_usage: Arc<ApiUsageState>,
+    /// Claims-scoped online corpus orchestration metadata. Jobs never select a
+    /// production graph; later runners use this state store plus staged APIs.
+    pub online_corpus_jobs: corpus_jobs::OnlineCorpusJobStore,
 }
 /// 流式任务执行规格：由 HTTP 流处理器构造并传入执行器。
 #[derive(Clone)]
@@ -271,6 +276,7 @@ pub fn build_router(
         api_clients: Arc::new(tokio::sync::RwLock::new(api_gov::load_api_clients())),
         api_keys: Arc::new(tokio::sync::RwLock::new(api_gov::load_api_keys())),
         api_usage: Arc::new(ApiUsageState::default()),
+        online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(load_online_corpus_jobs())),
     });
 
     // 启动首灌：把持久化的 models 注册表灌入 gateway，使进程启动即按多 provider 生效。
@@ -288,6 +294,19 @@ pub fn build_router(
         .route("/api/v1/tasks/:task_iri", get(get_task_handler))
         .route("/api/v1/tasks/stream", post(stream_task_handler))
         .route("/api/v1/tasks/trends", get(list_task_trends_handler))
+        // ── v0.6 online corpus orchestration metadata (no runner or production writes) ──
+        .route(
+            "/api/v1/online-corpus-jobs",
+            get(list_online_corpus_jobs_handler).post(create_online_corpus_job_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/:id",
+            get(get_online_corpus_job_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/:id/cancel",
+            post(cancel_online_corpus_job_handler),
+        )
         .route(
             "/api/v1/artifacts",
             get(list_artifacts_handler)
@@ -708,6 +727,7 @@ mod tests {
             api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
         });
 
         let router = Router::new()
