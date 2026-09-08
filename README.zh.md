@@ -3,7 +3,7 @@
 
 <img src="assets/logo_transparent.png" width="120" alt="Wild AgentOS Logo" />
 
-**面向受治理多智能体系统的 Rust 语义内核 AgentOS**
+**面向受治理多智能体协作的操作系统**
 
 [![Star on GitHub](https://img.shields.io/github/stars/skaiy/wild_agentos?style=flat)](https://github.com/skaiy/wild_agentos)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
@@ -24,103 +24,92 @@
 
 ## 什么是 Wild AgentOS？
 
-Wild AgentOS 是一个以 Rust 构建的**语义内核 AgentOS**。它以 PDCA
-循环编排多智能体工作，并结合 Oxigraph RDF/SPARQL 语义图、Hyperspace
-向量存储和受治理的本体知识工程。
+Wild AgentOS 是一个面向**多智能体协作治理**的操作系统，以 Rust（系统编程语言）构建。它用
+PDCA（计划、执行、检查、改进）组织智能体工作，帮助团队共享知识，并保留工作过程和
+决策的审计记录。
 
-系统的安全边界是经过验证的 JWT **`IsolationClaims`**：claims 为租户和
-项目 mint graph 与 vector 目标，并为租户 mint blob prefix 与 L0 path。缺少
-或无效 claims 时，claims-scoped storage path 会 fail closed。安全命名不等于迁移历史数据；
-请参阅[隔离契约](docs/17-isolation-contract.zh.md)。
+系统以租户和项目为安全边界。经过验证的 JWT（身份令牌）携带租户/项目隔离凭证
+`IsolationClaims`，系统据此划定调用方可用的知识图谱、向量、文件和工作记录存储范围。
+缺少或无效凭证即拒绝访问，调用方也不能指定其他租户的存储范围。此保证适用于已接入
+隔离凭证的接口，并不代表每个历史 HTTP 接口都已隔离。系统划定新的存储名称，不等于
+迁移历史数据；详见[隔离契约](docs/17-isolation-contract.zh.md)。
 
-## 核心技术栈
+## 你能获得什么
 
-| 组件 | 实现 |
-|---|---|
-| Agent 协调 | Rust PDCA orchestration、EventBus 与 task/runtime service |
-| 语义图 | Oxigraph RDF store、SPARQL 1.1 与 claims-derived named graph |
-| 向量检索 | 内嵌 `hyperspace-engine` HNSW store 与可配置 embedding service |
-| 隔离与身份 | `IsolationClaims`、JWT verification 与 production OIDC/JWKS validation |
-| 接口 | HTTP/SSE 与 gRPC；inbound MCP publishing 和 optional outbound A2A |
-| 治理 | Ontology staging、deterministic check、review/approval record 与 audit event |
+- **协同执行：** 基于 Rust 的 PDCA 工作流、任务服务和事件审计，支持多个智能体围绕
+  计划、执行、检查和改进协作。
+- **共享知识与检索：** 使用 Oxigraph 知识图谱（结构化知识存储）和 SPARQL 查询语言，
+  并提供内嵌向量检索，帮助找到相关信息。
+- **受控的知识变更：** 可从 CSV、JSON Schema、OpenAPI 和 SQL DDL 生成草稿，经过
+  检查、写入暂存区和人工审核后，才可按审批流程写入生产数据。草稿不会自动成为正式定义。
+- **人工把关与可追溯性：** 高风险或待审批的操作必须由人决定；低风险操作也只能在其
+  策略允许且通过护栏时自动提交。系统记录检查、审核、事件审计和回读证据。实体消歧
+  （判断两条记录是否指向同一实体）只会给出暂存建议，绝不自动合并。
+- **身份与集成：** 生产环境使用 OIDC/JWKS 进行身份校验；本地开发使用独立的开发用签名
+  模式。gRPC 用于服务间通信；MCP（Model Context Protocol，模型上下文协议）可将
+  经明确发布、按租户隔离的 Skill 作为工具提供。出站 A2A 适配器可选、默认关闭，且仅
+  提供尽力而为的能力。
+- **受治理的软件包：** Logic 和 Skill 软件包采用不可变版本、按租户可见，并记录安装、
+  升级和回滚。正式上线需通过既定检查、审核证据和人工审批。
 
-## v0.6.0：Online corpus job orchestration
+## v0.6：在线语料任务，始终由人把关
 
-v0.6.0 交付已认证、claims-scoped 的 online corpus job metadata 与
-orchestration。默认开启的 watcher 对已配置 source-version registration
-进行 polling，并为每个未出现过的 version 入队一个幂等 job。部署可以显式关闭
-这项 polling 与 enqueueing，而不会删除保留的 job、cursor、review 或 audit
-record。watcher 不会 fetch source URI、计算 content delta，也不会自行运行 job。
+v0.6.0 新增了在同一租户/项目边界内运行的、已认证的在线语料任务。监视器默认开启，
+但只检查已配置的数据源版本，并为每个新版本向队列加入一个任务。部署可关闭这项轮询
+和入队，而不会删除已有任务、游标、审核或审计记录。监视器不会抓取来源 URL、计算内容
+变化，也不会自行运行任务。
 
-已认证 caller 需要提供 text、extractor、extraction candidate 与 quality-gate
-request 来运行 queued job。随后 manual runner 遵循有边界的 KE 流程：
+已认证的人员或服务可手动运行队列中的任务，并提供文本、提取方法、提取候选项和质量检查请求。
+任务会规范化候选项，将相应证据放入暂存区，执行检查，生成一条待审批的实体消歧建议，然后
+等待审核。
 
-```text
-caller-supplied candidate → canonicalize → stage → quality gate → 保持待审批的 entity-resolution suggestion → awaiting review
-```
+系统保留有上限的来源追溯和运行可观测记录，包括来源版本、内容摘要、检查结果、审核
+状态、重试、容量压力和任务状态。临时的辅助服务故障最多重试三次；身份、校验或策略
+失败会直接停止任务。CI 已验证失败、无效、跨边界或未认证的路径不能写入生产数据。
 
-它保留有上限的 provenance 和按 scope 隔离的 observability，覆盖 source
-version、content digest、canonicalization、quality/review、ER suggestion、
-saturation、retry 与 job state。transient sidecar failure 最多重试三次；
-validation、authentication 和 policy failure 为 terminal。fail-closed CI 也
-覆盖 online job、runner、watcher 和 production-write path。
-
-job 只将证据写入 staging，不会自动合并实体、promote ontology 或
-materialize production data。这些操作仍然需要显式人工治理并保留审计。
+最重要的是，这些任务**不会**自动合并实体、将本体正式上线，或将暂存结果写入生产数据。
+这些都必须经过明确的人工治理决策，并保留审计记录。
 
 ## 已交付能力
 
-| 领域 | 当前可用能力 |
+| 领域 | 业务说明 |
 |---|---|
-| **PDCA 编排** | 用于多智能体 Plan/Do/Check/Act 工作流的 Rust 协调与生命周期原语，包含 EventBus 审计信号和持久化 L0 envelope。 |
-| **Claims 隔离** | 已验证 JWT `IsolationClaims` mint 租户/项目 graph 与 vector 目标，并 mint 租户 blob prefix 与 L0 path；scoped HTTP 与 runtime graph/vector path fail closed。 |
-| **身份认证** | 面向生产部署的 OIDC/JWKS 验证，对 issuer、audience 和 JWKS 进行 fail-closed 校验。本地开发 HS256 是独立的 development mode。 |
-| **本体 KE / GE** | 从 CSV、JSON Schema、OpenAPI 和 SQL DDL 生成 claims-scoped type draft；仅生成 draft 的 schema induction；constrained extraction 与 canonicalization；`KgQualityGate`；review；anchored materialization；冻结 golden evaluation；只读 ontology health evidence。 |
-| **HITL 与审计** | 可配置的 Action staging：low-risk action 可在通过 guardrail 后 auto-commit；approval-held 或 high-risk action 则使用 merge/discard 与 TTL。SPARQL `ASK` guardrail、高风险审批 hook 与 `ACTION_AUDIT` event 提供 audit evidence。entity-resolution suggestion 保守、写入 staging，绝不 auto-merge。 |
-| **Online corpus 运行** | JSON-persisted、claims-scoped create/list/get/cancel job；manual staging runner；默认开启、仅入队不执行 job 的 configured-version polling。随仓库提供的配置没有 watcher registration，需由 deployment 添加 trusted registration。包含 retry/backpressure、有上限 provenance 及 claims-scoped observability。 |
-| **Market 与 promote** | 带不可变版本、claims-scoped visibility 以及显式 install/upgrade/rollback record 的 Logic 和 Skill package catalog。tenant Skill 和 emergent promotion 使用 gate、golden SHA verification、rule review、audit evidence 和所需人工审批。package installation 尚不会把 Skill 注册到 process-global registry。 |
-| **互操作性** | 由 `IsolationClaims` 过滤的 inbound MCP catalog；显式发布且通过 gate 的 tenant Skill 可成为 MCP tool。薄型 outbound A2A adapter 默认由 feature flag 关闭，仅以 best-effort 方式运行。 |
-| **知识与检索** | Oxigraph RDF/SPARQL named graph、claims-scoped graph/vector ingest 与 retrieval，以及内嵌 Hyperspace HNSW vector engine。有限 RDFS query-time expansion 默认关闭，绝不持久化 inferred triple。 |
-| **制品与沙箱** | claims-scoped coding-artifact metadata 与服务端 mint 的 blob prefix；由默认关闭 feature flag 保护、尚未接入 agent/tool runtime 的 contract-only 外部 `SandboxProvider` HTTP adapter。 |
+| **PDCA 协同** | 以 Rust 实现的 PDCA 工作流、任务服务和事件审计，支持多智能体按计划、执行、检查、改进协作。 |
+| **租户/项目隔离** | 已验证的 JWT `IsolationClaims` 划定知识图谱、向量、文件和工作记录的存储范围；缺少或无效凭证即拒绝访问。 |
+| **身份认证** | 生产环境使用 OIDC/JWKS 身份校验；本地开发使用独立的开发用签名模式。 |
+| **知识工程** | 从 CSV、JSON Schema、OpenAPI 和 SQL DDL 生成按范围隔离的类型草稿；支持受限提取、规范化、质量检查、审核、带锚点的生产写入、冻结参考评测和只读健康证据。 |
+| **人工审核与审计** | 低风险操作仅在策略允许且通过护栏时自动提交；高风险或待审批操作使用审批、合并/丢弃和到期处理。SPARQL `ASK` 检查、审批钩子和 `ACTION_AUDIT` 事件提供审计证据；实体消歧建议绝不自动合并。 |
+| **在线语料运行** | 支持按隔离范围创建、查看、取消任务，以及手动暂存执行。默认开启的已配置版本轮询只负责入队，不执行任务；仓库默认配置没有监视器注册项，需由部署添加可信来源。包含重试、容量控制、有限来源追溯和按范围隔离的运行记录。 |
+| **软件包与上线** | Logic 和 Skill 软件包版本不可变、按租户可见，并记录安装、升级和回滚。租户 Skill 和新兴工具正式上线需通过检查、参考 SHA 校验、规则审核、审计证据和人工审批。安装软件包尚不会将 Skill 注册到进程全局目录。 |
+| **互操作性** | `IsolationClaims` 会过滤入站 MCP 工具目录；经过门控并明确发布的租户 Skill 可作为 MCP 工具。轻量出站 A2A 适配器默认关闭，且仅提供尽力而为的能力。 |
+| **知识与检索** | Oxigraph RDF/SPARQL 知识图谱、按隔离范围的数据写入和检索，以及内嵌 Hyperspace HNSW 向量检索。可选的 RDFS 查询时扩展默认关闭，且不会写入推导结果。 |
+| **制品与沙箱** | 按隔离范围保存的编程制品元数据与系统划定的文件前缀；外部 `SandboxProvider` HTTP 适配器默认关闭，当前仅定义对接契约，尚未接入智能体/工具运行时。 |
 
 配套的 Admin control-plane 和 online-job-list surface 已独立交付，不属于本
 仓库。
 
 ## 版本亮点
 
-| 版本 | 日期 | 亮点 |
+| 版本 | 日期 | 业务说明 |
 |---|---:|---|
-| **v0.6.0** | 2026-09-08 | 已认证、claims-scoped online corpus job metadata 与 manual staging runner；默认开启、仅入队的 configured-version watcher；idempotency、有上限 provenance、observability、retry/backpressure 与 fail-closed production-write CI。 |
-| **v0.5.0** | 2026-09-07 | 有边界的本体 Knowledge Engineering 与 Graph Engineering：仅写 staging 的 constrained extraction、quality/review、anchored materialization、待审批 ER suggestion、golden SHA gate、health reporting 和 compatibility-gated ontology design。 |
-| **v0.3.0** | 2026-09-05 | 具不可变版本的 Logic 与 Skill market；OIDC/JWKS；受 gate 的 emergent-tool promotion；可选、默认关闭的 query-time RDFS expansion。 |
-| **v0.2.2** | 2026-09-05 | claims-scoped artifact store、默认关闭的 external sandbox adapter 和可复现 private-deployment benchmark。 |
-| **v0.2.1** | 2026-09-05 | claims-scoped ontology type draft、已过滤的 inbound MCP catalog、通过 gate 的 Skill-as-MCP 发布，以及默认关闭的 outbound A2A。 |
-| **v0.2.0** | 2026-09-05 | Skill package verification、golden check、受控 tenant publishing 与 Rust CI golden evaluation。 |
-| **v0.1.8** | 2026-09-04 | Ontology Action HITL staging、guardrail、SPARQL assertion 和 event audit。 |
-| **v0.1.6–v0.1.7** | 2026-09-04 | `IsolationClaims`、fail-closed scoped path、isolation diagnosis/matrix/CI，以及显式 historical-key migration tool。 |
-| **v0.1.5** | 2026-08-18 | Causal reasoning、unified graph backend、graph feature、snapshot timeline，以及带 system Skill guard 的 Skill Center CRUD。 |
+| **v0.6.0** | 2026-09-08 | 已认证的在线语料任务记录、手动暂存执行器、仅入队的监视器、有限的来源追溯和运行记录、重试与容量控制，以及由 CI 验证的生产写入隔离。 |
+| **v0.5.0** | 2026-09-07 | 受治理的知识工程流程：暂存提取、质量检查和审核、待审批的实体消歧建议、审计证据、健康报告和兼容性门控的本体设计。 |
+| **v0.3.0** | 2026-09-05 | 版本化的 Logic 和 Skill 软件包、生产身份校验、人工门控的新兴工具，以及可选的查询时知识扩展。 |
+| **v0.2.0–v0.2.2** | 2026-09-05 | 软件包校验和发布控制、隔离的知识草稿与集成、制品存储、可选的外部沙箱适配器，以及可复现的部署基准。 |
+| **v0.1.5–v0.1.8** | 2026-08-18–2026-09-04 | 因果分析、图谱和记忆基础能力、操作审核与审计控制，以及带诊断和迁移工具的租户/项目隔离。 |
 
 完整版本记录请参阅 [changelog](CHANGELOG.md)。
 
-## 架构与治理
+## 治理如何落地
 
-Wild AgentOS 明确区分语义与治理边界：
-
-- **语义基础：** Oxigraph RDF/SPARQL 与 named graph 保持为 knowledge graph
-  store 和 query layer。
-- **受治理的本体写入：** extracted candidate 依据 promoted ontology definition
-  canonicalize、verify、stage 和 review。schema draft 永不 auto-promote。
-- **人工权威：** entity merge 保持待审批；ontology promotion 与 KE
-  materialization 需要显式 confirm 和受治理的 gate。只有不需要 approval 的
-  policy 才可让 Action staging auto-commit。
-- **独立证据：** deterministic SPARQL/SHACL check、冻结 golden fixture、audit
-  record 与 materialization 后 re-read，避免将 LLM 或 worker completion report
-  当作成功证据。pySHACL 在 KE quality gate 中可选；Action guardrail 使用
-  SPARQL check。
-- **隔离即默认：** 调用方不能选择 scoped storage target；verified claims 选择
-  server-minted target，cross-scope 或 failed path 无法写入 production。
-  这一点只适用于 claims-scoped interface，并不代表每个 legacy HTTP endpoint
-  都是 claims-scoped。
+- **知识可解释：** Oxigraph 保存知识图谱，SPARQL 是查询它的语言；不同的知识图谱区域
+  用于区分租户/项目数据。
+- **变更需要正确的决策：** 候选内容会依据已批准的定义规范化、检查、暂存和审核；正式
+  上线或写入生产数据必须经过明确的受治理步骤。
+- **证据独立保存：** 确定性检查、冻结的参考用例、审计记录和写入后的回读，确保不会只
+  因模型或工作进程声称“已完成”就视为成功。
+- **访问范围可控：** 经验证的租户/项目隔离凭证决定存储范围，因此已接入该机制的接口
+  不会跨边界写入数据。
 
 ## 从源码构建
 
