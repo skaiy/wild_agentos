@@ -1,4 +1,4 @@
-#![allow(deprecated)]
+#![allow(deprecated, unreachable_code)]
 
 use oxigraph::model::{GraphNameRef, NamedNodeRef};
 use oxigraph::sparql::QueryResults;

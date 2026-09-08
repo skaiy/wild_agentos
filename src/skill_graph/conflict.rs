@@ -688,6 +688,7 @@ impl ConflictDetectionEngine {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn create_test_skill(iri: &str, name: &str) -> SkillGraphNode {
         SkillGraphNode::new(iri, name, &format!("Description for {}", name))
     }

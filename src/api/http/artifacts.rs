@@ -379,7 +379,7 @@ mod tests {
     use super::*;
     use crate::{
         api::http::{api_gov::ApiUsageState, SharedVectorStore},
-        blob::{BlobStore, LocalFsBlobStore},
+        blob::LocalFsBlobStore,
         config::GatewaySettings,
         core::core_types::{CoreConfig, SemanticCore},
         gateway::unified_gateway::UnifiedGateway,
