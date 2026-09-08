@@ -30,7 +30,7 @@ Wild AgentOS 是一个以 Rust 构建的**语义内核 AgentOS**。它以 PDCA
 
 系统的安全边界是经过验证的 JWT **`IsolationClaims`**：claims 为租户和
 项目 mint graph 与 vector 目标，并为租户 mint blob prefix 与 L0 path。缺少
-或无效 claims 的 scoped path 会 fail closed。安全命名不等于迁移历史数据；
+或无效 claims 时，claims-scoped storage path 会 fail closed。安全命名不等于迁移历史数据；
 请参阅[隔离契约](docs/17-isolation-contract.zh.md)。
 
 ## 核心技术栈
@@ -76,12 +76,12 @@ materialize production data。这些操作仍然需要显式人工治理并保�
 | **Claims 隔离** | 已验证 JWT `IsolationClaims` mint 租户/项目 graph 与 vector 目标，并 mint 租户 blob prefix 与 L0 path；scoped HTTP 与 runtime graph/vector path fail closed。 |
 | **身份认证** | 面向生产部署的 OIDC/JWKS 验证，对 issuer、audience 和 JWKS 进行 fail-closed 校验。本地开发 HS256 是独立的 development mode。 |
 | **本体 KE / GE** | 从 CSV、JSON Schema、OpenAPI 和 SQL DDL 生成 claims-scoped type draft；仅生成 draft 的 schema induction；constrained extraction 与 canonicalization；`KgQualityGate`；review；anchored materialization；冻结 golden evaluation；只读 ontology health evidence。 |
-| **HITL 与审计** | 支持 approval-held Action staging、merge/discard 和 TTL；SPARQL `ASK` guardrail、高风险审批 hook 与 `ACTION_AUDIT` event。entity-resolution suggestion 保守、写入 staging，绝不 auto-merge。 |
-| **Online corpus 运行** | JSON-persisted、claims-scoped create/list/get/cancel job；manual staging runner；默认开启、仅入队不执行 job 的 configured-version polling；retry/backpressure、有上限 provenance 及 claims-scoped observability。 |
+| **HITL 与审计** | 可配置的 Action staging：low-risk action 可在通过 guardrail 后 auto-commit；approval-held 或 high-risk action 则使用 merge/discard 与 TTL。SPARQL `ASK` guardrail、高风险审批 hook 与 `ACTION_AUDIT` event 提供 audit evidence。entity-resolution suggestion 保守、写入 staging，绝不 auto-merge。 |
+| **Online corpus 运行** | JSON-persisted、claims-scoped create/list/get/cancel job；manual staging runner；默认开启、仅入队不执行 job 的 configured-version polling。随仓库提供的配置没有 watcher registration，需由 deployment 添加 trusted registration。包含 retry/backpressure、有上限 provenance 及 claims-scoped observability。 |
 | **Market 与 promote** | 带不可变版本、claims-scoped visibility 以及显式 install/upgrade/rollback record 的 Logic 和 Skill package catalog。tenant Skill 和 emergent promotion 使用 gate、golden SHA verification、rule review、audit evidence 和所需人工审批。package installation 尚不会把 Skill 注册到 process-global registry。 |
 | **互操作性** | 由 `IsolationClaims` 过滤的 inbound MCP catalog；显式发布且通过 gate 的 tenant Skill 可成为 MCP tool。薄型 outbound A2A adapter 默认由 feature flag 关闭，仅以 best-effort 方式运行。 |
 | **知识与检索** | Oxigraph RDF/SPARQL named graph、claims-scoped graph/vector ingest 与 retrieval，以及内嵌 Hyperspace HNSW vector engine。有限 RDFS query-time expansion 默认关闭，绝不持久化 inferred triple。 |
-| **制品与沙箱** | claims-scoped coding-artifact metadata 与服务端 mint 的 blob prefix；由默认关闭 feature flag 保护的外部 `SandboxProvider` adapter。 |
+| **制品与沙箱** | claims-scoped coding-artifact metadata 与服务端 mint 的 blob prefix；由默认关闭 feature flag 保护、尚未接入 agent/tool runtime 的 contract-only 外部 `SandboxProvider` HTTP adapter。 |
 
 配套的 Admin control-plane 和 online-job-list surface 已独立交付，不属于本
 仓库。
@@ -117,13 +117,17 @@ Wild AgentOS 明确区分语义与治理边界：
   store 和 query layer。
 - **受治理的本体写入：** extracted candidate 依据 promoted ontology definition
   canonicalize、verify、stage 和 review。schema draft 永不 auto-promote。
-- **人工权威：** entity merge、ontology promotion 和 production
-  materialization 必须分别走显式 approval path。
+- **人工权威：** entity merge 保持待审批；ontology promotion 与 KE
+  materialization 需要显式 confirm 和受治理的 gate。只有不需要 approval 的
+  policy 才可让 Action staging auto-commit。
 - **独立证据：** deterministic SPARQL/SHACL check、冻结 golden fixture、audit
   record 与 materialization 后 re-read，避免将 LLM 或 worker completion report
-  当作成功证据。
+  当作成功证据。pySHACL 在 KE quality gate 中可选；Action guardrail 使用
+  SPARQL check。
 - **隔离即默认：** 调用方不能选择 scoped storage target；verified claims 选择
   server-minted target，cross-scope 或 failed path 无法写入 production。
+  这一点只适用于 claims-scoped interface，并不代表每个 legacy HTTP endpoint
+  都是 claims-scoped。
 
 ## 从源码构建
 

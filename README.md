@@ -31,7 +31,8 @@ engineering.
 
 Its security boundary is verified JWT **`IsolationClaims`**: claims mint graph
 and vector targets for a tenant and project, plus tenant-scoped blob prefixes
-and L0 paths. Scoped paths fail closed when claims are absent or invalid.
+and L0 paths. Claims-scoped storage paths fail closed when claims are absent or
+invalid.
 Safe-name minting is not a migration of historical data; see the
 [Isolation Contract](docs/17-isolation-contract.md).
 
@@ -81,12 +82,12 @@ human-governed and auditable.
 | **Claims isolation** | Verified JWT `IsolationClaims` mint tenant/project graph and vector targets plus tenant blob prefixes and L0 paths; scoped HTTP and runtime graph/vector paths fail closed. |
 | **Identity** | OIDC/JWKS verification for production deployments, with fail-closed issuer, audience, and JWKS validation. Local-development HS256 remains a separate development mode. |
 | **Ontology KE / GE** | Claims-scoped type drafts from CSV, JSON Schema, OpenAPI, and SQL DDL; draft-only schema induction; constrained extraction and canonicalization; `KgQualityGate`; review; anchored materialization; frozen golden evaluations; and read-only ontology health evidence. |
-| **HITL and audit** | Approval-held Action staging with merge/discard and TTL handling, SPARQL `ASK` guardrails, high-risk approval hooks, and `ACTION_AUDIT` events. Entity-resolution suggestions are conservative, staged, and never auto-merged. |
-| **Online corpus operations** | JSON-persisted, claims-scoped create/list/get/cancel jobs; a manual staging runner; default-on configured-version polling that enqueues but does not execute jobs; retry/backpressure, bounded provenance, and claims-scoped observability. |
+| **HITL and audit** | Configurable Action staging: low-risk actions may auto-commit after guardrails, while approval-held or high-risk actions use merge/discard and TTL handling. SPARQL `ASK` guardrails, high-risk approval hooks, and `ACTION_AUDIT` events provide audit evidence. Entity-resolution suggestions are conservative, staged, and never auto-merged. |
+| **Online corpus operations** | JSON-persisted, claims-scoped create/list/get/cancel jobs; a manual staging runner; default-enabled configured-version polling that enqueues but does not execute jobs. The shipped configuration has no watcher registrations until a deployment adds trusted ones. Retry/backpressure, bounded provenance, and claims-scoped observability are included. |
 | **Markets and promotion** | A versioned Logic and Skill package catalog with immutable versions, claims-scoped visibility, and explicit install/upgrade/rollback records. Tenant Skill and emergent promotion use gates, golden SHA verification, rule review, audit evidence, and required human approval. Package installation does not yet register Skills in the process-global registry. |
 | **Interoperability** | An inbound MCP catalog filtered by `IsolationClaims`; explicitly published, gated tenant Skills can be MCP tools. A thin outbound A2A adapter is feature-flagged off by default and is best-effort only. |
 | **Knowledge and retrieval** | Oxigraph RDF/SPARQL named graphs, claims-scoped graph and vector ingestion/retrieval, and an embedded Hyperspace HNSW vector engine. Optional limited RDFS query-time expansion is disabled by default and never persists inferred triples. |
-| **Artifacts and sandboxing** | Claims-scoped coding-artifact metadata and server-minted blob prefixes; an external `SandboxProvider` adapter behind a default-off feature flag. |
+| **Artifacts and sandboxing** | Claims-scoped coding-artifact metadata and server-minted blob prefixes; a contract-only external `SandboxProvider` HTTP adapter behind a default-off feature flag, not yet wired into the agent/tool runtime. |
 
 The companion Admin control-plane and online-job-list surfaces are delivered
 separately; they are not part of this repository.
@@ -123,14 +124,18 @@ Wild AgentOS keeps the semantic and governance boundaries explicit:
 - **Governed ontology writes:** extracted candidates are canonicalized against
   promoted ontology definitions, verified, staged, and reviewed. Schema drafts
   never auto-promote.
-- **Human authority:** entity merges, ontology promotion, and production
-  materialization require their respective explicit approval paths.
+- **Human authority:** entity merges are approval-held; ontology promotion and
+  KE materialization require explicit confirmation and governed gates. Action
+  staging can instead auto-commit only for policies that do not require
+  approval.
 - **Independent evidence:** deterministic SPARQL/SHACL checks, frozen golden
   fixtures, audit records, and post-materialization re-reads prevent an LLM or
-  worker completion report from being treated as success evidence.
+  worker completion report from being treated as success evidence. pySHACL is
+  optional in the KE quality gate; Action guardrails use SPARQL checks.
 - **Isolation by construction:** callers cannot choose scoped storage targets;
   verified claims select server-minted targets, and cross-scope or failed paths
-  cannot write production.
+  cannot write production through the claims-scoped interfaces. This does not
+  make every legacy HTTP endpoint claims-scoped.
 
 ## Build from source
 
