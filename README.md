@@ -1,20 +1,20 @@
-# Wild AgentOS 
+# Wild AgentOS
 <div align="center">
 
 <img src="assets/logo_transparent.png" width="120" alt="Wild AgentOS Logo" />
 
-**An Industrial-Grade AI Agent Operating System Built in Rust**  [![Star on GitHub](https://img.shields.io/github/stars/skaiy/wild_agentos?style=flat)](https://github.com/skaiy/wild_agentos)
+**A governed operating system for teams that run multiple AI agents**
 
-
+[![Star on GitHub](https://img.shields.io/github/stars/skaiy/wild_agentos?style=flat)](https://github.com/skaiy/wild_agentos)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.5.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.6.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
-[**English**](README.md) · [**中文**](README.zh.md) · [**Design Detail →**](docs/13-DESIGN_DETAIL.md)
+[**English**](README.md) · [**中文**](README.zh.md) · [**Design detail →**](docs/13-DESIGN_DETAIL.md)
 
 <img src="assets/github-readme.png" alt="Wild AgentOS" width="100%" />
 
@@ -22,287 +22,174 @@
 
 ---
 
-## 🎉 Release History & Changelog
+## What is Wild AgentOS?
 
-Welcome to the release timeline of **Wild AgentOS**, featuring production-grade security gateway layers, partial tenant-scoped storage wiring, and an advanced cognitive operating system kernel. See the [Isolation Contract](docs/17-isolation-contract.md) for the current boundaries and unmigrated historical keys.
+Wild AgentOS is a **governed operating system for multi-agent work**, built in
+Rust (a systems programming language). It helps teams coordinate AI agents through PDCA (Plan, Do, Check, Act),
+share knowledge, and keep an auditable record of work and decisions.
 
-| Version | Release Date | Key Upgrades & Fused Features |
-|---------|--------------|------------------------------|
-| **v0.5.0** | **2026-09-07** | **Ontology Knowledge Engineering + Graph Engineering**<br>• Completes bounded, claims-scoped constrained extraction, optional Morph-KGC/RML materialization, quality/review supervision, and anchored staging-to-production materialization; no path auto-promotes schema or writes around verified claims.<br>• Adds conservative, approval-held entity-resolution suggestions through a process-isolated GLinker-style sidecar; no auto-merge path is provided.<br>• Freezes ontology KE golden evaluations behind a SHA gate, documents measurement-decay audit policy, and adds a read-only ontology health report for slow-loop review.<br>• Completes OpenAPI/SQL DDL drafts, draft-only schema induction, readiness reporting, and compatibility-gated promotion; companion Admin ontology design studio work remains separate. |
-| **v0.3.0** | **2026-09-05** | **Markets + IdP + Emergent**<br>• Adds a versioned Logic and Skill package market with immutable package versions, claims-scoped access, and explicit install, upgrade, and rollback.<br>• Adds OIDC/JWKS authentication beside local-development HS256, with asymmetric JWT verification and fail-closed issuer, audience, and JWKS validation.<br>• Adds a gated emergent-tool promotion pipeline: generated tools remain untrusted until sandbox/judge gates and required human approval pass.<br>• Adds optional, default-off limited RDFS inference for claims-scoped graph reads; query-time subclass and type expansion never persists inferred triples. |
-| **v0.2.2** | **2026-09-05** | **Artifacts + Sandbox + Bench**<br>• Adds a claims-scoped coding artifact store: immutable metadata is written to the caller’s `IsolationClaims` graph and bytes use a server-minted tenant blob prefix.<br>• Adds an external `SandboxProvider` adapter behind a default-off feature flag; its async path does not hold `MutexGuard` across an `await`.<br>• Adds reproducible private-deployment benchmarks for Oxigraph, redb, and Hyperspace that record measured results without fabricated speedups. |
-| **v0.2.1** | **2026-09-05** | **Ontology Data + Protocols**<br>• Adds claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema; promotion requires authorized human approval.<br>• Adds an inbound MCP tool catalog filtered by `IsolationClaims`, plus explicitly published, gated tenant Skills as MCP tools; kernel Skills remain excluded.<br>• Adds a thin outbound A2A adapter behind a default-off feature flag; it is best-effort and does not add an inbound server or alter the local task lifecycle. See [Outbound A2A adapter](docs/19-a2a-outbound.md). |
-| **v0.2.0** | **2026-09-05** | **Control Plane + Skill CI**<br>• Adds the Skill package format and CI gate: verification plus golden input/output checks, with the Judge hook disabled by default.<br>• Passing packages publish through the gated tenant channel; failing fixtures are blocked.<br>• Adds Rust-CI golden evaluations for Agent plans, Skill Markdown, and Action invocation via `scripts/test_golden.sh`.<br>• Companion Admin #16 delivered the separate-repository five-screen control-plane skeleton; this release does not change that repository's scope. |
-| **v0.1.8** | **2026-09-04** | **Ontology Action HITL**<br>• Adds configurable `commit_strategy` for automatic or approval-held Action staging, with merge/discard APIs and TTL expiry.<br>• Adds configurable guardrails, SPARQL `ASK` assertions, and a `high_risk` approval hook.<br>• Publishes `ACTION_AUDIT` EventBus events for committed, pending, approved, rejected, and violated outcomes; see the [Ontology Action Data Sandbox](docs/15-ontology-action-sandbox.md). |
-| **v0.1.7** | **2026-09-04** | **Isolation Proof & Eval**<br>• Adds the read-only `isolation-diagnose` CLI, customer-readable [Isolation Matrix](docs/17-isolation-matrix.md), and fail-closed `isolation_contract` CI coverage.<br>• Adds optional explicit `isolation-migrate`; it never uses a silent `UNION` and does not claim historical keys were migrated. |
-| **v0.1.6** | **2026-09-04** | **Isolation & Hardening**<br>• Verified JWT tenant/project claims now mint graph, blob, vector, and L0 targets; HTTP KG, ontology, KB, chat RAG, and runtime graph/vector tools are claims-scoped and fail closed when claims are absent.<br>• New user agents receive verified scope; public API-key chat is non-tenant-RAG.<br>• Adds optional `AGENTOS_TENANT_TOOL_CALL_CAP`, MCP disclosure, bash environment sanitization, tool-schema enforcement, and PDCA L0 envelopes.<br>• See the [Isolation Contract](docs/17-isolation-contract.md); historical keys are not migrated. |
-| **v0.1.5** | **2026-08-18** | **Cognitive Causal Engine & Advanced Graph Governance**<br>• **Causal Engine**: Standalone causal reasoning subsystem (`CausalEngine`, `FusionEngine`, `CausalStore`) to trace root causes and compute causal graphs of agent decisions.<br>• **Unified Graph Backend**: Consolidated fragmented graph operations into a single high-performance `GraphBackend`.<br>• **Graph Features**: Structural feature computation (PageRank, PageRank vector, centrality) and similarity scoring between cognitive snapshots.<br>• **Snapshot Timeline**: Temporal snapshot versioning with diff-based rollback and point-in-time state restoration.<br>• **Skill Center CRUD & Guard**: New client-side skill editing/deletion support, detail schema rendering, and strict **403 Forbidden** guards protecting system-level (`iri://`) builtins. |
-| **v0.1.4** | **2026-07-06** | **Model Registry Center (3-in-1 Consolidation) & Dynamic Ingestion**<br>• **Consolidated Model Registry**: Merged gateway, embedding, and resource mapping settings into a unified "Model Registry Center".<br>• **Auto Model Discovery**: Automatic endpoint model schema discovery (`/v1/models`) and keyword-matching modaly pre-evaluation.<br>• **Vector Service Bridge**: Dynamic hot-swapping embedding models, triggering zero-downtime database rebuilds and background indexing. |
-| **v0.1.3** | **2026-07-06** | **Multi-Modal Vision-Language (VL) Routing & Capability Slots**<br>• **Multi-Modal Gateway**: Automatic payload extraction (`ChatContent` parts) routing image payloads (Base64/URL) to VL models.<br>• **Agent Capability Slots**: Multi-model slot assignments per agent (e.g. Chat Slot → DeepSeek-V4, Vision Slot → Gemini-Pro). |
-| **v0.1.2** | **2026-07-05** | **Multi-Tenant Knowledge Ingestion & Unified Knowledge Packages**<br>• **Two-Phase Ingestion**: Concurrent multi-file chunking upload to vector databases, and structural CSV/N-Triples graph imports to named graphs.<br>• **Knowledge Package Mounting**: Decoupled individual graph path binding, unifying knowledge resources into multi-pack `knowledge_pack_ids` for structured routing.<br>• **Isolation status**: this release entry does not mean current live keys were migrated; see the Isolation Contract. |
-| **v0.1.1** | **2026-07-04** | **API Key Governance Center & One-Click Publishing**<br>• **API Key Governance**: Real-time client credentials management, quota limits enforcement, security audit logs, and access scopes.<br>• **OpenAI-Compatible Gateway**: One-click agent publishing with compatible endpoints (`/v1/chat/completions`) and SSE stream routes. |
-| **v0.1.0** | **2026-07-01** | **Initial Release — Core OS Engine & Hyperspace Vector Storage**<br>• **HyperspaceEngine**: Embedded HNSW vector database with WAL and Poincaré/Lorentz metrics.<br>• **Skill Graph & Blackboard**: 5W2H semantic skill hypergraph, L0-L3 memory cache hierarchy with MESI coherence.<br>• **Workspace Monitor**: Real-time file system triggers and proactive perception engine. |
+It is designed around tenant and project boundaries. A verified JWT (an
+identity token) carries tenant/project isolation claims (`IsolationClaims`).
+The system uses those claims to select the caller's graph, vector, file, and
+work-record storage. Missing or invalid identity means access is refused; a
+caller cannot select another tenant's storage. This applies to the
+claims-scoped interfaces, not every legacy HTTP endpoint. The naming scheme
+does not migrate historical data—see the [Isolation Contract](docs/17-isolation-contract.md).
 
----
+## What you get
 
-## What Is Wild AgentOS?
+- **Coordinated work:** Rust-based PDCA workflows, task services, and an event
+  audit trail for multi-agent Plan/Do/Check/Act work.
+- **Shared knowledge and retrieval:** an Oxigraph knowledge graph (a structured
+  store) queried with SPARQL, plus embedded vector retrieval for finding
+  relevant information.
+- **Controlled knowledge changes:** drafts from CSV, JSON Schema, OpenAPI, and
+  SQL DDL can be checked, placed in a staging area, reviewed, and—when
+  approved—written to production data. Drafts never become official
+  definitions automatically.
+- **Human oversight and evidence:** high-risk or approval-held Actions require
+  a decision; low-risk Actions can commit only when their policy permits it.
+  The system records checks, reviews, audit events, and read-back evidence.
+  Entity-resolution suggestions (whether two records are the same entity) are
+  staged and never merged automatically.
+- **Identity and integrations:** production uses OIDC/JWKS identity validation;
+  local development has a separate development signing mode. gRPC is available
+  for service-to-service communication, and MCP (Model Context Protocol) can
+  expose explicitly published, tenant-scoped Skills. The outbound A2A adapter
+  is optional, off by default, and best-effort only.
+- **Governed packages:** Logic and Skill packages have immutable versions,
+  tenant-scoped visibility, and recorded install, upgrade, and rollback steps.
+  Promotion requires defined gates, review evidence, and human approval.
 
-An **AI agent operating system** built in Rust that orchestrates multiple agents via the PDCA cycle, enabling coordinated, auditable, and self-improving systems.
+The companion Admin control-plane and online-job-list user interfaces are
+separate products and are not in this repository.
 
-> "We don't just build agents; we build the **infrastructure that harnesses their collective intelligence**."
+## v0.6: Online corpus jobs, with people in control
 
-### Core Architecture
+v0.6.0 adds authenticated online-corpus jobs within the same tenant/project
+boundary. Watchers are enabled by default but only watch configured source
+versions and place one job in the queue for each new version. A deployment can
+turn that polling and queueing off without deleting retained jobs, cursors,
+reviews, or audit records. Watchers do not fetch source URLs, calculate content
+changes, or run jobs.
 
-| Layer | Technology | Role |
-|-------|-----------|------|
-| **Core Coordination** (Rust) | `PDCA cycle` · `5W2H ontology` · `EventBus` | Agent orchestration & lifecycle |
-| **Skill Graph** | `RDF` · `6 link types` · `18 modules` | Dynamic cognitive network |
-| **Memory System** | `L0 redb` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI coherence` | Hierarchical memory with prefetch |
-| **Knowledge Graph** | `Oxigraph RDF` · `SPARQL 1.1` · `Code AST` · `Named Graphs` | Cross-subsystem unified store |
-| **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean` · `Hybrid search` | Embedded vector embeddings |
-| **Wild Code TUI** | `ratatui` · `crossterm` · `MCP` · `checkpoint/resume` | Terminal AI coding assistant |
-| **Data Bus** | `JSON-LD 1.1` · `@id/@type/@context` · `Named Graphs` | Universal interoperability |
-| **Gateway** | `gRPC` · `HTTP (OpenAI-compatible)` · `MCP` | Production interface |
-| **Perception Engine** | `10 triggers` · `Anomaly dedup` · `5W2H constraint check` | Proactive monitoring |
-| **Agent Workflow** | `PA/DA/CA` · `Tool system` · `Checkpoint` · `Tracked actions` | Multi-agent execution |
+An authenticated person or service manually runs a queued job with supplied
+text, extraction method, candidates, and a quality-check request. The job standardizes
+the candidates, keeps their evidence in a staging area, runs checks, creates an
+approval-held entity-resolution suggestion, and then awaits review.
 
----
+The system keeps limited source-tracing and operational records, including
+source versions, content digests, checks, review status, retries, capacity
+pressure, and job state. Temporary sidecar failures retry at most three times;
+identity, validation, and policy failures stop the job. CI verifies that failed,
+invalid, cross-boundary, or unauthenticated paths cannot write production data.
 
-## 🔧 Key Highlights
+Crucially, these jobs do **not** automatically merge entities, make an ontology
+official, or write staged results to production. Those are explicit,
+human-governed, auditable decisions.
 
-### 1. HyperspaceEngine — Embedded Vector Engine
-Production-grade spatial memory engine with **runtime-switchable metrics** (Poincaré, Cosine, Euclidean, Lorentz). Features **HNSW approximate nearest neighbor search**, CRC32-verified **Write-Ahead Log (WAL)** with 3 sync modes, **tangent-space pruning** for Poincaré ball search, JSON-LD metadata index with RoaringBitmap filters, and dual-space **hybrid search** (text × structural). A self-contained crate with zero external vector database dependencies.
+## Release highlights
 
-### 2. Skill Graph Cognitive Network
-Dynamic in-memory cognitive network with **6 semantic link types** (Prerequisite, Composition, Related, Alternative, Extends, Generalization). Includes **Poincaré structural embedding** computation from graph topology (prerequisite depth, tag fingerprinting), **hypergraph composition** with first-class `Hyperedge` and `CompositionType` (Sequential, Parallel, Conditional, Optional, Fallback), **graph algorithms** (PageRank, betweenness centrality, label-propagation community detection, DFS prerequisite chains, Tarjan SCC cycle detection), **causal failure analysis** with root cause inference, **formal invariant verification** (6 checks: acyclicity, link existence, composite reachability, no deprecated prereqs, valid 5W2H, valid security levels), and **temporal versioning** with snapshot/rollback.
+| Version | Date | Business summary |
+|---|---:|---|
+| **v0.6.0** | 2026-09-08 | Authenticated online-corpus job records, manual staging runner, queue-only watchers, bounded source tracing and operational records, retry/capacity controls, and CI-proven production-write isolation. |
+| **v0.5.0** | 2026-09-07 | Governed knowledge-engineering flow: staged extraction, quality and review, approval-held identity suggestions, evidence, health reporting, and compatibility-gated ontology design. |
+| **v0.3.0** | 2026-09-05 | Versioned Logic and Skill packages, production identity validation, human-gated emerging tools, and optional read-time knowledge expansion. |
+| **v0.2.0–v0.2.2** | 2026-09-05 | Package verification and publishing controls, scoped knowledge drafts and integrations, artifact storage, an optional external sandbox adapter, and reproducible deployment benchmarks. |
+| **v0.1.5–v0.1.8** | 2026-08-18–2026-09-04 | Causal analysis, graph and memory foundations, Action review and audit controls, and tenant/project isolation with diagnosis and migration tooling. |
 
-### 3. Generalized PDCA — 7-Level Adaptive Execution
-Dynamically selects from 7 complexity levels (L0 instant → L5 recursive → L6 emergency) via 5W2H metadata. One engine handles everything from instant queries to multi-week projects — no rigid workflows. **PA/DA/CA agent roles** with template-driven prompt construction.
+See the full [changelog](CHANGELOG.md).
 
-### 4. CPU Cache-Inspired Memory — 4 Layers + MESI Coherence
-First-ever application of CPU cache coherence protocol to multi-agent memory. **L0** redb disk KV + HyperspaceEngine vectors → **L1** session context → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL projection cache. Intelligent prefetch engine reduces perceived latency by 90%. Solves context explosion and shared memory inconsistency across concurrent agents.
+## How governance works
 
-### 5. JSON-LD Universal Data Bus — W3C-Standard Interoperability
-`@context` duck-typing eliminates field name conflicts between skills. `@id` enables zero-cost cross-agent entity merging. `@graph` named graphs allow conflict-free parallel writes across subsystems. Turns interoperability hell into plug-and-play.
+- **Knowledge stays explainable:** Oxigraph stores the knowledge graph; SPARQL
+  is the query language used to inspect it. Separate knowledge-graph areas keep
+  tenant/project data distinct.
+- **Changes require the right decision:** candidates are standardized against
+  approved definitions, checked, staged, and reviewed. Production promotion and
+  writing production data require explicit governed steps.
+- **Evidence is independent:** deterministic checks, frozen reference cases,
+  audit records, and production read-backs mean a model or worker saying
+  “complete” is not treated as proof.
+- **Access is contained:** verified tenant/project claims choose the storage
+  boundary, so claims-scoped interfaces do not write across boundaries.
 
-### 6. Self-Evolving Skill Graph — Autonomous Learning
-AA agents create **knowledge fragments** and new semantic links after each task completion. `/learn` and `/reduce` mechanisms enable autonomous skill acquisition and consolidation. `BootstrapEngine` ingests markdown skills from the filesystem.
-
-### 7. Universal Knowledge Graph — Unified Cognitive Backbone
-All subsystems (skills, memories, tasks, code knowledge) share a single **Oxigraph RDF store** via named graphs, enabling cross-subsystem SPARQL joins. Code ASTs parsed by tree-sitter are automatically converted to RDF triples. **Bidirectional SPARQL sync** from `SkillGraphStore` keeps the cognitive graph in sync with the semantic store.
-
-### 8. Semantic Skill Discovery Engine
-`SkillDiscoveryEngine` wraps `HyperspaceStore` for vector-based semantic search across skills. `suggest_links()` falls back from Jaccard tag overlap to cosine similarity via embedding vectors. Includes BFS path finding (`find_skill_chain()`), composition tree construction (`get_skill_tree()`), and conflict detection.
-
-### 9. 5W2H Dimension-Level Audit — Precision Rollback
-CA audits each of the 7 dimensions independently. What/Why fail → re-analyze. How/Where fail → re-plan. When/HowMuch fail → conditional pass. No more black-box "PASS/FAIL" — you know exactly what went wrong.
-
-### 10. Proactive Perception Engine
-10 execution triggers with 60-second anomaly deduplication. Monitors deadline violations, budget overruns (>80% tokens), role mismatches, environment conflicts. **Workspace Monitor** detects file creations/modifications/deletions in real-time. Auto-escalates to human when needed.
-
-### 11. Micro-Tool System — Tame Large Outputs
-Results >8KB auto-generate conversational micro-tools (e.g., "search_in_results"). Transforms unwieldy 50KB+ outputs into interactive, queryable artifacts within the LLM context.
-
-### 12. MCP Integration — One Protocol to Connect Them All
-Standard **Model Context Protocol** connects GitHub, Slack, Jira, and any MCP-compatible server. Dynamic tool discovery at runtime. Supports both HTTP SSE and stdio transport modes with repeatable `--mcp-server` CLI flags.
-
-#### Third-party MCP disclosure
-
-An MCP server is a third party. It receives the JSON-RPC requests Wild AgentOS sends to it, including the selected tool name and arguments, and returns its tool results to the Agent. Only connect servers you trust with the task data you choose to send.
-
-For `--mcp-server-stdio`, Wild AgentOS starts the server as a child process. That process inherits the Agent process environment, with any server-specific environment variables overlaid. Environment sanitization is tracked in [#26](https://github.com/skaiy/wild_agentos/issues/26) (implementation [#37](https://github.com/skaiy/wild_agentos/pull/37)); until that protection is applied to stdio MCP launches, do not put secrets in the Agent environment when starting a third-party server.
-
-MCP failures are fail-loud: a failed connection is reported as `status=error:...`, clears any discovered tools, and returns an error to the caller. Failed tool calls are also returned as errors—they are not skipped and never replaced with a `simulated` result.
-
-#### Published Skill MCP tools
-
-Tenant Skills that pass the publication gate can be explicitly exposed at
-`POST /mcp` as MCP tools. Exposure is default-deny, scoped to a tenant, and
-managed by DA users through `/api/v1/mcp/skill-exposures`; built-in `iri://`
-Skills are never exposed. A verified Bearer JWT is required for discovery and
-calls, and `allowed_roles` plus the Skill input schema are enforced. See
-[#92](https://github.com/skaiy/wild_agentos/issues/92).
-
-### 13. Checkpoint & Recovery — Crash-Proof Long-Running Tasks
-Session state snapshots at critical points with full restoration on crash. Enables hour/day-long agent tasks and post-mortem replay debugging. `--resume <task_iri>` and `--list-checkpoints` commands for explicit session management.
-
-### 14. Center + Edge Federation — Local Autonomy, Global Orchestration
-Go Center handles workflow orchestration (Temporal), project management, agent registry. Rust Edge runs local LLM execution with Docker sandbox. VS Code Plugin provides real-time developer awareness. No single point of failure.
-
----
-
-## 🖥️ Wild Code — The Terminal AI Assistant
-
-**Wild Code** is a terminal-based AI coding assistant (`ratatui` TUI) that brings the power of Wild AgentOS's knowledge graph and agent orchestration directly into your command line — no IDE required.
-
-**Features:**
-- Interactive TUI with **Markdown rendering** (`tui-markdown`) and **mermaid diagram** support
-- **MCP server integration** via `--mcp-server` and `--mcp-server-stdio` flags
-- **Checkpoint/resume** with `--resume <task_iri>` and `--list-checkpoints`
-- **Multi-model backends**: DeepSeek, OpenAI-compatible APIs
-- **PDCA workflow execution** with plan/do/check/act cycles
-- **Configurable** workspace, max iterations, max PDCA cycles, verbosity
-
-![Wild Code Demo](assets/screenshot.gif)
-
-![Knowledge Graph in Action](assets/wild_code_kg.JPG)
-*Knowledge graph visualization — real-time entity relationships, code structure understanding, and cross-subsystem awareness powered by Oxigraph RDF*
-
-![Completed Programming Task](assets/wild_code.JPG)
-*Task completion interface — AI agent successfully analyzing and solving a programming task with full traceability*
-
----
-
-## 🚀 Quick Start
-
-### Download & Run — Wild Code
-
-No dependencies required. Just download, extract, and run:
-
-| Platform | Download |
-|----------|----------|
-| Linux (x86_64, musl) | [`wildcode-x86_64-unknown-linux-musl.tar.gz`](https://github.com/skaiy/wild_agentos/releases) (~15 MB) |
-| Linux (aarch64, musl) | [`wildcode-aarch64-unknown-linux-musl.tar.gz`](https://github.com/skaiy/wild_agentos/releases) (~14 MB) |
-| macOS (Apple Silicon) | [`wildcode-aarch64-apple-darwin.tar.gz`](https://github.com/skaiy/wild_agentos/releases) (~13 MB) |
-| Windows (x86_64) | [`wildcode-x86_64-pc-windows-msvc.zip`](https://github.com/skaiy/wild_agentos/releases) (~12 MB) |
-
-```bash
-# Linux / macOS
-tar xzf wildcode-*.tar.gz
-./wildcode --help
-
-# Windows (PowerShell)
-Expand-Archive wildcode-x86_64-pc-windows-msvc.zip .
-.\wildcode.exe --help
-```
-
-> All Linux builds are **fully statically linked** (musl) — no runtime dependencies required.
-
-Set your API key and start using it:
-
-```bash
-export DEEPSEEK_API_KEY="sk-..."        # Linux / macOS
-# or
-set DEEPSEEK_API_KEY="sk-..."            # Windows (cmd)
-# or
-$env:DEEPSEEK_API_KEY="sk-..."           # Windows (PowerShell)
-
-# Alternatively, use any OpenAI-compatible provider:
-export AGENT_OS_GATEWAY_API_KEY="sk-..."
-export AGENT_OS_GATEWAY_BASE_URL="https://your-endpoint/v1"
-
-# Web search tool (powered by Exa):
-# Get your free API key at https://exa.ai/docs/reference/team-management/get-api-key
-# Falls back to DuckDuckGo (unreliable in China, not recommended for Chinese users)
-export EXA_API_KEY="your-exa-api-key"
-
-# Run an interactive session
-./wildcode
-
-# Or run a one-shot task
-./wildcode "Explain how Rust's borrow checker works"
-
-# With MCP server attached
-./wildcode --mcp-server chrome=http://localhost:3000/sse
-
-# Resume from checkpoint
-./wildcode --resume task:abc123
-```
-
-### Build from Source
+## Build from source
 
 ```bash
 git clone https://github.com/skaiy/wild_agentos.git
-cd Wild_AgentOS
-
-# Build the wildcode binary (release, ~51 MB)
-cargo build -p wild-code-cli --release
-./target/release/wildcode --help
+cd wild_agentos
+# Install Protocol Buffers' protoc compiler before building.
+cargo build --workspace
+cargo test --workspace
 ```
 
----
+## Run locally
 
-## 🗺️ Roadmap
+### Runtime configuration
 
-Wild AgentOS is a **semantic-kernel AgentOS**: Rust PDCA orchestration with Oxigraph RDF/SPARQL, Hyperspace, the `IsolationClaims` naming contract, and an ontology Action **data** sandbox. It is not a bare-metal microkernel OS or a comprehensive proprietary-platform recreation; it does not replace Oxigraph with Nebula/Cypher, mix separate product/business repositories or product boundaries into this open-source tree, or confuse minting names with migrating historical data. See the [Evolution Roadmap](docs/18-evolution-roadmap.md) and [Isolation Contract](docs/17-isolation-contract.md).
-
-- **v0.1.6 — done:** JWT `IsolationClaims` mint graph/blob/vector/L0 targets; relevant HTTP paths fail closed; historical keys are not migrated.
-- **v0.1.7 — done:** read-only minted-vs-historical diagnose CLI, customer-readable isolation matrix, fail-closed golden CI, and optional explicit migration with no silent `UNION`.
-- **v0.1.8 — done:** approval-held Action staging with merge/discard APIs and TTL, configurable guardrails plus SPARQL assertions, and `ACTION_AUDIT` event-bus audit.
-- **v0.2.0 — done:** Skill package verification, golden checks, default-off Judge hook, and gated tenant publishing; Rust-CI Agent/Skill/Action golden evaluations; companion Admin #16 delivered the separate-repository five-screen control-plane skeleton.
-- **v0.2.1 — done:** claims-scoped ObjectType/LinkType drafts from CSV or JSON Schema with authorized approval before promotion; an `IsolationClaims`-filtered inbound MCP catalog; gated tenant Skill publishing as MCP tools; and a default-off, best-effort outbound A2A adapter. See [Outbound A2A adapter](docs/19-a2a-outbound.md).
-- **v0.2.2 — done:** a claims-scoped coding artifact store with `IsolationClaims` graph metadata and a server-minted tenant blob prefix; a default-off external `SandboxProvider` adapter that does not hold `MutexGuard` across an `await`; and reproducible private-deployment benchmarks for Oxigraph, redb, and Hyperspace without fabricated speedups.
-- **v0.3.0 — done:** versioned Logic and Skill package market with immutable versions and explicit install/upgrade/rollback; fail-closed OIDC/JWKS authentication beside local-development HS256; a gated, human-approved emergent-tool promotion pipeline; and default-off limited RDFS query-time inference that never persists inferred triples.
-- **v0.5.0 — done:** the two-track Ontology Knowledge Engineering / Graph Engineering milestone: staging-only constrained extraction and Morph-KGC/RML inputs; `KgQualityGate` and review; anchored, auditable materialization; conservative, approval-held entity-resolution suggestions; frozen golden SHA checks and read-only health reporting; OpenAPI/SQL DDL and induction drafts, readiness reporting, and compatibility-gated promotion. Tenant Skill/Emergent promotion now requires golden SHA verification, named rule review, and audit evidence. The companion Admin ontology design studio is delivered separately.
-- **v0.6 — planned:** authenticated, claims-scoped online corpus jobs and enabled-by-default corpus watchers will orchestrate the existing KE primitives, including required approval-held entity-resolution suggestions, with idempotency, retry/backpressure, provenance, and observable job state. Deployments can explicitly disable watcher configuration when needed; production ontology promotion, entity-resolution merge, and materialization remain human-governed.
+The server fails closed and exits non-zero if `config.yaml`, the runtime
+override, or configuration environment variables cannot be parsed. For local
+development only, explicitly opt into defaults with
+`AGENT_OS_CONFIG_PROFILE=development` or `AGENT_OS_ALLOW_DEFAULT_CONFIG=true`;
+do not set either in production.
 
 ---
 
-## 📊 Performance Targets
-
-This historical reference table is not a benchmark result. Do not change it or
-publish speedup ratios without a sourced measured run; use the
-[private deployment benchmark](docs/19-private-deploy-benchmark.md) to produce
-JSON and Markdown evidence on the target machine.
-
-| Operation | Latency | Throughput |
-|-----------|---------|-----------|
-| L2 Node Write (Oxigraph) | ~2ms | 500 ops/sec |
-| L3 SPARQL Projection | ~15ms | 66 ops/sec |
-| L0 redb KV Read | ~1ms | 1000 ops/sec |
-| Hyperspace HNSW Search (10K vectors) | ~1ms | 1000 qps |
-| Poincaré Embedding (4D) | ~50µs | — |
-| Agent ReAct Turn | 1-5s | 0.2-1 turns/sec |
-| Idle Memory | ~200MB | scales with tasks |
-
----
-
-## 📚 Documentation
-
-- **Memory System** → [`docs/03-memory-system.md`](docs/03-memory-system.md) (L0 redb · HyperspaceEngine · Oxigraph SPARQL)
-- **Isolation Contract** → [`docs/17-isolation-contract.md`](docs/17-isolation-contract.md) (verified claims and future naming; no storage migration)
-- **Isolation Matrix** → [`docs/17-isolation-matrix.md`](docs/17-isolation-matrix.md) (CI-verified fail-closed behavior; historical keys are not migrated)
-- **Evolution Roadmap** → [`docs/18-evolution-roadmap.md`](docs/18-evolution-roadmap.md) (post-v0.1.6 strategy and explicit non-goals)
-- **Private Deployment Benchmark** → [`docs/19-private-deploy-benchmark.md`](docs/19-private-deploy-benchmark.md) (reproducible measured Oxigraph/redb/Hyperspace profile)
-- **Ontology Action Data Sandbox** → [`docs/15-ontology-action-sandbox.md`](docs/15-ontology-action-sandbox.md) (staging graph guardrails; not a compute sandbox)
-- **Ontology KE Pipeline** → [`docs/21-ontology-knowledge-engineering-pipeline.md`](docs/21-ontology-knowledge-engineering-pipeline.md) (two-track milestone boundaries and remaining online-automation gaps)
-- **Ontology KE Golden Freeze Policy** → [`docs/22-ontology-ke-golden-freeze-policy.md`](docs/22-ontology-ke-golden-freeze-policy.md) (frozen scorecard and measurement-decay audit)
-- **Design Detail** → [`docs/13-DESIGN_DETAIL.md`](docs/13-DESIGN_DETAIL.md) · [`docs/13-DESIGN_DETAIL.zh.md`](docs/13-DESIGN_DETAIL.zh.md) (中文)
-- **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
-- **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
-
----
-
-## 🤝 Contributing
-
-We welcome contributions from the community!
-
-- **🐛 Report bugs**: [GitHub Issues](https://github.com/skaiy/wild_agentos/issues)
-- **💡 Propose ideas**: [GitHub Discussions](https://github.com/skaiy/wild_agentos/discussions)
-- **🔀 Submit PRs**: Fork → feature branch → PR against `main`
+The default binary starts the HTTP/SSE server on port `8080` and gRPC on
+`50051`. Start it from a checkout with the provided `config.yaml`:
 
 ```bash
-git checkout -b feat/my-feature
-# Make your changes
-cargo fmt && cargo clippy  # Keep code clean
-cargo test                 # Ensure nothing breaks
-git commit -am 'Add my feature'
-git push origin feat/my-feature
+cargo run --bin wild-agent-os-core
 ```
 
-All contributors are expected to adhere to our [Code of Conduct](docs/CODE_OF_CONDUCT.md).
+Configure an LLM gateway before using LLM-backed features. The supplied config
+contains empty gateway credentials; keep deployment credentials outside version
+control. For production, set `AGENTOS_ENV=production` and configure the required
+OIDC/JWKS environment values described in the
+[Isolation Contract](docs/17-isolation-contract.md). The server refuses a
+production HS256 configuration.
 
----
+## Documentation
 
-## 📄 License
+- [Evolution roadmap](docs/18-evolution-roadmap.md) — shipped milestones,
+  boundaries, and explicit non-goals
+- [Isolation contract](docs/17-isolation-contract.md) — verified claims,
+  fail-closed storage targeting, and historical-key status
+- [Isolation matrix](docs/17-isolation-matrix.md) — CI-verified isolation
+  behavior
+- [Ontology KE pipeline](docs/21-ontology-knowledge-engineering-pipeline.md) —
+  online corpus jobs/watchers and KE governance boundaries
+- [Ontology Action data sandbox](docs/15-ontology-action-sandbox.md) — HITL
+  staging, guardrails, and audit
+- [Ontology KE golden-freeze policy](docs/22-ontology-ke-golden-freeze-policy.md)
+- [Outbound A2A adapter](docs/19-a2a-outbound.md)
+- [Private-deployment benchmark](docs/19-private-deploy-benchmark.md)
+- [Design detail](docs/13-DESIGN_DETAIL.md)
+
+## Contributing
+
+- Report bugs in [GitHub Issues](https://github.com/skaiy/wild_agentos/issues).
+- Propose ideas in [GitHub Discussions](https://github.com/skaiy/wild_agentos/discussions).
+- Submit pull requests against `main`.
+
+Before submitting, run the relevant checks:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets
+cargo test --workspace
+```
+
+## License
 
 Wild AgentOS is dual-licensed:
 
-- **Community Edition** — [GNU AGPL v3.0](LICENSE) (see also [NOTICE](NOTICE)). If you run a modified version over a network, AGPLv3 Section 13 requires you to offer the complete corresponding source to its users.
-- **Commercial Edition** — commercial use that cannot comply with the AGPLv3 requires a separate commercial license; see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+- **Community Edition** — [GNU AGPL v3.0](LICENSE) (see [NOTICE](NOTICE)).
+- **Commercial Edition** — commercial use that cannot comply with AGPLv3
+  requires a separate commercial license; see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
 
-For commercial licensing inquiries, contact **diaoguoliang@gmail.com**.
-
-Contributions require signing our [Contributor License Agreement](CLA.md), handled automatically by CLA Assistant on your first pull request.
+For commercial licensing, contact **diaoguoliang@gmail.com**. Contributions
+require the [Contributor License Agreement](CLA.md).
 
 Copyright (c) 2026 skaiy (diaoguoliang@gmail.com).
