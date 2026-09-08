@@ -100,6 +100,7 @@ separately; they are not part of this repository.
 | **v0.2.0** | 2026-09-05 | Skill package verification, golden checks, gated tenant publishing, and Rust CI golden evaluations. |
 | **v0.1.8** | 2026-09-04 | Ontology Action HITL staging, guardrails, SPARQL assertions, and event audit. |
 | **v0.1.6–v0.1.7** | 2026-09-04 | `IsolationClaims`, fail-closed scoped paths, isolation diagnosis/matrix/CI, and explicit historical-key migration tooling. |
+| **v0.1.5** | 2026-08-18 | Causal reasoning, a unified graph backend, graph features, snapshot timeline, and Skill Center CRUD with system Skill guards. |
 
 See the full [changelog](CHANGELOG.md).
 

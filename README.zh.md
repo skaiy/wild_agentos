@@ -96,6 +96,7 @@ materialize production data。这些操作仍然需要显式人工治理并保�
 | **v0.2.0** | 2026-09-05 | Skill package verification、golden check、受控 tenant publishing 与 Rust CI golden evaluation。 |
 | **v0.1.8** | 2026-09-04 | Ontology Action HITL staging、guardrail、SPARQL assertion 和 event audit。 |
 | **v0.1.6–v0.1.7** | 2026-09-04 | `IsolationClaims`、fail-closed scoped path、isolation diagnosis/matrix/CI，以及显式 historical-key migration tool。 |
+| **v0.1.5** | 2026-08-18 | Causal reasoning、unified graph backend、graph feature、snapshot timeline，以及带 system Skill guard 的 Skill Center CRUD。 |
 
 完整版本记录请参阅 [changelog](CHANGELOG.md)。
 
