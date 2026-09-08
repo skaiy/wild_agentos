@@ -146,7 +146,8 @@ pub(crate) fn create_entity_resolution_suggestion_from_staging(
     let candidates = kg.query_sparql_for_claims(
         claims,
         &format!("SELECT DISTINCT ?candidate ?label WHERE {{ ?candidate <{RDFS_LABEL}> ?label . FILTER(?candidate != <{source_iri}>) }} LIMIT 50"),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let candidates: Vec<(String, String)> = candidates
         .into_iter()
         .filter_map(|row| {
