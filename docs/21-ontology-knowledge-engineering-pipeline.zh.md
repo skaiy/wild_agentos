@@ -58,7 +58,7 @@ schema 使用。
 | 可选推理 | 有限 RDFS query-time 扩展可选且默认关闭；不持久化推理三元组。 |
 | 隔离 | `IsolationClaims` 决定 graph、blob、vector 目标；缺失或无效 claims 必须 fail closed。mint 安全目标名称**不等于**迁移历史数据。 |
 
-### 待办或近期完成的工作不会填补该缺口
+### 已完成的支撑工作不会填补在线 job 缺口
 
 本文编写时：
 
@@ -68,20 +68,60 @@ schema 使用。
 - [#131](https://github.com/skaiy/wild_agentos/issues/131) 的生产 OIDC 已合并。
 - [#132](https://github.com/skaiy/wild_agentos/issues/132) 的密钥、tenant scope 和 action audit 运维能力已合并。
 
-这些工作改进隔离、认证或运维；没有任何一项提供连续本体提取、自动 promote 或受治理的仓库物化。
+这些工作改进隔离、认证或运维；但没有提供连续 corpus-to-graph 服务所需的、已认证且
+claims-scoped 的在线 job 与 watcher 编排。
 
 ### 明确缺口
 
-当前系统没有：
+v0.5.0 已完成此前在此列出的有边界原语：将 constrained extraction 与
+canonicalization 写入 staging、`KgQualityGate`、带锚点的 materialization、待审批的
+entity-resolution suggestion、冻结 golden evaluation、ontology-health reporting、
+仅生成 draft 的 schema induction，以及 schema-evolution compatibility check。
 
-1. 连续、在线的 corpus-to-graph job pipeline；
-2. 本体约束提取，或提取后的 canonicalization/correction；
-3. entity resolution / deduplication 服务；
-4. draft-to-instance materialization job；
-5. GraphJudge/refiner 一类图质量 gate；
-6. schema evolution CI；
-7. 定时 corpus watcher；以及
-8. 让 type draft 发明 `LinkType` 或 `ActionType` 的机制。type draft 被刻意限定得比 schema induction 更窄。
+仍缺少：
+
+1. 一条已认证、claims-scoped 的 online corpus-to-graph job pipeline，用 idempotency、
+   retry/backpressure、provenance 和可观测 job state 端到端调用这些原语（验收标准 1）；以及
+2. 将这些 job 入队的定时或 event-driven corpus watcher。
+
+因此，在完整验收标准均得到可证明的满足之前，上文对于*完全*在线自动化工具链的回答仍是
+**否**。
+
+### v0.6 范围 — 计划中的 online corpus job + watcher
+
+**纳入范围**
+
+- 面向已配置 corpus change 或 incremental delta 的 claims-scoped job model，提供 create、
+  list、get、cancel（或等价）操作。
+- 一个复用现有
+  extract → canonicalize → quality gate → approval-held entity-resolution suggestion → staging
+  路径的 runner。它调用现有 constrained-extraction endpoint、`KgQualityGate`、
+  staging/review record 与带锚点的 materialization 边界，而不是新增第二套 KE stack。
+- 默认开启的 scheduled 或 event-driven watcher，将 job 入队。部署可在需要时显式关闭其
+  watcher configuration。
+- job state、带 backpressure 的 retry、idempotency，以及串联 source、candidate、gate result
+  和 decision 的 provenance。
+- 仅接受已验证的 `IsolationClaims`：未认证或 claims 无效的请求必须 fail closed。测试必须证明
+  failed 与 unauthenticated path 绝不写入 production。
+
+**范围外 / 非目标**
+
+- 静默 promote production ontology 或自动 merge entity-resolution；materialization 仍须
+  approval-held 并保持 anchored。
+- 替换 Oxigraph/SPARQL、加入 Cypher 或 Nebula，或重做 `KgQualityGate`、Morph-KGC/RML、
+  golden freeze 或 Admin design studio。
+- 在以下全部验收标准得到证明前，宣称“fully online automated with governance”。v0.6 可关闭
+  标准 1 和 watcher 缺口，同时仍保留人工对 promote 与 materialize 的权威。
+- 将独立 product 或 business repository 混入此代码树。
+
+**拟议的未来 Issue 清单（仅标题；暂不创建）**
+
+- Claims-Scoped Online Corpus Job API and State Store
+- Idempotent Online Job Runner for Existing KE Primitives
+- Default-Enabled Corpus Watcher Scheduler, Queueing, and Explicit Disablement
+- Online Job Provenance, Audit, Retry, and Backpressure Observability
+- Fail-Closed Online Job Isolation and Production-Write CI
+- Companion Admin Job List（本仓库范围外）
 
 ## 公开最佳实践信号
 
@@ -292,10 +332,6 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   `ObjectType`/`LinkType` 做确定性 canonicalize，并且只将接受的
   triple 及每项 mapping decision 写入 claims mint 的 staging 图；绝不
   promote type，也绝不写 production 图。
-- 增加本体约束 extraction API，其 domain **仅限 promoted type**。
-- 对 promoted `ObjectType` 和 `LinkType` 执行提取后 canonicalization。
-- fail closed，只能把候选写入 claims-scoped staging graph。
-- 记录 source provenance 与被拒绝/有歧义的 mapping。
 
 #### P1 — 质量 gate 与审阅
 
@@ -303,12 +339,6 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   SPARQL `ASK` 锚点与显式启用的 pySHACL sidecar。其带版本的质量/覆盖率仲裁默认
   合规优先；报告附着在 staging `extraction_id` 与 claims-scoped review queue 上，
   approve/reject 只记录人工决定而不写生产图；确定性锚点失败时 Judge 不会运行，也绝不能推翻结果。
-
-- [#140](https://github.com/skaiy/wild_agentos/issues/140)：将 `KgQualityGate`
-  作为中速 quality supervisory loop，使用针对 type、predicate、cardinality 和
-  provenance policy 的确定性 `ASK`/SHACL anchor。
-- 可选、以 source 为依据的 Judge/refiner 位于确定性检查后，但绝不可覆盖失败的 anchor。
-- 增加 review queue，用于暂存候选、证据、违规及 approve/reject decision。
 
 #### P1.5 — 带 anchor 的 materialize
 
@@ -335,7 +365,8 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   SPARQL 回读由服务端生成的 anchor；anchor 缺失时返回 `needs_repair` 且保留记录
   以供修复。GLinker 可仅安装在该 worker 环境；kernel process 不链接 GLinker
   代码、模型权重或 LGPL 组件。任何 LGPL linker 必须保持进程隔离。
-- 增加显式配置的 blob-watch/reindex job，并具备 idempotent cursor、retry、observability 和 backpressure。
+- 编排这些既有原语的 online-job runner 与默认开启的 watcher 是 v0.6 计划工作；
+  部署可在需要时显式关闭 watcher configuration。见上文的范围边界。
 
 #### P2b — 冻结提取评测与 measurement-decay 审计
 

@@ -67,7 +67,7 @@ before a kernel loop can use it as a promoted schema.
 | Optional inference | Limited RDFS query-time expansion is available only when enabled; it is off by default and does not persist inferred triples. |
 | Isolation | `IsolationClaims` determine graph, blob, and vector targets; missing or invalid claims fail closed. Minting a safe target name is **not** historical-data migration. |
 
-### Pending or recently completed work does not close this gap
+### Completed supporting work does not close the online-job gap
 
 At the time of writing:
 
@@ -79,24 +79,66 @@ At the time of writing:
 - [#132](https://github.com/skaiy/wild_agentos/issues/132), operations
   surfaces for keys, tenant scope, and action auditing, is merged.
 
-These changes improve isolation, authentication, or operations. None supplies
-continuous ontology extraction, automatic promotion, or governed warehouse
-materialization.
+These changes improve isolation, authentication, or operations. They do not
+provide the authenticated, claims-scoped online job and watcher orchestration
+required for a continuous corpus-to-graph service.
 
 ### Explicit gaps
 
-The current system has no:
+v0.5.0 closed the bounded primitives previously listed here: constrained
+extraction and canonicalization to staging, `KgQualityGate`, anchored
+materialization, approval-held entity-resolution suggestions, frozen golden
+evaluation, ontology-health reporting, draft-only schema induction, and
+schema-evolution compatibility checks.
 
-1. continuous online corpus-to-graph job pipeline;
-2. ontology-constrained extraction or post-extraction canonicalization and
-   correction;
-3. entity-resolution / deduplication service;
-4. draft-to-instance materialization job;
-5. graph-quality gate such as a GraphJudge/refiner;
-6. schema-evolution CI;
-7. scheduled corpus watchers; or
-8. mechanism for type drafts to invent `LinkType`s or `ActionType`s. Type
-   drafts are deliberately narrower than schema induction.
+What remains is:
+
+1. an authenticated, claims-scoped online corpus-to-graph job pipeline that
+   invokes those primitives end-to-end with idempotency, retry/backpressure,
+   provenance, and observable job state (acceptance criterion 1); and
+2. scheduled or event-driven corpus watchers that enqueue those jobs.
+
+This leaves the answer above as **No** for a *fully* online, automated
+toolchain until the complete acceptance criteria are demonstrably true.
+
+### v0.6 scope — planned online corpus job + watcher
+
+**In**
+
+- A claims-scoped job model with create, list, get, and cancel (or equivalent)
+  operations for configured corpus changes or incremental deltas.
+- A runner that orchestrates the existing
+  extract → canonicalize → quality gate → approval-held entity-resolution suggestion
+  → staging path. It reuses the existing constrained-extraction endpoints,
+  `KgQualityGate`, staging/review records, and anchored materialization
+  boundary rather than creating another KE stack.
+- Enabled-by-default scheduled or event-driven watchers that enqueue jobs.
+  Deployments may explicitly disable their watcher configuration when needed.
+- Job state, retry with backpressure, idempotency, and provenance linking
+  source, candidates, gate result, and decision.
+- Verified `IsolationClaims` only: unauthenticated or invalid-claims requests
+  fail closed. Tests must prove that failed and unauthenticated paths never
+  write production.
+
+**Out / non-goals**
+
+- Silent promotion of a production ontology or automatic entity-resolution
+  merge; materialization remains approval-held and anchored.
+- Replacing Oxigraph/SPARQL, adding Cypher or Nebula, or reimplementing
+  `KgQualityGate`, Morph-KGC/RML, golden freeze, or the Admin design studio.
+- Claiming “fully online automated with governance” before every acceptance
+  criterion below is proven. v0.6 may close criterion 1 and the watcher gap
+  while human authority over promotion and materialization remains intact.
+- Mixing separate product or business repositories into this tree.
+
+**Proposed future Issue checklist (titles only; do not file yet)**
+
+- Claims-Scoped Online Corpus Job API and State Store
+- Idempotent Online Job Runner for Existing KE Primitives
+- Default-Enabled Corpus Watcher Scheduler, Queueing, and Explicit Disablement
+- Online Job Provenance, Audit, Retry, and Backpressure Observability
+- Fail-Closed Online Job Isolation and Production-Write CI
+- Companion Admin Job List (outside this repository)
 
 ## Public best-practice signals
 
@@ -363,12 +405,6 @@ and skill loops that use a promoted ontology.
   canonicalizes them against promoted `ObjectType`/`LinkType` definitions, and
   writes accepted triples plus every mapping decision only to a claims-minted
   staging graph. It never promotes types or writes the production graph.
-- Add an ontology-constrained extraction API whose domain is **promoted types
-  only**.
-- Run post-extraction canonicalization against promoted `ObjectType` and
-  `LinkType` definitions.
-- Fail closed and write candidates to a claims-scoped staging graph only.
-- Record source provenance and rejected/ambiguous mappings.
 
 #### P1 — quality gate and review
 
@@ -378,14 +414,6 @@ and skill loops that use a promoted ontology.
   remain attached to the staging `extraction_id` and claims-scoped review
   queue; approve/reject records no production write, and a Judge cannot
   run—or overturn the result—when a deterministic anchor fails.
-
-- [#140](https://github.com/skaiy/wild_agentos/issues/140): make
-  `KgQualityGate` the medium-speed quality supervisory loop, with deterministic
-  `ASK`/SHACL anchors for type, predicate, cardinality, and provenance policy.
-- An optional, source-grounded Judge/refiner follows deterministic checks but
-  never overrides a failed anchor.
-- Add a review queue for staged candidates, evidence, violations, and
-  approve/reject decisions.
 
 #### P1.5 — materialize with anchors
 
@@ -420,8 +448,9 @@ and skill loops that use a promoted ontology.
   GLinker is used as an Apache-2.0 pattern and can be installed only in that
   worker environment; no GLinker code, model weights, or LGPL component is
   linked into the kernel process. Any LGPL linker must remain process-isolated.
-- Add explicitly configured blob-watch/reindex jobs with idempotent cursors,
-  retries, observability, and backpressure.
+- The online-job runner and enabled-by-default watcher that schedule these
+  existing primitives are v0.6 planned work; deployments can explicitly
+  disable watcher configuration when needed. See the scope boundary above.
 
 #### P2b — frozen extraction evaluation and measurement-decay audit
 

@@ -217,6 +217,7 @@ Wild AgentOS 是 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核心，�
 - **v0.2.2 — 已完成：** claims 作用域 coding artifact store（`IsolationClaims` graph 元数据与服务端 mint 的 tenant blob 前缀）；默认关闭的外部 `SandboxProvider` adapter（不会跨 `await` 持有 `MutexGuard`）；以及面向 Oxigraph、redb 与 Hyperspace 的可复现 private-deployment benchmarks，不编造速度提升。
 - **v0.3.0 — 已完成：** 具有不可变版本和显式 install/upgrade/rollback 的版本化 Logic 与 Skill package market；与本地开发 HS256 并行、且 fail-closed 的 OIDC/JWKS 身份验证；带 gate 和人工审批的 emergent-tool promotion pipeline；以及默认关闭、仅在 query-time 扩展且绝不持久化推理三元组的有限 RDFS 推理。
 - **v0.5.0 — 已完成：** 双轨本体知识工程 / Graph Engineering 里程碑：只写 staging 的 constrained extraction 与 Morph-KGC/RML 输入；`KgQualityGate` 与审阅；带锚点、可审计的 materialization；保守、待审批的 entity-resolution suggestion；冻结 golden SHA 检查与只读 health reporting；以及 OpenAPI/SQL DDL 与 induction draft、readiness report 和 compatibility-gated promote。租户 Skill/Emergent promotion 现要求 golden SHA 验证、具名规则审阅与 audit evidence。配套 Admin ontology design studio 已独立交付。
+- **v0.6 — 计划：** 已认证、claims-scoped 的 online corpus job 与默认开启的 corpus watcher 将以 idempotency、retry/backpressure、provenance 和可观测 job state 编排既有 KE 原语，包括必选且 approval-held 的 entity-resolution suggestion。部署可在需要时显式关闭 watcher configuration；production ontology promote、entity-resolution merge 和 materialization 仍由人工治理。
 
 ---
 
