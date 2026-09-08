@@ -1060,7 +1060,7 @@ fn sandbox_status_for_input(input: &BashInput, cwd: &std::path::Path) -> Sandbox
 }
 
 /// Refuse host-shell execution when the required sandbox cannot be activated.
-fn require_active_bash_sandbox(status: &SandboxStatus) -> Result<(), String> {
+pub(super) fn require_active_bash_sandbox(status: &SandboxStatus) -> Result<(), String> {
     if status.active && status.namespace_active && status.filesystem_active {
         return Ok(());
     }
