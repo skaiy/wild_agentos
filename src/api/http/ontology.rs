@@ -4304,6 +4304,7 @@ mod ontology_crud_tests {
             "a passed gate report must be available to materialization"
         );
         let materialized = app
+            .clone()
             .oneshot(post(
                 "/api/v1/ontology/constrained-extractions/approved/materialize".into(),
                 Some(&token),
