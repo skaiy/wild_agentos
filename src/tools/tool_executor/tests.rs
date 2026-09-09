@@ -320,9 +320,12 @@ mod tests {
                 assert_eq!(bash["exit_code"], 0);
                 assert_eq!(bash["stdout"], "advertised");
             } else {
-                assert!(bash
-                    .unwrap_err()
-                    .contains("active workspace sandbox is required"));
+                assert!(matches!(
+                    bash.unwrap_err(),
+                    ToolExecutionError::ExecutionFailed { name, message }
+                        if name == "bash"
+                            && message.contains("active workspace sandbox is required")
+                ));
             }
             std::fs::remove_file(path).unwrap();
         });
