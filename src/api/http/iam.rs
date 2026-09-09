@@ -820,7 +820,7 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
     const TEST_RSA_N: &str = "hURhZoOh6atOtKyK4W56CRODmWSVKPNA6zF96o9G_-WXpfeI64BASV9IFnad820UY9eHeXmOP6zmJl_emcRBh5i5UKLWXVQ1NrvMBUpF7-HQU9ZrulbPsgnhMII1vLMAp6Wdfj-ejj0YzjSrx_peId0S2fOlJg64ENwUzRZm-w01ch2s1myb5Vci3MPCPDMiygTBRH-ixZeuOjgQUJeTXzwvaHPJviXPFEtZ-72j4ZQ7lDtM9sQqP9UT-HXTAgeWgWbtrK8bIhkWVPT3CGwQpi_YIc5OSDD0IP7HPBamQw7si4iasaKypFMstSWwT3fJc0Pl1aPvAjrcPOFIigr2Jw";
 
     #[tokio::test]
-    async fn oidc_jwks_verifies_claims_and_rejects_wrong_issuer() {
+    async fn oidc_jwks_verifies_claims_and_fails_closed_for_invalid_claims() {
         use axum::{routing::get, Json, Router};
         use serde_json::json;
 
@@ -843,6 +843,7 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
         });
 
         let saved: Vec<_> = [
+            "AGENTOS_ENV",
             "AGENTOS_AUTH_MODE",
             "AGENTOS_OIDC_JWKS_URL",
             "AGENTOS_OIDC_ISSUER",
@@ -851,6 +852,7 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
         .into_iter()
         .map(|name| (name, std::env::var_os(name)))
         .collect();
+        std::env::remove_var("AGENTOS_ENV");
         std::env::set_var("AGENTOS_AUTH_MODE", "oidc");
         std::env::set_var("AGENTOS_OIDC_JWKS_URL", format!("http://{address}/jwks"));
         std::env::set_var("AGENTOS_OIDC_ISSUER", "https://issuer.example.test");
@@ -877,6 +879,71 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
         assert_eq!(
             identity.isolation_claims().unwrap().project_id(),
             "research_1"
+        );
+        assert_eq!(
+            identity.isolation_claims().unwrap().actor_id(),
+            "service",
+            "the verified OIDC subject must become the isolation actor"
+        );
+        assert_eq!(
+            identity.isolation_claims().unwrap().graph_iri().unwrap(),
+            "graph://acme/research_1"
+        );
+
+        let wrong_audience = encode(
+            &header,
+            &OidcJwtClaims {
+                sub: "service".to_string(),
+                tenant_id: "acme".to_string(),
+                project_id: "research_1".to_string(),
+                roles: vec![],
+                iss: "https://issuer.example.test".to_string(),
+                aud: "another-service".to_string(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            verify_jwt(&wrong_audience).await.is_none(),
+            "a wrong OIDC audience must not mint claims"
+        );
+
+        let expired = encode(
+            &header,
+            &OidcJwtClaims {
+                sub: "service".to_string(),
+                tenant_id: "acme".to_string(),
+                project_id: "research_1".to_string(),
+                roles: vec![],
+                iss: "https://issuer.example.test".to_string(),
+                aud: "wild-agent-os".to_string(),
+                exp: (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            verify_jwt(&expired).await.is_none(),
+            "an expired OIDC token must not mint claims"
+        );
+
+        let missing_tenant = encode(
+            &header,
+            &json!({
+                "sub": "service",
+                "project_id": "research_1",
+                "roles": [],
+                "iss": "https://issuer.example.test",
+                "aud": "wild-agent-os",
+                "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+            }),
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            verify_jwt(&missing_tenant).await.is_none(),
+            "an OIDC token without tenant_id must not mint claims"
         );
 
         std::env::set_var("AGENTOS_OIDC_ISSUER", "https://other-issuer.example.test");

@@ -35,6 +35,54 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 传入 `IsolationClaims::from_verified`；`.`、`..`、路径分隔符（如 `a/b`）等不安全
 值会 fail closed，`verify_jwt` 不产生 identity。
 
+## 业务 BFF 的 workload OIDC 契约 / Workload OIDC contract
+
+StructCapture Capture BFF 等业务 BFF 向 AgentOS 发起请求时，必须转发短时效的
+workload OIDC access token：`Authorization: Bearer <token>`。BFF **不得**签发新的
+AgentOS token。按以下方式配置 AgentOS HTTP 服务：
+
+```bash
+AGENTOS_ENV=production
+AGENTOS_AUTH_MODE=oidc
+AGENTOS_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
+AGENTOS_OIDC_ISSUER=https://issuer.example.com/
+AGENTOS_OIDC_AUDIENCE=wild-agentos
+```
+
+issuer 必须在该 JWKS URL 发布非对称签名公钥；token 的 `iss` 与 `aud` 必须和配置
+精确匹配。只有验过签名、`exp`、`iss` 与 `aud` 后，AgentOS 才会 mint 隔离作用域。
+Capture BFF 可直接采用以下检查表：
+
+1. 从 BFF 现有 OIDC provider 获取短时效 workload token。
+2. 将 token audience 设为 `AGENTOS_OIDC_AUDIENCE`。
+3. 填入下列必需的 tenant 和 project claim。
+4. 向包括 Agent chat 在内的 AgentOS HTTP API 原样转发 Bearer token；不得以请求
+   body 中的 tenant/project 值替代认证授权。
+
+最小 token claims：
+
+```json
+{
+  "sub": "workload:structcapture:capture-bff",
+  "tenant_id": "acme",
+  "project_id": "capture-prod",
+  "exp": 1798761600
+}
+```
+
+验签成功后，`sub` 映射为 `IsolationClaims.actor_id`，`tenant_id` 映射为
+`IsolationClaims.tenant_id`，`project_id` 映射为
+`IsolationClaims.project_id`。因此会 mint
+`graph://acme/capture-prod`、`vector://acme/capture-prod`、`acme/` object prefix
+以及 `/data/l0/acme` L0 path。`tenant_id` 必填；缺失、空值、非法、过期、issuer
+不匹配或 audience 不匹配的 token 都不会产生 `IsolationClaims`，并会被拒绝。
+本 BFF 契约要求提供 `project_id`；旧版 AgentOS token 若缺失该字段，仍按已记录的兼容
+行为使用 `default` project。
+
+**生产禁令：** BFF 绝不能持有 `AGENTOS_JWT_SECRET`，也不能自行签发 HS256 token。
+`AGENTOS_JWT_SECRET` 仅用于 AgentOS 本地开发；生产环境下 AgentOS 会拒绝以 HS256
+模式启动。
+
 ## 命名契约，不是迁移
 
 | Mint | 契约 |
