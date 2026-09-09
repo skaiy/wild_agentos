@@ -19,6 +19,7 @@ use crate::tools::builtin::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
+use crate::tools::workspace_path::canonicalize_workspace_path;
 use crate::utils::text::safe_truncate;
 
 use super::{GlobSearchInput, GrepSearchInput, ToolSearchInput, WebFetchInput, WebSearchInput};
@@ -80,30 +81,16 @@ pub(super) async fn execute_kb_vector_search(
 pub(super) async fn execute_glob_search(input: Value) -> Result<Value, String> {
     let params: GlobSearchInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    let root = params.path.as_deref().unwrap_or(".");
-
-    // check if search path is within workspace
-    if root != "." {
-        if let Err(msg) = check_path_in_workspace(root) {
-            return Err(format!(
-                "{}\nPlease focus on the current workspace, search within the working directory.",
-                msg
-            ));
-        }
-    }
+    let root = canonicalize_workspace_path(params.path.as_deref().unwrap_or("."))?;
+    reject_escaping_glob_pattern(&params.pattern)?;
 
     let mut files = Vec::new();
-    let glob_pattern = if root != "." {
-        format!("{}/{}", root.trim_end_matches('/'), &params.pattern)
-    } else {
-        params.pattern.clone()
-    };
+    let glob_pattern = root.join(&params.pattern).display().to_string();
     match glob::glob(&glob_pattern) {
         Ok(entries) => {
             for entry in entries.flatten() {
-                if let Some(p) = entry.to_str() {
-                    files.push(p.to_string());
-                }
+                let p = canonicalize_workspace_path(&entry)?;
+                files.push(p.display().to_string());
             }
         }
         Err(e) => return Err(format!("Glob error: {}", e)),
@@ -113,11 +100,25 @@ pub(super) async fn execute_glob_search(input: Value) -> Result<Value, String> {
     Ok(json!({ "files": files, "count": files.len(), "pattern": params.pattern }))
 }
 
+fn reject_escaping_glob_pattern(pattern: &str) -> Result<(), String> {
+    let path = std::path::Path::new(pattern);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "Path rejected: glob pattern {pattern:?} escapes the allowed workspace"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
     let params: GrepSearchInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
-    let root = params.path.as_deref().unwrap_or(".");
+    let root = canonicalize_workspace_path(params.path.as_deref().unwrap_or("."))?;
     let mode = params
         .output_mode
         .as_deref()
@@ -716,21 +717,18 @@ struct PowerShellInput {
 pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
     let params: FileReadInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    let path = &params.path;
-    let path_obj = std::path::Path::new(path);
+    let path = canonicalize_workspace_path(&params.path)?;
+    let path_obj = &path;
 
     // directory not readable → guide LLM to use file_list to view contents
     if path_obj.is_dir() {
         return Err(format!(
             "Read error: \"{}\" is a directory and cannot be read directly. Use file_list(\"{}\") to view files in this directory, then retry with the correct filename.",
-            path, path
+            params.path, params.path
         ));
     }
 
-    // check if file is within workspace, provide helpful message
-    check_path_in_workspace(path)?;
-
-    let content = match std::fs::read_to_string(path) {
+    let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
             let hint = if !path_obj.exists() {
@@ -767,7 +765,7 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
                 }
                 format!(
                     "Read error: {}.\nFile \"{}\" does not exist. {}\nPlease verify the filename and path, then retry.",
-                    e, path, listing
+                    e, params.path, listing
                 )
             } else if e.kind() == std::io::ErrorKind::InvalidData {
                 // binary/non-UTF-8 file → guide LLM to use bash tool instead
@@ -777,7 +775,7 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
                      To check file size: bash(\"ls -lh '{}'\")\n\
                      To view beginning (text embedded in binary): bash(\"head -c 200 '{}' | strings\")\n\
                      Please focus on workspace files relevant to the current task.",
-                    path, path, path, path
+                    params.path, params.path, params.path, params.path
                 )
             } else {
                 format!("Read error: {}", e)
@@ -796,7 +794,7 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
         .collect();
     let total = lines.len();
     Ok(json!({
-        "path": params.path, "total_lines": total,
+        "path": path, "total_lines": total,
         "offset": start, "lines": selected, "returned": selected.len(),
     }))
 }
@@ -804,20 +802,20 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
 pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
     let params: FileWriteInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    check_path_in_workspace(&params.path)?;
-    let existing_content = match std::fs::read_to_string(&params.path) {
+    let path = canonicalize_workspace_path(&params.path)?;
+    let existing_content = match std::fs::read_to_string(&path) {
         Ok(content) => Some(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("Read before write error: {}", error)),
     };
     validate_file_write_effect(existing_content.as_deref(), &params.content)?;
-    if let Some(parent) = std::path::Path::new(&params.path).parent() {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
     }
-    std::fs::write(&params.path, &params.content).map_err(|e| format!("Write error: {}", e))?;
-    verify_file_write_effect(&params.path, &params.content)?;
+    std::fs::write(&path, &params.content).map_err(|e| format!("Write error: {}", e))?;
+    verify_file_write_effect(&path, &params.content)?;
     Ok(json!({
-        "path": params.path,
+        "path": path,
         "bytes_written": params.content.len(),
         "effect_applied": true,
         "success": true
@@ -849,12 +847,12 @@ fn validate_file_write_effect(
 
 /// Re-read the target after mutation so the reported success is backed by a
 /// workspace artifact instead of the write call's return value alone.
-fn verify_file_write_effect(path: &str, expected_content: &str) -> Result<(), String> {
+fn verify_file_write_effect(path: &std::path::Path, expected_content: &str) -> Result<(), String> {
     match std::fs::read_to_string(path) {
         Ok(content) if content == expected_content && !content.is_empty() => Ok(()),
         Ok(_) => Err(format!(
             "Write verification failed: {} does not contain the requested artifact",
-            path
+            path.display()
         )),
         Err(error) => Err(format!("Write verification read error: {}", error)),
     }
@@ -863,21 +861,10 @@ fn verify_file_write_effect(path: &str, expected_content: &str) -> Result<(), St
 pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
     let params: FileListInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    let dir = params.path.as_deref().unwrap_or(".");
-
-    // check if within workspace
-    if dir != "." {
-        if let Err(msg) = check_path_in_workspace(dir) {
-            return Err(format!(
-                "{}\nPlease focus on the current workspace ({}), list files under the working directory.",
-                msg,
-                std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_else(|_| ".".to_string())
-            ));
-        }
-    }
+    let dir = canonicalize_workspace_path(params.path.as_deref().unwrap_or("."))?;
 
     let mut entries = Vec::new();
-    let read_dir = std::fs::read_dir(dir).map_err(|e| format!("List error: {}", e))?;
+    let read_dir = std::fs::read_dir(&dir).map_err(|e| format!("List error: {}", e))?;
     for entry in read_dir.flatten() {
         let ft = entry.file_type().ok();
         let kind = if ft.is_some_and(|t| t.is_dir()) {
@@ -918,6 +905,7 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         let timeout_ms = params.timeout.unwrap_or(60_000);
         let cwd = std::env::current_dir().map_err(|e| format!("Current dir error: {}", e))?;
         let sandbox_status = sandbox_status_for_input(&params, &cwd);
+        require_active_bash_sandbox(&sandbox_status)?;
         let sandbox_status_json = serde_json::to_value(&sandbox_status)
             .map_err(|e| format!("Sandbox status serialize error: {}", e))?;
 
@@ -1049,25 +1037,41 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
 }
 
 /// Resolve the effective sandbox status from the per-command overrides.
-/// Sandboxing is opt-in: without an explicit `dangerouslyDisableSandbox`
-/// value the sandbox stays disabled, preserving existing behaviour (and
-/// keeping pkill/pgrep able to manage host processes across the namespace
-/// boundary, which a default-enabled PID namespace would break).
+///
+/// Bash is fail-closed: it always requests workspace-only namespace isolation.
+/// A caller cannot opt out because the default shell tool must never execute
+/// directly on the agent host.
 ///
 /// Ported from doiito/gliding_horse (MIT), Copyright (c) 2026 doiito.
 fn sandbox_status_for_input(input: &BashInput, cwd: &std::path::Path) -> SandboxStatus {
-    let enabled = input
-        .dangerously_disable_sandbox
-        .map(|disabled| !disabled)
-        .unwrap_or(false);
+    let enabled = !input.dangerously_disable_sandbox.unwrap_or(false);
     let request = SandboxConfig::default().resolve_request(
         Some(enabled),
-        input.namespace_restrictions,
+        Some(input.namespace_restrictions.unwrap_or(true)),
         input.isolate_network,
-        input.filesystem_mode,
+        Some(
+            input
+                .filesystem_mode
+                .unwrap_or(FilesystemIsolationMode::WorkspaceOnly),
+        ),
         input.allowed_mounts.clone(),
     );
     resolve_sandbox_status_for_request(&request, cwd)
+}
+
+/// Refuse host-shell execution when the required sandbox cannot be activated.
+pub(super) fn require_active_bash_sandbox(status: &SandboxStatus) -> Result<(), String> {
+    if status.active && status.namespace_active && status.filesystem_active {
+        return Ok(());
+    }
+
+    let reason = status
+        .fallback_reason
+        .as_deref()
+        .unwrap_or("namespace and workspace filesystem isolation are required");
+    Err(format!(
+        "Bash execution denied: an active workspace sandbox is required ({reason})"
+    ))
 }
 
 /// Prepare a bash spawn: unshare launcher when the sandbox is active,
@@ -1212,74 +1216,30 @@ fn kill_process_group(child: &std::process::Child) {
 #[cfg(not(unix))]
 fn kill_process_group(_child: &std::process::Child) {}
 
-/// Check if a path is within the current working directory (workspace).
-/// Returns an error if the path is outside the workspace.
-/// For non-existent paths (e.g. file_write creating new files), checks the parent directory.
-fn check_path_in_workspace(path: &str) -> Result<(), String> {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
-    };
-    let cwd_canonical = match cwd.canonicalize() {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
-    };
-
-    let requested = std::path::Path::new(path);
-    // relative path: join with cwd then resolve; absolute path: resolve directly
-    let requested_abs = if requested.is_relative() {
-        cwd.join(requested)
-    } else {
-        requested.to_path_buf()
-    };
-    // try to canonicalize path; if file doesn't exist, check parent directory is within workspace
-    let check_path = match requested_abs.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // file doesn't exist, check parent
-            match requested_abs.parent() {
-                Some(parent) => match parent.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()), // parent also doesn't exist, don't block
-                },
-                None => return Ok(()), // no parent (e.g. root path), don't block
-            }
-        }
-    };
-
-    if !check_path.starts_with(&cwd_canonical) {
-        return Err(format!(
-            "Path is not within the workspace: {}. The current task should only access files in the workspace.",
-            check_path.display(),
-        ));
-    }
-    Ok(())
-}
-
 pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
     let params: FileEditInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
-    check_path_in_workspace(&params.path)?;
+    let path = canonicalize_workspace_path(&params.path)?;
 
-    let content =
-        std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("Read error: {}", e))?;
 
     let count = content.matches(&params.old_string).count();
     if count == 0 {
-        return Err(format!("old_string not found in {}", params.path));
+        return Err(format!("old_string not found in {}", path.display()));
     }
     if count > 1 && !params.replace_all.unwrap_or(false) {
         return Err(format!(
             "old_string found {} times in {}. Set replace_all=true to replace all occurrences.",
-            count, params.path
+            count,
+            path.display()
         ));
     }
 
     let old_lines: Vec<&str> = params.old_string.lines().collect();
     let new_lines: Vec<&str> = params.new_string.lines().collect();
 
-    let diff = generate_diff(&params.path, &old_lines, &new_lines);
+    let diff = generate_diff(&path.display().to_string(), &old_lines, &new_lines);
 
     let new_content = if params.replace_all.unwrap_or(false) {
         content.replace(&params.old_string, &params.new_string)
@@ -1293,10 +1253,10 @@ pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
         1
     };
 
-    std::fs::write(&params.path, &new_content).map_err(|e| format!("Write error: {}", e))?;
+    std::fs::write(&path, &new_content).map_err(|e| format!("Write error: {}", e))?;
 
     Ok(json!({
-        "path": params.path,
+        "path": path,
         "success": true,
         "replacements": replacements,
         "diff": diff,
@@ -1327,85 +1287,11 @@ fn generate_diff(path: &str, old_lines: &[&str], new_lines: &[&str]) -> String {
 }
 
 pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
-    let params: PowerShellInput =
+    let _params: PowerShellInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-
-    let exe = if cfg!(target_os = "windows") {
-        "powershell"
-    } else {
-        "pwsh"
-    };
-
-    let exe_path = match which_powershell(exe) {
-        Some(p) => p,
-        None => return Err(format!("{} not found on this system", exe)),
-    };
-
-    let timeout_ms = params.timeout.unwrap_or(60_000);
-
-    let mut child = std::process::Command::new(&exe_path)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &params.command])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Spawn error: {}", e))?;
-
-    let start = std::time::Instant::now();
-    let max_dur = std::time::Duration::from_millis(timeout_ms);
-
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|out| std::io::read_to_string(out).unwrap_or_default())
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|err| std::io::read_to_string(err).unwrap_or_default())
-                    .unwrap_or_default();
-                let code = status.code().unwrap_or(-1);
-                break json!({
-                    "command": params.command, "exit_code": code,
-                    "stdout": stdout, "stderr": stderr,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                    "shell": exe,
-                });
-            }
-            Ok(None) => {
-                if start.elapsed() > max_dur {
-                    let _ = child.kill();
-                    break json!({
-                        "command": params.command, "timed_out": true,
-                        "error": format!("Timeout after {}ms", timeout_ms),
-                        "shell": exe,
-                    });
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => {
-                break json!({"command": params.command, "error": e.to_string(), "shell": exe})
-            }
-        }
-    };
-    Ok(result)
-}
-
-fn which_powershell(exe: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(exe);
-        if candidate.exists() {
-            return candidate.to_str().map(|s| s.to_string());
-        }
-        let with_ext = dir.join(format!("{}.exe", exe));
-        if with_ext.exists() {
-            return with_ext.to_str().map(|s| s.to_string());
-        }
-    }
-    None
+    // There is no PowerShell sandbox implementation equivalent to the Linux
+    // bash launcher. Fail closed instead of silently running on the host.
+    Err("PowerShell execution denied: no active workspace sandbox is available".to_string())
 }
 fn html_to_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
@@ -1780,7 +1666,9 @@ pub(super) async fn execute_knowledge_extract(
     let graph = claims
         .graph_iri()
         .map_err(|e| format!("invalid verified graph scope: {e}"))?;
-    store.write_quads_for_claims(&claims, &result.quads)?;
+    store
+        .write_quads_for_claims(&claims, &result.quads)
+        .map_err(|error| error.to_string())?;
 
     Ok(json!({
         "success": true,
@@ -1804,7 +1692,9 @@ pub(super) async fn execute_knowledge_query(
         .read()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
     // `named_graph` is intentionally ignored; the claims graph is automatic.
-    let results = store.query_sparql_for_claims(&claims, &sparql)?;
+    let results = store
+        .query_sparql_for_claims(&claims, &sparql)
+        .map_err(|error| error.to_string())?;
 
     Ok(json!({
         "success": true,
@@ -1973,7 +1863,9 @@ pub(super) async fn execute_knowledge_import_json(
         let store = kg_store
             .write()
             .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-        store.write_quads_for_claims(&claims, &result.quads)?;
+        store
+            .write_quads_for_claims(&claims, &result.quads)
+            .map_err(|error| error.to_string())?;
     }
 
     Ok(json!({
@@ -2052,7 +1944,9 @@ pub(super) async fn execute_ontology_register(
         let store = kg_store
             .write()
             .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-        store.write_quads_for_claims(&claims, &quads)?;
+        store
+            .write_quads_for_claims(&claims, &quads)
+            .map_err(|error| error.to_string())?;
     }
 
     Ok(json!({
@@ -2109,7 +2003,9 @@ pub(super) async fn execute_knowledge_bridge_with_store(
     let store = kg_store
         .write()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    store.write_quads_for_claims(&claims, &[quad])?;
+    store
+        .write_quads_for_claims(&claims, &[quad])
+        .map_err(|error| error.to_string())?;
 
     Ok(json!({
         "success": true,
@@ -2128,6 +2024,9 @@ pub(super) async fn execute_knowledge_extract_code(
     if file_path.is_empty() {
         return Err("file_path parameter cannot be empty".to_string());
     }
+    let file_path = canonicalize_workspace_path(&file_path)?
+        .to_string_lossy()
+        .into_owned();
     // `named_graph` is intentionally ignored; claims select the graph.
     let graph = claims
         .graph_iri()
@@ -2144,7 +2043,9 @@ pub(super) async fn execute_knowledge_extract_code(
             &claims,
             &format!("iri://entity/file:{}", file_path),
         )?;
-        store.write_quads_for_claims(&claims, &result.quads)?;
+        store
+            .write_quads_for_claims(&claims, &result.quads)
+            .map_err(|error| error.to_string())?;
         Ok(json!({
             "success": true,
             "file_path": file_path,
@@ -2217,8 +2118,8 @@ mod tests {
         let path = file.path().to_string_lossy().to_string();
         std::fs::write(&path, "expected").unwrap();
 
-        assert!(verify_file_write_effect(&path, "expected").is_ok());
-        assert!(verify_file_write_effect(&path, "different").is_err());
+        assert!(verify_file_write_effect(file.path(), "expected").is_ok());
+        assert!(verify_file_write_effect(file.path(), "different").is_err());
     }
 
     #[test]

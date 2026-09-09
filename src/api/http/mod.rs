@@ -265,10 +265,20 @@ pub fn build_router(
     let (agents_migrated, packs_migrated) =
         migrate_legacy_agent_graphs(&mut loaded_agents, &mut loaded_packs);
     if agents_migrated {
-        let _ = save_user_agents(&loaded_agents);
+        if let Err(error) = save_user_agents(&loaded_agents) {
+            tracing::error!(
+                error = %error,
+                "Failed to persist migrated user agents; preserving legacy fields requires operator attention"
+            );
+        }
     }
     if packs_migrated {
-        let _ = save_knowledge_packs(&loaded_packs);
+        if let Err(error) = save_knowledge_packs(&loaded_packs) {
+            tracing::error!(
+                error = %error,
+                "Failed to persist migrated knowledge packs; migration will retry at next startup"
+            );
+        }
     }
 
     let state = Arc::new(AppState {

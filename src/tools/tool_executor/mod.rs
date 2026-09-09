@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use thiserror::Error;
 use tracing::debug;
 
 use crate::isolation::IsolationClaims;
@@ -89,6 +90,20 @@ pub struct ToolSearchInput {
 }
 type ToolFn =
     Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> + Send + Sync>;
+
+/// Stable error contract for callers of the tool-execution boundary.
+///
+/// Individual built-ins still supply their detailed failure text internally;
+/// this type prevents those implementation details from becoming the public
+/// error API and lets callers distinguish a missing tool from its failure.
+#[derive(Debug, Error, PartialEq, Eq, serde::Serialize)]
+pub enum ToolExecutionError {
+    #[error("tool not found: {name}")]
+    NotFound { name: String },
+
+    #[error("tool '{name}' failed: {message}")]
+    ExecutionFailed { name: String, message: String },
+}
 
 /// Wrap a synchronous tool function (takes &Value) as an async ToolFn
 fn sync_tool_ref<F>(f: F) -> ToolFn
@@ -586,7 +601,7 @@ impl ToolExecutor {
                 "description": {"type":"string","description":"What this command does"},
                 "timeout": {"type":"integer","description":"Timeout in milliseconds"},
                 "run_in_background": {"type":"boolean","description":"Spawn detached and return a task id immediately (default false)"},
-                "dangerouslyDisableSandbox": {"type":"boolean","description":"Run outside the sandbox. Only use when the command cannot work sandboxed and you are certain it is safe"},
+                "dangerouslyDisableSandbox": {"type":"boolean","description":"Unsupported for the default shell tool. Commands without an active sandbox are rejected."},
                 "namespaceRestrictions": {"type":"boolean","description":"Enable user/mount/pid namespace isolation via unshare (default true when sandbox enabled)"},
                 "isolateNetwork": {"type":"boolean","description":"Isolate network via a new network namespace (default false)"},
                 "filesystemMode": {"type":"string","enum":["off","workspace-only","allow-list"],"description":"Filesystem isolation level (default workspace-only)"},
@@ -1176,7 +1191,7 @@ impl ToolExecutor {
         self.micro_tool_contexts.read().keys().cloned().collect()
     }
 
-    pub async fn execute(&self, name: &str, input: Value) -> Result<Value, String> {
+    pub async fn execute(&self, name: &str, input: Value) -> Result<Value, ToolExecutionError> {
         self.execute_with_claims(name, input, None).await
     }
 
@@ -1185,13 +1200,13 @@ impl ToolExecutor {
         name: &str,
         input: Value,
         claims: Option<IsolationClaims>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, ToolExecutionError> {
         TOOL_ISOLATION_CLAIMS
             .scope(claims, self.execute_inner(name, input))
             .await
     }
 
-    async fn execute_inner(&self, name: &str, input: Value) -> Result<Value, String> {
+    async fn execute_inner(&self, name: &str, input: Value) -> Result<Value, ToolExecutionError> {
         let input_str = input.to_string();
 
         if let Some(ref policy) = self.permission_policy {
@@ -1230,12 +1245,21 @@ impl ToolExecutor {
         // permission/hook/syscall gates does not break micro-tool dispatch.
         let handler = match self.try_get_handler(name) {
             Some(h) => h,
-            None => return Err(format!("Tool not found: {}", name)),
+            None => {
+                return Err(ToolExecutionError::NotFound {
+                    name: name.to_string(),
+                })
+            }
         };
         debug!(tool = %name, "Executing tool");
 
         // Execute and capture result for post-hooks
-        let result = handler(input).await;
+        let result = handler(input)
+            .await
+            .map_err(|message| ToolExecutionError::ExecutionFailed {
+                name: name.to_string(),
+                message,
+            });
 
         // Post-tool-use hook
         if let Some(ref runner) = self.hook_runner {
@@ -1251,7 +1275,7 @@ impl ToolExecutor {
                     }
                 }
                 Err(e) => {
-                    let _ = runner.run_post_tool_use_failure(name, &input_str, e);
+                    let _ = runner.run_post_tool_use_failure(name, &input_str, &e.to_string());
                 }
             }
         }
@@ -1275,7 +1299,7 @@ impl ToolExecutor {
         input: Value,
         context: SecurityContext,
         advertised_tools: &[String],
-    ) -> Result<Value, String> {
+    ) -> Result<Value, ToolExecutionError> {
         self.execute_with_security_context_and_claims(name, input, context, advertised_tools, None)
             .await
     }
@@ -1290,7 +1314,7 @@ impl ToolExecutor {
         context: SecurityContext,
         advertised_tools: &[String],
         claims: Option<IsolationClaims>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, ToolExecutionError> {
         if !advertised_tools.iter().any(|tool| tool == name) {
             return Ok(json!({
                 "error": format!("Tool not advertised for this turn: {}", name),

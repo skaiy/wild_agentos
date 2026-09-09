@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::knowledge_graph::rdf_mapper::RdfMapper;
-use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::knowledge_graph::store::{KnowledgeGraphError, KnowledgeGraphStore};
 use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
 use crate::memory::l2_blackboard::QueryFilter;
 
@@ -499,7 +499,13 @@ pub(crate) async fn kg_import_handler(
 
     let kg = match KnowledgeGraphStore::with_shared_store(store) {
         Ok(kg) => kg,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+        Err(e) => {
+            tracing::error!(error = %e, "KG store initialization failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "knowledge graph storage unavailable"})),
+            );
+        }
     };
 
     match kg.write_quads_for_claims(claims, &result.quads) {
@@ -513,7 +519,13 @@ pub(crate) async fn kg_import_handler(
                 "graph": graph_iri,
             })),
         ),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+        Err(e) => {
+            tracing::warn!(error = %e, "KG import failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
     }
 }
 
@@ -534,7 +546,13 @@ pub(crate) async fn kg_query_handler(
     let store = state.kg_store.clone();
     let kg = match KnowledgeGraphStore::with_shared_store(store) {
         Ok(kg) => kg,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+        Err(e) => {
+            tracing::error!(error = %e, "KG store initialization failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "knowledge graph storage unavailable"})),
+            );
+        }
     };
 
     match kg.query_sparql_for_claims(claims, &req.sparql) {
@@ -546,7 +564,17 @@ pub(crate) async fn kg_query_handler(
                 "count": results.len(),
             })),
         ),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
+        Err(KnowledgeGraphError::Query { message })
+        | Err(KnowledgeGraphError::InvalidScope { message }) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": message})))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "KG query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "knowledge graph query unavailable"})),
+            )
+        }
     }
 }
 

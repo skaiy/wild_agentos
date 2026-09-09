@@ -17,7 +17,7 @@ pub struct KnowledgeBridge {
 
 impl KnowledgeBridge {
     pub fn new() -> Result<Self, String> {
-        let store = KnowledgeGraphStore::new()?;
+        let store = KnowledgeGraphStore::new().map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             bridge_graph: "graph:bridge".to_string(),
@@ -25,7 +25,8 @@ impl KnowledgeBridge {
     }
 
     pub fn with_shared_store(store: Arc<oxigraph::store::Store>) -> Result<Self, String> {
-        let store = KnowledgeGraphStore::with_shared_store(store)?;
+        let store = KnowledgeGraphStore::with_shared_store(store)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             bridge_graph: "graph:bridge".to_string(),
