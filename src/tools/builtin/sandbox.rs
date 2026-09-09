@@ -174,14 +174,13 @@ pub fn unshare_available() -> bool {
 #[must_use]
 pub fn sandbox_runtime_snapshot() -> serde_json::Value {
     let unshare = unshare_available();
-    // Bash sandbox is opt-in (default disabled) so pkill/pgrep can still
-    // manage host processes. `enabled` reports that default; `unshare_enabled`
-    // is true only when a command actually requested isolation *and* unshare works.
+    // The default shell is sandbox-required. `enabled` reports that policy;
+    // callers must still reject command execution when unshare is unavailable.
     serde_json::json!({
-        "enabled": false,
+        "enabled": true,
         "unshare_supported": unshare,
-        "unshare_enabled": false,
-        "opt_in": true,
+        "unshare_enabled": unshare,
+        "opt_in": false,
     })
 }
 
@@ -399,7 +398,7 @@ mod tests {
         assert!(snap["enabled"].is_boolean());
         assert!(snap["unshare_supported"].is_boolean());
         assert!(snap["unshare_enabled"].is_boolean());
-        assert_eq!(snap["opt_in"], true);
+        assert_eq!(snap["opt_in"], false);
         let obj = snap.as_object().unwrap();
         assert!(!obj.keys().any(|k| k.contains("key") || k.contains("token")));
     }

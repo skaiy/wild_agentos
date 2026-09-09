@@ -603,7 +603,7 @@ impl ToolExecutor {
                 "description": {"type":"string","description":"What this command does"},
                 "timeout": {"type":"integer","description":"Timeout in milliseconds"},
                 "run_in_background": {"type":"boolean","description":"Spawn detached and return a task id immediately (default false)"},
-                "dangerouslyDisableSandbox": {"type":"boolean","description":"Run outside the sandbox. Only use when the command cannot work sandboxed and you are certain it is safe"},
+                "dangerouslyDisableSandbox": {"type":"boolean","description":"Unsupported for the default shell tool. Commands without an active sandbox are rejected."},
                 "namespaceRestrictions": {"type":"boolean","description":"Enable user/mount/pid namespace isolation via unshare (default true when sandbox enabled)"},
                 "isolateNetwork": {"type":"boolean","description":"Isolate network via a new network namespace (default false)"},
                 "filesystemMode": {"type":"string","enum":["off","workspace-only","allow-list"],"description":"Filesystem isolation level (default workspace-only)"},
