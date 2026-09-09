@@ -1666,7 +1666,9 @@ pub(super) async fn execute_knowledge_extract(
     let graph = claims
         .graph_iri()
         .map_err(|e| format!("invalid verified graph scope: {e}"))?;
-    store.write_quads_for_claims(&claims, &result.quads)?;
+    store
+        .write_quads_for_claims(&claims, &result.quads)
+        .map_err(|error| error.to_string())?;
 
     Ok(json!({
         "success": true,
@@ -1690,7 +1692,9 @@ pub(super) async fn execute_knowledge_query(
         .read()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
     // `named_graph` is intentionally ignored; the claims graph is automatic.
-    let results = store.query_sparql_for_claims(&claims, &sparql)?;
+    let results = store
+        .query_sparql_for_claims(&claims, &sparql)
+        .map_err(|error| error.to_string())?;
 
     Ok(json!({
         "success": true,
@@ -1859,7 +1863,9 @@ pub(super) async fn execute_knowledge_import_json(
         let store = kg_store
             .write()
             .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-        store.write_quads_for_claims(&claims, &result.quads)?;
+        store
+            .write_quads_for_claims(&claims, &result.quads)
+            .map_err(|error| error.to_string())?;
     }
 
     Ok(json!({
@@ -1938,7 +1944,9 @@ pub(super) async fn execute_ontology_register(
         let store = kg_store
             .write()
             .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-        store.write_quads_for_claims(&claims, &quads)?;
+        store
+            .write_quads_for_claims(&claims, &quads)
+            .map_err(|error| error.to_string())?;
     }
 
     Ok(json!({
@@ -1995,7 +2003,9 @@ pub(super) async fn execute_knowledge_bridge_with_store(
     let store = kg_store
         .write()
         .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    store.write_quads_for_claims(&claims, &[quad])?;
+    store
+        .write_quads_for_claims(&claims, &[quad])
+        .map_err(|error| error.to_string())?;
 
     Ok(json!({
         "success": true,
@@ -2033,7 +2043,9 @@ pub(super) async fn execute_knowledge_extract_code(
             &claims,
             &format!("iri://entity/file:{}", file_path),
         )?;
-        store.write_quads_for_claims(&claims, &result.quads)?;
+        store
+            .write_quads_for_claims(&claims, &result.quads)
+            .map_err(|error| error.to_string())?;
         Ok(json!({
             "success": true,
             "file_path": file_path,

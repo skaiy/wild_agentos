@@ -236,15 +236,17 @@ fn production_type_counts(
         "SELECT ?type (COUNT(DISTINCT ?subject) AS ?count) WHERE {{ \
          ?subject <{RDF_TYPE}> ?type }} GROUP BY ?type"
     );
-    kg.query_sparql_for_claims(claims, &query).map(|rows| {
-        rows.into_iter()
-            .filter_map(|row| {
-                let kind = row.get("?type")?.as_str()?.to_owned();
-                let count = row.get("?count")?.as_str()?.parse().ok()?;
-                Some((kind, count))
-            })
-            .collect()
-    })
+    kg.query_sparql_for_claims(claims, &query)
+        .map_err(|error| error.to_string())
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let kind = row.get("?type")?.as_str()?.to_owned();
+                    let count = row.get("?count")?.as_str()?.parse().ok()?;
+                    Some((kind, count))
+                })
+                .collect()
+        })
 }
 
 fn stale_drafts(drafts: Vec<PendingTypeDraft>, stale_after_hours: i64) -> StaleDraftHealth {
