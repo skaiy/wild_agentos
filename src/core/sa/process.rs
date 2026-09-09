@@ -431,7 +431,14 @@ impl SupervisorAgent {
                 .await;
 
                 if let Some(scheduler) = &self.scheduler {
-                    let _ = scheduler.on_task_complete(task_iri).await;
+                    if let Err(error) = scheduler.on_task_complete(task_iri).await {
+                        warn!(
+                            task_iri = %task_iri,
+                            error = %error,
+                            "Scheduler completion handling failed"
+                        );
+                        return Err(error);
+                    }
                 }
                 return Ok(result);
             }
@@ -460,7 +467,14 @@ impl SupervisorAgent {
         }
 
         if let Some(scheduler) = &self.scheduler {
-            let _ = scheduler.on_task_complete(task_iri).await;
+            if let Err(error) = scheduler.on_task_complete(task_iri).await {
+                warn!(
+                    task_iri = %task_iri,
+                    error = %error,
+                    "Scheduler completion handling failed"
+                );
+                return Err(error);
+            }
         }
         Ok(final_result.unwrap_or_else(|| TaskResult {
             task_iri: task_iri.to_string(),
