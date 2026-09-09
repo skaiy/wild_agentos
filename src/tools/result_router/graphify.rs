@@ -30,7 +30,8 @@ impl GraphifyEngine {
         store: Arc<oxigraph::store::Store>,
         max_entities: usize,
     ) -> Result<Self, String> {
-        let store = KnowledgeGraphStore::with_shared_store(store).map_err(|error| error.to_string())?;
+        let store =
+            KnowledgeGraphStore::with_shared_store(store).map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             max_entities,
