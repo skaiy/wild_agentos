@@ -19,8 +19,6 @@ use serde_json::{json, Value};
 
 use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
 use crate::isolation::IsolationClaims;
-use crate::knowledge_graph::store::KnowledgeGraphStore;
-use crate::memory::hyperspace_store::HybridSearchFilter;
 
 use super::api_gov;
 use super::iam::UserIdentity;
@@ -39,131 +37,7 @@ pub struct AgentChatRequest {
     _vector_namespace: Option<String>,
 }
 
-/// 仅保留 ASCII 字母/数字/下划线组成、长度≥3 且包含数字或下划线（或长度≥4）的片段，
-/// 作为故障码检索 token；可有效命中 APP_w009 / P0A80 等代码而排除普通停用词。
-fn extract_code_tokens(message: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let flush = |cur: &mut String, out: &mut Vec<String>| {
-        if cur.len() >= 3 {
-            let has_digit = cur.chars().any(|c| c.is_ascii_digit());
-            if has_digit || cur.contains('_') || cur.len() >= 4 {
-                out.push(cur.to_lowercase());
-            }
-        }
-        cur.clear();
-    };
-    for ch in message.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            cur.push(ch);
-        } else {
-            flush(&mut cur, &mut tokens);
-        }
-    }
-    flush(&mut cur, &mut tokens);
-    tokens.dedup();
-    tokens
-}
-
-/// 将用户问题中的品牌别名映射为图谱中的品牌 label（如 特斯拉→Tesla）。
-fn extract_brand_labels(message: &str) -> Vec<String> {
-    let lower = message.to_lowercase();
-    let mut out = Vec::new();
-    let table: [(&[&str], &str); 6] = [
-        (&["特斯拉", "tesla"], "Tesla"),
-        (&["比亚迪", "byd"], "比亚迪"),
-        (&["蔚来", "nio"], "蔚来"),
-        (&["小鹏", "xpeng"], "小鹏"),
-        (&["理想", "li auto", "lixiang"], "理想"),
-        (&["问界", "aito"], "问界"),
-    ];
-    for (aliases, label) in table {
-        if aliases
-            .iter()
-            .any(|a| message.contains(*a) || lower.contains(&a.to_lowercase()))
-        {
-            out.push(label.to_string());
-        }
-    }
-    out
-}
-
-const ONT_FAULT: &str = "http://aps.local/ontology/FaultCode";
-const ONT_BRAND_REL: &str = "http://aps.local/ontology/belongsToBrand";
-const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
-const META: &str = "https://agentos.ontology/meta";
-
-/// 构造检索 FaultCode 的 SPARQL；filter_expr 为已组装好的 FILTER 条件表达式。
-fn build_fault_query(filter_expr: &str, limit: usize) -> String {
-    format!(
-        "SELECT ?code ?label ?meaning ?can_drive ?repair ?models ?brand WHERE {{ \
-            ?n a <{f}> . \
-            ?n <{m}/code> ?code . \
-            OPTIONAL {{ ?n <{rl}> ?label }} \
-            OPTIONAL {{ ?n <{m}/meaning> ?meaning }} \
-            OPTIONAL {{ ?n <{m}/can_drive> ?can_drive }} \
-            OPTIONAL {{ ?n <{m}/repair> ?repair }} \
-            OPTIONAL {{ ?n <{m}/models> ?models }} \
-            OPTIONAL {{ ?n <{br}> ?bn . ?bn <{rl}> ?brand }} \
-            FILTER( {flt} ) \
-        }} LIMIT {lim}",
-        f = ONT_FAULT,
-        m = META,
-        rl = RDFS_LABEL,
-        br = ONT_BRAND_REL,
-        flt = filter_expr,
-        lim = limit,
-    )
-}
-
-fn trunc(s: &str, n: usize) -> String {
-    let t = s.trim();
-    if t.chars().count() <= n {
-        t.to_string()
-    } else {
-        t.chars().take(n).collect::<String>() + "…"
-    }
-}
-
-/// POST /api/v1/agents/:id/chat — 基于该 Agent 绑定知识图谱的检索增强问答（RAG）。
-/// 流程：定位 Agent → 抽取故障码/品牌 token → SPARQL 检索 FaultCode 事实 →
-/// 决策层（Phase 4）：将诊断出的故障码意图映射到适用的动力层 ActionType。
-///
-/// 取首个命中的故障码作为动作目标（applies_to=FaultCode 的动作），生成「建议动作」供前端
-/// 渲染「诊断 → 建议 → 一键执行」。`requires_business_data=true` 的动作（如生成维修工单需车辆
-/// VIN 等业务数据）当前工单系统尚未接入，前端仅弹窗占位，不直接落库。
-fn build_action_suggestions(sources: &[Value]) -> Vec<Value> {
-    let code = sources
-        .first()
-        .and_then(|s| s.get("code"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if code.is_empty() {
-        return Vec::new();
-    }
-    vec![
-        json!({
-            "action": "GenerateRepairOrder",
-            "label": "生成维修工单",
-            "icon": "Wrench",
-            "target": code,
-            "requires_business_data": true,
-            "note": "需车辆VIN等业务数据，工单系统对接中（规划中）",
-            "reason": format!("针对诊断故障码 {code} 一键生成维修工单"),
-        }),
-        json!({
-            "action": "AppendFaq",
-            "label": "沉淀为常见问答",
-            "icon": "MessageCirclePlus",
-            "target": code,
-            "requires_business_data": false,
-            "reason": format!("将本次诊断沉淀为故障码 {code} 的 FAQ"),
-        }),
-    ]
-}
-
-/// POST /api/v1/agents/:id/chat — 内部单轮 RAG 问答（必须携带验证过的 JWT claims）。
+/// POST /api/v1/agents/:id/chat — 内部单轮聊天（必须携带验证过的 JWT claims）。
 pub(crate) async fn agent_chat_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
@@ -182,24 +56,18 @@ pub(crate) async fn agent_chat_handler(
         None => {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "verified isolation claims required for chat RAG" })),
+                Json(json!({ "error": "verified isolation claims required for chat" })),
             )
         }
     };
-    let (status, body) = run_agent_rag(&state, &id, &message, &req.images, Some(claims)).await;
+    let messages = single_user_message(&message, &req.images);
+    let (status, body) = run_agent_chat(&state, &id, messages, Some(claims)).await;
     (status, Json(body))
 }
 
-/// Agent RAG 检索上下文：检索完成、提示已组装，待（同步或流式）调用 LLM。
-struct RagContext {
+/// Agent chat context ready for the gateway.
+struct ChatContext {
     messages: Vec<ChatMessage>,
-    sources: Vec<Value>,
-    retrieved: usize,
-    vector_retrieved: usize,
-    grounded: bool,
-    /// 网关不可用时的图谱直出回退答案（有命中时才有）。
-    fallback_answer: Option<String>,
-    suggested_actions: Vec<Value>,
     /// 本次实际调用的真实型号名（按 model_mounts 选模型解析，回退旧 model/default）。
     model: String,
 }
@@ -246,27 +114,42 @@ async fn resolve_agent_model(state: &Arc<AppState>, agent: &Value, keys: &[&str]
 
 /// Claims-scoped chat may use only an agent explicitly owned by the same
 /// tenant/project. Missing scope is denied rather than treated as a shared
-/// agent, so a legacy record cannot accidentally expose its prompt or model.
+/// agent, so a legacy record cannot accidentally expose its model.
 fn agent_matches_claims(agent: &Value, claims: &IsolationClaims) -> bool {
     agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
         && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
 }
 
-/// 单轮聊天上下文组装。提供 claims 时执行 claims-scoped RAG；未提供时不访问
-/// tenant 图或向量库，供 API-key 的公开聊天面使用。
-/// 返回可复用的 RagContext，供内部 chat、对外 public chat、SSE 流式与 OpenAI 兼容层共用。
-/// `images` 为随消息透传的图片 URL 列表（非空即走 VL：选 vision 模型 + 组多部件 user 消息）。
+/// Single-turn native chat requests become a regular user message. The generic
+/// HTTP paths deliberately add neither a default system message nor retrieval
+/// context, so an Agent can be used by businesses other than EV repair.
+fn single_user_message(message: &str, images: &[String]) -> Vec<ChatMessage> {
+    let content = if images.is_empty() {
+        ChatContent::text(message)
+    } else {
+        let mut parts = vec![ChatContent::part_text(message)];
+        parts.extend(images.iter().cloned().map(ChatContent::image));
+        ChatContent::Parts(parts)
+    };
+    vec![ChatMessage {
+        role: "user".into(),
+        content,
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }]
+}
+
+/// Validate Agent accessibility and choose its chat/vision model. Callers'
+/// messages are forwarded unchanged; the generic path performs no RAG.
 async fn build_chat_context(
     state: &Arc<AppState>,
     id: &str,
-    message: &str,
-    images: &[String],
+    messages: Vec<ChatMessage>,
     claims: Option<&IsolationClaims>,
-) -> Result<RagContext, (StatusCode, Value)> {
-    let message = message.to_string();
-    let has_image = !images.is_empty();
-
-    // 1. 定位 Agent（用户态优先，其次批处理静态）。
+) -> Result<ChatContext, (StatusCode, Value)> {
+    // Locate user-state Agent first, then the static batch configuration.
     let agent = {
         let guard = state.user_agents.read().await;
         guard
@@ -305,191 +188,30 @@ async fn build_chat_context(
             ));
         }
     }
-    let agent_name = agent
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("维修助手")
-        .to_string();
-    // 选模型：有图走 vision 槽（回退 chat 槽），纯文本走 chat 槽；均未命中回退旧 model/default。
+    let has_image = messages
+        .iter()
+        .any(|message| !message.content.image_urls().is_empty());
+    // Images use the vision slot (falling back to chat); text uses chat.
     let model_keys: &[&str] = if has_image {
         &["vision", "chat"]
     } else {
         &["chat"]
     };
     let selected_model = resolve_agent_model(state, &agent, model_keys).await;
-    // 2. Claims-scoped RAG. Agent configuration and request JSON never select
-    // graph/vector targets: the stores mint those names from verified claims.
-    let mut rows: Vec<Value> = Vec::new();
-    let mut vector_hits: Vec<(String, f32)> = Vec::new();
-    if let Some(claims) = claims {
-        let kg = state.kg_store.clone();
-        let store = KnowledgeGraphStore::with_shared_store(kg).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": format!("chat graph retrieval unavailable: {e}") }),
-            )
-        })?;
-        let codes = extract_code_tokens(&message);
-        let brands = extract_brand_labels(&message);
-        if !codes.is_empty() {
-            let conds: Vec<String> = codes
-                .iter()
-                .map(|t| format!("CONTAINS(LCASE(STR(?code)), \"{}\")", t))
-                .collect();
-            let q = build_fault_query(&conds.join(" || "), 6);
-            rows = store.query_sparql_for_claims(claims, &q).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({ "error": format!("chat graph retrieval failed: {e}") }),
-                )
-            })?;
-        }
-        if rows.is_empty() && !brands.is_empty() {
-            let conds: Vec<String> = brands
-                .iter()
-                .map(|b| format!("CONTAINS(STR(?brand), \"{}\")", b.replace('"', "")))
-                .collect();
-            let q = format!(
-                "SELECT ?code ?label ?meaning ?can_drive ?repair ?models ?brand WHERE {{ \
-                    ?n a <{f}> . ?n <{m}/code> ?code . ?n <{br}> ?bn . ?bn <{rl}> ?brand . \
-                    OPTIONAL {{ ?n <{rl}> ?label }} OPTIONAL {{ ?n <{m}/meaning> ?meaning }} \
-                    OPTIONAL {{ ?n <{m}/can_drive> ?can_drive }} OPTIONAL {{ ?n <{m}/repair> ?repair }} \
-                    OPTIONAL {{ ?n <{m}/models> ?models }} FILTER( {flt} ) }} LIMIT 6",
-                f = ONT_FAULT, m = META, rl = RDFS_LABEL, br = ONT_BRAND_REL, flt = conds.join(" || "),
-            );
-            rows = store.query_sparql_for_claims(claims, &q).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({ "error": format!("chat graph retrieval failed: {e}") }),
-                )
-            })?;
-        }
-        if let Some(vstore) = state.vector_store.load_full() {
-            let hits = vstore
-                .search_with_claims(claims, &message, &HybridSearchFilter::new(), 5)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({ "error": format!("chat vector retrieval failed: {e}") }),
-                    )
-                })?;
-            vector_hits.extend(hits.into_iter().map(|h| (h.text, h.score)));
-        }
-    }
-
-    // 3. 组装检索事实上下文（图知识库 + 向量知识库）。
-    let get = |row: &Value, k: &str| {
-        row.get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let mut facts = String::new();
-    let mut sources: Vec<Value> = Vec::new();
-    for row in &rows {
-        let code = get(row, "?code");
-        let label = get(row, "?label");
-        let brand = get(row, "?brand");
-        facts.push_str(&format!(
-            "- 故障码 {code}（{brand}）：{label}\n  含义：{}\n  能否行驶：{}\n  维修建议：{}\n  适用车型：{}\n",
-            trunc(&get(row, "?meaning"), 300),
-            trunc(&get(row, "?can_drive"), 200),
-            trunc(&get(row, "?repair"), 300),
-            trunc(&get(row, "?models"), 160),
-        ));
-        sources.push(json!({ "code": code, "label": label, "brand": brand }));
-    }
-    // 向量检索命中作为补充事实（不并入 sources，避免污染故障码来源与动作建议）。
-    let mut vector_facts = String::new();
-    for (text, score) in &vector_hits {
-        vector_facts.push_str(&format!("- （相关度 {:.2}）{}\n", score, trunc(text, 400)));
-    }
-    let vector_retrieved = vector_hits.len();
-
-    // 4. 构造提示并调用 LLM 网关。
-    let sys = format!(
-        "你是「{agent_name}」，一名专业的新能源汽车故障诊断与维修助手。请严格依据下方“知识库检索结果”，\
-用简体中文回答用户问题：解释故障含义、是否可继续行驶、维修建议与适用车型。\
-若检索结果为空或不足以支撑回答，请如实说明并给出通用排查建议，切勿编造具体故障码信息。\
-回答需专业、严谨、条理清晰。"
-    );
-    let graph_section = if facts.is_empty() {
-        "【知识图谱检索结果】\n（未检索到相关故障码记录）\n".to_string()
-    } else {
-        format!("【知识图谱检索结果】\n{facts}")
-    };
-    let vector_section = if vector_facts.is_empty() {
-        String::new()
-    } else {
-        format!("\n【向量知识库检索结果】\n{vector_facts}")
-    };
-    let user_content = format!("{graph_section}{vector_section}\n【用户问题】\n{message}");
-    // 有图时组多部件 user 消息（文本 + 各 image_url），否则退化为纯文本。
-    let user_msg = if has_image {
-        let mut parts = vec![ChatContent::part_text(user_content)];
-        for u in images {
-            parts.push(ChatContent::image(u.clone()));
-        }
-        ChatMessage {
-            role: "user".into(),
-            content: ChatContent::Parts(parts),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        }
-    } else {
-        ChatMessage {
-            role: "user".into(),
-            content: user_content.into(),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        }
-    };
-    let messages = vec![
-        ChatMessage {
-            role: "system".into(),
-            content: sys.into(),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-        user_msg,
-    ];
-
-    // 网关不可用时的图谱直出回退（有命中才提供）。
-    let fallback_answer = rows.first().map(|row| {
-        format!(
-            "【基于知识图谱的检索结果】\n故障码 {}（{}）：{}\n含义：{}\n能否行驶：{}\n维修建议：{}\n适用车型：{}",
-            get(row, "?code"), get(row, "?brand"), get(row, "?label"),
-            get(row, "?meaning"), get(row, "?can_drive"), get(row, "?repair"), get(row, "?models"),
-        )
-    });
-    Ok(RagContext {
-        suggested_actions: build_action_suggestions(&sources),
-        grounded: !rows.is_empty(),
-        retrieved: rows.len(),
-        vector_retrieved,
-        fallback_answer,
-        sources,
+    Ok(ChatContext {
         messages,
         model: selected_model,
     })
 }
 
-/// 单轮 RAG（同步）：检索 → 调 LLM 网关生成简体中文回答。返回 (状态码, JSON 响应体)。
-async fn run_agent_rag(
+/// Send generic chat context through the selected Agent model.
+async fn run_agent_chat(
     state: &Arc<AppState>,
     id: &str,
-    message: &str,
-    images: &[String],
+    messages: Vec<ChatMessage>,
     claims: Option<&IsolationClaims>,
 ) -> (StatusCode, Value) {
-    let rc = match build_chat_context(state, id, message, images, claims).await {
+    let rc = match build_chat_context(state, id, messages, claims).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -505,38 +227,14 @@ async fn run_agent_rag(
                 json!({
                     "status": "ok",
                     "answer": answer,
-                    "grounded": rc.grounded,
-                    "sources": rc.sources,
-                    "retrieved": rc.retrieved,
-                    "vector_retrieved": rc.vector_retrieved,
                     "model": rc.model,
-                    "suggested_actions": rc.suggested_actions,
                 }),
             )
         }
-        Err(e) => {
-            // 网关失败但已检索到事实时，回退为基于图谱的确定性回答，保证可用性。
-            if let Some(fallback) = rc.fallback_answer {
-                (
-                    StatusCode::OK,
-                    json!({
-                        "status": "degraded",
-                        "answer": fallback,
-                        "grounded": true,
-                        "sources": rc.sources,
-                        "retrieved": rc.retrieved,
-                        "vector_retrieved": rc.vector_retrieved,
-                        "warning": format!("LLM 网关不可用，已回退为图谱直出：{}", e),
-                        "suggested_actions": rc.suggested_actions,
-                    }),
-                )
-            } else {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    json!({ "error": format!("LLM 网关调用失败：{}", e) }),
-                )
-            }
-        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": format!("LLM 网关调用失败：{}", e) }),
+        ),
     }
 }
 
@@ -723,7 +421,8 @@ pub(crate) async fn public_agent_chat_handler(
         )
             .into_response();
     }
-    let (status, body) = run_agent_rag(&state, &id, &message, &[], None).await;
+    let (status, body) =
+        run_agent_chat(&state, &id, single_user_message(&message, &[]), None).await;
     touch_key_last_used(&state, &ctx.key_id).await;
     write_public_audit(&ctx, &id, "chat", status.as_u16(), started, "ok");
     (status, Json(body)).into_response()
@@ -757,8 +456,8 @@ fn delta_event(shape: StreamShape, chat_id: &str, created: i64, model: &str, tex
     }
 }
 
-/// 基于已完成检索的 RagContext，调用网关流式接口并逐 token 下发 SSE；
-/// 尾部下发汇总（原生 done / OpenAI 结束 chunk + [DONE]），并在流结束后落审计。
+/// Stream a gateway chat context as native or OpenAI-compatible SSE.
+/// The stream completion is audited after the concurrency guard is released.
 /// `guard` 随流移动、于流结束时归还并发额度。
 #[allow(clippy::too_many_arguments)]
 fn build_sse_response(
@@ -767,7 +466,7 @@ fn build_sse_response(
     id: String,
     endpoint: &'static str,
     started: std::time::Instant,
-    rc: RagContext,
+    rc: ChatContext,
     guard: api_gov::ConcurrencyGuard,
     shape: StreamShape,
     report_model: String,
@@ -802,25 +501,13 @@ fn build_sse_response(
             },
             Err(_) => { ok = false; }
         }
-        // 流式失败或无产出且有图谱命中 → 回退图谱直出，保证可用性。
-        if full.is_empty() {
-            if let Some(fb) = &rc.fallback_answer {
-                full = fb.clone();
-                yield Ok(delta_event(shape, &chat_id, created, &report_model, fb));
-            }
-        }
         // 尾包。
         match shape {
             StreamShape::Native => {
                 yield Ok(Event::default().event("done").data(
                     json!({
                         "answer": full,
-                        "grounded": rc.grounded,
-                        "sources": rc.sources,
-                        "retrieved": rc.retrieved,
-                        "vector_retrieved": rc.vector_retrieved,
                         "model": llm_model,
-                        "suggested_actions": rc.suggested_actions,
                     })
                     .to_string(),
                 ));
@@ -872,9 +559,7 @@ pub(crate) async fn public_agent_chat_stream_handler(
         )
             .into_response();
     }
-    // Public API-key chat has no verified IsolationClaims, so it never reads
-    // tenant graph/vector data.
-    let rc = match build_chat_context(&state, &id, &message, &[], None).await {
+    let rc = match build_chat_context(&state, &id, single_user_message(&message, &[]), None).await {
         Ok(c) => c,
         Err((status, body)) => {
             write_public_audit(&ctx, &id, "chat_stream", status.as_u16(), started, "error");
@@ -984,14 +669,19 @@ pub(crate) async fn openai_list_models_handler(
         .into_response()
 }
 
-/// POST /v1/chat/completions — OpenAI 兼容问答（model=agentId，取末条 user 内容做单轮 RAG）。
+/// POST /v1/chat/completions — OpenAI-compatible chat (model = agentId).
 pub(crate) async fn openai_chat_completions_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<OpenAiChatRequest>,
 ) -> impl IntoResponse {
     let started = std::time::Instant::now();
-    let id = req.model.trim().to_string();
+    let OpenAiChatRequest {
+        model,
+        messages,
+        stream,
+    } = req;
+    let id = model.trim().to_string();
     if id.is_empty() {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -999,7 +689,7 @@ pub(crate) async fn openai_chat_completions_handler(
             "invalid_request_error",
         );
     }
-    let endpoint: &'static str = if req.stream {
+    let endpoint: &'static str = if stream {
         "chat_completions_stream"
     } else {
         "chat_completions"
@@ -1008,15 +698,10 @@ pub(crate) async fn openai_chat_completions_handler(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let last_user = req.messages.iter().rev().find(|m| m.role == "user");
-    let message = last_user
-        .map(|m| m.content.as_text().trim().to_string())
-        .unwrap_or_default();
-    // 提取末条 user 消息内的图片 URL(image_url 部件),供 VL 透传给 build_chat_context。
-    let images: Vec<String> = last_user
-        .map(|m| m.content.image_urls())
-        .unwrap_or_default();
-    if message.is_empty() {
+    if !messages
+        .iter()
+        .any(|message| message.role == "user" && !message.content.as_text().trim().is_empty())
+    {
         write_public_audit(&ctx, &id, endpoint, 400, started, "empty_message");
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -1024,8 +709,20 @@ pub(crate) async fn openai_chat_completions_handler(
             "invalid_request_error",
         );
     }
-    // OpenAI-compatible API-key chat follows the same explicit no-tenant-RAG policy.
-    let rc = match build_chat_context(&state, &id, &message, &images, None).await {
+    // Preserve the full caller conversation, including caller-supplied system
+    // messages and multimodal content. No default system prompt or RAG is added.
+    let gateway_messages = messages
+        .into_iter()
+        .map(|message| ChatMessage {
+            role: message.role,
+            content: message.content,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        })
+        .collect();
+    let rc = match build_chat_context(&state, &id, gateway_messages, None).await {
         Ok(c) => c,
         Err((status, body)) => {
             write_public_audit(&ctx, &id, endpoint, status.as_u16(), started, "error");
@@ -1038,7 +735,7 @@ pub(crate) async fn openai_chat_completions_handler(
         }
     };
     touch_key_last_used(&state, &ctx.key_id).await;
-    if req.stream {
+    if stream {
         return build_sse_response(
             state,
             ctx,
@@ -1062,17 +759,12 @@ pub(crate) async fn openai_chat_completions_handler(
             openai_completion_json(&id, &answer)
         }
         Err(e) => {
-            if let Some(fb) = rc.fallback_answer {
-                write_public_audit(&ctx, &id, endpoint, 200, started, "degraded");
-                openai_completion_json(&id, &fb)
-            } else {
-                write_public_audit(&ctx, &id, endpoint, 502, started, "error");
-                openai_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("LLM 网关调用失败：{}", e),
-                    "api_error",
-                )
-            }
+            write_public_audit(&ctx, &id, endpoint, 502, started, "error");
+            openai_error(
+                StatusCode::BAD_GATEWAY,
+                format!("LLM 网关调用失败：{}", e),
+                "api_error",
+            )
         }
     }
 }
@@ -1154,37 +846,31 @@ mod tests {
         })
     }
 
-    fn insert_fault(store: &oxigraph::store::Store, claims: &IsolationClaims, code: &str) {
-        let graph = claims.graph_iri().unwrap();
-        store
-            .update(&format!(
-                "INSERT DATA {{ GRAPH <{graph}> {{ \
-                    <https://example.test/fault/{code}> a <{ONT_FAULT}> ; \
-                    <{META}/code> \"{code}\" ; <{RDFS_LABEL}> \"isolated fault\" . \
-                }} }}"
-            ))
-            .unwrap();
-    }
-
     #[tokio::test]
-    async fn isolation_contract_chat_retrieval_isolates_tenants_and_ignores_client_targets() {
+    async fn isolation_contract_chat_keeps_agent_access_scoped() {
         let state = make_state();
         let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
         let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
-        insert_fault(&state.kg_store, &tenant_a, "P0A80");
-        insert_fault(&state.kg_store, &tenant_b, "P0A81");
 
-        let a = build_chat_context(&state, "agent-a", "P0A80", &[], Some(&tenant_a))
-            .await
-            .unwrap();
-        assert_eq!(a.retrieved, 1);
-        assert_eq!(a.sources[0]["code"], "P0A80");
+        let a = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("P0A80", &[]),
+            Some(&tenant_a),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.messages[0].content.as_text(), "P0A80");
 
-        // Tenant B's permitted agent cannot enumerate tenant A's graph.
-        let b = build_chat_context(&state, "agent-b", "P0A80", &[], Some(&tenant_b))
-            .await
-            .unwrap();
-        assert_eq!(b.retrieved, 0);
+        let b = build_chat_context(
+            &state,
+            "agent-b",
+            single_user_message("P0A80", &[]),
+            Some(&tenant_b),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.messages[0].content.as_text(), "P0A80");
     }
 
     #[tokio::test]
@@ -1192,7 +878,14 @@ mod tests {
         let state = make_state();
         let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
 
-        let err = match build_chat_context(&state, "agent-a", "P0A80", &[], Some(&tenant_b)).await {
+        let err = match build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("P0A80", &[]),
+            Some(&tenant_b),
+        )
+        .await
+        {
             Err(err) => err,
             Ok(_) => panic!("tenant B accessed tenant A's agent"),
         };
@@ -1200,17 +893,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn isolation_contract_public_api_key_chat_performs_no_tenant_rag() {
+    async fn generic_chat_context_has_no_ev_repair_prompt_or_rag() {
         let state = make_state();
         let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
-        insert_fault(&state.kg_store, &tenant_a, "P0A80");
 
-        // `None` is passed exclusively by API-key public endpoints.
-        let public = build_chat_context(&state, "agent-a", "P0A80", &[], None)
+        let generic = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("Explain P0A80", &[]),
+            Some(&tenant_a),
+        )
+        .await
+        .unwrap();
+        assert_eq!(generic.messages.len(), 1);
+        assert_eq!(generic.messages[0].role, "user");
+        assert_eq!(generic.messages[0].content.as_text(), "Explain P0A80");
+        assert!(!generic.messages.iter().any(|message| {
+            message
+                .content
+                .as_text()
+                .contains("新能源汽车故障诊断与维修")
+        }));
+    }
+
+    #[tokio::test]
+    async fn generic_chat_context_preserves_caller_messages() {
+        let state = make_state();
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "Reply in English.".into(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Summarize this release.".into(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let generic = build_chat_context(&state, "agent-a", messages, None)
             .await
             .unwrap();
-        assert_eq!(public.retrieved, 0);
-        assert_eq!(public.vector_retrieved, 0);
+        assert_eq!(generic.messages.len(), 2);
+        assert_eq!(generic.messages[0].content.as_text(), "Reply in English.");
+        assert_eq!(
+            generic.messages[1].content.as_text(),
+            "Summarize this release."
+        );
     }
 
     #[tokio::test]
