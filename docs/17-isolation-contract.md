@@ -48,6 +48,58 @@ blob names are minted. In that case `verify_jwt` produces no identity.
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
 
+## Workload OIDC contract for business BFFs
+
+Business BFFs such as the StructCapture Capture BFF authenticate to AgentOS by
+forwarding a short-lived workload OIDC access token in
+`Authorization: Bearer <token>`. They do **not** sign a new AgentOS token.
+Configure the AgentOS HTTP service:
+
+```bash
+AGENTOS_ENV=production
+AGENTOS_AUTH_MODE=oidc
+AGENTOS_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
+AGENTOS_OIDC_ISSUER=https://issuer.example.com/
+AGENTOS_OIDC_AUDIENCE=wild-agentos
+```
+
+The issuer must publish an asymmetric signing key at the configured JWKS URL.
+The exact issuer and audience strings must match the token; AgentOS verifies
+the signature, `exp`, `iss`, and `aud` before it mints any isolation scope.
+This is a configuration checklist for the Capture BFF integration:
+
+1. Obtain a short-lived workload token from the BFF's existing OIDC provider.
+2. Set the token's audience to the configured `AGENTOS_OIDC_AUDIENCE`.
+3. Include the required tenant and project claims below.
+4. Forward the original token unchanged as a Bearer token to AgentOS HTTP
+   APIs, including agent chat. Do not send tenant or project scope in request
+   bodies as an authority substitute.
+
+Minimum token claims:
+
+```json
+{
+  "sub": "workload:structcapture:capture-bff",
+  "tenant_id": "acme",
+  "project_id": "capture-prod",
+  "exp": 1798761600
+}
+```
+
+After verification, AgentOS maps `sub` to `IsolationClaims.actor_id`,
+`tenant_id` to `IsolationClaims.tenant_id`, and `project_id` to
+`IsolationClaims.project_id`. The resulting claims mint
+`graph://acme/capture-prod`, `vector://acme/capture-prod`, the `acme/` object
+prefix, and the `/data/l0/acme` L0 path. `tenant_id` is mandatory; a missing,
+empty, invalid, expired, wrong-issuer, or wrong-audience token produces no
+`IsolationClaims` and is rejected. `project_id` is required for this BFF
+contract; legacy AgentOS tokens that omit it retain the documented `default`
+project compatibility behavior.
+
+**Production ban:** a BFF must never hold `AGENTOS_JWT_SECRET` or self-sign
+HS256 tokens. `AGENTOS_JWT_SECRET` is a local-development-only AgentOS
+configuration. Production AgentOS refuses to boot in HS256 mode.
+
 ## Naming contract, not a migration
 
 Claims mint the following isolated layout:
