@@ -227,10 +227,10 @@ POST message + images[]  ─────────────►  已有 chat
 
 ## 12. 开放问题（开源线拍板）
 
-1. vision 回退到 chat（文本模型）时：硬错误 vs 带 `warning` 的软降级？  
+1. ~~vision 回退到 chat（文本模型）时：硬错误 vs 带 `warning` 的软降级？~~ **已定**：默认软降级 + `warning: vision_mount_unavailable` / `degraded`；`AGENTOS_VISION_FALLBACK=error` 可硬 4xx。  
 2. 单请求 `max_images` / `max_bytes` 官方默认？  
 3. 图证据是否在 P1 强制落 L2 @id，还是 chat 无状态透传即可？  
-4. 目标版本：`0.6.x` 热修还是 `0.7.0`？
+4. ~~目标版本：`0.6.x` 热修还是 `0.7.0`？~~ **已定**：**v0.6.2**（milestone 热修切片）。
 
 ---
 
@@ -240,3 +240,4 @@ POST message + images[]  ─────────────►  已有 chat
 |---|---|---|
 | 2026-09-09 | 0.1.0 | 初稿能力清单 |
 | 2026-09-09 | 0.2.0 | **修订**：强制对齐 `13-DESIGN_DETAIL`；标明已有 `images`/vision mounts；P0 改为配置+契约硬化优先，反对平行造轮 |
+| 2026-09-09 | 0.2.0 | 记入开源线定案：v0.6.2；vision 回退默认软降级+warning；配 EN 文件 |
