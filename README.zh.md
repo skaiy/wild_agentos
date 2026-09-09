@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.6.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.6.1-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -92,6 +92,7 @@ v0.6.0 新增了在同一租户/项目边界内运行的、已认证的在线语
 
 | 版本 | 日期 | 业务说明 |
 |---|---:|---|
+| **v0.6.1** | 2026-09-09 | 通用 Agent chat 与 completions 默认不再注入特定领域上下文；workload OIDC 现定义用于 `IsolationClaims` 的短期 JWT，且 BFF 不共享 `AGENTOS_JWT_SECRET`。 |
 | **v0.6.0** | 2026-09-08 | 已认证的在线语料任务记录、手动暂存执行器、仅入队的监视器、有限的来源追溯和运行记录、重试与容量控制，以及由 CI 验证的生产写入隔离。 |
 | **v0.5.0** | 2026-09-07 | 受治理的知识工程流程：暂存提取、质量检查和审核、待审批的实体消歧建议、审计证据、健康报告和兼容性门控的本体设计。 |
 | **v0.3.0** | 2026-09-05 | 版本化的 Logic 和 Skill 软件包、生产身份校验、人工门控的新兴工具，以及可选的查询时知识扩展。 |

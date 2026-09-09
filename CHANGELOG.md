@@ -2,6 +2,17 @@
 
 日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.6.0`。
 
+## [0.6.1] — 2026-09-09
+
+### Generic chat neutrality and workload identity
+
+- Generic Agent HTTP chat and completions no longer inject the EV-repair
+  system prompt or FaultCode RAG context by default. Domain-specific context
+  remains opt-in for endpoints that explicitly require it. (#206, #212)
+- Defined the workload OIDC contract for short-lived JWTs that mint
+  `IsolationClaims`. Backend-for-frontend services must validate workload
+  tokens and must not share `AGENTOS_JWT_SECRET`. (#211, #213)
+
 ## [0.6.0] — 2026-09-08
 
 ### Online Corpus Job + Watcher

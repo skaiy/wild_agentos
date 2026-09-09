@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.6.0-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.6.1-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -92,6 +92,7 @@ human-governed, auditable decisions.
 
 | Version | Date | Business summary |
 |---|---:|---|
+| **v0.6.1** | 2026-09-09 | Generic Agent chat and completions are domain-neutral by default; workload OIDC now defines short-lived JWTs for `IsolationClaims` without sharing BFF signing secrets. |
 | **v0.6.0** | 2026-09-08 | Authenticated online-corpus job records, manual staging runner, queue-only watchers, bounded source tracing and operational records, retry/capacity controls, and CI-proven production-write isolation. |
 | **v0.5.0** | 2026-09-07 | Governed knowledge-engineering flow: staged extraction, quality and review, approval-held identity suggestions, evidence, health reporting, and compatibility-gated ontology design. |
 | **v0.3.0** | 2026-09-05 | Versioned Logic and Skill packages, production identity validation, human-gated emerging tools, and optional read-time knowledge expansion. |
