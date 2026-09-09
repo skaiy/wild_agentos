@@ -6,8 +6,8 @@ license = "AGPL-3.0-only"
 description = "Portable OWL/RDF ontology engine — SHACL, reasoning, lint, diff"
 
 [dependencies]
-oxigraph = "0.5"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-anyhow = "1"
+oxigraph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

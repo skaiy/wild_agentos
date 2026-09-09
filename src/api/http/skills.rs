@@ -269,9 +269,7 @@ pub(crate) async fn register_skill_handler(
     }
     // 走技能准入流水线（Lint→Security→Test→Publish）：签名/Schema 等门禁在流水线内统一裁决，
     // 仅当门禁放行时 publish 回调才会真正持久化并注册技能。
-    use crate::tools::skill_pipeline::{
-        run_pipeline, PipelineContext, PipelineSource, TenantPromotionReview,
-    };
+    use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
     let iri = skill.skill_iri.clone();
     let ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
     let registry = state.core.skills.clone();

@@ -119,30 +119,28 @@ impl super::AgentRunner {
             if let Some(action) = parsed.get("action").and_then(|a| a.as_str()) {
                 response.action = Some(action.to_string());
             }
-        } else {
-            if let Some(extracted) = Self::try_extract_json_from_markdown(content) {
-                if let Ok(parsed) = serde_json::from_str::<Value>(&extracted) {
-                    response.is_valid_json = true;
-                    if let Some(summary) = parsed.get("summary").and_then(|s| s.as_str()) {
-                        response.summary = Some(summary.to_string());
+        } else if let Some(extracted) = Self::try_extract_json_from_markdown(content) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&extracted) {
+                response.is_valid_json = true;
+                if let Some(summary) = parsed.get("summary").and_then(|s| s.as_str()) {
+                    response.summary = Some(summary.to_string());
+                }
+                if let Some(content_str) = parsed.get("content").and_then(|s| s.as_str()) {
+                    response.content = content_str.to_string();
+                }
+                if !supports_native_reasoning {
+                    if let Some(thought) = parsed.get("thought").and_then(|s| s.as_str()) {
+                        response.thought = Some(thought.to_string());
                     }
-                    if let Some(content_str) = parsed.get("content").and_then(|s| s.as_str()) {
-                        response.content = content_str.to_string();
-                    }
-                    if !supports_native_reasoning {
-                        if let Some(thought) = parsed.get("thought").and_then(|s| s.as_str()) {
-                            response.thought = Some(thought.to_string());
-                        }
-                    }
-                    if let Some(action) = parsed.get("action").and_then(|a| a.as_str()) {
-                        response.action = Some(action.to_string());
-                    }
-                } else {
-                    response.summary = Some(Self::generate_auto_summary(content));
+                }
+                if let Some(action) = parsed.get("action").and_then(|a| a.as_str()) {
+                    response.action = Some(action.to_string());
                 }
             } else {
                 response.summary = Some(Self::generate_auto_summary(content));
             }
+        } else {
+            response.summary = Some(Self::generate_auto_summary(content));
         }
 
         response

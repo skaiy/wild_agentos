@@ -466,13 +466,11 @@ impl ToolExecutor {
                                                 "Cache hit: file unchanged since last read. Content already in your context from a previous read — skip re-reading and proceed with what you have.".to_string()
                                             ));
                                         }
-                                    } else {
-                                        if let Some(obj) = result.as_object_mut() {
-                                            obj.insert("from_cache".to_string(), Value::Bool(true));
-                                            obj.insert("message".to_string(), Value::String(
-                                                "Cache hit: file unchanged since last read. Content already in your context — skip re-reading.".to_string()
-                                            ));
-                                        }
+                                    } else if let Some(obj) = result.as_object_mut() {
+                                        obj.insert("from_cache".to_string(), Value::Bool(true));
+                                        obj.insert("message".to_string(), Value::String(
+                                            "Cache hit: file unchanged since last read. Content already in your context — skip re-reading.".to_string()
+                                        ));
                                     }
                                 }
                                 return Ok(result);

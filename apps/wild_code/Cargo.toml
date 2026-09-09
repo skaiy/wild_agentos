@@ -10,17 +10,17 @@ path = "src/main.rs"
 
 [dependencies]
 wild-agent-os-core = { path = "../..", features = ["ontology"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-anyhow = "1"
-glob = "0.3"
-tempfile = "3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+glob = { workspace = true }
+tempfile = { workspace = true }
 # openssl-sys 是 transitive dep via reqwest→native-tls（async-openai/jsonschema 引入）
 # CI 中手动预编译 musl OpenSSL + OPENSSL_DIR，不使用 openssl-src（它无法正确交叉编译 musl）
 
@@ -29,8 +29,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 crossterm = "0.28"
 tui-markdown = "0.3"
 mermaid-rs-renderer = { version = "0.2", default-features = false }
-unicode-width = "0.1"
-unicode-segmentation = "1.10"
+unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

@@ -7,6 +7,12 @@ pub struct LogBuffer {
     buffer: Arc<Mutex<VecDeque<String>>>,
 }
 
+impl Default for LogBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogBuffer {
     pub fn new() -> Self {
         Self {

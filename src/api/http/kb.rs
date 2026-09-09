@@ -2573,6 +2573,8 @@ mod kb_ingest_tests {
 /// CI golden cases selected with `cargo test isolation_contract`.
 #[cfg(test)]
 mod isolation_contract {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::api::http::{api_gov::ApiUsageState, AppState, TEST_ENV_LOCK};
     use crate::core::core_types::{CoreConfig, SemanticCore};

@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    blob::BlobStore,
     isolation::IsolationClaims,
     knowledge_graph::{
         store::KnowledgeGraphStore,
@@ -380,7 +379,7 @@ mod tests {
     use super::*;
     use crate::{
         api::http::{api_gov::ApiUsageState, SharedVectorStore},
-        blob::{BlobStore, LocalFsBlobStore},
+        blob::LocalFsBlobStore,
         config::GatewaySettings,
         core::core_types::{CoreConfig, SemanticCore},
         gateway::unified_gateway::UnifiedGateway,

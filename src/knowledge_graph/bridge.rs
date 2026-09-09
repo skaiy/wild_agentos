@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use super::store::KnowledgeGraphStore;
@@ -23,8 +25,8 @@ impl KnowledgeBridge {
     }
 
     pub fn with_shared_store(store: Arc<oxigraph::store::Store>) -> Result<Self, String> {
-        let store = KnowledgeGraphStore::with_shared_store(store)
-            .map_err(|error| error.to_string())?;
+        let store =
+            KnowledgeGraphStore::with_shared_store(store).map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             bridge_graph: "graph:bridge".to_string(),

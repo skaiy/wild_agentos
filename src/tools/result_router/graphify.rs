@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +30,8 @@ impl GraphifyEngine {
         store: Arc<oxigraph::store::Store>,
         max_entities: usize,
     ) -> Result<Self, String> {
-        let store = KnowledgeGraphStore::with_shared_store(store).map_err(|error| error.to_string())?;
+        let store =
+            KnowledgeGraphStore::with_shared_store(store).map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             max_entities,
@@ -467,10 +470,8 @@ impl GraphifyEngine {
                         relation_types.push(pred_short);
                     }
                     relation_count += 1;
-                } else {
-                    if !property_names.contains(&pred_short) {
-                        property_names.push(pred_short);
-                    }
+                } else if !property_names.contains(&pred_short) {
+                    property_names.push(pred_short);
                 }
             }
         }

@@ -4,7 +4,10 @@
 //! from the AgentOS process. This module removes variables whose names are
 //! conventionally used for secrets before creating a child process.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
+
+#[cfg(test)]
+use std::ffi::OsStr;
 
 const SENSITIVE_EXACT_KEYS: &[&str] = &[
     "AGENTOS_JWT_SECRET",

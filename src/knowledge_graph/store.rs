@@ -1,3 +1,5 @@
+#![allow(deprecated, unreachable_code)]
+
 use oxigraph::model::{GraphNameRef, NamedNodeRef};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
@@ -494,10 +496,7 @@ impl KnowledgeGraphStore {
 
     fn graph_triple_count_for_claims(&self, claims: &IsolationClaims) -> Result<usize, String> {
         let rows = self
-            .query_sparql_for_claims(
-                claims,
-                "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }",
-            )
+            .query_sparql_for_claims(claims, "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }")
             .map_err(|error| error.to_string())?;
         Self::parse_count_result(rows, "production")
     }

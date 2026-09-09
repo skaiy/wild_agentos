@@ -16,7 +16,6 @@ use wild_agent_os_core::core::five_w2h::{
 };
 use wild_agent_os_core::core::sa::SupervisorAgent;
 use wild_agent_os_core::gateway::unified_gateway::UnifiedGateway;
-use wild_agent_os_core::memory::l0_store::L0Store;
 use wild_agent_os_core::memory::l2_blackboard::Blackboard;
 use wild_agent_os_core::memory::l3_projection::ProjectionEngine;
 use wild_agent_os_core::memory::memory_manager::MemoryManager;

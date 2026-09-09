@@ -89,17 +89,14 @@ impl PreAggregatedIndex {
 
         for tag in &skill.tags {
             let tag_key = tag.to_lowercase();
-            self.tag_index
-                .entry(tag_key)
-                .or_insert_with(Vec::new)
-                .push(iri.clone());
+            self.tag_index.entry(tag_key).or_default().push(iri.clone());
         }
 
         for stack in &skill.w2h.where_.target_stack {
             let stack_key = stack.to_lowercase();
             self.stack_index
                 .entry(stack_key)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(iri.clone());
         }
 
@@ -107,7 +104,7 @@ impl PreAggregatedIndex {
             let role_key = role.to_lowercase();
             self.role_index
                 .entry(role_key)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(iri.clone());
         }
 

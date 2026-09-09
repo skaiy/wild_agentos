@@ -367,16 +367,14 @@ Output only the JSON array, no other content."#,
     fn parse_decomposition_result(&self, content: &str, context: &TaskContext) -> Vec<TaskContext> {
         let json_str = if content.starts_with('[') {
             content.to_string()
-        } else {
-            if let Some(start) = content.find('[') {
-                if let Some(end) = content.rfind(']') {
-                    content[start..=end].to_string()
-                } else {
-                    content.to_string()
-                }
+        } else if let Some(start) = content.find('[') {
+            if let Some(end) = content.rfind(']') {
+                content[start..=end].to_string()
             } else {
                 content.to_string()
             }
+        } else {
+            content.to_string()
         };
 
         match serde_json::from_str::<Value>(&json_str) {
@@ -499,16 +497,14 @@ Output only the JSON, no other content."#,
     fn parse_aggregation_result(&self, content: &str, fallback: &TaskResult) -> TaskResult {
         let json_str = if content.starts_with('{') {
             content.to_string()
-        } else {
-            if let Some(start) = content.find('{') {
-                if let Some(end) = content.rfind('}') {
-                    content[start..=end].to_string()
-                } else {
-                    content.to_string()
-                }
+        } else if let Some(start) = content.find('{') {
+            if let Some(end) = content.rfind('}') {
+                content[start..=end].to_string()
             } else {
                 content.to_string()
             }
+        } else {
+            content.to_string()
         };
 
         match serde_json::from_str::<Value>(&json_str) {

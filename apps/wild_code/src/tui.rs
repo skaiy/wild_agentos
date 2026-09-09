@@ -257,6 +257,7 @@ fn default_code_lang(content: &str) -> String {
     out
 }
 
+#[allow(clippy::useless_transmute)]
 fn markdown_to_owned_lines(content: &str) -> Vec<Line<'static>> {
     let prepared = default_code_lang(content);
     let text = tui_markdown::from_str(&prepared);
@@ -321,8 +322,8 @@ fn width_truncate(s: &str, max_width: usize) -> String {
         let gw = g.width();
         if w + gw > max_width {
             // Only add ellipsis if it fits — avoids terminal auto-wrap on overflow
-            if w + 1 <= max_width {
-                out.push_str("…");
+            if w < max_width {
+                out.push('…');
             }
             break;
         }
@@ -354,6 +355,7 @@ fn pad_to_width(s: &str, width: usize) -> String {
 /// Split a single Line into multiple Lines at display-width boundaries so that
 /// ratatui's Paragraph wrapping does not need to add extra visual rows (which
 /// would break the 1:1 mapping between line_map entries and screen rows).
+#[allow(clippy::needless_range_loop)]
 fn prewrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
     struct Chunk {
         text: String,
@@ -559,6 +561,7 @@ fn agent_id_to_role(agent_id: &str) -> &str {
 }
 
 /// Return phase only for major-phase events (SA/PA/DA/CA/AA).
+#[allow(clippy::if_same_then_else)]
 fn detect_phase(et: &str) -> Option<String> {
     if et == "TASK_START" || et.contains("CYCLE_STARTED") || et.contains("SA_STARTED") {
         Some("SA".into())
@@ -723,10 +726,9 @@ impl App {
             timeline_pending: 0,
         };
 
-        let welcome = format!(
-            "## Agent OS Programming Console\n\
-             \nCommands: `/help` for help  |  `Esc` to quit",
-        );
+        let welcome = "## Agent OS Programming Console\n\
+             \nCommands: `/help` for help  |  `Esc` to quit"
+            .to_string();
         app.messages.push(Message {
             role: MessageRole::System,
             content: welcome,
@@ -1096,10 +1098,8 @@ impl App {
             return;
         }
         if let Some(msg) = self.messages.get(msg_idx) {
-            if msg.can_expand {
-                if !self.expanded.remove(&msg_idx) {
-                    self.expanded.insert(msg_idx);
-                }
+            if msg.can_expand && !self.expanded.remove(&msg_idx) {
+                self.expanded.insert(msg_idx);
             }
         }
     }
@@ -1179,7 +1179,7 @@ impl App {
                         .skip(1)
                         .find(|(_, ch)| ch.is_whitespace())
                         .map(|(idx, _)| idx)
-                        .or_else(|| if before.is_empty() { None } else { Some(0) })
+                        .or(if before.is_empty() { None } else { Some(0) })
                     {
                         let end = Self::next_char_boundary(before, pos);
                         self.input.drain(end..self.cursor_position);
@@ -1662,6 +1662,7 @@ impl App {
     /// Format an event bus event into a clean human-readable message for the
     /// messages panel. Returns `(role, summary_text, optional_full_raw)` or
     /// `None` if the event should be silently consumed.
+    #[allow(clippy::redundant_guards)]
     fn format_ui_message(
         &self,
         event_type: &str,
@@ -2540,7 +2541,7 @@ fn strip_ansi_escapes(s: &str) -> String {
                             match ci.next() {
                                 Some((off, '\x07')) => break off + 1,
                                 Some((off, '\x1b')) => {
-                                    if ci.next().map_or(false, |(_, c2)| c2 == '\\') {
+                                    if ci.next().is_some_and(|(_, c2)| c2 == '\\') {
                                         break off + 2;
                                     }
                                 }
@@ -2556,7 +2557,7 @@ fn strip_ansi_escapes(s: &str) -> String {
                         let skip = loop {
                             match ci.next() {
                                 Some((off, '\x1b')) => {
-                                    if ci.next().map_or(false, |(_, c2)| c2 == '\\') {
+                                    if ci.next().is_some_and(|(_, c2)| c2 == '\\') {
                                         break off + 2;
                                     }
                                 }
