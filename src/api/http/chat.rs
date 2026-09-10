@@ -61,22 +61,105 @@ pub(crate) async fn agent_chat_handler(
         }
     };
     let messages = single_user_message(&message, &req.images);
+    if let Err((status, body)) = validate_image_payload(&messages) {
+        return (status, Json(body));
+    }
     let (status, body) = run_agent_chat(&state, &id, messages, Some(claims)).await;
     (status, Json(body))
 }
 
+const DEFAULT_MAX_IMAGES: usize = 8;
+const DEFAULT_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Image input is URL/data-URI payload, so this limits the bytes supplied by
+/// the caller. Remote image content is fetched by the configured model
+/// provider and cannot be measured safely at this boundary.
+fn image_payload_limits() -> (usize, usize) {
+    let max_images = std::env::var("AGENTOS_MAX_IMAGES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MAX_IMAGES);
+    let max_bytes = std::env::var("AGENTOS_MAX_IMAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MAX_IMAGE_BYTES);
+    (max_images, max_bytes)
+}
+
+fn image_urls(messages: &[ChatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.content.image_urls())
+        .collect()
+}
+
+fn validate_image_payload(messages: &[ChatMessage]) -> Result<(), (StatusCode, Value)> {
+    validate_image_payload_with_limits(messages, image_payload_limits())
+}
+
+fn validate_image_payload_with_limits(
+    messages: &[ChatMessage],
+    (max_images, max_bytes): (usize, usize),
+) -> Result<(), (StatusCode, Value)> {
+    let image_urls = image_urls(messages);
+    if image_urls.len() > max_images {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({
+                "error": "too_many_images",
+                "max_images": max_images,
+                "received_images": image_urls.len(),
+            }),
+        ));
+    }
+    let payload_bytes = image_urls.iter().map(String::len).sum::<usize>();
+    if payload_bytes > max_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({
+                "error": "image_payload_too_large",
+                "max_image_bytes": max_bytes,
+                "received_image_bytes": payload_bytes,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisionFallback {
+    Error,
+    Degrade,
+}
+
+fn vision_fallback_policy() -> VisionFallback {
+    vision_fallback_policy_from(std::env::var("AGENTOS_VISION_FALLBACK").ok().as_deref())
+}
+
+fn vision_fallback_policy_from(value: Option<&str>) -> VisionFallback {
+    if value == Some("degrade") {
+        VisionFallback::Degrade
+    } else {
+        VisionFallback::Error
+    }
+}
+
 /// Agent chat context ready for the gateway.
+#[derive(Debug)]
 struct ChatContext {
     messages: Vec<ChatMessage>,
     /// 本次实际调用的真实型号名（按 model_mounts 选模型解析，回退旧 model/default）。
     model: String,
+    vision_mount_unavailable: bool,
 }
 
-/// 解析 Agent 在指定能力槽上实际调用的真实型号名。
-/// 依 `keys` 顺序读 `model_mounts[key]` → `config_info.models.resources[id].model`；
-/// 均未命中时回退旧 `agent.model`（单模型），再回退 `gateway.default_model()`。
-async fn resolve_agent_model(state: &Arc<AppState>, agent: &Value, keys: &[&str]) -> String {
-    let mounts = agent.get("model_mounts");
+/// Resolve the configured resource for one capability mount.
+async fn mounted_model(state: &Arc<AppState>, agent: &Value, key: &str) -> Option<(String, Value)> {
+    let res_id = agent
+        .get("model_mounts")
+        .and_then(|mounts| mounts.get(key))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
     let resources = {
         let cfg = state.config_info.read().await;
         cfg.get("models")
@@ -84,25 +167,23 @@ async fn resolve_agent_model(state: &Arc<AppState>, agent: &Value, keys: &[&str]
             .and_then(|v| v.as_array())
             .cloned()
     };
-    if let (Some(mounts), Some(resources)) = (mounts, resources.as_ref()) {
-        for key in keys {
-            let res_id = match mounts
-                .get(key)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                Some(r) => r,
-                None => continue,
-            };
-            if let Some(model) = resources
-                .iter()
-                .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(res_id))
-                .and_then(|r| r.get("model").and_then(|v| v.as_str()))
-                .filter(|s| !s.is_empty())
-            {
-                return model.to_string();
-            }
-        }
+    resources?
+        .into_iter()
+        .find(|resource| resource.get("id").and_then(Value::as_str) == Some(res_id))
+        .and_then(|resource| {
+            let model = resource
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned);
+            model.map(|model| (model, resource))
+        })
+}
+
+/// Resolve the existing chat mount, then preserve legacy model/default fallback.
+async fn resolve_chat_model(state: &Arc<AppState>, agent: &Value) -> String {
+    if let Some((model, _)) = mounted_model(state, agent, "chat").await {
+        return model;
     }
     agent
         .get("model")
@@ -110,6 +191,21 @@ async fn resolve_agent_model(state: &Arc<AppState>, agent: &Value, keys: &[&str]
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| state.gateway.default_model())
+}
+
+fn resource_supports_vision(resource: &Value) -> bool {
+    resource
+        .get("supports_vision")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || resource
+            .get("modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| modality.as_str() == Some("vision"))
+            })
 }
 
 /// Claims-scoped chat may use only an agent explicitly owned by the same
@@ -148,6 +244,16 @@ async fn build_chat_context(
     id: &str,
     messages: Vec<ChatMessage>,
     claims: Option<&IsolationClaims>,
+) -> Result<ChatContext, (StatusCode, Value)> {
+    build_chat_context_with_fallback(state, id, messages, claims, vision_fallback_policy()).await
+}
+
+async fn build_chat_context_with_fallback(
+    state: &Arc<AppState>,
+    id: &str,
+    messages: Vec<ChatMessage>,
+    claims: Option<&IsolationClaims>,
+    fallback: VisionFallback,
 ) -> Result<ChatContext, (StatusCode, Value)> {
     // Locate user-state Agent first, then the static batch configuration.
     let agent = {
@@ -188,19 +294,28 @@ async fn build_chat_context(
             ));
         }
     }
-    let has_image = messages
-        .iter()
-        .any(|message| !message.content.image_urls().is_empty());
-    // Images use the vision slot (falling back to chat); text uses chat.
-    let model_keys: &[&str] = if has_image {
-        &["vision", "chat"]
+    let has_image = !image_urls(&messages).is_empty();
+    let (selected_model, vision_mount_unavailable) = if has_image {
+        match mounted_model(state, &agent, "vision").await {
+            Some((model, resource)) if resource_supports_vision(&resource) => (model, false),
+            _ => (resolve_chat_model(state, &agent).await, true),
+        }
     } else {
-        &["chat"]
+        (resolve_chat_model(state, &agent).await, false)
     };
-    let selected_model = resolve_agent_model(state, &agent, model_keys).await;
+    if vision_mount_unavailable && fallback == VisionFallback::Error {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "error": "vision_mount_unavailable",
+                "message": "images require a model_mounts.vision resource with vision capability",
+            }),
+        ));
+    }
     Ok(ChatContext {
         messages,
         model: selected_model,
+        vision_mount_unavailable,
     })
 }
 
@@ -222,14 +337,16 @@ async fn run_agent_chat(
                 .first()
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
-            (
-                StatusCode::OK,
-                json!({
-                    "status": "ok",
-                    "answer": answer,
-                    "model": rc.model,
-                }),
-            )
+            let mut body = json!({
+                "status": "ok",
+                "answer": answer,
+                "model": rc.model,
+            });
+            if rc.vision_mount_unavailable {
+                body["degraded"] = json!(true);
+                body["warning"] = json!("vision_mount_unavailable");
+            }
+            (StatusCode::OK, body)
         }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -421,8 +538,19 @@ pub(crate) async fn public_agent_chat_handler(
         )
             .into_response();
     }
-    let (status, body) =
-        run_agent_chat(&state, &id, single_user_message(&message, &[]), None).await;
+    let messages = single_user_message(&message, &req.images);
+    if let Err((status, body)) = validate_image_payload(&messages) {
+        write_public_audit(
+            &ctx,
+            &id,
+            "chat",
+            status.as_u16(),
+            started,
+            "image_payload_rejected",
+        );
+        return (status, Json(body)).into_response();
+    }
+    let (status, body) = run_agent_chat(&state, &id, messages, None).await;
     touch_key_last_used(&state, &ctx.key_id).await;
     write_public_audit(&ctx, &id, "chat", status.as_u16(), started, "ok");
     (status, Json(body)).into_response()
@@ -472,6 +600,7 @@ fn build_sse_response(
     report_model: String,
 ) -> axum::response::Response {
     let llm_model = rc.model.clone();
+    let vision_mount_unavailable = rc.vision_mount_unavailable;
     let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let created = chrono::Utc::now().timestamp();
     let stream = async_stream::stream! {
@@ -504,12 +633,16 @@ fn build_sse_response(
         // 尾包。
         match shape {
             StreamShape::Native => {
+                let mut done = json!({
+                    "answer": full,
+                    "model": llm_model,
+                });
+                if vision_mount_unavailable {
+                    done["degraded"] = json!(true);
+                    done["warning"] = json!("vision_mount_unavailable");
+                }
                 yield Ok(Event::default().event("done").data(
-                    json!({
-                        "answer": full,
-                        "model": llm_model,
-                    })
-                    .to_string(),
+                    done.to_string(),
                 ));
             }
             StreamShape::OpenAI => {
@@ -559,7 +692,11 @@ pub(crate) async fn public_agent_chat_stream_handler(
         )
             .into_response();
     }
-    let rc = match build_chat_context(&state, &id, single_user_message(&message, &[]), None).await {
+    let messages = single_user_message(&message, &req.images);
+    if let Err((status, body)) = validate_image_payload(&messages) {
+        return (status, Json(body)).into_response();
+    }
+    let rc = match build_chat_context(&state, &id, messages, None).await {
         Ok(c) => c,
         Err((status, body)) => {
             write_public_audit(&ctx, &id, "chat_stream", status.as_u16(), started, "error");
@@ -615,23 +752,28 @@ fn openai_error(
 }
 
 /// 非流式 OpenAI chat.completion 响应（model 回显请求的 agentId）。
-fn openai_completion_json(model: &str, answer: &str) -> axum::response::Response {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
-            "object": "chat.completion",
-            "created": chrono::Utc::now().timestamp(),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": answer },
-                "finish_reason": "stop",
-            }],
-            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
-        })),
-    )
-        .into_response()
+fn openai_completion_json(
+    model: &str,
+    answer: &str,
+    vision_mount_unavailable: bool,
+) -> axum::response::Response {
+    let mut body = json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": answer },
+            "finish_reason": "stop",
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
+    });
+    if vision_mount_unavailable {
+        body["degraded"] = json!(true);
+        body["warning"] = json!("vision_mount_unavailable");
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// GET /v1/models — 列出当前调用方 scope 内、且 published 的 Agent 作为 model。
@@ -711,7 +853,7 @@ pub(crate) async fn openai_chat_completions_handler(
     }
     // Preserve the full caller conversation, including caller-supplied system
     // messages and multimodal content. No default system prompt or RAG is added.
-    let gateway_messages = messages
+    let gateway_messages: Vec<ChatMessage> = messages
         .into_iter()
         .map(|message| ChatMessage {
             role: message.role,
@@ -722,6 +864,15 @@ pub(crate) async fn openai_chat_completions_handler(
             reasoning_content: None,
         })
         .collect();
+    if let Err((status, body)) = validate_image_payload(&gateway_messages) {
+        return openai_error(
+            status,
+            body.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid image payload"),
+            "invalid_request_error",
+        );
+    }
     let rc = match build_chat_context(&state, &id, gateway_messages, None).await {
         Ok(c) => c,
         Err((status, body)) => {
@@ -756,7 +907,7 @@ pub(crate) async fn openai_chat_completions_handler(
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
             write_public_audit(&ctx, &id, endpoint, 200, started, "ok");
-            openai_completion_json(&id, &answer)
+            openai_completion_json(&id, &answer, rc.vision_mount_unavailable)
         }
         Err(e) => {
             write_public_audit(&ctx, &id, endpoint, 502, started, "error");
@@ -949,6 +1100,134 @@ mod tests {
         );
     }
 
+    async fn configure_agent_a_model_mounts(
+        state: &Arc<AppState>,
+        vision_resource: Option<Value>,
+        chat_resource: Value,
+    ) {
+        *state.config_info.write().await = json!({
+            "models": { "resources": vision_resource.into_iter().chain(std::iter::once(chat_resource)).collect::<Vec<_>>() }
+        });
+        let mut agents = state.user_agents.write().await;
+        let agent = agents
+            .iter_mut()
+            .find(|agent| agent.get("id").and_then(Value::as_str) == Some("agent-a"))
+            .unwrap();
+        agent["model_mounts"] = json!({ "vision": "vision", "chat": "chat" });
+    }
+
+    #[tokio::test]
+    async fn image_request_uses_vision_mount_when_resource_supports_vision() {
+        let state = make_state();
+        configure_agent_a_model_mounts(
+            &state,
+            Some(json!({
+                "id": "vision", "model": "vl-model", "modalities": ["chat", "vision"]
+            })),
+            json!({ "id": "chat", "model": "text-model", "modalities": ["chat"] }),
+        )
+        .await;
+
+        let context = build_chat_context_with_fallback(
+            &state,
+            "agent-a",
+            single_user_message("describe", &["https://example.test/image.png".into()]),
+            None,
+            VisionFallback::Error,
+        )
+        .await
+        .unwrap();
+        assert_eq!(context.model, "vl-model");
+        assert!(!context.vision_mount_unavailable);
+    }
+
+    #[tokio::test]
+    async fn image_request_degrades_only_when_explicitly_enabled() {
+        let state = make_state();
+        configure_agent_a_model_mounts(
+            &state,
+            Some(json!({ "id": "vision", "model": "text-vision-slot", "modalities": ["chat"] })),
+            json!({ "id": "chat", "model": "text-model", "modalities": ["chat"] }),
+        )
+        .await;
+
+        let context = build_chat_context_with_fallback(
+            &state,
+            "agent-a",
+            single_user_message("describe", &["https://example.test/image.png".into()]),
+            None,
+            VisionFallback::Degrade,
+        )
+        .await
+        .unwrap();
+        assert_eq!(context.model, "text-model");
+        assert!(context.vision_mount_unavailable);
+    }
+
+    #[tokio::test]
+    async fn image_request_hard_fails_when_vision_mount_is_missing() {
+        let state = make_state();
+        let error = build_chat_context_with_fallback(
+            &state,
+            "agent-a",
+            single_user_message("describe", &["https://example.test/image.png".into()]),
+            None,
+            VisionFallback::Error,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.1["error"], "vision_mount_unavailable");
+    }
+
+    #[test]
+    fn vision_fallback_degrade_mode_is_opt_in() {
+        assert_eq!(vision_fallback_policy_from(None), VisionFallback::Error);
+        assert_eq!(
+            vision_fallback_policy_from(Some("degrade")),
+            VisionFallback::Degrade
+        );
+        assert_eq!(
+            vision_fallback_policy_from(Some("error")),
+            VisionFallback::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_request_does_not_require_a_vision_mount() {
+        let state = make_state();
+        let context = build_chat_context_with_fallback(
+            &state,
+            "agent-a",
+            single_user_message("text only", &[]),
+            None,
+            VisionFallback::Error,
+        )
+        .await
+        .unwrap();
+        assert_eq!(context.model, "test-model");
+        assert!(!context.vision_mount_unavailable);
+    }
+
+    #[test]
+    fn image_payload_limits_reject_excess_count_and_bytes() {
+        let too_many = single_user_message(
+            "describe",
+            &[
+                "https://example.test/1.png".into(),
+                "https://example.test/2.png".into(),
+            ],
+        );
+        let count_error = validate_image_payload_with_limits(&too_many, (1, 1024)).unwrap_err();
+        assert_eq!(count_error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(count_error.1["error"], "too_many_images");
+
+        let too_large = single_user_message("describe", &["x".repeat(11)]);
+        let bytes_error = validate_image_payload_with_limits(&too_large, (1, 10)).unwrap_err();
+        assert_eq!(bytes_error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(bytes_error.1["error"], "image_payload_too_large");
+    }
+
     #[tokio::test]
     async fn isolation_contract_chat_without_verified_identity_returns_unauthorized_not_empty_success(
     ) {
@@ -963,7 +1242,7 @@ mod tests {
                     .uri("/api/v1/agents/agent-a/chat")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"message":"P0A80","named_graph":"graph://tenant-b/project-1","vector_namespace":"vector://tenant-b/project-1"}"#,
+                        r#"{"message":"P0A80","images":["https://example.test/vehicle.png"],"named_graph":"graph://tenant-b/project-1","vector_namespace":"vector://tenant-b/project-1"}"#,
                     ))
                     .unwrap(),
             )

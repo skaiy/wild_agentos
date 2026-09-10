@@ -48,6 +48,8 @@ jobs:
       run: cargo build --workspace --verbose
     - name: Run isolation contract golden suite
       run: cargo test --workspace isolation_contract --verbose
+    - name: Run chat vision and isolation contract gate
+      run: cargo test --lib api::http::chat --verbose
     - name: Run online corpus fail-closed isolation gate
       run: cargo test --workspace isolation_contract_online_corpus --verbose
     - name: Run materialization production-write gate
