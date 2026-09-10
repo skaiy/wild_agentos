@@ -1242,7 +1242,7 @@ mod tests {
                     .uri("/api/v1/agents/agent-a/chat")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"message":"P0A80","named_graph":"graph://tenant-b/project-1","vector_namespace":"vector://tenant-b/project-1"}"#,
+                        r#"{"message":"P0A80","images":["https://example.test/vehicle.png"],"named_graph":"graph://tenant-b/project-1","vector_namespace":"vector://tenant-b/project-1"}"#,
                     ))
                     .unwrap(),
             )
