@@ -171,11 +171,12 @@ async fn mounted_model(state: &Arc<AppState>, agent: &Value, key: &str) -> Optio
         .into_iter()
         .find(|resource| resource.get("id").and_then(Value::as_str) == Some(res_id))
         .and_then(|resource| {
-            resource
+            let model = resource
                 .get("model")
                 .and_then(Value::as_str)
                 .filter(|model| !model.is_empty())
-                .map(|model| (model.to_string(), resource))
+                .map(str::to_owned);
+            model.map(|model| (model, resource))
         })
 }
 
@@ -852,7 +853,7 @@ pub(crate) async fn openai_chat_completions_handler(
     }
     // Preserve the full caller conversation, including caller-supplied system
     // messages and multimodal content. No default system prompt or RAG is added.
-    let gateway_messages = messages
+    let gateway_messages: Vec<ChatMessage> = messages
         .into_iter()
         .map(|message| ChatMessage {
             role: message.role,
