@@ -607,7 +607,7 @@ pub(crate) async fn import_git_skill_handler(
         let _ = std::fs::remove_dir_all(dir);
     };
 
-    if !output.status.success() && req.r#ref == "main" {
+    if !output.status.success() && git_source.git_ref == "main" {
         cleanup(&clone_dir);
         output = match tokio::process::Command::new("git")
             .args([
