@@ -126,7 +126,7 @@ fn validate_image_payload_with_limits(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisionFallback {
     Error,
     Degrade,
