@@ -72,8 +72,10 @@ Content-Type: application/json
 
 ### 2.2 模型槽（已有）
 
-有图时解析顺序：`model_mounts["vision"]` → `model_mounts["chat"]` → 旧 `agent.model` → `gateway.default_model()`。  
-无图：仅 `chat` 槽。
+有图时，配置的 `model_mounts["vision"]` resource 必须解析为具备视觉能力的模型（`supports_vision: true` 或 `modalities` 含 `vision`）。vision resource 缺失、无法解析或指向文本模型时，默认返回 `422 vision_mount_unavailable`，不得静默回退 chat。仅兼容模式可设 `AGENTOS_VISION_FALLBACK=degrade`，返回 `degraded: true` 与 `warning: "vision_mount_unavailable"`。  
+无图时解析：`model_mounts["chat"]` → 旧 `agent.model` → `gateway.default_model()`。
+
+图片输入在 gateway 调用前受限：`AGENTOS_MAX_IMAGES` 默认 `8`，`AGENTOS_MAX_IMAGE_BYTES` 默认 `10485760`（10 MiB），按提交的 URL/data-URI payload 字节计。超限返回 `413 too_many_images` 或 `413 image_payload_too_large`。gateway 拒绝或超时仍是硬错误，不得重试为纯文本。
 
 **演示现网缺口（配置，非架构）**：`structcapture-organizer` 的 **vision 槽未挂真实 VL**（或挂了文本型号），gateway 亦多为文本 MiniMax → 表现为「能传 images，但识图质量/能力不足」。优先 **配模型资源 + mounts**，再谈改代码。
 
@@ -118,6 +120,8 @@ Content-Type: application/json
 | P0-3 | 当 vision 槽缺失且回退到纯文本模型时：**可观测**（响应头/正文字段/`warning` 或 4xx 策略二选一，产品定一种并写死） | 小改/策略 | 测例证明不「假识图」 |
 | P0-4 | 体积上限与 413/业务码（可配置） | 硬化 | 超限可测 |
 | P0-5 | OIDC + isolation + 带图：正/负例 CI | 测试 | 无 claims 仍 401 |
+
+**已定回退策略（开源线）：** 默认**硬 4xx**（`vision_mount_unavailable`）；仅 `AGENTOS_VISION_FALLBACK=degrade` 是兼容逃生阀，且必须带 `degraded` / `warning: vision_mount_unavailable`。**始终禁止静默丢图。**
 
 ### P1 — 对齐记忆与技能（仍复用 DESIGN_DETAIL）
 
@@ -227,8 +231,8 @@ POST message + images[]  ─────────────►  已有 chat
 
 ## 12. 开放问题（开源线拍板）
 
-1. ~~vision 回退到 chat（文本模型）时：硬错误 vs 带 `warning` 的软降级？~~ **已定**：默认软降级 + `warning: vision_mount_unavailable` / `degraded`；`AGENTOS_VISION_FALLBACK=error` 可硬 4xx。  
-2. 单请求 `max_images` / `max_bytes` 官方默认？  
+1. ~~vision 回退到 chat（文本模型）时：硬错误 vs 带 `warning` 的软降级？~~ **已定**：默认硬 4xx；`AGENTOS_VISION_FALLBACK=degrade` 是显式的仅兼容软降级模式。  
+2. ~~单请求 `max_images` / `max_bytes` 官方默认？~~ **已定**：`8` 张、`10485760` 个提交 payload 字节（均可配置）。  
 3. 图证据是否在 P1 强制落 L2 @id，还是 chat 无状态透传即可？  
 4. ~~目标版本：`0.6.x` 热修还是 `0.7.0`？~~ **已定**：**v0.6.2**（milestone 热修切片）。
 
@@ -240,4 +244,4 @@ POST message + images[]  ─────────────►  已有 chat
 |---|---|---|
 | 2026-09-09 | 0.1.0 | 初稿能力清单 |
 | 2026-09-09 | 0.2.0 | **修订**：强制对齐 `13-DESIGN_DETAIL`；标明已有 `images`/vision mounts；P0 改为配置+契约硬化优先，反对平行造轮 |
-| 2026-09-09 | 0.2.0 | 记入开源线定案：v0.6.2；vision 回退默认软降级+warning；配 EN 文件 |
+| 2026-09-10 | 0.2.1 | 修正回退契约：默认硬失败；记录兼容软降级模式与 payload 默认值。 |

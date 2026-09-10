@@ -73,8 +73,10 @@ Content-Type: application/json
 
 ### 2.2 Model mounts (already implemented)
 
-With images, resolve in order: `model_mounts["vision"]` → `model_mounts["chat"]` → legacy `agent.model` → `gateway.default_model()`.  
-Without images: `chat` only.
+With images, the configured `model_mounts["vision"]` resource must resolve to a vision-capable model (`supports_vision: true` or `modalities` containing `vision`). Missing, unresolved, or text-only vision resources return `422 vision_mount_unavailable` by default; they do not fall back silently to chat. Set `AGENTOS_VISION_FALLBACK=degrade` only for compatibility mode, which returns `degraded: true` and `warning: "vision_mount_unavailable"`.  
+Without images: resolve `model_mounts["chat"]` → legacy `agent.model` → `gateway.default_model()`.
+
+Image input is limited before gateway dispatch: `AGENTOS_MAX_IMAGES` defaults to `8` and `AGENTOS_MAX_IMAGE_BYTES` defaults to `10485760` (10 MiB), counting the supplied URL/data-URI payload bytes. Exceeding either limit returns `413 too_many_images` or `413 image_payload_too_large`. Gateway rejections and timeouts remain hard errors; they never trigger a text-only retry.
 
 **Demo gap (config, not architecture):** `structcapture-organizer` often has **no real VL on the vision mount** (or points at a text model); gateway may also be text MiniMax → “images are accepted but vision quality is poor”. Prefer **register model resources + mounts** before changing Core.
 
@@ -120,7 +122,7 @@ Without images: `chat` only.
 | P0-4 | Payload limits + 413 / business code (configurable) | Harden | Oversize is testable |
 | P0-5 | OIDC + isolation + images: positive/negative CI | Tests | Missing claims still 401 |
 
-**Decided fallback policy (open-source line):** default **soft degrade + warning** (`degraded` / `warning: vision_mount_unavailable`); set `AGENTOS_VISION_FALLBACK=error` for hard 4xx. **Silent drop remains forbidden.**
+**Decided fallback policy (open-source line):** default **hard 4xx** (`vision_mount_unavailable`); `AGENTOS_VISION_FALLBACK=degrade` is the sole compatibility escape hatch and includes `degraded` / `warning: vision_mount_unavailable`. **Silent drop remains forbidden.**
 
 ### P1 — Align memory & skills (still reuse DESIGN_DETAIL)
 
@@ -230,8 +232,8 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 
 ## 12. Open questions (product/ops)
 
-1. ~~Soft vs hard when vision falls back to text?~~ **Decided:** soft + warning by default; `AGENTOS_VISION_FALLBACK=error` for hard 4xx.  
-2. Official defaults for `max_images` / `max_bytes`?  
+1. ~~Soft vs hard when vision falls back to text?~~ **Decided:** hard 4xx by default; `AGENTOS_VISION_FALLBACK=degrade` is explicit compatibility-only degrade mode.  
+2. ~~Official defaults for `max_images` / `max_bytes`?~~ **Decided:** `8` images and `10485760` supplied payload bytes (both configurable).  
 3. Must P1 force L2 @id persistence, or is stateless chat enough for now?  
 4. ~~0.6.x vs 0.7.0?~~ **Decided:** **v0.6.2** hotfix slice.
 
@@ -243,4 +245,4 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 |---|---|---|
 | 2026-09-09 | 0.1.0 | Initial capability list (zh) |
 | 2026-09-09 | 0.2.0 | zh: force DESIGN_DETAIL reuse; document landed `images`/vision mounts |
-| 2026-09-09 | 0.2.0 | **EN pair** for PR #215; record v0.6.2 + soft-degrade+warning decision |
+| 2026-09-10 | 0.2.1 | Correct fallback contract: hard fail by default; document compatibility degrade mode and payload defaults. |
