@@ -1050,7 +1050,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(nodes["count"].as_u64().unwrap() >= 2);
+        assert_eq!(nodes["count"], 1);
+        assert!(nodes.to_string().contains("only tenant a may read this"));
         assert!(!nodes.to_string().contains(&tenant_b_task));
 
         for task_iri in [&tenant_b_task, &legacy_task] {
