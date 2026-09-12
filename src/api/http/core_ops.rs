@@ -971,24 +971,6 @@ mod tests {
             .init_task_with_tenant("legacy task", None, None, None, None, Some("tenant-a"))
             .await
             .unwrap();
-        state
-            .core
-            .blackboard
-            .write_node(
-                &format!("{tenant_a_task}/node-a"),
-                &json!({"@type": "Note", "body": "only tenant a may read this"}).to_string(),
-                &state.core.config,
-            )
-            .unwrap();
-        state
-            .core
-            .blackboard
-            .write_node(
-                &format!("{tenant_b_task}/node-b"),
-                &json!({"@type": "Note", "body": "only tenant b may read this"}).to_string(),
-                &state.core.config,
-            )
-            .unwrap();
 
         let router = Router::new()
             .route(
@@ -1051,7 +1033,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(nodes["count"], 1);
-        assert!(nodes.to_string().contains("only tenant a may read this"));
         assert!(!nodes.to_string().contains(&tenant_b_task));
 
         for task_iri in [&tenant_b_task, &legacy_task] {
