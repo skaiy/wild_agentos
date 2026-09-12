@@ -7,6 +7,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::isolation::IsolationClaims;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HookPoint {
     AgentInit,
@@ -75,6 +77,8 @@ pub struct HookContext {
     pub hook_point: HookPoint,
     pub agent_id: String,
     pub agent_role: String,
+    /// Verified scope of the operation that caused this hook invocation.
+    pub isolation_claims: Option<IsolationClaims>,
     pub task_id: Option<String>,
     pub task_iri: Option<String>,
     pub data: HashMap<String, Value>,
@@ -89,6 +93,7 @@ impl HookContext {
             hook_point,
             agent_id: agent_id.to_string(),
             agent_role: agent_role.to_string(),
+            isolation_claims: None,
             task_id: None,
             task_iri: None,
             data: HashMap::new(),
@@ -104,6 +109,12 @@ impl HookContext {
     pub fn with_task(mut self, task_id: &str, task_iri: &str) -> Self {
         self.task_id = Some(task_id.to_string());
         self.task_iri = Some(task_iri.to_string());
+        self
+    }
+
+    /// Associates this hook invocation with authentication-bound claims.
+    pub fn with_isolation_claims(mut self, claims: Option<IsolationClaims>) -> Self {
+        self.isolation_claims = claims;
         self
     }
 
