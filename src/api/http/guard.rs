@@ -13,17 +13,15 @@ use crate::{
     tools::tool_guard::{GuardAuditEntry, GUARD_AUDIT_LOG},
 };
 
-fn require_claims(identity: &UserIdentity) -> Result<&IsolationClaims, Response> {
-    identity.isolation_claims().ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "verified_isolation_claims_required",
-                "message": "Verified IsolationClaims are required for guard audit access",
-            })),
-        )
-            .into_response()
-    })
+fn missing_isolation_claims() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "verified_isolation_claims_required",
+            "message": "Verified IsolationClaims are required for guard audit access",
+        })),
+    )
+        .into_response()
 }
 
 fn audit_entry_is_in_scope(entry: &GuardAuditEntry, claims: &IsolationClaims) -> bool {
@@ -90,9 +88,8 @@ fn redact_audit_entry(entry: GuardAuditEntry) -> Value {
 }
 
 pub(crate) async fn guard_audit_handler(identity: UserIdentity) -> Response {
-    let claims = match require_claims(&identity) {
-        Ok(claims) => claims,
-        Err(response) => return response,
+    let Some(claims) = identity.isolation_claims() else {
+        return missing_isolation_claims();
     };
     let entries: Vec<Value> = scoped_audit_entries(claims)
         .into_iter()
@@ -106,9 +103,8 @@ pub(crate) async fn guard_audit_handler(identity: UserIdentity) -> Response {
 }
 
 pub(crate) async fn guard_stats_handler(identity: UserIdentity) -> Response {
-    let claims = match require_claims(&identity) {
-        Ok(claims) => claims,
-        Err(response) => return response,
+    let Some(claims) = identity.isolation_claims() else {
+        return missing_isolation_claims();
     };
     let entries = scoped_audit_entries(claims);
     let total = entries.len();
