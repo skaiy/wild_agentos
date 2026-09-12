@@ -52,18 +52,32 @@ pub(crate) async fn create_task_handler(
     identity: UserIdentity,
     Json(req): Json<TaskRequest>,
 ) -> impl IntoResponse {
-    match state
-        .core
-        .init_task_with_tenant(
-            &req.user_input,
-            None,
-            None,
-            req.user_id.as_deref(),
-            req.session_id.as_deref(),
-            identity.isolation_claims().map(|claims| claims.tenant_id()),
-        )
-        .await
-    {
+    let result = if let Some(claims) = identity.isolation_claims() {
+        state
+            .core
+            .init_task_with_claims(
+                &req.user_input,
+                None,
+                None,
+                req.user_id.as_deref(),
+                req.session_id.as_deref(),
+                claims,
+            )
+            .await
+    } else {
+        state
+            .core
+            .init_task_with_tenant(
+                &req.user_input,
+                None,
+                None,
+                req.user_id.as_deref(),
+                req.session_id.as_deref(),
+                None,
+            )
+            .await
+    };
+    match result {
         Ok(task_iri) => (
             StatusCode::CREATED,
             Json(json!({"task_iri": task_iri, "status": "created"})),

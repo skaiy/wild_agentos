@@ -267,15 +267,37 @@ pub(crate) async fn stream_batch_events_handler(
 }
 
 // ============================================================
-// 方案A 平台运维态：L2 黑板浏览器（只读）+ 批处理 Agent 运维台
+// L2 黑板浏览器（claims-scoped 只读）+ 批处理 Agent 运维台
 // ============================================================
 
-/// GET /api/v1/blackboard/tasks — 列出黑板上所有任务（平台/任务态，跨租户）。
+/// GET /api/v1/blackboard/tasks — list tasks in the verified tenant/project scope.
 pub(crate) async fn list_blackboard_tasks_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
 ) -> impl IntoResponse {
-    let tasks = state.core.blackboard.list_task_summaries();
-    Json(json!({ "count": tasks.len(), "tasks": tasks }))
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims required for blackboard access"})),
+        )
+            .into_response();
+    };
+    let tasks: Vec<_> = state
+        .core
+        .blackboard
+        .list_task_summaries()
+        .into_iter()
+        .filter(|summary| {
+            state
+                .core
+                .blackboard
+                .read_node(&summary.task_iri)
+                .ok()
+                .flatten()
+                .is_some_and(|task| task_is_in_scope(&task.json_ld, claims))
+        })
+        .collect();
+    Json(json!({ "count": tasks.len(), "tasks": tasks })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,17 +309,52 @@ pub(crate) struct BlackboardNodesQuery {
 }
 
 /// GET /api/v1/blackboard/nodes?task_iri=..&role=..&node_type=..&cycle_id=..
-/// 读取指定任务下的节点（只读），支持角色/类型/周期多维过滤。task_iri 以查询参数传入以规避 IRI 内含斜杠。
+/// Read nodes in a verified task scope, with role/type/cycle filters.
+/// `task_iri` remains a query parameter because IRIs may contain slashes.
 pub(crate) async fn list_blackboard_nodes_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Query(q): Query<BlackboardNodesQuery>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims required for blackboard access"})),
+        )
+            .into_response();
+    };
     let task_iri = q.task_iri.trim().to_string();
     if task_iri.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "task_iri 不能为空" })),
-        );
+        )
+            .into_response();
+    }
+    match state.core.blackboard.read_node(&task_iri) {
+        Ok(Some(task)) if task_is_in_scope(&task.json_ld, claims) => {}
+        Ok(Some(_)) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "task is outside the verified isolation scope"})),
+            )
+                .into_response()
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "task not found"})),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%task_iri, "failed to read task scope: {}", error);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to verify task scope"})),
+            )
+                .into_response();
+        }
     }
     let filter = QueryFilter {
         role: q.role.as_deref().and_then(|r| r.parse().ok()),
@@ -316,12 +373,34 @@ pub(crate) async fn list_blackboard_nodes_handler(
                 StatusCode::OK,
                 Json(json!({ "task_iri": task_iri, "count": items.len(), "nodes": items })),
             )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("读取节点失败: {e}") })),
-        ),
+        )
+            .into_response(),
     }
+}
+
+/// Validate a persisted task scope against verified claims.
+///
+/// This deliberately treats malformed, tenant-only, and otherwise legacy task
+/// records as out of scope. The endpoint must not infer scope from task IRI or
+/// child nodes.
+fn task_is_in_scope(json_ld: &str, claims: &crate::isolation::IsolationClaims) -> bool {
+    let Ok(task) = serde_json::from_str::<Value>(json_ld) else {
+        return false;
+    };
+    let is_task = task.get("@type").is_some_and(|kind| {
+        kind.as_str() == Some("Task")
+            || kind
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|value| value.as_str() == Some("Task")))
+    });
+    is_task
+        && task.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+        && task.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
 }
 
 /// GET /api/v1/batch/agents — 列出所有批处理 Agent 及其状态/窗口/指标/配置摘要（平台运维态）。
@@ -585,7 +664,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
-        routing::post,
+        routing::{get, post},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -670,6 +749,13 @@ mod tests {
 
     async fn response_status(router: &Router, request: Request<Body>) -> StatusCode {
         router.clone().oneshot(request).await.unwrap().status()
+    }
+
+    async fn response_json(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
     }
 
     #[tokio::test]
@@ -835,6 +921,150 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"], "task_iri is required");
+
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+        match previous_jwt_secret {
+            Some(value) => std::env::set_var("AGENTOS_JWT_SECRET", value),
+            None => std::env::remove_var("AGENTOS_JWT_SECRET"),
+        }
+    }
+
+    #[tokio::test]
+    async fn blackboard_list_and_nodes_require_claims_and_are_scope_limited() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let tenant_a =
+            crate::isolation::IsolationClaims::from_verified("tenant-a", "project-a", "actor-a")
+                .unwrap();
+        let tenant_b =
+            crate::isolation::IsolationClaims::from_verified("tenant-b", "project-a", "actor-b")
+                .unwrap();
+        let tenant_a_task = state
+            .core
+            .init_task_with_claims("tenant a task", None, None, None, None, &tenant_a)
+            .await
+            .unwrap();
+        let tenant_b_task = state
+            .core
+            .init_task_with_claims("tenant b task", None, None, None, None, &tenant_b)
+            .await
+            .unwrap();
+        let legacy_task = state
+            .core
+            .init_task_with_tenant("legacy task", None, None, None, None, Some("tenant-a"))
+            .await
+            .unwrap();
+        state
+            .core
+            .blackboard
+            .write_node(
+                &format!("{tenant_a_task}/node-a"),
+                &json!({"@type": "Note", "body": "only tenant a may read this"}).to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+        state
+            .core
+            .blackboard
+            .write_node(
+                &format!("{tenant_b_task}/node-b"),
+                &json!({"@type": "Note", "body": "only tenant b may read this"}).to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+
+        let router = Router::new()
+            .route(
+                "/api/v1/blackboard/tasks",
+                get(list_blackboard_tasks_handler),
+            )
+            .route(
+                "/api/v1/blackboard/nodes",
+                get(list_blackboard_nodes_handler),
+            )
+            .with_state(state);
+
+        let unauthenticated_uris = vec![
+            "/api/v1/blackboard/tasks".to_string(),
+            format!("/api/v1/blackboard/nodes?task_iri={tenant_a_task}"),
+        ];
+        for uri in unauthenticated_uris {
+            let request = Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                response_status(&router, request).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let (status, tasks) = response_json(
+            &router,
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/blackboard/tasks")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tasks["count"], 1);
+        assert_eq!(tasks["tasks"][0]["task_iri"], tenant_a_task);
+        assert!(!tasks.to_string().contains(&tenant_b_task));
+        assert!(!tasks.to_string().contains(&legacy_task));
+
+        let (status, nodes) = response_json(
+            &router,
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/blackboard/nodes?task_iri={tenant_a_task}"))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(nodes["count"].as_u64().unwrap() >= 2);
+        assert!(!nodes.to_string().contains(&tenant_b_task));
+
+        for task_iri in [&tenant_b_task, &legacy_task] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/blackboard/nodes?task_iri={task_iri}"))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+                )
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                response_status(&router, request).await,
+                StatusCode::FORBIDDEN
+            );
+        }
 
         match previous_auth_mode {
             Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
