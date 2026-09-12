@@ -78,6 +78,7 @@ pub struct HookContext {
     pub agent_id: String,
     pub agent_role: String,
     /// Verified scope of the operation that caused this hook invocation.
+    #[serde(skip)]
     pub isolation_claims: Option<IsolationClaims>,
     pub task_id: Option<String>,
     pub task_iri: Option<String>,
