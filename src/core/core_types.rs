@@ -185,7 +185,6 @@ impl SemanticCore {
             user_id,
             session_id,
             None,
-            None,
         )
         .await
     }
@@ -207,8 +206,7 @@ impl SemanticCore {
             parent_task_iri,
             user_id,
             session_id,
-            tenant_id,
-            None,
+            tenant_id.map(|tenant_id| (tenant_id, None)),
         )
         .await
     }
@@ -232,8 +230,7 @@ impl SemanticCore {
             parent_task_iri,
             user_id,
             session_id,
-            Some(claims.tenant_id()),
-            Some(claims.project_id()),
+            Some((claims.tenant_id(), Some(claims.project_id()))),
         )
         .await
     }
@@ -245,9 +242,11 @@ impl SemanticCore {
         parent_task_iri: Option<&str>,
         user_id: Option<&str>,
         session_id: Option<&str>,
-        tenant_id: Option<&str>,
-        project_id: Option<&str>,
+        scope: Option<(&str, Option<&str>)>,
     ) -> Result<String, CoreError> {
+        let (tenant_id, project_id) = scope.map_or((None, None), |(tenant_id, project_id)| {
+            (Some(tenant_id), project_id)
+        });
         let task_iri = format!("iri://task_{}", uuid::Uuid::new_v4().hyphenated());
         let task_node = serde_json::json!({
             "@id": &task_iri,
