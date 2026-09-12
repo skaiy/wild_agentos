@@ -52,18 +52,26 @@ pub(crate) async fn create_task_handler(
     identity: UserIdentity,
     Json(req): Json<TaskRequest>,
 ) -> impl IntoResponse {
-    match state
-        .core
-        .init_task_with_tenant(
+    let result = if let Some(claims) = identity.isolation_claims() {
+        state.core.init_task_with_claims(
             &req.user_input,
             None,
             None,
             req.user_id.as_deref(),
             req.session_id.as_deref(),
-            identity.isolation_claims().map(|claims| claims.tenant_id()),
+            claims,
         )
-        .await
-    {
+    } else {
+        state.core.init_task_with_tenant(
+            &req.user_input,
+            None,
+            None,
+            req.user_id.as_deref(),
+            req.session_id.as_deref(),
+            None,
+        )
+    };
+    match result.await {
         Ok(task_iri) => (
             StatusCode::CREATED,
             Json(json!({"task_iri": task_iri, "status": "created"})),
@@ -73,6 +81,68 @@ pub(crate) async fn create_task_handler(
             Json(json!({"error": e.to_string()})),
         ),
     }
+}
+
+/// GET /api/v1/tasks — list only tasks carrying the caller's verified scope.
+///
+/// Task records without both scope fields are legacy/unverified and deliberately
+/// excluded. This endpoint must never fall back to the platform task index.
+pub(crate) async fn list_tasks_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims are required"})),
+        )
+            .into_response();
+    };
+
+    let mut tasks: Vec<Value> = state
+        .core
+        .blackboard
+        .list_task_summaries()
+        .into_iter()
+        .filter_map(|summary| {
+            let node = state.core.blackboard.read_node(&summary.task_iri).ok()??;
+            let task: Value = serde_json::from_str(&node.json_ld).ok()?;
+            let is_task = task.get("@type").is_some_and(|kind| {
+                kind.as_str() == Some("Task")
+                    || kind.as_array().is_some_and(|kinds| {
+                        kinds.iter().any(|value| value.as_str() == Some("Task"))
+                    })
+            });
+            let in_scope = task.get("tenant_id").and_then(Value::as_str)
+                == Some(claims.tenant_id())
+                && task.get("project_id").and_then(Value::as_str) == Some(claims.project_id());
+            if !is_task || !in_scope {
+                return None;
+            }
+
+            let created_at = task
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| node.created_at.to_rfc3339());
+            Some(json!({
+                "id": summary.task_iri,
+                "iri": summary.task_iri,
+                "task_iri": summary.task_iri,
+                "status": task.get("status").and_then(Value::as_str).unwrap_or(&summary.status),
+                "created_at": created_at,
+                "interrupt_status": Value::Null,
+                "approval_status": Value::Null,
+            }))
+        })
+        .collect();
+    tasks.sort_by(|left, right| {
+        right["created_at"]
+            .as_str()
+            .cmp(&left["created_at"].as_str())
+    });
+
+    Json(json!({ "count": tasks.len(), "tasks": tasks })).into_response()
 }
 
 pub(crate) async fn get_task_handler(
@@ -652,4 +722,175 @@ fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> 
     };
 
     Some(Event::default().event(event_name).data(data.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::{
+        api::http::{api_gov::ApiUsageState, iam::JwtClaims, AppState, TEST_ENV_LOCK},
+        config::GatewaySettings,
+        core::core_types::{CoreConfig, SemanticCore},
+        gateway::unified_gateway::UnifiedGateway,
+        isolation::IsolationClaims,
+        tools::prompt_registry::PromptRegistry,
+    };
+
+    fn test_state() -> Arc<AppState> {
+        let dir = tempfile::tempdir().unwrap();
+        let l0_dir = dir.keep();
+        let core = Arc::new(
+            SemanticCore::new(CoreConfig {
+                l0_storage_path: l0_dir.to_string_lossy().into_owned(),
+                enable_metrics: false,
+                ..CoreConfig::default()
+            })
+            .unwrap(),
+        );
+        let gateway = Arc::new(
+            UnifiedGateway::new(&GatewaySettings {
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                default_model: "test-model".into(),
+                timeout_seconds: 30,
+                max_retries: 1,
+                retry_base_ms: 500,
+                use_responses_api: false,
+                model_mapping: std::collections::HashMap::new(),
+            })
+            .unwrap(),
+        );
+        Arc::new(AppState {
+            core,
+            gateway,
+            kg_store: Arc::new(oxigraph::store::Store::new().unwrap()),
+            config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
+            agents_info: json!({}),
+            mcp_servers: Arc::new(tokio::sync::RwLock::new(vec![])),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![])),
+            prompts: Arc::new(PromptRegistry::new()),
+            kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            blob_store: None,
+            task_executor: None,
+            batch_manager: None,
+            api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    fn jwt(tenant_id: &str, project_id: &str) -> String {
+        encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "test-user".into(),
+                tenant_id: tenant_id.into(),
+                project_id: Some(project_id.into()),
+                roles: vec![],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
+    async fn get_tasks(router: &Router, token: Option<&str>) -> (StatusCode, Value) {
+        let mut request = Request::builder().method("GET").uri("/api/v1/tasks");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn task_list_requires_claims_and_never_exposes_other_scopes() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let saved_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+
+        let state = test_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-a", "actor-b").unwrap();
+        let tenant_a_task = state
+            .core
+            .init_task_with_claims("task for tenant a", None, None, None, None, &tenant_a)
+            .await
+            .unwrap();
+        let tenant_b_task = state
+            .core
+            .init_task_with_claims("task for tenant b", None, None, None, None, &tenant_b)
+            .await
+            .unwrap();
+        // Legacy records without a full verified scope must not be enumerable.
+        state
+            .core
+            .init_task_with_tenant("legacy task", None, None, None, None, Some("tenant-a"))
+            .await
+            .unwrap();
+
+        let router = Router::new()
+            .route("/api/v1/tasks", get(list_tasks_handler))
+            .with_state(state);
+
+        let (status, _) = get_tasks(&router, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, response) = get_tasks(&router, Some(&jwt("tenant-a", "project-a"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["count"], 1);
+        let tasks = response["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["id"], tenant_a_task);
+        assert_eq!(tasks[0]["iri"], tenant_a_task);
+        assert_ne!(tasks[0]["iri"], tenant_b_task);
+        assert!(tasks[0]["created_at"].is_string());
+        assert!(tasks[0]["interrupt_status"].is_null());
+        assert!(tasks[0]["approval_status"].is_null());
+        assert!(
+            !response.to_string().contains(&tenant_b_task),
+            "cross-tenant task IRI leaked in response"
+        );
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    fn restore_env(name: &str, previous: Option<std::ffi::OsString>) {
+        if let Some(value) = previous {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
 }
