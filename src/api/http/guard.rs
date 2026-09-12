@@ -76,11 +76,7 @@ fn redact_secrets(value: &mut Value) {
         }
         // Validators can include an external tool's JSON response in `error`.
         // Never expose an opaque error that advertises or embeds secret fields.
-        Value::String(text)
-            if text
-                .split(|character: char| !character.is_ascii_alphanumeric())
-                .any(is_sensitive_field) =>
-        {
+        Value::String(text) if is_sensitive_field(text) => {
             *text = "[REDACTED]".to_string();
         }
         _ => {}
