@@ -671,7 +671,10 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use super::{emit_event_handler, write_node_handler};
+    use super::{
+        emit_event_handler, list_blackboard_nodes_handler, list_blackboard_tasks_handler,
+        write_node_handler,
+    };
     use crate::{
         api::http::{iam::JwtClaims, ApiUsageState, AppState, TEST_ENV_LOCK},
         core::core_types::{CoreConfig, SemanticCore},
