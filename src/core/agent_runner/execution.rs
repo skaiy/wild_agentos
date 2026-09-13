@@ -2033,6 +2033,7 @@ Output the summary report directly, not in JSON format."#,
                                     &agent.role.to_string(),
                                 )
                                 .with_task(&ctx.task_iri, &ctx.task_iri)
+                                .with_isolation_claims(ctx.isolation_claims.clone())
                                 .with_data("tool_name", Value::String(name.clone()));
                                 self.hook_manager
                                     .execute(HookPoint::SkillBefore, &mut hook_ctx)
@@ -2203,6 +2204,7 @@ Output the summary report directly, not in JSON format."#,
                                     &agent.role.to_string(),
                                 )
                                 .with_task(&ctx.task_iri, &ctx.task_iri)
+                                .with_isolation_claims(ctx.isolation_claims.clone())
                                 .with_data("tool_name", Value::String(name.clone()))
                                 .with_data("tool_result", Value::String(raw_result_str.clone()));
                                 let hook_result = self
