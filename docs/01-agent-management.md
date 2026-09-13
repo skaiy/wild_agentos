@@ -10,6 +10,15 @@ New user Agents are written with the `tenant_id` and `project_id` from authentic
 
 Domain-specific chat behavior belongs to an Agent-bound runtime asset or client, not core middleware; `ev-repair` is an optional example asset and bind alias for the persisted `ev-repair-fault-kb` pack, not a middleware requirement.
 
+### Business client chat
+
+A business client calls `POST /api/v1/agents/:id/chat` with verified JWT claims
+and `{"message":"..."}` (optionally `images`); bind ordinary pack IDs through
+the Agent's `knowledge_pack_ids` when creating or updating it. Chat forwards
+the caller context unchanged unless that scoped Agent mounts a known built-in
+runtime asset; domain instructions belong in the client or an optional example
+pack.
+
 ```mermaid
 graph TB
     subgraph Agent Management

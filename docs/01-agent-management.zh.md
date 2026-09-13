@@ -16,6 +16,13 @@ Agent 不再被隐式共享。具体可信边界和 public API-key chat 的行�
 
 领域 chat 行为应由 Agent 绑定的运行时资产或客户端承载，而不是核心中间件；`ev-repair` 是持久化 `ev-repair-fault-kb` 包的可选示例运行时资产和绑定别名，并非中间件要求。
 
+### 业务客户端 chat
+
+业务客户端使用已验证 JWT claims 调用 `POST /api/v1/agents/:id/chat`，请求体为
+`{"message":"..."}`（可选 `images`）；创建或更新 Agent 时通过
+`knowledge_pack_ids` 绑定普通包 ID。除非该作用域 Agent 绑定了已知内置运行时
+资产，chat 会原样转发调用方上下文；领域说明应放在客户端或可选示例包中。
+
 ```mermaid
 graph TB
     subgraph Agent管理

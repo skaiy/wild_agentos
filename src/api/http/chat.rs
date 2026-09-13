@@ -222,32 +222,60 @@ fn agent_matches_claims(agent: &Value, claims: &IsolationClaims) -> bool {
         && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
 }
 
-/// The only built-in chat runtime asset. The Agent's mount remains the
-/// authorization point; the pack itself is only a capability declaration.
+/// Built-in runtime capabilities are allowlisted in code. Pack JSON remains
+/// descriptive metadata, never executable prompt or query configuration.
 ///
-/// The check accepts the stable persisted pack ID and its `ev-repair` bind
-/// alias, rather than trusting a caller-selected graph or prompt string.
-async fn has_ev_repair_asset(state: &Arc<AppState>, agent: &Value) -> bool {
-    let mounted = agent
-        .get("knowledge_pack_ids")
-        .and_then(Value::as_array)
-        .is_some_and(|ids| {
-            ids.iter().any(|id| {
-                matches!(
-                    id.as_str(),
+/// New assets add one variant and a corresponding context loader below. This
+/// keeps an Agent's pack mount as the authorization point while avoiding
+/// execution of operator- or tenant-supplied prompt/SPARQL strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltinRuntimeAsset {
+    EvRepair,
+}
+
+impl BuiltinRuntimeAsset {
+    fn from_mount_id(id: &str) -> Option<Self> {
+        match id {
+            EV_REPAIR_RUNTIME_ASSET_ID | EV_REPAIR_KNOWLEDGE_PACK_ID => Some(Self::EvRepair),
+            _ => None,
+        }
+    }
+
+    fn matches_builtin_pack(self, pack: &Value) -> bool {
+        pack.get("builtin").and_then(Value::as_bool) == Some(true)
+            && matches!(
+                (self, pack.get("id").and_then(Value::as_str)),
+                (
+                    Self::EvRepair,
                     Some(EV_REPAIR_RUNTIME_ASSET_ID | EV_REPAIR_KNOWLEDGE_PACK_ID)
                 )
-            })
-        });
-    if !mounted {
-        return false;
+            )
     }
-    state.knowledge_packs.read().await.iter().any(|pack| {
-        matches!(
-            pack.get("id").and_then(Value::as_str),
-            Some(EV_REPAIR_RUNTIME_ASSET_ID | EV_REPAIR_KNOWLEDGE_PACK_ID)
-        ) && pack.get("builtin").and_then(Value::as_bool) == Some(true)
-    })
+}
+
+/// Resolve a mounted, known built-in runtime capability. The known asset ID is
+/// an allowlist lookup; `runtime_asset` fields from pack JSON are intentionally
+/// not inspected or executed.
+async fn mounted_builtin_runtime_asset(
+    state: &Arc<AppState>,
+    agent: &Value,
+) -> Option<BuiltinRuntimeAsset> {
+    let mounted_assets: Vec<BuiltinRuntimeAsset> = agent
+        .get("knowledge_pack_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(BuiltinRuntimeAsset::from_mount_id)
+        .collect();
+    if mounted_assets.is_empty() {
+        return None;
+    }
+
+    let packs = state.knowledge_packs.read().await;
+    mounted_assets
+        .into_iter()
+        .find(|asset| packs.iter().any(|pack| asset.matches_builtin_pack(pack)))
 }
 
 fn extract_fault_code_tokens(message: &str) -> Vec<String> {
@@ -396,6 +424,20 @@ async fn ev_repair_context(
     ])
 }
 
+async fn builtin_runtime_context(
+    asset: BuiltinRuntimeAsset,
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    messages: &[ChatMessage],
+    agent_name: &str,
+) -> Result<Vec<ChatMessage>, (StatusCode, Value)> {
+    match asset {
+        BuiltinRuntimeAsset::EvRepair => {
+            ev_repair_context(state, claims, messages, agent_name).await
+        }
+    }
+}
+
 /// Single-turn native chat requests become a regular user message. The generic
 /// HTTP paths deliberately add neither a default system message nor retrieval
 /// context, so an Agent can be used by businesses other than EV repair.
@@ -419,7 +461,7 @@ fn single_user_message(message: &str, images: &[String]) -> Vec<ChatMessage> {
 
 /// Validate Agent accessibility and choose its chat/vision model. Callers'
 /// messages are forwarded unchanged unless this claims-scoped Agent explicitly
-/// mounts the built-in `ev-repair` runtime asset.
+/// mounts a known built-in runtime asset.
 async fn build_chat_context(
     state: &Arc<AppState>,
     id: &str,
@@ -494,13 +536,13 @@ async fn build_chat_context_with_fallback(
         ));
     }
     let messages = if let Some(claims) = claims {
-        if has_ev_repair_asset(state, &agent).await {
+        if let Some(asset) = mounted_builtin_runtime_asset(state, &agent).await {
             let agent_name = agent
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("维修助手");
             let mut asset_messages =
-                ev_repair_context(state, claims, &messages, agent_name).await?;
+                builtin_runtime_context(asset, state, claims, &messages, agent_name).await?;
             asset_messages.extend(messages);
             asset_messages
         } else {
@@ -1171,6 +1213,15 @@ mod tests {
                     "id": "agent-b", "name": "Tenant B agent",
                     "tenant_id": "tenant-b", "project_id": "project-1"
                 }),
+                // A non-EV business Agent fixture: ordinary packs must not
+                // activate any built-in runtime prompt or retrieval.
+                json!({
+                    "id": "structcapture-organizer-fixture",
+                    "name": "Home organizer",
+                    "tenant_id": "structcapture",
+                    "project_id": "home-project",
+                    "knowledge_pack_ids": ["home-inventory", "crash-prep"]
+                }),
             ])),
             prompts: Arc::new(PromptRegistry::new()),
             kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
@@ -1185,6 +1236,14 @@ mod tests {
                 json!({
                     "id": EV_REPAIR_KNOWLEDGE_PACK_ID,
                     "builtin": true,
+                }),
+                json!({
+                    "id": "home-inventory",
+                    "builtin": false,
+                }),
+                json!({
+                    "id": "crash-prep",
+                    "builtin": false,
                 }),
             ])),
             vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -1272,6 +1331,33 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.content.as_text().contains("FaultCode")));
+    }
+
+    #[tokio::test]
+    async fn structcapture_like_agent_with_ordinary_packs_keeps_chat_context_clean() {
+        let state = make_state();
+        let claims =
+            IsolationClaims::from_verified("structcapture", "home-project", "home-user").unwrap();
+
+        let context = build_chat_context(
+            &state,
+            "structcapture-organizer-fixture",
+            single_user_message("Organize the inventory item P0A80", &[]),
+            Some(&claims),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.messages[0].role, "user");
+        assert_eq!(
+            context.messages[0].content.as_text(),
+            "Organize the inventory item P0A80"
+        );
+        assert!(!context.messages.iter().any(|message| {
+            let content = message.content.as_text();
+            content.contains("新能源汽车故障诊断与维修") || content.contains("FaultCode")
+        }));
     }
 
     fn insert_fault(store: &oxigraph::store::Store, claims: &IsolationClaims, code: &str) {
