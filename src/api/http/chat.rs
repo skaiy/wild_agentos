@@ -1344,7 +1344,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(context.messages.len(), 1);
-        assert!(!context.messages[0].content.as_text().contains("P0A80"));
+        assert_eq!(context.messages[0].role, "user");
+        assert_eq!(context.messages[0].content.as_text(), "Explain P0A80");
     }
 
     #[tokio::test]
