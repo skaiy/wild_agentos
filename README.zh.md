@@ -151,7 +151,7 @@ configuration。
 - [本体 Action 数据沙箱](docs/15-ontology-action-sandbox.zh.md) — HITL staging、
   guardrail 与 audit
 - [本体 KE Golden Freeze Policy](docs/22-ontology-ke-golden-freeze-policy.zh.md)
-- [Admin control-plane API matrix](docs/23-admin-control-plane-api-matrix.md) —
+- [Admin control-plane API matrix](docs/23-admin-control-plane-api-matrix.zh.md) —
   Admin 与内核 API 的当前覆盖范围及访问边界
 - [Outbound A2A adapter](docs/19-a2a-outbound.md)
 - [Private-deployment benchmark](docs/19-private-deploy-benchmark.md)

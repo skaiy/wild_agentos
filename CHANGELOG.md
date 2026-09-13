@@ -8,9 +8,9 @@
 
 - Generic Agent chat remains domain-neutral by default. EV-repair prompt and
   FaultCode RAG load only when an Agent mounts the builtin
-  `ev-repair-fault-kb` pack or its `ev-repair` alias; ordinary packs such as
-  StructCapture pass through unchanged. Same-instance coexistence is covered
-  by tests, and missing or invalid claims fail closed. (#207, #210, #208;
+  `ev-repair-fault-kb` pack or its `ev-repair` alias; ordinary business packs
+  pass through unchanged. Same-instance coexistence is covered by tests, and
+  missing or invalid claims fail closed. (#207, #210, #208;
   PR #229, PR #230, PR #231)
 
 ### Runtime operations on this tag
