@@ -1407,6 +1407,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ev_repair_and_structcapture_like_agents_coexist_on_one_state_without_leakage() {
+        let state = make_state();
+        let ev_claims = IsolationClaims::from_verified("tenant-a", "project-1", "ev-user").unwrap();
+        let structcapture_claims =
+            IsolationClaims::from_verified("structcapture", "home-project", "home-user").unwrap();
+        insert_fault(&state.kg_store, &ev_claims, "P0A80");
+
+        let mut agents = state.user_agents.write().await;
+        let ev_agent = agents
+            .iter_mut()
+            .find(|agent| agent["id"] == "agent-a")
+            .unwrap();
+        // The runtime alias resolves only because the persisted built-in pack
+        // is present in this same AppState.
+        ev_agent["knowledge_pack_ids"] = json!([EV_REPAIR_RUNTIME_ASSET_ID]);
+        drop(agents);
+
+        let ev_context = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("Explain P0A80", &[]),
+            Some(&ev_claims),
+        )
+        .await
+        .unwrap();
+        assert!(ev_context.messages[0]
+            .content
+            .as_text()
+            .contains("新能源汽车故障诊断与维修"));
+        assert!(ev_context.messages[1]
+            .content
+            .as_text()
+            .contains("故障码 P0A80"));
+
+        let caller_messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You organize a home inventory. Reply in English.".into(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Organize the inventory item P0A80.".into(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        let structcapture_context = build_chat_context(
+            &state,
+            "structcapture-organizer-fixture",
+            caller_messages,
+            Some(&structcapture_claims),
+        )
+        .await
+        .unwrap();
+        assert_eq!(structcapture_context.messages.len(), 2);
+        assert_eq!(
+            structcapture_context.messages[0].content.as_text(),
+            "You organize a home inventory. Reply in English."
+        );
+        assert_eq!(
+            structcapture_context.messages[1].content.as_text(),
+            "Organize the inventory item P0A80."
+        );
+        assert!(!structcapture_context.messages.iter().any(|message| {
+            let content = message.content.as_text();
+            content.contains("新能源汽车故障诊断与维修")
+                || content.contains("FaultCode")
+                || content.contains("故障码 P0A80")
+        }));
+
+        let cross_tenant = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("Explain P0A80", &[]),
+            Some(&structcapture_claims),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cross_tenant.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn ev_repair_asset_does_not_cross_claims_bound_agents() {
         let state = make_state();
         let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
