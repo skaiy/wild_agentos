@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
 use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::ontology_layer::{
-    EV_REPAIR_ONT_FAULT, EV_REPAIR_PROMPT_TEMPLATE, EV_REPAIR_RUNTIME_ASSET_ID,
+    EV_REPAIR_KNOWLEDGE_PACK_ID, EV_REPAIR_ONT_FAULT, EV_REPAIR_PROMPT_TEMPLATE,
+    EV_REPAIR_RUNTIME_ASSET_ID,
 };
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::memory::hyperspace_store::HybridSearchFilter;
@@ -224,28 +225,28 @@ fn agent_matches_claims(agent: &Value, claims: &IsolationClaims) -> bool {
 /// The only built-in chat runtime asset. The Agent's mount remains the
 /// authorization point; the pack itself is only a capability declaration.
 ///
-/// The check intentionally requires the seeded built-in identity and profile,
-/// rather than trusting a caller-selected graph, a mutable prompt string, or
-/// another tenant's similarly named pack.
+/// The check accepts the stable persisted pack ID and its `ev-repair` bind
+/// alias, rather than trusting a caller-selected graph or prompt string.
 async fn has_ev_repair_asset(state: &Arc<AppState>, agent: &Value) -> bool {
     let mounted = agent
         .get("knowledge_pack_ids")
         .and_then(Value::as_array)
         .is_some_and(|ids| {
-            ids.iter()
-                .any(|id| id.as_str() == Some(EV_REPAIR_RUNTIME_ASSET_ID))
+            ids.iter().any(|id| {
+                matches!(
+                    id.as_str(),
+                    Some(EV_REPAIR_RUNTIME_ASSET_ID | EV_REPAIR_KNOWLEDGE_PACK_ID)
+                )
+            })
         });
     if !mounted {
         return false;
     }
     state.knowledge_packs.read().await.iter().any(|pack| {
-        pack.get("id").and_then(Value::as_str) == Some(EV_REPAIR_RUNTIME_ASSET_ID)
-            && pack.get("builtin").and_then(Value::as_bool) == Some(true)
-            && pack
-                .get("runtime_asset")
-                .and_then(|asset| asset.get("id"))
-                .and_then(Value::as_str)
-                == Some(EV_REPAIR_RUNTIME_ASSET_ID)
+        matches!(
+            pack.get("id").and_then(Value::as_str),
+            Some(EV_REPAIR_RUNTIME_ASSET_ID | EV_REPAIR_KNOWLEDGE_PACK_ID)
+        ) && pack.get("builtin").and_then(Value::as_bool) == Some(true)
     })
 }
 
@@ -1182,9 +1183,8 @@ mod tests {
                     "vector_namespace": "vector://tenant-b/project-1"
                 }),
                 json!({
-                    "id": EV_REPAIR_RUNTIME_ASSET_ID,
+                    "id": EV_REPAIR_KNOWLEDGE_PACK_ID,
                     "builtin": true,
-                    "runtime_asset": { "id": EV_REPAIR_RUNTIME_ASSET_ID }
                 }),
             ])),
             vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -1297,7 +1297,7 @@ mod tests {
             .iter_mut()
             .find(|agent| agent["id"] == "agent-a")
             .unwrap();
-        agent["knowledge_pack_ids"] = json!([EV_REPAIR_RUNTIME_ASSET_ID]);
+        agent["knowledge_pack_ids"] = json!([EV_REPAIR_KNOWLEDGE_PACK_ID]);
         drop(agents);
 
         let context = build_chat_context(
@@ -1331,7 +1331,7 @@ mod tests {
             .iter_mut()
             .find(|agent| agent["id"] == "agent-a")
             .unwrap();
-        agent["knowledge_pack_ids"] = json!([EV_REPAIR_RUNTIME_ASSET_ID]);
+        agent["knowledge_pack_ids"] = json!([EV_REPAIR_KNOWLEDGE_PACK_ID]);
         drop(agents);
 
         let context = build_chat_context(
@@ -1346,6 +1346,63 @@ mod tests {
         assert_eq!(context.messages.len(), 1);
         assert_eq!(context.messages[0].role, "user");
         assert_eq!(context.messages[0].content.as_text(), "Explain P0A80");
+    }
+
+    #[tokio::test]
+    async fn ev_repair_runtime_asset_alias_binds_the_legacy_builtin_pack() {
+        let state = make_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let mut agents = state.user_agents.write().await;
+        let agent = agents
+            .iter_mut()
+            .find(|agent| agent["id"] == "agent-a")
+            .unwrap();
+        agent["knowledge_pack_ids"] = json!([EV_REPAIR_RUNTIME_ASSET_ID]);
+        drop(agents);
+
+        let context = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("Explain P0A80", &[]),
+            Some(&tenant_a),
+        )
+        .await
+        .unwrap();
+
+        assert!(context.messages[0]
+            .content
+            .as_text()
+            .contains("新能源汽车故障诊断与维修"));
+    }
+
+    #[tokio::test]
+    async fn non_builtin_ev_repair_pack_cannot_enable_the_runtime_asset() {
+        let state = make_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        *state.knowledge_packs.write().await = vec![json!({
+            "id": EV_REPAIR_RUNTIME_ASSET_ID,
+            "builtin": false,
+            "runtime_asset": { "id": EV_REPAIR_RUNTIME_ASSET_ID }
+        })];
+        let mut agents = state.user_agents.write().await;
+        let agent = agents
+            .iter_mut()
+            .find(|agent| agent["id"] == "agent-a")
+            .unwrap();
+        agent["knowledge_pack_ids"] = json!([EV_REPAIR_RUNTIME_ASSET_ID]);
+        drop(agents);
+
+        let context = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("Explain P0A80", &[]),
+            Some(&tenant_a),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(context.messages.len(), 1);
+        assert_eq!(context.messages[0].role, "user");
     }
 
     #[tokio::test]

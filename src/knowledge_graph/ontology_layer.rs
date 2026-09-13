@@ -301,6 +301,9 @@ pub struct RuntimeRetrievalProfile {
 }
 
 pub const EV_REPAIR_RUNTIME_ASSET_ID: &str = "ev-repair";
+/// Stable persisted knowledge-pack ID. `ev-repair` is the runtime asset and
+/// Agent bind alias, not a replacement for this storage identity.
+pub const EV_REPAIR_KNOWLEDGE_PACK_ID: &str = "ev-repair-fault-kb";
 pub const EV_REPAIR_ONT_FAULT: &str = "http://aps.local/ontology/FaultCode";
 pub const EV_REPAIR_PROMPT_TEMPLATE: &str = "你是「{{agent_name}}」，一名专业的新能源汽车故障诊断与维修助手。请严格依据下方“知识库检索结果”，用简体中文回答用户问题：解释故障含义、是否可继续行驶、维修建议与适用车型。若检索结果为空或不足以支撑回答，请如实说明并给出通用排查建议，切勿编造具体故障码信息。回答需专业、严谨、条理清晰。";
 pub const EV_REPAIR_FAULT_QUERY_PROFILE: &str =
@@ -911,7 +914,7 @@ pub fn knowledge_packs() -> Vec<KnowledgePack> {
         functions: ont.functions.len(),
     };
     vec![KnowledgePack {
-        id: EV_REPAIR_RUNTIME_ASSET_ID.into(),
+        id: EV_REPAIR_KNOWLEDGE_PACK_ID.into(),
         name: "新能源车维修故障库".into(),
         description: "覆盖品牌/车型/系统/故障码/原因/诊断步骤/处理措施/费用参考/FAQ/数据来源的新能源车维修知识包，封装知识图谱与向量切片，支持 Agent 挂载与包间隔离。".into(),
         version: "1.0.0".into(),
@@ -946,7 +949,7 @@ mod tests {
     #[test]
     fn ev_repair_pack_declares_its_runtime_asset_profile() {
         let pack = knowledge_packs().pop().expect("seeded ev-repair pack");
-        assert_eq!(pack.id, EV_REPAIR_RUNTIME_ASSET_ID);
+        assert_eq!(pack.id, EV_REPAIR_KNOWLEDGE_PACK_ID);
         let asset = pack.runtime_asset.expect("runtime asset profile");
         assert_eq!(asset.id, EV_REPAIR_RUNTIME_ASSET_ID);
         assert_eq!(asset.retrieval.ontology_type, EV_REPAIR_ONT_FAULT);
