@@ -938,3 +938,19 @@ pub fn knowledge_packs() -> Vec<KnowledgePack> {
         }),
     }]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ev_repair_pack_declares_its_runtime_asset_profile() {
+        let pack = knowledge_packs().pop().expect("seeded ev-repair pack");
+        assert_eq!(pack.id, EV_REPAIR_RUNTIME_ASSET_ID);
+        let asset = pack.runtime_asset.expect("runtime asset profile");
+        assert_eq!(asset.id, EV_REPAIR_RUNTIME_ASSET_ID);
+        assert_eq!(asset.retrieval.ontology_type, EV_REPAIR_ONT_FAULT);
+        assert!(asset.retrieval.vector_supplement);
+        assert!(asset.prompt_template.contains("新能源汽车故障诊断与维修"));
+    }
+}
