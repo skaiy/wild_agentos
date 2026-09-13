@@ -19,6 +19,11 @@ use serde_json::{json, Value};
 
 use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
 use crate::isolation::IsolationClaims;
+use crate::knowledge_graph::ontology_layer::{
+    EV_REPAIR_ONT_FAULT, EV_REPAIR_PROMPT_TEMPLATE, EV_REPAIR_RUNTIME_ASSET_ID,
+};
+use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::memory::hyperspace_store::HybridSearchFilter;
 
 use super::api_gov;
 use super::iam::UserIdentity;
@@ -216,6 +221,180 @@ fn agent_matches_claims(agent: &Value, claims: &IsolationClaims) -> bool {
         && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
 }
 
+/// The only built-in chat runtime asset. The Agent's mount remains the
+/// authorization point; the pack itself is only a capability declaration.
+///
+/// The check intentionally requires the seeded built-in identity and profile,
+/// rather than trusting a caller-selected graph, a mutable prompt string, or
+/// another tenant's similarly named pack.
+async fn has_ev_repair_asset(state: &Arc<AppState>, agent: &Value) -> bool {
+    let mounted = agent
+        .get("knowledge_pack_ids")
+        .and_then(Value::as_array)
+        .is_some_and(|ids| {
+            ids.iter()
+                .any(|id| id.as_str() == Some(EV_REPAIR_RUNTIME_ASSET_ID))
+        });
+    if !mounted {
+        return false;
+    }
+    state.knowledge_packs.read().await.iter().any(|pack| {
+        pack.get("id").and_then(Value::as_str) == Some(EV_REPAIR_RUNTIME_ASSET_ID)
+            && pack.get("builtin").and_then(Value::as_bool) == Some(true)
+            && pack
+                .get("runtime_asset")
+                .and_then(|asset| asset.get("id"))
+                .and_then(Value::as_str)
+                == Some(EV_REPAIR_RUNTIME_ASSET_ID)
+    })
+}
+
+fn extract_fault_code_tokens(message: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let flush = |current: &mut String, tokens: &mut Vec<String>| {
+        if current.len() >= 3
+            && (current.chars().any(|c| c.is_ascii_digit())
+                || current.contains('_')
+                || current.len() >= 4)
+        {
+            tokens.push(current.to_lowercase());
+        }
+        current.clear();
+    };
+    for character in message.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            current.push(character);
+        } else {
+            flush(&mut current, &mut tokens);
+        }
+    }
+    flush(&mut current, &mut tokens);
+    tokens.dedup();
+    tokens
+}
+
+fn ev_repair_retrieval_query(code_tokens: &[String]) -> Option<String> {
+    if code_tokens.is_empty() {
+        return None;
+    }
+    let filters = code_tokens
+        .iter()
+        .map(|token| format!("CONTAINS(LCASE(STR(?code)), \"{token}\")"))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    Some(format!(
+        "SELECT ?code ?label ?meaning ?can_drive ?repair ?models ?brand WHERE {{ \
+         ?n a <{EV_REPAIR_ONT_FAULT}> . \
+         ?n <https://agentos.ontology/meta/code> ?code . \
+         OPTIONAL {{ ?n <http://www.w3.org/2000/01/rdf-schema#label> ?label }} \
+         OPTIONAL {{ ?n <https://agentos.ontology/meta/meaning> ?meaning }} \
+         OPTIONAL {{ ?n <https://agentos.ontology/meta/can_drive> ?can_drive }} \
+         OPTIONAL {{ ?n <https://agentos.ontology/meta/repair> ?repair }} \
+         OPTIONAL {{ ?n <https://agentos.ontology/meta/models> ?models }} \
+         OPTIONAL {{ ?n <http://aps.local/ontology/belongsToBrand> ?bn . ?bn <http://www.w3.org/2000/01/rdf-schema#label> ?brand }} \
+         FILTER({filters}) }} LIMIT 6"
+    ))
+}
+
+fn truncate_retrieval_fact(value: &str, maximum: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= maximum {
+        value.to_string()
+    } else {
+        format!("{}…", value.chars().take(maximum).collect::<String>())
+    }
+}
+
+async fn ev_repair_context(
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    messages: &[ChatMessage],
+    agent_name: &str,
+) -> Result<Vec<ChatMessage>, (StatusCode, Value)> {
+    let question = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_text())
+        .unwrap_or_default();
+    let mut facts = String::new();
+    if let Some(query) = ev_repair_retrieval_query(&extract_fault_code_tokens(&question)) {
+        let graph =
+            KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("chat graph retrieval unavailable: {e}") }),
+                )
+            })?;
+        let rows = graph.query_sparql_for_claims(claims, &query).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("chat graph retrieval failed: {e}") }),
+            )
+        })?;
+        for row in rows {
+            let value = |name| row.get(name).and_then(Value::as_str).unwrap_or_default();
+            facts.push_str(&format!(
+                "- 故障码 {}（{}）：{}\n  含义：{}\n  能否行驶：{}\n  维修建议：{}\n  适用车型：{}\n",
+                value("?code"),
+                value("?brand"),
+                value("?label"),
+                truncate_retrieval_fact(value("?meaning"), 300),
+                truncate_retrieval_fact(value("?can_drive"), 200),
+                truncate_retrieval_fact(value("?repair"), 300),
+                truncate_retrieval_fact(value("?models"), 160),
+            ));
+        }
+    }
+    let mut retrieval = if facts.is_empty() {
+        "【知识图谱检索结果】\n（未检索到相关故障码记录）".to_string()
+    } else {
+        format!("【知识图谱检索结果】\n{facts}")
+    };
+    if let Some(store) = state.vector_store.load_full() {
+        let hits = store
+            .search_with_claims(claims, &question, &HybridSearchFilter::new(), 5)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("chat vector retrieval failed: {e}") }),
+                )
+            })?;
+        if !hits.is_empty() {
+            retrieval.push_str("\n【向量知识库检索结果】\n");
+            for hit in hits {
+                retrieval.push_str(&format!(
+                    "- （相关度 {:.2}）{}\n",
+                    hit.score,
+                    truncate_retrieval_fact(&hit.text, 400)
+                ));
+            }
+        }
+    }
+    Ok(vec![
+        ChatMessage {
+            role: "system".into(),
+            content: EV_REPAIR_PROMPT_TEMPLATE
+                .replace("{{agent_name}}", agent_name)
+                .into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        ChatMessage {
+            role: "system".into(),
+            content: retrieval.into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ])
+}
+
 /// Single-turn native chat requests become a regular user message. The generic
 /// HTTP paths deliberately add neither a default system message nor retrieval
 /// context, so an Agent can be used by businesses other than EV repair.
@@ -238,7 +417,8 @@ fn single_user_message(message: &str, images: &[String]) -> Vec<ChatMessage> {
 }
 
 /// Validate Agent accessibility and choose its chat/vision model. Callers'
-/// messages are forwarded unchanged; the generic path performs no RAG.
+/// messages are forwarded unchanged unless this claims-scoped Agent explicitly
+/// mounts the built-in `ev-repair` runtime asset.
 async fn build_chat_context(
     state: &Arc<AppState>,
     id: &str,
@@ -312,6 +492,22 @@ async fn build_chat_context_with_fallback(
             }),
         ));
     }
+    let messages = if let Some(claims) = claims {
+        if has_ev_repair_asset(state, &agent).await {
+            let agent_name = agent
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("维修助手");
+            let mut asset_messages =
+                ev_repair_context(state, claims, &messages, agent_name).await?;
+            asset_messages.extend(messages);
+            asset_messages
+        } else {
+            messages
+        }
+    } else {
+        messages
+    };
     Ok(ChatContext {
         messages,
         model: selected_model,
@@ -979,11 +1175,18 @@ mod tests {
             kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
             knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
             // An attacker-controlled legacy pack target must not affect chat retrieval.
-            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![json!({
-                "id": "attacker-pack",
-                "named_graph": "graph://tenant-b/project-1",
-                "vector_namespace": "vector://tenant-b/project-1"
-            })])),
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![
+                json!({
+                    "id": "attacker-pack",
+                    "named_graph": "graph://tenant-b/project-1",
+                    "vector_namespace": "vector://tenant-b/project-1"
+                }),
+                json!({
+                    "id": EV_REPAIR_RUNTIME_ASSET_ID,
+                    "builtin": true,
+                    "runtime_asset": { "id": EV_REPAIR_RUNTIME_ASSET_ID }
+                }),
+            ])),
             vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
             blob_store: None,
             task_executor: None,
@@ -1065,6 +1268,83 @@ mod tests {
                 .as_text()
                 .contains("新能源汽车故障诊断与维修")
         }));
+        assert!(!generic
+            .messages
+            .iter()
+            .any(|message| message.content.as_text().contains("FaultCode")));
+    }
+
+    fn insert_fault(store: &oxigraph::store::Store, claims: &IsolationClaims, code: &str) {
+        let graph = claims.graph_iri().unwrap();
+        store
+            .update(&format!(
+                "INSERT DATA {{ GRAPH <{graph}> {{ \
+                 <https://example.test/fault/{code}> a <{EV_REPAIR_ONT_FAULT}> ; \
+                 <https://agentos.ontology/meta/code> \"{code}\" ; \
+                 <http://www.w3.org/2000/01/rdf-schema#label> \"isolated fault\" . \
+                 }} }}"
+            ))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ev_repair_asset_mount_adds_prompt_and_claims_scoped_fault_retrieval() {
+        let state = make_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        insert_fault(&state.kg_store, &tenant_a, "P0A80");
+        let mut agents = state.user_agents.write().await;
+        let agent = agents
+            .iter_mut()
+            .find(|agent| agent["id"] == "agent-a")
+            .unwrap();
+        agent["knowledge_pack_ids"] = json!([EV_REPAIR_RUNTIME_ASSET_ID]);
+        drop(agents);
+
+        let context = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("Explain P0A80", &[]),
+            Some(&tenant_a),
+        )
+        .await
+        .unwrap();
+
+        assert!(context.messages[0]
+            .content
+            .as_text()
+            .contains("新能源汽车故障诊断与维修"));
+        assert!(context.messages[1]
+            .content
+            .as_text()
+            .contains("故障码 P0A80"));
+        assert_eq!(context.messages[2].content.as_text(), "Explain P0A80");
+    }
+
+    #[tokio::test]
+    async fn ev_repair_asset_does_not_cross_claims_bound_agents() {
+        let state = make_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
+        insert_fault(&state.kg_store, &tenant_a, "P0A80");
+        let mut agents = state.user_agents.write().await;
+        let agent = agents
+            .iter_mut()
+            .find(|agent| agent["id"] == "agent-a")
+            .unwrap();
+        agent["knowledge_pack_ids"] = json!([EV_REPAIR_RUNTIME_ASSET_ID]);
+        drop(agents);
+
+        let context = build_chat_context(
+            &state,
+            "agent-b",
+            single_user_message("Explain P0A80", &[]),
+            Some(&tenant_b),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(context.messages.len(), 1);
+        assert!(!context.messages[0].content.as_text().contains("P0A80"));
     }
 
     #[tokio::test]
