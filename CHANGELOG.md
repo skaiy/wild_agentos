@@ -2,6 +2,29 @@
 
 日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.6.0`。
 
+## [0.7.0] — 2026-09-13
+
+### Middleware chat neutrality
+
+- Generic Agent chat remains domain-neutral by default. EV-repair prompt and
+  FaultCode RAG load only when an Agent mounts the builtin
+  `ev-repair-fault-kb` pack or its `ev-repair` alias; ordinary packs such as
+  StructCapture pass through unchanged. Same-instance coexistence is covered
+  by tests, and missing or invalid claims fail closed. (#207, #210, #208;
+  PR #229, PR #230, PR #231)
+
+### Runtime operations on this tag
+
+- Added claims-scoped task listing, redacted guard audit and statistics,
+  claims-scoped blackboard task and node listing, and the Admin control-plane
+  API matrix documentation. (#221, #222, #223, #224; PR #225, PR #226,
+  PR #227, PR #228)
+
+## [0.6.2] — 2026-09-10
+
+- Hardened multimodal vision handling with fail-closed fallback and payload
+  limits. (#215, PR #219)
+
 ## [0.6.1] — 2026-09-09
 
 ### Generic chat neutrality and workload identity
