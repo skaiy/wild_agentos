@@ -387,6 +387,61 @@ pub(crate) struct GitImportRequest {
 fn default_ref() -> String {
     "main".into()
 }
+
+/// Values that may be passed to `git clone`.
+///
+/// Git is executed without a shell, but option-looking or control-character
+/// values can still change the behavior of the git process unless they are
+/// validated and options are terminated explicitly.
+struct ValidatedGitCloneSource {
+    repo_url: String,
+    git_ref: String,
+}
+
+fn validate_git_clone_source(
+    repo_url: &str,
+    git_ref: &str,
+) -> Result<ValidatedGitCloneSource, &'static str> {
+    let repo_url = repo_url.trim();
+    let git_ref = git_ref.trim();
+
+    if repo_url.is_empty() {
+        return Err("repo_url 不能为空");
+    }
+    if repo_url.len() > 2048
+        || repo_url
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        || !(repo_url.starts_with("https://") || repo_url.starts_with("git@"))
+    {
+        return Err("repo_url 必须是无空白字符的 https:// 或 git@ 仓库地址");
+    }
+
+    // `git clone --branch <ref>` must not receive option-like or malformed
+    // refnames. This matches Git's refname restrictions for the branch/tag
+    // names supported by this endpoint.
+    if git_ref.is_empty()
+        || git_ref.len() > 255
+        || git_ref.starts_with('-')
+        || git_ref.starts_with('/')
+        || git_ref.ends_with('/')
+        || git_ref.ends_with('.')
+        || git_ref.ends_with(".lock")
+        || git_ref.contains("..")
+        || git_ref.contains("//")
+        || git_ref.contains("@{")
+        || git_ref
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || "~^:?*[\\".contains(ch))
+    {
+        return Err("ref 必须是有效且不以 - 开头的 Git 分支或标签名");
+    }
+
+    Ok(ValidatedGitCloneSource {
+        repo_url: repo_url.to_owned(),
+        git_ref: git_ref.to_owned(),
+    })
+}
 pub(crate) fn normalize_git_skill_subpath(path: &str) -> Result<std::path::PathBuf, &'static str> {
     let requested_path = path.trim();
     if requested_path.is_empty() || requested_path == "." || requested_path == "/" {
@@ -492,13 +547,16 @@ pub(crate) async fn import_git_skill_handler(
     if let Err(e) = identity.require_role("DA") {
         return e.into_response();
     }
-    if req.repo_url.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "status": "error", "error": "repo_url 不能为空" })),
-        )
-            .into_response();
-    }
+    let git_source = match validate_git_clone_source(&req.repo_url, &req.r#ref) {
+        Ok(source) => source,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "status": "error", "error": error })),
+            )
+                .into_response();
+        }
+    };
     let relative_path = match normalize_git_skill_subpath(&req.path) {
         Ok(path) => path,
         Err(error) => {
@@ -513,17 +571,19 @@ pub(crate) async fn import_git_skill_handler(
         }
     };
 
-    // 1. git clone --depth 1 -b <ref> <url> /tmp/<uuid>
+    // 1. All options precede `--`, which terminates option parsing before the
+    // validated repository URL. The ref is passed as a distinct argv value.
     let clone_dir = std::env::temp_dir().join(format!("waos-skill-{}", uuid::Uuid::new_v4()));
     let mut output = match tokio::process::Command::new("git")
         .args([
             "clone",
             "--depth",
             "1",
-            "-b",
-            req.r#ref.as_str(),
+            "--branch",
+            git_source.git_ref.as_str(),
             "--single-branch",
-            req.repo_url.trim(),
+            "--",
+            git_source.repo_url.as_str(),
             clone_dir.to_str().unwrap_or("/tmp/waos-skill-clone"),
         ])
         .output()
@@ -547,14 +607,15 @@ pub(crate) async fn import_git_skill_handler(
         let _ = std::fs::remove_dir_all(dir);
     };
 
-    if !output.status.success() && req.r#ref == "main" {
+    if !output.status.success() && git_source.git_ref == "main" {
         cleanup(&clone_dir);
         output = match tokio::process::Command::new("git")
             .args([
                 "clone",
                 "--depth",
                 "1",
-                req.repo_url.as_str(),
+                "--",
+                git_source.repo_url.as_str(),
                 clone_dir.to_string_lossy().as_ref(),
             ])
             .output()
@@ -1149,6 +1210,34 @@ version: \"2.0.0\"\n\
         assert!(normalize_git_skill_subpath("../outside").is_err());
         assert!(normalize_git_skill_subpath("skills/../../outside").is_err());
         assert!(normalize_git_skill_subpath("/tmp/outside").is_err());
+    }
+
+    #[test]
+    fn test_validate_git_clone_source_accepts_supported_safe_values() {
+        let source =
+            validate_git_clone_source("https://github.com/skaiy/wild_agentos.git", "release/v0.6")
+                .unwrap();
+        assert_eq!(source.repo_url, "https://github.com/skaiy/wild_agentos.git");
+        assert_eq!(source.git_ref, "release/v0.6");
+
+        assert!(validate_git_clone_source("git@github.com:skaiy/wild_agentos.git", "main").is_ok());
+    }
+
+    #[test]
+    fn test_validate_git_clone_source_rejects_command_and_ref_injection_inputs() {
+        assert!(validate_git_clone_source("--upload-pack=evil", "main").is_err());
+        assert!(validate_git_clone_source("file:///tmp/skill", "main").is_err());
+        assert!(validate_git_clone_source(
+            "https://github.com/org/repo\n--upload-pack=evil",
+            "main"
+        )
+        .is_err());
+        assert!(
+            validate_git_clone_source("https://github.com/org/repo", "--upload-pack=evil").is_err()
+        );
+        assert!(
+            validate_git_clone_source("https://github.com/org/repo", "topic\n--config=x").is_err()
+        );
     }
 
     // ── HTTP 集成测试 ─────────────────────────────────────────────────────────
