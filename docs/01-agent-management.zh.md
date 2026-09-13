@@ -14,6 +14,8 @@ Agent 管理与调度是系统的核心，负责动态决定 Agent 组合与流�
 Agent 不再被隐式共享。具体可信边界和 public API-key chat 的行为见
 [17-isolation-contract.md](17-isolation-contract.md)。
 
+领域 chat 行为应由 Agent 绑定的运行时资产或客户端承载，而不是核心中间件；`ev-repair` 是持久化 `ev-repair-fault-kb` 包的可选示例运行时资产和绑定别名，并非中间件要求。
+
 ```mermaid
 graph TB
     subgraph Agent管理

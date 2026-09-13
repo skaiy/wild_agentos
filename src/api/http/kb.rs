@@ -169,10 +169,39 @@ fn knowledge_packs_store_path() -> std::path::PathBuf {
     data_dir().join("knowledge_packs.json")
 }
 
+/// Add newly introduced runtime metadata to an existing built-in pack without
+/// replacing operator-owned presentation or KB-link fields.
+fn upsert_builtin_runtime_assets(packs: &mut [Value]) -> bool {
+    let seeds = crate::knowledge_graph::ontology_layer::knowledge_packs();
+    let mut changed = false;
+    for seed in seeds {
+        let Some(runtime_asset) = seed.runtime_asset else {
+            continue;
+        };
+        let Some(pack) = packs.iter_mut().find(|pack| {
+            pack.get("id").and_then(Value::as_str) == Some(seed.id.as_str())
+                && pack.get("builtin").and_then(Value::as_bool) == Some(true)
+        }) else {
+            continue;
+        };
+        if pack.get("runtime_asset").is_none() {
+            pack["runtime_asset"] = serde_json::to_value(runtime_asset).unwrap_or(Value::Null);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// 启动时加载知识包；文件不存在时用内置包种子化并落盘（Decision B：内置包亦可编辑）。
 pub(crate) fn load_knowledge_packs() -> Vec<Value> {
     match std::fs::read_to_string(knowledge_packs_store_path()) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Ok(content) => {
+            let mut packs: Vec<Value> = serde_json::from_str(&content).unwrap_or_default();
+            if upsert_builtin_runtime_assets(&mut packs) {
+                let _ = save_knowledge_packs(&packs);
+            }
+            packs
+        }
         Err(_) => {
             // 种子化：把内置静态知识包写入 JSON，之后完全由 JSON 驱动、可编辑。
             let seed: Vec<Value> = crate::knowledge_graph::ontology_layer::knowledge_packs()
@@ -2438,6 +2467,7 @@ pub(crate) async fn import_graph_knowledge_base_handler(
 #[cfg(test)]
 mod kb_ingest_tests {
     use super::*;
+    use crate::api::http::TEST_ENV_LOCK;
     use crate::isolation::IsolationClaims;
     use crate::knowledge_graph::store::KnowledgeGraphStore;
 
@@ -2517,6 +2547,40 @@ mod kb_ingest_tests {
             .and_then(|s| s.parse::<u64>().ok())
             .expect("?c parses to u64");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn load_knowledge_packs_upserts_ev_repair_runtime_asset_without_replacing_pack_fields() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("ev_repair_pack_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        save_knowledge_packs(&[json!({
+            "id": "ev-repair-fault-kb",
+            "builtin": true,
+            "name": "operator-renamed pack",
+            "description": "operator description",
+            "graph_kb_ids": ["existing-graph-kb"],
+            "vector_kb_ids": ["existing-vector-kb"]
+        })])
+        .unwrap();
+
+        let packs = load_knowledge_packs();
+        let pack = packs.first().unwrap();
+        assert_eq!(pack["name"], "operator-renamed pack");
+        assert_eq!(pack["description"], "operator description");
+        assert_eq!(pack["graph_kb_ids"], json!(["existing-graph-kb"]));
+        assert_eq!(pack["vector_kb_ids"], json!(["existing-vector-kb"]));
+        assert_eq!(pack["runtime_asset"]["id"], "ev-repair");
+        assert_eq!(packs.len(), 1, "the existing pack must not be duplicated");
+
+        if let Some(value) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", value);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     /// 回归：旧 knowledge_graph 已被某知识包（graph_kb_ids）覆盖时——
