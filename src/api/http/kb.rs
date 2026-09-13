@@ -196,7 +196,7 @@ fn upsert_builtin_runtime_assets(packs: &mut [Value]) -> bool {
 pub(crate) fn load_knowledge_packs() -> Vec<Value> {
     match std::fs::read_to_string(knowledge_packs_store_path()) {
         Ok(content) => {
-            let mut packs = serde_json::from_str(&content).unwrap_or_default();
+            let mut packs: Vec<Value> = serde_json::from_str(&content).unwrap_or_default();
             if upsert_builtin_runtime_assets(&mut packs) {
                 let _ = save_knowledge_packs(&packs);
             }
@@ -2467,6 +2467,7 @@ pub(crate) async fn import_graph_knowledge_base_handler(
 #[cfg(test)]
 mod kb_ingest_tests {
     use super::*;
+    use crate::api::http::TEST_ENV_LOCK;
     use crate::isolation::IsolationClaims;
     use crate::knowledge_graph::store::KnowledgeGraphStore;
 
