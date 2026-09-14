@@ -5,7 +5,7 @@
 # 17. 隔离契约
 
 `src/isolation/` 是作用域身份和存储名称的内核契约。它不是身份提供商（IdP）、OIDC
-或 Keycloak 集成、17 状态 IAM 工作流，也不是存储迁移。本文件说明 2026-09-04 的
+或 Keycloak 集成、17 状态 IAM 工作流，也不是存储迁移。本文件说明 2026-09-14（v0.7.0）的
 `main`：区分当前已接线的存储路径和仍在使用的历史路径；已 mint 名称不证明已有数据
 已经迁移。
 
@@ -37,7 +37,7 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 
 ## 业务 BFF 的 workload OIDC 契约 / Workload OIDC contract
 
-StructCapture Capture BFF 等业务 BFF 向 AgentOS 发起请求时，必须转发短时效的
+业务 BFF 向 AgentOS 发起请求时，必须转发短时效的
 workload OIDC access token：`Authorization: Bearer <token>`。BFF **不得**签发新的
 AgentOS token。按以下方式配置 AgentOS HTTP 服务：
 
@@ -51,7 +51,7 @@ AGENTOS_OIDC_AUDIENCE=wild-agentos
 
 issuer 必须在该 JWKS URL 发布非对称签名公钥；token 的 `iss` 与 `aud` 必须和配置
 精确匹配。只有验过签名、`exp`、`iss` 与 `aud` 后，AgentOS 才会 mint 隔离作用域。
-Capture BFF 可直接采用以下检查表：
+业务 BFF 可直接采用以下检查表：
 
 1. 从 BFF 现有 OIDC provider 获取短时效 workload token。
 2. 将 token audience 设为 `AGENTOS_OIDC_AUDIENCE`。
@@ -63,7 +63,7 @@ Capture BFF 可直接采用以下检查表：
 
 ```json
 {
-  "sub": "workload:structcapture:capture-bff",
+  "sub": "workload:example-bff",
   "tenant_id": "acme",
   "project_id": "capture-prod",
   "exp": 1798761600
@@ -174,6 +174,19 @@ action 清空它；原 source 仍可用。删除无法自动撤销，因而需�
 同等行为。在每个历史 backend 被显式迁移和验证前，生产查询不得宣称隔离完成。
 
 ## 当前接线
+
+### Runtime read list
+
+`GET /api/v1/tasks` 要求已验证的 tenant/project `IsolationClaims`，且只列出调用方
+持久化作用域内的任务。`GET /api/v1/guard/audit` 和
+`GET /api/v1/guard/stats` 同样要求已验证 claims；audit entry 和 statistics 均受作用域
+限制，敏感值会脱敏。黑板的 `GET /api/v1/blackboard/tasks` 和
+`GET /api/v1/blackboard/nodes?task_iri=…` 要求已验证 claims，并排除没有匹配持久化
+作用域的任务。
+
+此列表契约不延伸到任务详情路径（`GET /tasks/:iri`、status、details 或 trends），
+这些路径尚无统一的 verified-claims 门禁。当前 claims 覆盖不一致的边界见
+[Admin 控制面 API 对照矩阵](23-admin-control-plane-api-matrix.zh.md)。
 
 ### Spend gate
 

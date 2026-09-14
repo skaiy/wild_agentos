@@ -4,7 +4,8 @@
 > [21-ontology-knowledge-engineering-pipeline.zh.md](21-ontology-knowledge-engineering-pipeline.zh.md).*
 >
 > v0.5.0 completes the bounded Ontology Knowledge Engineering / Graph
-> Engineering milestone documented here. It does not claim a continuous,
+> Engineering milestone documented here. Current `main` adds continuous online
+> job and watcher orchestration, but does not claim an approval-free,
 > fully automated corpus-to-graph service.
 > It complements [Knowledge Ingestion](16-knowledge-ingest-import-graph.md),
 > [Ontology Action Data Sandbox](15-ontology-action-sandbox.md), and the
@@ -12,15 +13,16 @@
 
 ## Status and question answered
 
-**Question:** Do the implemented capabilities in v0.5.0 form a
-complete, online, fully automated ontology knowledge-graph engineering
+**Question:** Do the implemented capabilities form a complete, online,
+approval-free ontology knowledge-graph engineering
 toolchain?
 
 **Answer: No.**
 
-The current code provides bounded ingestion, graph, ontology, staging, quality,
-and human-approval primitives. It does **not** provide an online, fully automatic
-pipeline that extracts ontology-aligned knowledge from a changing corpus,
+The current code provides online job and watcher orchestration alongside bounded
+ingestion, graph, ontology, staging, quality, and human-approval primitives. It
+does **not** provide an approval-free, fully automatic pipeline that extracts
+ontology-aligned knowledge from a changing corpus,
 validates it, resolves entities, promotes schema, and materializes a governed
 warehouse. The design below describes what would be required to make that
 statement true without weakening the current security and governance boundary.
@@ -67,7 +69,7 @@ before a kernel loop can use it as a promoted schema.
 | Optional inference | Limited RDFS query-time expansion is available only when enabled; it is off by default and does not persist inferred triples. |
 | Isolation | `IsolationClaims` determine graph, blob, and vector targets; missing or invalid claims fail closed. Minting a safe target name is **not** historical-data migration. |
 
-### Completed supporting work does not close the online-job gap
+### Supporting work and delivered online orchestration
 
 At the time of writing:
 
@@ -79,9 +81,10 @@ At the time of writing:
 - [#132](https://github.com/skaiy/wild_agentos/issues/132), operations
   surfaces for keys, tenant scope, and action auditing, is merged.
 
-These changes improve isolation, authentication, or operations. They do not
-provide the authenticated, claims-scoped online job and watcher orchestration
-required for a continuous corpus-to-graph service.
+These changes improve isolation, authentication, or operations. The
+authenticated, claims-scoped online job and watcher orchestration is delivered
+below; fully automatic, approval-free corpus-to-graph promotion remains outside
+its scope.
 
 ### v0.6 online job and watcher delivery
 
