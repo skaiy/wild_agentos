@@ -5,18 +5,18 @@
 # 21. 本体知识工程流水线
 
 > v0.5.0 已完成本文记录的、有边界的本体知识工程 / Graph Engineering 里程碑；
-> 它不代表已有持续、全自动的 corpus-to-graph 服务。
+> 它不代表已有持续、无需审批的 corpus-to-graph 服务。
 > 参见[知识摄取](16-knowledge-ingest-import-graph.zh.md)、
 > [本体 Action 数据沙箱](15-ontology-action-sandbox.zh.md) 和
 > [Isolation Contract](17-isolation-contract.zh.md)。
 
 ## 状态与回答的问题
 
-**问题：** v0.5.0 已实现能力是否已经构成完整、在线、全自动的本体知识图谱工程工具链？
+**问题：** 已实现能力是否已经构成完整、在线、无需审批的本体知识图谱工程工具链？
 
 **回答：否。**
 
-当前代码提供了有边界的摄取、图谱、本体、暂存、质量与人工审批原语；它**尚未**提供一条在线全自动流水线，用于从持续变化的语料中提取本体对齐知识、验证知识、消解实体、提升 schema，并物化为受治理的知识仓库。以下设计说明了在不削弱现有安全与治理边界的前提下，需要具备哪些能力才能作出这一表述。
+当前代码已提供有边界的在线 job 与 watcher 编排，以及摄取、图谱、本体、暂存、质量与人工审批原语；它**尚未**提供一条无需审批的全自动流水线，用于从持续变化的语料中提取本体对齐知识、验证知识、消解实体、提升 schema，并物化为受治理的知识仓库。以下设计说明了在不削弱现有安全与治理边界的前提下，需要具备哪些能力才能作出这一表述。
 
 ## 双轨：前置本体设计与内核 Graph Engineering
 
@@ -58,7 +58,7 @@ schema 使用。
 | 可选推理 | 有限 RDFS query-time 扩展可选且默认关闭；不持久化推理三元组。 |
 | 隔离 | `IsolationClaims` 决定 graph、blob、vector 目标；缺失或无效 claims 必须 fail closed。mint 安全目标名称**不等于**迁移历史数据。 |
 
-### 已完成的支撑工作不会填补在线 job 缺口
+### 支撑工作与已交付的在线编排
 
 本文编写时：
 
@@ -68,8 +68,8 @@ schema 使用。
 - [#131](https://github.com/skaiy/wild_agentos/issues/131) 的生产 OIDC 已合并。
 - [#132](https://github.com/skaiy/wild_agentos/issues/132) 的密钥、tenant scope 和 action audit 运维能力已合并。
 
-这些工作改进隔离、认证或运维；但没有提供连续 corpus-to-graph 服务所需的、已认证且
-claims-scoped 的在线 job 与 watcher 编排。
+这些工作改进隔离、认证或运维。下文已交付已认证、claims-scoped 的在线 job 与 watcher
+编排；无需审批的全自动 corpus-to-graph promotion 仍不在其范围内。
 
 ### v0.6 online job 与 watcher 交付
 

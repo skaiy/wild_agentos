@@ -2,8 +2,8 @@
 
 | 项 | 内容 |
 |---|---|
-| 文档版本 | 0.2.0（修订：强调对齐既有设计与已落地契约） |
-| 受众 | 如野 · 运野 · 测野 · 安野 |
+| 文档版本 | 0.2.2（刷新为当前 main 状态） |
+| 受众 | 开源项目的协调、运维、测试和安全人员 |
 | 触发方 | 业务客户端集成（业务仓只消费契约） |
 | 上位设计 | [docs/13-DESIGN_DETAIL.zh.md](https://github.com/skaiy/wild_agentos/blob/main/docs/13-DESIGN_DETAIL.zh.md)（**主依据，勿平行造轮**） |
 | 关联 | 隔离见 `17-isolation-contract`；工具见 `05-tool-system`；摄取见 `16-knowledge-ingest-import-graph` |
@@ -45,7 +45,8 @@
 | **§10 模板 + JSON Schema「一次往返双重收获」** | 结构化字段应用 **Schema 校验 → 转 JSON-LD → 写黑板**；与 think/content/summary 模式一致 | 只靠自由文本 JSON 无校验 |
 | **§11 组件：Gateway / LLMClient** | 统一走 gateway；有图选 vision 槽 | 业务侧再维护第二套「WAO 外专用 gateway」当作正道 |
 
-**结论给如野**：排期时应写成「**接通 / 配置 /  hardening / 文档化既有 chat+vision+隔离+记忆**」，而不是「从零设计多模态子系统」。
+**结论：** 排期时应写成「**接通 / 配置 / hardening / 文档化既有
+chat+vision+隔离+记忆**」，而不是「从零设计多模态子系统」。
 
 ---
 
@@ -130,7 +131,7 @@ fail closed；显式的兼容降级路径可观测，图片限制返回 `413`，
 | ID | 事项 | 复用 |
 |---|---|---|
 | P1-1 | 可选：图证据写入 L2/L0 为 `mem:`/`exec:` 节点，L1 仅 IRI | §2 §3 |
-| P1-2 | 审计日志：`image_count`、字节数、选用 model id；**不落 base64** | §6 / 安野 |
+| P1-2 | 审计日志：`image_count`、字节数、选用 model id；**不落 base64** | §6 / 安全 |
 | P1-3 | https 图 URL：SSRF 防护（allowlist）；优先预签名 | §7 网络工具同类约束 |
 | P1-4 | 结构化输出走 Schema 校验 + JSON-LD（一次往返双重收获） | §10 |
 | P1-5 | 可选 AtomicSkill/MCP「vision.describe」供 PDCA Do 调用；chat 直传 images 仍保留 | §5 §7 |
@@ -161,7 +162,7 @@ POST message + images[]  ─────────────►  已有 chat
 
 ---
 
-## 6. 建议里程碑表述（给如野排期用语）
+## 6. 建议里程碑表述
 
 请避免：「新建多模态子系统 / 新 Vision API」。  
 推荐：「**Agent chat 多模态接线验收**（既有 `images` + `model_mounts.vision`）+ DESIGN_DETAIL 交叉引用 + 演示配置」。
@@ -176,19 +177,19 @@ POST message + images[]  ─────────────►  已有 chat
 
 ---
 
-## 7. 运维要点（运野）— 配置面优先
+## 7. 运维要点 — 配置面优先
 
 | 项 | 建议 |
 |---|---|
-| 模型资源 | 在 `models.resources` 登记 VL（号池 Qwen3-VL 等） |
+| 模型资源 | 在 `models.resources` 登记 VL |
 | Agent | `model_mounts.chat` = 文本；`model_mounts.vision` = VL |
 | 回滚 | 移除 vision mount 或使用显式兼容策略；客户端停止发送图片 |
 | 健康 | 可选 vision probe（1×1 或 fixture 图） |
-| 配额 | WildPool/MiniMax 账单先确认再切 VL |
+| 配额 | 切换 VL 前确认配额和计费 |
 
 ---
 
-## 8. 测试要点（测野）
+## 8. 测试要点
 
 1. 无 `images`：纯文本回归。  
 2. 有图 + vision 挂 VL：fixture 包装图，回复含可见品牌/规格线索。  
@@ -199,7 +200,7 @@ POST message + images[]  ─────────────►  已有 chat
 
 ---
 
-## 9. 安全（安野）
+## 9. 安全
 
 1. 鉴权强度与纯文本相同（已有 claims 门禁，勿为带图降级）。  
 2. 日志禁止 data URL / 原图。  
@@ -219,7 +220,7 @@ POST message + images[]  ─────────────►  已有 chat
 
 ---
 
-## 11. 给如野的一页摘要（可转发）
+## 11. 一页摘要
 
 > 请对照 [13-DESIGN_DETAIL.zh.md](https://github.com/skaiy/wild_agentos/blob/main/docs/13-DESIGN_DETAIL.zh.md)：**多模态不是新中台**，而是把图证据接进已有 PDCA/记忆/JSON-LD/5W2H/技能/工具/Gateway。  
 > 代码已有 `POST .../chat` 的 `images[]` 与 `model_mounts.vision→chat`。请优先 **挂 VL、写清契约与错误语义、补 CI**，禁止静默丢图。  

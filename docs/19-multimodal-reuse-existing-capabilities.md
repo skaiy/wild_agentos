@@ -2,7 +2,7 @@
 
 | Item | Content |
 |---|---|
-| Doc version | 0.2.0 (revision: align with existing design + landed contracts) |
+| Doc version | 0.2.2 (current-main status refresh) |
 | Audience | Open-source line (coordination / deploy / test / security) |
 | Trigger | Business-client integration (the business repo only consumes the contract) |
 | Parent design | [docs/13-DESIGN_DETAIL.md](./13-DESIGN_DETAIL.md) / [zh](./13-DESIGN_DETAIL.zh.md) (**authoritative — do not invent a parallel stack**) |

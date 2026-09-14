@@ -78,6 +78,15 @@ export AUTHORIZATION='Authorization: Bearer <verified-jwt>'
 The examples use `http://127.0.0.1:8080`. A single upload/import body is limited
 to **60MB** by `KB_UPLOAD_MAX_BYTES`.
 
+### Online corpus ingestion
+
+Current `main` also provides claims-scoped online corpus jobs under
+`/api/v1/online-corpus-jobs`, including list/create, per-job read, cancel, run,
+and `/observability` endpoints. Watchers are enabled by default and enqueue
+the same governed job path; entity-resolution suggestions require approval and
+are never auto-merged. See the
+[Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md).
+
 ## 5. Create a base
 
 Create a graph base:
