@@ -42,7 +42,7 @@ require_secret() {
         red "AGENTOS_JWT_SECRET is required (at least 32 bytes)."
         exit 2
     fi
-    if ! python3 -c 'import os, sys; sys.exit(len(os.environ["AGENTOS_JWT_SECRET"].encode()) >= 32)' 2>/dev/null; then
+    if ! python3 -c 'import os, sys; sys.exit(0 if len(os.environ["AGENTOS_JWT_SECRET"].encode()) >= 32 else 1)' 2>/dev/null; then
         red "AGENTOS_JWT_SECRET must be at least 32 bytes."
         exit 2
     fi
@@ -110,11 +110,12 @@ expect_status() {
 
 json_field() {
     local field="$1"
-    python3 - "$field" <"$RESPONSE_BODY" <<'PY'
+    python3 - "$field" "$RESPONSE_BODY" <<'PY'
 import json
 import sys
 
-value = json.load(sys.stdin)
+with open(sys.argv[2], encoding="utf-8") as response_body:
+    value = json.load(response_body)
 for part in sys.argv[1].split("."):
     value = value[part]
 if not isinstance(value, str) or not value:
@@ -126,11 +127,12 @@ PY
 json_list_contains() {
     local list_field="$1"
     local needle="$2"
-    python3 - "$list_field" "$needle" <"$RESPONSE_BODY" <<'PY'
+    python3 - "$list_field" "$needle" "$RESPONSE_BODY" <<'PY'
 import json
 import sys
 
-document = json.load(sys.stdin)
+with open(sys.argv[3], encoding="utf-8") as response_body:
+    document = json.load(response_body)
 items = document[sys.argv[1]]
 needle = sys.argv[2]
 sys.exit(0 if any(
