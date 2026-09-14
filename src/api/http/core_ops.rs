@@ -388,7 +388,7 @@ pub(crate) async fn list_blackboard_nodes_handler(
 /// This deliberately treats malformed, tenant-only, and otherwise legacy task
 /// records as out of scope. The endpoint must not infer scope from task IRI or
 /// child nodes.
-fn task_is_in_scope(json_ld: &str, claims: &crate::isolation::IsolationClaims) -> bool {
+pub(crate) fn task_is_in_scope(json_ld: &str, claims: &crate::isolation::IsolationClaims) -> bool {
     let Ok(task) = serde_json::from_str::<Value>(json_ld) else {
         return false;
     };

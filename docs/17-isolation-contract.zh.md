@@ -184,9 +184,9 @@ action 清空它；原 source 仍可用。删除无法自动撤销，因而需�
 `GET /api/v1/blackboard/nodes?task_iri=…` 要求已验证 claims，并排除没有匹配持久化
 作用域的任务。
 
-此列表契约不延伸到任务详情路径（`GET /tasks/:iri`、status、details 或 trends），
-这些路径尚无统一的 verified-claims 门禁。当前 claims 覆盖不一致的边界见
-[Admin 控制面 API 对照矩阵](23-admin-control-plane-api-matrix.zh.md)。
+任务详情路径（`GET /tasks/:iri`、status、details 和 trends）共享同一 verified-claims
+边界：单任务读取要求调用方的持久化作用域，且不会返回范围外任务数据；trends 仅聚合该作用域
+任务的 checkpoint。没有完整持久化作用域的记录仍会被排除。
 
 ### Spend gate
 
