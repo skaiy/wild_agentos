@@ -48,6 +48,21 @@ blob names are minted. In that case `verify_jwt` produces no identity.
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
 
+### Local HS256 empirical check
+
+For a running **local** kernel configured for HS256 with an explicitly set,
+non-default `AGENTOS_JWT_SECRET` (at least 32 bytes), run:
+
+```bash
+AGENTOS_JWT_SECRET="$AGENTOS_JWT_SECRET" scripts/claims-smoke.sh
+```
+
+The script does not start or deploy a server. It mints two short-lived local
+HS256 JWTs in-process and verifies anonymous rejection plus tenant/project
+isolation for user agents and task detail/list endpoints. It never prints or
+stores the secret. This is an empirical local-development check only;
+production remains the OIDC/JWKS configuration described above.
+
 ## Workload OIDC contract for business BFFs
 
 Business BFFs authenticate to AgentOS by

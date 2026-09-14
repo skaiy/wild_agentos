@@ -35,6 +35,19 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 传入 `IsolationClaims::from_verified`；`.`、`..`、路径分隔符（如 `a/b`）等不安全
 值会 fail closed，`verify_jwt` 不产生 identity。
 
+### 本地 HS256 实证检查
+
+对已使用显式、非默认且至少 32 字节 `AGENTOS_JWT_SECRET` 配置为 HS256 的**运行中**
+本地 kernel，执行：
+
+```bash
+AGENTOS_JWT_SECRET="$AGENTOS_JWT_SECRET" scripts/claims-smoke.sh
+```
+
+该脚本不会启动或部署服务器。它在进程内签发两个短时效本地 HS256 JWT，检查匿名请求
+被拒绝，以及 user agent 与 task detail/list endpoint 的 tenant/project 隔离；不会打印
+或存储 secret。这仅是本地开发的实证检查；生产环境仍使用上文所述 OIDC/JWKS 配置。
+
 ## 业务 BFF 的 workload OIDC 契约 / Workload OIDC contract
 
 业务 BFF 向 AgentOS 发起请求时，必须转发短时效的
