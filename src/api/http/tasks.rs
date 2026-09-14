@@ -16,7 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::iam::UserIdentity;
+use super::{core_ops::task_is_in_scope, iam::UserIdentity};
 use super::{AppState, TaskExecSpec};
 
 #[derive(Deserialize)]
@@ -153,22 +153,36 @@ pub(crate) async fn list_tasks_handler(
 
 pub(crate) async fn get_task_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(task_iri): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims are required"})),
+        )
+            .into_response();
+    };
     match state.core.read_node(&task_iri).await {
-        Ok(Some(node)) => Json(json!({
+        Ok(Some(node)) if task_is_in_scope(&node.json_ld, claims) => Json(json!({
             "task_iri": task_iri,
             "found": true,
             "node": node,
-        })),
-        Ok(None) => Json(json!({
-            "task_iri": task_iri,
-            "found": false,
-        })),
-        Err(e) => Json(json!({
-            "task_iri": task_iri,
-            "error": e.to_string(),
-        })),
+        }))
+        .into_response(),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "task not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(%task_iri, "failed to read task scope: {}", error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to verify task scope"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -300,11 +314,19 @@ pub(crate) async fn stream_task_handler(
 
 pub(crate) async fn get_realtime_status_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(task_iri): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims are required"})),
+        )
+            .into_response();
+    };
     // Read the task node from L2 blackboard; return 404 when not found.
     match state.core.blackboard.read_node(&task_iri) {
-        Ok(Some(node)) => {
+        Ok(Some(node)) if task_is_in_scope(&node.json_ld, claims) => {
             // Parse json_ld to extract runtime status fields if present.
             let parsed: Value = serde_json::from_str(&node.json_ld).unwrap_or(Value::Null);
             let status = parsed
@@ -358,7 +380,7 @@ pub(crate) async fn get_realtime_status_handler(
         }
         _ => (
             axum::http::StatusCode::NOT_FOUND,
-            Json(json!({ "error": "task not found", "task_iri": task_iri })),
+            Json(json!({ "error": "task not found" })),
         )
             .into_response(),
     }
@@ -366,11 +388,19 @@ pub(crate) async fn get_realtime_status_handler(
 
 pub(crate) async fn get_execution_details_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(task_iri): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims are required"})),
+        )
+            .into_response();
+    };
     // Read the task node from L2 blackboard; return 404 when not found.
     match state.core.blackboard.read_node(&task_iri) {
-        Ok(Some(node)) => {
+        Ok(Some(node)) if task_is_in_scope(&node.json_ld, claims) => {
             let parsed: Value = serde_json::from_str(&node.json_ld).unwrap_or(Value::Null);
             let status = parsed
                 .get("status")
@@ -411,7 +441,7 @@ pub(crate) async fn get_execution_details_handler(
         }
         _ => (
             axum::http::StatusCode::NOT_FOUND,
-            Json(json!({ "error": "task not found", "task_iri": task_iri })),
+            Json(json!({ "error": "task not found" })),
         )
             .into_response(),
     }
@@ -428,8 +458,16 @@ pub(crate) struct TaskTrendsQuery {
 /// 预置最近 N 天的空桶以保证图表时间轴连续（默认 7 天，范围 1..=90）。
 pub(crate) async fn list_task_trends_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Query(q): Query<TaskTrendsQuery>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims are required"})),
+        )
+            .into_response();
+    };
     let days = q.days.unwrap_or(7).clamp(1, 90);
     let today = chrono::Utc::now().date_naive();
     let start = today - chrono::Duration::days(days - 1);
@@ -457,6 +495,16 @@ pub(crate) async fn list_task_trends_handler(
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            let in_scope = state
+                .core
+                .blackboard
+                .read_node(&cp.task_iri)
+                .ok()
+                .flatten()
+                .is_some_and(|task| task_is_in_scope(&task.json_ld, claims));
+            if !in_scope {
+                continue;
+            }
             let d = cp.created_at.date_naive();
             if let Some(bucket) = buckets.get_mut(&d) {
                 bucket.0.insert(cp.task_iri.clone());
@@ -481,7 +529,7 @@ pub(crate) async fn list_task_trends_handler(
         })
         .collect();
 
-    Json(json!({ "days": days, "trends": trends }))
+    Json(json!({ "days": days, "trends": trends })).into_response()
 }
 
 /// 从序列化后的 ExecutionEvent payload 中取出内层某一 kind 的字段对象。
@@ -887,6 +935,146 @@ mod tests {
             !response.to_string().contains(&tenant_b_task),
             "cross-tenant task IRI leaked in response"
         );
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    #[tokio::test]
+    async fn task_detail_and_trends_require_claims_and_never_expose_other_scopes() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let saved_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+
+        let state = test_state();
+        let tenant_a_task = "task-a".to_string();
+        let tenant_b_task = "task-b".to_string();
+        for (task_iri, tenant_id) in [
+            (tenant_a_task.as_str(), "tenant-a"),
+            (tenant_b_task.as_str(), "tenant-b"),
+        ] {
+            state
+                .core
+                .blackboard
+                .write_node(
+                    task_iri,
+                    &json!({
+                        "@id": task_iri,
+                        "@type": "Task",
+                        "tenant_id": tenant_id,
+                        "project_id": "project-a",
+                        "status": "queued"
+                    })
+                    .to_string(),
+                    &state.core.config,
+                )
+                .unwrap();
+        }
+        let checkpoint = |task_iri: &str| {
+            json!({
+                "checkpoint_iri": format!("iri://checkpoint/test/{}", uuid::Uuid::new_v4()),
+                "task_iri": task_iri,
+                "name": "step_complete_test",
+                "node_count": 0,
+                "total_size_bytes": 0,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "tags": [],
+                "nodes_json": "[]",
+                "session_messages_json": "[]",
+                "agent_state_json": "{}"
+            })
+            .to_string()
+        };
+        state
+            .core
+            .l0_store
+            .store("iri://checkpoint/test/a", &checkpoint(&tenant_a_task))
+            .unwrap();
+        state
+            .core
+            .l0_store
+            .store("iri://checkpoint/test/b", &checkpoint(&tenant_b_task))
+            .unwrap();
+
+        let router = Router::new()
+            .route("/api/v1/tasks/trends", get(list_task_trends_handler))
+            .route("/api/v1/tasks/:task_iri", get(get_task_handler))
+            .route(
+                "/api/v1/tasks/:task_iri/status",
+                get(get_realtime_status_handler),
+            )
+            .route(
+                "/api/v1/tasks/:task_iri/details",
+                get(get_execution_details_handler),
+            )
+            .with_state(state);
+        let tenant_a_token = jwt("tenant-a", "project-a");
+        let request = |uri: String, token: Option<&str>| {
+            let mut request = Request::builder().method("GET").uri(uri);
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            request.body(Body::empty()).unwrap()
+        };
+
+        for uri in [
+            format!("/api/v1/tasks/{tenant_a_task}"),
+            format!("/api/v1/tasks/{tenant_a_task}/status"),
+            format!("/api/v1/tasks/{tenant_a_task}/details"),
+            "/api/v1/tasks/trends".to_string(),
+        ] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(request(uri, None))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        for suffix in ["", "/status", "/details"] {
+            let response = router
+                .clone()
+                .oneshot(request(
+                    format!("/api/v1/tasks/{tenant_b_task}{suffix}"),
+                    Some(&tenant_a_token),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains(&tenant_b_task));
+        }
+
+        let response = router
+            .clone()
+            .oneshot(request(
+                format!("/api/v1/tasks/{tenant_a_task}/details"),
+                Some(&tenant_a_token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(request(
+                "/api/v1/tasks/trends".to_string(),
+                Some(&tenant_a_token),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(&tenant_b_task));
 
         restore_env("AGENTOS_AUTH_MODE", saved_mode);
         restore_env("AGENTOS_JWT_SECRET", saved_secret);

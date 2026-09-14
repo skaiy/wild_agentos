@@ -18,8 +18,8 @@ Admin 页面，不是内核路径。“所需 claims”只陈述当前内核行�
 | Admin 屏 | hash 路由 | 内核 method+path | 所需 claims | 状态 |
 | --- | --- | --- | --- | --- |
 | Runs | `#/runs` | `GET /api/v1/tasks` | 已验证的 tenant/project `IsolationClaims`；只列出调用方持久化作用域内的任务。 | **已有** |
-| Runs — 任务详情 | `#/runs` | `GET /api/v1/tasks/:task_iri`、`GET /api/v1/tasks/:task_iri/status`、`GET /api/v1/tasks/:task_iri/details`、`GET /api/v1/tasks/trends` | 当前 `main` 没有统一的 verified-claims 门禁；不能把这些详情/读取路径当作有作用域的 Admin 列表契约。 | **已有** |
-| Agents | `#/agents` | `GET, POST /api/v1/agents`；`PUT, DELETE /api/v1/agents/:id`；`POST /api/v1/agents/:id/chat` | 创建和内部 chat 要求 verified `IsolationClaims`；当前 list/update/delete handler 没有统一要求或按 claims 过滤。 | **已有** — claims 覆盖不一致 |
+| Runs — 任务详情 | `#/runs` | `GET /api/v1/tasks/:task_iri`、`GET /api/v1/tasks/:task_iri/status`、`GET /api/v1/tasks/:task_iri/details`、`GET /api/v1/tasks/trends` | 已验证的 tenant/project `IsolationClaims`；详情读取要求与 Runs 列表相同的持久化任务作用域，trends 仅聚合该作用域。 | **已有** |
+| Agents | `#/agents` | `GET, POST /api/v1/agents`；`PUT, DELETE /api/v1/agents/:id`；`POST /api/v1/agents/:id/chat` | 已验证的 tenant/project `IsolationClaims`；用户 Agent 仅在调用方持久化作用域内列出和变更。无作用域的平台目录仍为共享运行期元数据。 | **已有** |
 | Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`；`GET /api/v1/skills/manifest`；`POST /api/v1/skills/import-git`；`GET /api/v1/skills/pipeline-runs`；`POST /api/v1/skills/pipeline-rerun` | Skill 变更要求 `DA`；读取没有统一的 `IsolationClaims` 门禁。 | **已有** |
 | KB · Ontology | `#/kb-ontology` | `GET, POST /api/v1/kb/bases`；`GET, POST /api/v1/kb/categories`；`GET, POST /api/v1/knowledge-packs`；`GET /api/v1/ontology/types`；`GET /api/v1/ontology/health` | KB 图/向量摄取、目录 CRUD 和本体写入使用已验证的 tenant/project `IsolationClaims`；缺失 claims 会 fail closed。 | **已有** |
 | Isolation | `#/isolation` | 没有 create-tenant HTTP 路径。本地只读诊断：`scripts/isolation-diagnose --data-root <path>` | JWT 验证 mint tenant/project claims。诊断 CLI 不需 JWT，仍可作为只读本地导入/盘点辅助；它不是 HTTP endpoint。 | **已有** — 没有 Admin 建租户表单 |

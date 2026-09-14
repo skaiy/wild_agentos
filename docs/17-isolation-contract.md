@@ -266,10 +266,11 @@ statistics are scope-limited and sensitive values are redacted. Blackboard
 `GET /api/v1/blackboard/nodes?task_iri=…` require verified claims and exclude
 tasks without matching persisted scope.
 
-This list contract does not extend to task detail paths (`GET /tasks/:iri`,
-status, details, or trends), which do not yet share a uniform verified-claims
-gate. See [Admin Control-Plane API Matrix](23-admin-control-plane-api-matrix.md)
-for the current mixed-coverage boundary.
+Task detail paths (`GET /tasks/:iri`, status, details, and trends) share the
+same verified-claims boundary: single-task reads require the caller's persisted
+scope and return no out-of-scope task data, while trends aggregate only
+checkpoints for tasks in that scope. Records without a complete persisted scope
+remain excluded.
 
 ### Spend gate
 

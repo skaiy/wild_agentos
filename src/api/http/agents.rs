@@ -146,8 +146,18 @@ pub(crate) fn migrate_legacy_agent_graphs(
     (agents_changed, packs_changed)
 }
 
-/// GET /api/v1/agents — 返回批处理 Agent（静态）与用户态 Agent（持久化）合并列表
-pub(crate) async fn list_agents_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+/// GET /api/v1/agents — 返回共享批处理目录与当前作用域的用户态 Agent。
+pub(crate) async fn list_agents_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
     let mut agents: Vec<Value> = state
         .agents_info
         .get("agents")
@@ -155,7 +165,17 @@ pub(crate) async fn list_agents_handler(State(state): State<Arc<AppState>>) -> i
         .cloned()
         .unwrap_or_default();
     let batch_count = agents.len();
-    let user_agents = state.user_agents.read().await.clone();
+    let user_agents: Vec<Value> = state
+        .user_agents
+        .read()
+        .await
+        .iter()
+        .filter(|agent| {
+            agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+                && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+        })
+        .cloned()
+        .collect();
     let user_count = user_agents.len();
     agents.extend(user_agents);
     Json(json!({
@@ -164,6 +184,7 @@ pub(crate) async fn list_agents_handler(State(state): State<Arc<AppState>>) -> i
         "user_count": user_count,
         "agents": agents,
     }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -224,18 +245,31 @@ pub(crate) async fn create_agent_handler(
 /// PUT /api/v1/agents/:id — 更新用户态 Agent 并持久化
 pub(crate) async fn update_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(patch): Json<Value>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
     let mut guard = state.user_agents.write().await;
-    let found = guard
-        .iter_mut()
-        .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id.as_str()));
+    let found = guard.iter_mut().find(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    });
     match found {
         Some(agent) => {
             if let (Some(obj), Some(patch_obj)) = (agent.as_object_mut(), patch.as_object()) {
                 for (k, v) in patch_obj {
-                    if k == "id" || k == "source" || k == "created_at" {
+                    if matches!(
+                        k.as_str(),
+                        "id" | "source" | "created_at" | "tenant_id" | "project_id"
+                    ) {
                         continue;
                     }
                     obj.insert(k.clone(), v.clone());
@@ -251,28 +285,260 @@ pub(crate) async fn update_agent_handler(
         }
         None => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "agent not found", "id": id })),
+            Json(json!({ "error": "agent not found" })),
         ),
     }
+    .into_response()
 }
 
 /// DELETE /api/v1/agents/:id — 删除用户态 Agent 并持久化
 pub(crate) async fn delete_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
     let mut guard = state.user_agents.write().await;
     let before = guard.len();
-    guard.retain(|a| a.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
+    guard.retain(|agent| {
+        !(agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id()))
+    });
     if guard.len() == before {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "agent not found", "id": id })),
-        );
+            Json(json!({ "error": "agent not found" })),
+        )
+            .into_response();
     }
     let _ = save_user_agents(&guard);
     (
         StatusCode::OK,
         Json(json!({ "status": "deleted", "id": id })),
     )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        routing::{get, put},
+        Router,
+    };
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::{
+        api::http::{api_gov::ApiUsageState, iam::JwtClaims, AppState, TEST_ENV_LOCK},
+        config::GatewaySettings,
+        core::core_types::{CoreConfig, SemanticCore},
+        gateway::unified_gateway::UnifiedGateway,
+        tools::prompt_registry::PromptRegistry,
+    };
+
+    fn test_state(path: &std::path::Path) -> Arc<AppState> {
+        let core = Arc::new(
+            SemanticCore::new(CoreConfig {
+                l0_storage_path: path.join("l0").display().to_string(),
+                enable_metrics: false,
+                ..CoreConfig::default()
+            })
+            .unwrap(),
+        );
+        let gateway = Arc::new(
+            UnifiedGateway::new(&GatewaySettings {
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                default_model: "test-model".into(),
+                timeout_seconds: 30,
+                max_retries: 1,
+                retry_base_ms: 500,
+                use_responses_api: false,
+                model_mapping: Default::default(),
+            })
+            .unwrap(),
+        );
+        Arc::new(AppState {
+            core,
+            gateway,
+            kg_store: Arc::new(oxigraph::store::Store::new().unwrap()),
+            config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
+            agents_info: json!({"agents": [{"id": "platform-agent", "source": "platform"}]}),
+            mcp_servers: Arc::new(tokio::sync::RwLock::new(vec![])),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![
+                json!({"id": "agent-a", "name": "Agent A", "source": "user", "tenant_id": "tenant-a", "project_id": "project-a", "created_at": "2026-01-01T00:00:00Z"}),
+                json!({"id": "agent-b", "name": "Agent B", "source": "user", "tenant_id": "tenant-b", "project_id": "project-a", "created_at": "2026-01-01T00:00:00Z"}),
+                json!({"id": "legacy-agent", "name": "Legacy", "source": "user"}),
+            ])),
+            prompts: Arc::new(PromptRegistry::new()),
+            kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            blob_store: None,
+            task_executor: None,
+            batch_manager: None,
+            api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    fn jwt(tenant_id: &str, project_id: &str) -> String {
+        encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "test-user".into(),
+                tenant_id: tenant_id.into(),
+                project_id: Some(project_id.into()),
+                roles: vec![],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
+    async fn request(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn agent_crud_requires_claims_and_never_exposes_other_scopes() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+
+        let state = test_state(temp.path());
+        let router = Router::new()
+            .route("/api/v1/agents", get(list_agents_handler))
+            .route(
+                "/api/v1/agents/:id",
+                put(update_agent_handler).delete(delete_agent_handler),
+            )
+            .with_state(state.clone());
+
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let tenant_a_token = jwt("tenant-a", "project-a");
+        let (status, listed) = request(
+            &router,
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agents")
+                .header("authorization", format!("Bearer {tenant_a_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["user_count"], 1);
+        assert!(listed.to_string().contains("platform-agent"));
+        assert!(listed.to_string().contains("agent-a"));
+        assert!(!listed.to_string().contains("agent-b"));
+        assert!(!listed.to_string().contains("legacy-agent"));
+
+        for method in ["PUT", "DELETE"] {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri("/api/v1/agents/agent-b")
+                .header("authorization", format!("Bearer {tenant_a_token}"));
+            if method == "PUT" {
+                builder = builder.header("content-type", "application/json");
+            }
+            let (status, body) = request(
+                &router,
+                builder
+                    .body(if method == "PUT" {
+                        Body::from(json!({"name": "attacker"}).to_string())
+                    } else {
+                        Body::empty()
+                    })
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(!body.to_string().contains("agent-b"));
+        }
+
+        let (status, updated) = request(
+            &router,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/agents/agent-a")
+                .header("authorization", format!("Bearer {tenant_a_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"name": "Updated A", "tenant_id": "tenant-b", "project_id": "other", "id": "other"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["agent"]["name"], "Updated A");
+        assert_eq!(updated["agent"]["tenant_id"], "tenant-a");
+        assert_eq!(updated["agent"]["project_id"], "project-a");
+        assert_eq!(updated["agent"]["id"], "agent-a");
+
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/agents/agent-a")
+                .header("authorization", format!("Bearer {tenant_a_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        restore_env("AGENTOS_AUTH_MODE", previous_auth_mode);
+        restore_env("AGENTOS_JWT_SECRET", previous_jwt_secret);
+        restore_env("AGENTOS_DATA_DIR", previous_data_dir);
+    }
+
+    fn restore_env(name: &str, previous: Option<std::ffi::OsString>) {
+        if let Some(value) = previous {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
 }
