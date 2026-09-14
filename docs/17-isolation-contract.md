@@ -4,7 +4,7 @@
 It is not an identity provider (IdP), an OIDC or Keycloak integration, a
 17-state IAM workflow, or a storage migration.
 
-This document describes the state of `main` as of 2026-09-04. It distinguishes
+This document describes the state of `main` as of 2026-09-14 (v0.7.0). It distinguishes
 the storage paths that are wired today from historical paths that remain live.
 Do not treat a minted name as proof that existing data has moved to it.
 
@@ -50,7 +50,7 @@ or a StageExecutor feature.
 
 ## Workload OIDC contract for business BFFs
 
-Business BFFs such as the StructCapture Capture BFF authenticate to AgentOS by
+Business BFFs authenticate to AgentOS by
 forwarding a short-lived workload OIDC access token in
 `Authorization: Bearer <token>`. They do **not** sign a new AgentOS token.
 Configure the AgentOS HTTP service:
@@ -66,7 +66,7 @@ AGENTOS_OIDC_AUDIENCE=wild-agentos
 The issuer must publish an asymmetric signing key at the configured JWKS URL.
 The exact issuer and audience strings must match the token; AgentOS verifies
 the signature, `exp`, `iss`, and `aud` before it mints any isolation scope.
-This is a configuration checklist for the Capture BFF integration:
+This is a configuration checklist for a business BFF integration:
 
 1. Obtain a short-lived workload token from the BFF's existing OIDC provider.
 2. Set the token's audience to the configured `AGENTOS_OIDC_AUDIENCE`.
@@ -79,7 +79,7 @@ Minimum token claims:
 
 ```json
 {
-  "sub": "workload:structcapture:capture-bff",
+  "sub": "workload:example-bff",
   "tenant_id": "acme",
   "project_id": "capture-prod",
   "exp": 1798761600
@@ -255,6 +255,21 @@ L0, or blob keys). Until each historical backend is explicitly migrated and
 verified, production queries must not claim that isolation is complete.
 
 ## Current wiring
+
+### Runtime read lists
+
+`GET /api/v1/tasks` requires verified tenant/project `IsolationClaims` and
+lists only tasks with the caller's persisted scope. `GET /api/v1/guard/audit`
+and `GET /api/v1/guard/stats` also require verified claims; audit entries and
+statistics are scope-limited and sensitive values are redacted. Blackboard
+`GET /api/v1/blackboard/tasks` and
+`GET /api/v1/blackboard/nodes?task_iri=…` require verified claims and exclude
+tasks without matching persisted scope.
+
+This list contract does not extend to task detail paths (`GET /tasks/:iri`,
+status, details, or trends), which do not yet share a uniform verified-claims
+gate. See [Admin Control-Plane API Matrix](23-admin-control-plane-api-matrix.md)
+for the current mixed-coverage boundary.
 
 ### Spend gate
 

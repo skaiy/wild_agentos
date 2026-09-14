@@ -174,6 +174,29 @@ anchored. The companion Admin job list is delivered separately.
 See [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
 for the delivered boundary and configuration.
 
+### v0.6.1 — complete: isolation/auth hardening and generic chat
+
+Workload OIDC identities mint verified `IsolationClaims` without sharing the
+local-development HS256 secret. Generic Agent chat and completions are
+domain-neutral by default: domain context is opt-in rather than injected for
+every request.
+
+### v0.6.2 — complete: multimodal P0
+
+Agent chat image handling now uses the existing vision mount, fails closed when
+vision is unavailable by default, and enforces image-count and payload-size
+limits. The explicit compatibility degradation path remains observable; images
+are never silently dropped.
+
+### v0.7.0 — complete: optional runtime assets and scoped runtime operations
+
+The builtin `ev-repair-fault-kb` pack (or its `ev-repair` alias) is opt-in; it
+does not supply default chat system context or RAG. Runtime operations now
+include claims-scoped task listing, redacted claims-scoped Guard audit and
+statistics, and claims-scoped Blackboard task and node lists. Task detail paths
+and several Admin APIs retain their documented mixed claims coverage; see the
+[Admin Control-Plane API Matrix](23-admin-control-plane-api-matrix.md).
+
 ## Explicit non-goals
 
 1. No category-IV “microkernel OS” or bare-metal OS.

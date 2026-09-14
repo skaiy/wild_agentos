@@ -4,17 +4,17 @@
 |---|---|
 | Doc version | 0.2.0 (revision: align with existing design + landed contracts) |
 | Audience | Open-source line (coordination / deploy / test / security) |
-| Trigger | StructCapture demo line (business repo only consumes the contract) |
+| Trigger | Business-client integration (the business repo only consumes the contract) |
 | Parent design | [docs/13-DESIGN_DETAIL.md](./13-DESIGN_DETAIL.md) / [zh](./13-DESIGN_DETAIL.zh.md) (**authoritative — do not invent a parallel stack**) |
-| Related | Sibling business-layer design in `wild-struct-capture`; isolation `17-isolation-contract`; tools `05-tool-system`; ingest `16-knowledge-ingest-import-graph` |
+| Related | Isolation `17-isolation-contract`; tools `05-tool-system`; ingest `16-knowledge-ingest-import-graph` |
 | Chinese | [19-multimodal-reuse-existing-capabilities.zh.md](./19-multimodal-reuse-existing-capabilities.zh.md) |
-| Demo snapshot | WAO `core:v0.6.1` · OIDC · Agent `structcapture-organizer` · gateway temporarily text MiniMax |
+| Current snapshot | WAO `v0.7.0` · OIDC · generic business Agent |
 
 ---
 
 ## 0. Hard principles for the open-source line (pin this)
 
-> **Do not build a separate “multimodal middleware” for StructCapture.**  
+> **Do not build a separate multimodal middleware for a business client.**
 > First **wire / configure / document / close gaps** on capabilities that already exist; any gap is a minimal delta written back into DESIGN_DETAIL (or the matching numbered doc), not a second semantics stack in the business repo or a side path.
 
 | Principle | Meaning |
@@ -39,7 +39,7 @@ Multimodal here is an **input-shape extension on the existing architecture**, no
 | **§2 Five-layer memory** | Image evidence enters L0/L2 as **@id / IRI**; L1 keeps summary + pointers. Do not dump full base64 into the context window | A parallel “image cache service” that bypasses memory layers |
 | **§3 JSON-LD semantic bus** | Each shot / extracted field as a typed `@id`/`@type` node; Framing controls projection depth; conflicts trace via named graphs | A business-only non-RDF evidence store as the “official” path |
 | **§4 5W2H** | **Where** = image/URL evidence; **What/Why** = structuring goal and success criteria; CA can audit image↔text alignment per dimension | A separate “vision meta” schema unrelated to 5W2H |
-| **§5 Skill graph** | Vision/OCR/VL completion as **AtomicSkill or MCP wrapper**; text extraction via `AlternativeLink` fallback; pitfalls as KnowledgeFragment | Hard-coding StructCapture packaging OCR inside Core |
+| **§5 Skill graph** | Vision/OCR/VL completion as **AtomicSkill or MCP wrapper**; text extraction via `AlternativeLink` fallback; pitfalls as KnowledgeFragment | Hard-coding business-specific OCR inside Core |
 | **§6 Proactive perception** | CycleTimeout / QualityDegradation cover slow VL and bad extracts; reuse dedup window | A separate vision alert bus |
 | **§7 Tools + MCP** | Large vision outputs go through result routing / micro-tools; external VL via **existing LLMClient / MCP**, not a private protocol | Business clients bypassing SyscallGate / isolation |
 | **§8–§9 Checkpoints / work queue** | Long vision jobs may be async + checkpoint; bulk evidence import may use workers | Forcing the sync demo path onto a heavy queue (not required) |
@@ -78,7 +78,11 @@ Without images: resolve `model_mounts["chat"]` → legacy `agent.model` → `gat
 
 Image input is limited before gateway dispatch: `AGENTOS_MAX_IMAGES` defaults to `8` and `AGENTOS_MAX_IMAGE_BYTES` defaults to `10485760` (10 MiB), counting the supplied URL/data-URI payload bytes. Exceeding either limit returns `413 too_many_images` or `413 image_payload_too_large`. Gateway rejections and timeouts remain hard errors; they never trigger a text-only retry.
 
-**Demo gap (config, not architecture):** `structcapture-organizer` often has **no real VL on the vision mount** (or points at a text model); gateway may also be text MiniMax → “images are accepted but vision quality is poor”. Prefer **register model resources + mounts** before changing Core.
+**Shipped P0 (v0.6.2):** the existing vision mount is the supported image path.
+Vision-unavailable requests fail closed by default; the explicit compatibility
+degradation path is observable, image limits return `413`, and images are never
+silently dropped. Business clients should register model resources and mounts
+instead of changing Core.
 
 ### 2.3 Links back to DESIGN_DETAIL
 
@@ -103,7 +107,7 @@ Image input is limited before gateway dispatch: `AGENTOS_MAX_IMAGES` defaults to
 
 ### 3.2 Non-goals
 
-- No StructCapture-domain OCR / enums / HITL inside WAO.  
+- No business-specific OCR / enums / HITL inside WAO.
 - No parallel “Vision Service” replacing gateway.  
 - Vision not required on every Agent.  
 - No commercial VL SDK wired into Core as a bypass.
@@ -112,15 +116,15 @@ Image input is limited before gateway dispatch: `AGENTOS_MAX_IMAGES` defaults to
 
 ## 4. Gap list: minimal deltas on top of what exists
 
-### P0 — Demo correct path (config + contract hardening)
+### P0 — shipped in v0.6.2: correct path (config + contract hardening)
 
 | ID | Work | Kind | Acceptance |
 |---|---|---|---|
-| P0-1 | Formal docs: `images`, mounts `vision`/`chat`, limits, error codes; link DESIGN_DETAIL §7/§11 | Docs | Copy-pasteable curl; matches code |
-| P0-2 | Demo/sample: add VL under `models.resources`; Agent `model_mounts.vision` points to it | **Config** | 1-image chat references visible text/objects |
-| P0-3 | When vision mount missing and resolve falls back to a text model: **observable** policy | Small change / policy | Tests prove no fake “vision success” |
-| P0-4 | Payload limits + 413 / business code (configurable) | Harden | Oversize is testable |
-| P0-5 | OIDC + isolation + images: positive/negative CI | Tests | Missing claims still 401 |
+| P0-1 | `images`, `vision`/`chat` mounts, limits, and error codes documented | Docs | Matches code |
+| P0-2 | Model resources and `model_mounts.vision` supported | **Config** | A business Agent can mount a VL model |
+| P0-3 | Vision-unavailable behavior is observable | Policy | No fake vision success |
+| P0-4 | Payload limits return configurable `413` responses | Hardened | Oversize is testable |
+| P0-5 | OIDC + isolation + images have positive/negative CI coverage | Tests | Missing claims still returns `401` |
 
 **Decided fallback policy (open-source line):** default **hard 4xx** (`vision_mount_unavailable`); `AGENTOS_VISION_FALLBACK=degrade` is the sole compatibility escape hatch and includes `degraded` / `warning: vision_mount_unavailable`. **Silent drop remains forbidden.**
 
@@ -145,24 +149,19 @@ Image input is limited before gateway dispatch: `AGENTOS_MAX_IMAGES` defaults to
 
 ---
 
-## 5. Collaboration with the business layer
+## 5. Business-client boundary
 
 ```
-Business (StructCapture)                    Stock WAO (open-source)
-────────────────────────                    ───────────────────────
-compress / max shots / flags / HITL / enums
+Business client                              Stock WAO (open-source)
+───────────────                              ───────────────────────
+domain limits / flags / HITL / enums
 POST message + images[]  ─────────────►  existing chat contract
                          ◄─────────────  reply / distinguishable errors
-temp VL bypass  ◄── only while P0 is open
 ```
 
-**Conditions to turn off business VL bypass:**
-
-1. P0-1…P0-5 done (docs + demo Agent vision mount + observable policy + tests)  
-2. Demo VPS smoke: imaged organize beats text-only  
-3. Deploy samples; test checklist; security confirms no image bodies in logs  
-
-Target release for this P0 slice: **v0.6.2** (hotfix; not mixed into v0.7).
+The shipped P0 contract is the supported path. A business client may use
+application-specific fallbacks outside this repository, but they do not replace
+the generic chat contract.
 
 ---
 
@@ -173,7 +172,7 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 
 | Slice | Content |
 |---|---|
-| Hotfix / small release (v0.6.2) | P0: docs, VL mount, silent-drop governance, 413, CI |
+| Shipped in v0.6.2 | P0: docs, VL mount, silent-drop governance, 413, CI |
 | Next small release | P1: evidence nodes, audit, SSRF, Schema→JSON-LD |
 | Later | P2 |
 
@@ -185,7 +184,7 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 |---|---|
 | Model resources | Register VL in `models.resources` |
 | Agent | `model_mounts.chat` = text; `model_mounts.vision` = VL |
-| Rollback | Remove vision mount or point at text = immediate text path; business clears `INCLUDE_IMAGES` |
+| Rollback | Remove the vision mount or use the explicit compatibility policy; the client stops sending images |
 | Health | Optional vision probe (tiny fixture image) |
 | Quota | Confirm pool/billing before switching VL |
 
@@ -198,7 +197,8 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 3. Images but vision unset: assert **observable** policy (not silent fake success).  
 4. Oversized payload.  
 5. No OIDC / missing isolation claims.  
-6. StructCapture organize E2E stays in the business repo; Core provides staging notes.
+6. Business-client end-to-end flows stay in the business repository; Core provides
+   the generic contract.
 
 ---
 
@@ -216,8 +216,8 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 
 | Item | Owner |
 |---|---|
-| home-inventory fields, enums, HITL UI, ASR UX | StructCapture / business line |
-| Customer Basic Auth, Caddy, kaiy.ai | Demo ops / business VPS |
+| Domain fields, enums, HITL UI, ASR UX | Business client |
+| Client-specific authentication and hosting | Business client |
 | Which commercial VL | Joint advice; lands as **`models.resources` config** |
 
 ---
@@ -226,7 +226,8 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 
 > Per [13-DESIGN_DETAIL](./13-DESIGN_DETAIL.md): multimodal is **not** a new mid-tier — attach image evidence to existing PDCA / memory / JSON-LD / 5W2H / skills / tools / Gateway.  
 > Code already has `POST .../chat` `images[]` and `model_mounts.vision→chat`. Prioritize **mounting VL, freezing contract + error semantics, CI**; forbid silent image drop.  
-> StructCapture only consumes the contract; domain + HITL stay in the business repo. VL bypass is temporary. Target **v0.6.2** for P0.
+> Business clients consume this contract; domain behavior and HITL stay outside
+> this repository. The P0 contract shipped in **v0.6.2**.
 
 ---
 
@@ -235,7 +236,7 @@ Prefer: “**Agent chat multimodal wiring acceptance** (existing `images` + `mod
 1. ~~Soft vs hard when vision falls back to text?~~ **Decided:** hard 4xx by default; `AGENTOS_VISION_FALLBACK=degrade` is explicit compatibility-only degrade mode.  
 2. ~~Official defaults for `max_images` / `max_bytes`?~~ **Decided:** `8` images and `10485760` supplied payload bytes (both configurable).  
 3. Must P1 force L2 @id persistence, or is stateless chat enough for now?  
-4. ~~0.6.x vs 0.7.0?~~ **Decided:** **v0.6.2** hotfix slice.
+4. ~~0.6.x vs 0.7.0?~~ **Shipped:** **v0.6.2**.
 
 ---
 
