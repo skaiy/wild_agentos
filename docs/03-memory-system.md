@@ -204,7 +204,8 @@ graph TB
 
 ### 3.2.4 L2 Battle Map Enhancements
 
-**Implementation status**: ✅ Complete (v2.1.0)
+**Implementation status**: ✅ Complete (internal feature version v2.1.0; not a
+repository release tag)
 
 The L2 Blackboard adds Battle Map capabilities, allowing Agents to perceive global state, coordinate resources, and track cross-task dependencies.
 

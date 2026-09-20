@@ -18,18 +18,21 @@ graph TB
     end
 
     subgraph Event_types
-        ET1["Task lifecycle<br/>6 types"]
+        ET1["Task lifecycle<br/>5 types"]
         ET2["PDCA phases<br/>8 types"]
         ET3["Agent events<br/>3 types"]
         ET4["Memory events<br/>4 types"]
         ET5["5W2H constraints<br/>2 types"]
         ET6["Human approval<br/>2 types"]
         ET7["System events<br/>3 types"]
+        ET8["Action audit<br/>1 type"]
+        ET9["Batch curation<br/>23 types"]
+        ET10["Workspace files<br/>4 types"]
     end
 
     EB --> EF --> SUB
     MB --> CE
-    ET1 & ET2 & ET3 & ET4 & ET5 & ET6 & ET7 --> EB
+    ET1 & ET2 & ET3 & ET4 & ET5 & ET6 & ET7 & ET8 & ET9 & ET10 --> EB
 ```
 
 ## 4.2 EventBus — Event Bus
@@ -92,6 +95,19 @@ pub enum EventType {
     // User supplementary input
     UserSupplementaryInput,
     
+    // Audited actions, batch curation, and workspace monitoring
+    ActionAudit,
+    BatchAgentRegistered, BatchAgentStarted, BatchAgentStopped, BatchAgentError,
+    BatchExtractionStarted, BatchExtractionCompleted, BatchExtractionFailed,
+    BatchEntityDetected, BatchRelationDetected, BatchIntentDetected,
+    BatchDecisionDetected, BatchContextInjected, BatchSkillMergeSuggested,
+    BatchSkillMergeApplied, BatchFragmentRefined, BatchEntityResolved,
+    BatchEntityMergeConflict, BatchFailurePatternDetected,
+    BatchHealthReportGenerated, BatchMemoryCompacted, BatchLinkRecommended,
+    BatchLinkApplied, BatchTemplateAnalysisReady,
+    WorkspaceFileCreated, WorkspaceFileModified,
+    WorkspaceFileRemoved, WorkspaceFileStale,
+
     // Custom
     Custom(String),
 }

@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.6.1-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.7.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -35,6 +35,9 @@ work-record storage. Missing or invalid identity means access is refused; a
 caller cannot select another tenant's storage. This applies to the
 claims-scoped interfaces, not every legacy HTTP endpoint. The naming scheme
 does not migrate historical data—see the [Isolation Contract](docs/17-isolation-contract.md).
+
+Domain-specific conversation belongs in the client or an optional example pack
+such as `ev-repair`, not in the core middleware.
 
 ## What you get
 
@@ -92,6 +95,7 @@ human-governed, auditable decisions.
 
 | Version | Date | Business summary |
 |---|---:|---|
+| **v0.7.0** | 2026-09-13 | Core chat stays general-purpose; optional example packs can add domain help when selected. Teams can also view only their own tasks, guard records, and blackboard data, with sensitive details removed from guard views. |
 | **v0.6.1** | 2026-09-09 | Generic Agent chat and completions are domain-neutral by default; workload OIDC now defines short-lived JWTs for `IsolationClaims` without sharing BFF signing secrets. |
 | **v0.6.0** | 2026-09-08 | Authenticated online-corpus job records, manual staging runner, queue-only watchers, bounded source tracing and operational records, retry/capacity controls, and CI-proven production-write isolation. |
 | **v0.5.0** | 2026-09-07 | Governed knowledge-engineering flow: staged extraction, quality and review, approval-held identity suggestions, evidence, health reporting, and compatibility-gated ontology design. |
@@ -164,6 +168,8 @@ production HS256 configuration.
 - [Ontology Action data sandbox](docs/15-ontology-action-sandbox.md) — HITL
   staging, guardrails, and audit
 - [Ontology KE golden-freeze policy](docs/22-ontology-ke-golden-freeze-policy.md)
+- [Admin control-plane API matrix](docs/23-admin-control-plane-api-matrix.md) —
+  current Admin-to-kernel API coverage and access boundaries
 - [Outbound A2A adapter](docs/19-a2a-outbound.md)
 - [Private-deployment benchmark](docs/19-private-deploy-benchmark.md)
 - [Design detail](docs/13-DESIGN_DETAIL.md)

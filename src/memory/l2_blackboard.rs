@@ -62,7 +62,7 @@ pub struct TaskTreeNode {
     pub node_iris: Vec<String>,
 }
 
-/// Platform-level task overview row for the admin Blackboard browser.
+/// Task overview row for the claims-scoped Blackboard browser.
 /// Aggregates task_nodes (node count) with task_tree (status/hierarchy).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TaskSummary {
@@ -1805,7 +1805,7 @@ impl Blackboard {
         }
     }
 
-    /// List all known tasks on the blackboard (platform/task-scope, cross-tenant).
+    /// List all known tasks on the blackboard for a caller to scope before exposure.
     /// Unions keys from `task_nodes` (any task that ever had nodes written) and
     /// `task_tree` (any task registered in the hierarchy), sorted by task_iri.
     pub fn list_task_summaries(&self) -> Vec<TaskSummary> {

@@ -11,11 +11,11 @@
 Wild AgentOS 已有：
 
 - **技能图谱**：7,500+ LOC 动态语义网络，6 类链接类型，Learn/Reduce 自举学习，冲突检测
-- **五层记忆**：MESI 一致性协议的 L0→L3 层次化存储
+- **四层记忆**：MESI 一致性协议的 L0→L3 层次化存储
 - **执行引擎**：PDCA 循环 + 10 类感知触发器
 - **Batch Agent 框架**：滑动窗口 + 模板引擎 + 抽取管道 + 知识持久化（Phase 1-5 已完成）
 
-### 缺口
+### 尚待成熟的能力缺口
 
 LLM 的后台整理能力未被充分利用。技能合并/拆分/质量评估、知识碎片提炼、跨会话记忆整合、失败模式挖掘等场景仍依赖简单规则或人工确认。
 
@@ -566,14 +566,14 @@ batch:
       lookback_hours: 168
 ```
 
-### 6.3 SkillGraphStore 新增接口
+### 6.3 已实现的 SkillGraphStore 接口
 
 ```rust
 // 所有角色共享的扩展接口
 impl SkillGraphStore {
     pub fn bulk_read_skills(&self, iris: &[&str]) -> Vec<SkillGraphNode>;
     pub fn create_composite_skill(&self, name: &str, children: &[String]) -> Result<...>;
-    pub fn deprecate_skill(&self, iri: &str, reason: &str) -> Result<(), BatchError>;
+    pub fn deprecate_skill(&self, iri: &str) -> Result<(), BatchError>;
     pub fn batch_add_links(&self, links: &[BulkLinkInput]) -> Result<usize, BatchError>;
 }
 ```

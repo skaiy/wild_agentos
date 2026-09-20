@@ -276,7 +276,38 @@ pub struct KnowledgePack {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// Optional, named runtime behavior contributed only when an Agent mounts
+    /// this pack. It is descriptive metadata; the runtime recognizes built-in
+    /// asset IDs rather than executing arbitrary pack-provided instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_asset: Option<RuntimeAssetProfile>,
 }
+
+/// A declarative profile for a built-in, opt-in runtime asset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeAssetProfile {
+    pub id: String,
+    pub prompt_template: String,
+    pub retrieval: RuntimeRetrievalProfile,
+}
+
+/// Retrieval metadata exposed with a runtime asset. Query execution stays in
+/// the claims-scoped store boundary; pack metadata never selects a graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRetrievalProfile {
+    pub ontology_type: String,
+    pub query: String,
+    pub vector_supplement: bool,
+}
+
+pub const EV_REPAIR_RUNTIME_ASSET_ID: &str = "ev-repair";
+/// Stable persisted knowledge-pack ID. `ev-repair` is the runtime asset and
+/// Agent bind alias, not a replacement for this storage identity.
+pub const EV_REPAIR_KNOWLEDGE_PACK_ID: &str = "ev-repair-fault-kb";
+pub const EV_REPAIR_ONT_FAULT: &str = "http://aps.local/ontology/FaultCode";
+pub const EV_REPAIR_PROMPT_TEMPLATE: &str = "你是「{{agent_name}}」，一名专业的新能源汽车故障诊断与维修助手。请严格依据下方“知识库检索结果”，用简体中文回答用户问题：解释故障含义、是否可继续行驶、维修建议与适用车型。若检索结果为空或不足以支撑回答，请如实说明并给出通用排查建议，切勿编造具体故障码信息。回答需专业、严谨、条理清晰。";
+pub const EV_REPAIR_FAULT_QUERY_PROFILE: &str =
+    "FaultCode SPARQL: code, label, meaning, can_drive, repair, models, brand";
 
 // ─── 种子构造辅助 ──────────────────────────────────────────
 
@@ -883,7 +914,7 @@ pub fn knowledge_packs() -> Vec<KnowledgePack> {
         functions: ont.functions.len(),
     };
     vec![KnowledgePack {
-        id: "ev-repair-fault-kb".into(),
+        id: EV_REPAIR_KNOWLEDGE_PACK_ID.into(),
         name: "新能源车维修故障库".into(),
         description: "覆盖品牌/车型/系统/故障码/原因/诊断步骤/处理措施/费用参考/FAQ/数据来源的新能源车维修知识包，封装知识图谱与向量切片，支持 Agent 挂载与包间隔离。".into(),
         version: "1.0.0".into(),
@@ -899,5 +930,30 @@ pub fn knowledge_packs() -> Vec<KnowledgePack> {
         builtin: true,
         created_at: None,
         updated_at: None,
+        runtime_asset: Some(RuntimeAssetProfile {
+            id: EV_REPAIR_RUNTIME_ASSET_ID.into(),
+            prompt_template: EV_REPAIR_PROMPT_TEMPLATE.into(),
+            retrieval: RuntimeRetrievalProfile {
+                ontology_type: EV_REPAIR_ONT_FAULT.into(),
+                query: EV_REPAIR_FAULT_QUERY_PROFILE.into(),
+                vector_supplement: true,
+            },
+        }),
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ev_repair_pack_declares_its_runtime_asset_profile() {
+        let pack = knowledge_packs().pop().expect("seeded ev-repair pack");
+        assert_eq!(pack.id, EV_REPAIR_KNOWLEDGE_PACK_ID);
+        let asset = pack.runtime_asset.expect("runtime asset profile");
+        assert_eq!(asset.id, EV_REPAIR_RUNTIME_ASSET_ID);
+        assert_eq!(asset.retrieval.ontology_type, EV_REPAIR_ONT_FAULT);
+        assert!(asset.retrieval.vector_supplement);
+        assert!(asset.prompt_template.contains("新能源汽车故障诊断与维修"));
+    }
 }

@@ -20,18 +20,21 @@ graph TB
     end
 
     subgraph 事件类型
-        ET1["Task 生命周期<br/>6种"]
+        ET1["Task 生命周期<br/>5种"]
         ET2["PDCA 阶段<br/>8种"]
         ET3["Agent 事件<br/>3种"]
         ET4["Memory 事件<br/>4种"]
         ET5["5W2H 约束<br/>2种"]
         ET6["人工审批<br/>2种"]
         ET7["系统事件<br/>3种"]
+        ET8["动作审计<br/>1种"]
+        ET9["批处理治理<br/>23种"]
+        ET10["工作区文件<br/>4种"]
     end
 
     EB --> EF --> SUB
     MB --> CE
-    ET1 & ET2 & ET3 & ET4 & ET5 & ET6 & ET7 --> EB
+    ET1 & ET2 & ET3 & ET4 & ET5 & ET6 & ET7 & ET8 & ET9 & ET10 --> EB
 ```
 
 ## 4.2 EventBus — 事件总线
@@ -94,6 +97,19 @@ pub enum EventType {
     // User supplementary input
     UserSupplementaryInput,
     
+    // 审计动作、批处理治理与工作区监控
+    ActionAudit,
+    BatchAgentRegistered, BatchAgentStarted, BatchAgentStopped, BatchAgentError,
+    BatchExtractionStarted, BatchExtractionCompleted, BatchExtractionFailed,
+    BatchEntityDetected, BatchRelationDetected, BatchIntentDetected,
+    BatchDecisionDetected, BatchContextInjected, BatchSkillMergeSuggested,
+    BatchSkillMergeApplied, BatchFragmentRefined, BatchEntityResolved,
+    BatchEntityMergeConflict, BatchFailurePatternDetected,
+    BatchHealthReportGenerated, BatchMemoryCompacted, BatchLinkRecommended,
+    BatchLinkApplied, BatchTemplateAnalysisReady,
+    WorkspaceFileCreated, WorkspaceFileModified,
+    WorkspaceFileRemoved, WorkspaceFileStale,
+
     // Custom
     Custom(String),
 }

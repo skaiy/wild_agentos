@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.6.1-blue)](https://github.com/skaiy/wild_agentos/releases)
+[![Release](https://img.shields.io/badge/release-v0.7.0-blue)](https://github.com/skaiy/wild_agentos/releases)
 
 ---
 
@@ -33,6 +33,8 @@ PDCA（计划、执行、检查、改进）组织智能体工作，帮助团队�
 缺少或无效凭证即拒绝访问，调用方也不能指定其他租户的存储范围。此保证适用于已接入
 隔离凭证的接口，并不代表每个历史 HTTP 接口都已隔离。系统划定新的存储名称，不等于
 迁移历史数据；详见[隔离契约](docs/17-isolation-contract.zh.md)。
+
+领域对话应放在客户端或可选示例包（如 `ev-repair`）中，核心中间件保持通用。
 
 ## 你能获得什么
 
@@ -92,6 +94,7 @@ v0.6.0 新增了在同一租户/项目边界内运行的、已认证的在线语
 
 | 版本 | 日期 | 业务说明 |
 |---|---:|---|
+| **v0.7.0** | 2026-09-13 | 核心对话保持通用，按需启用示例包才会加入领域帮助；团队还能只查看自己范围内的任务、护栏记录和黑板数据，护栏查看会隐藏敏感细节。 |
 | **v0.6.1** | 2026-09-09 | 通用 Agent chat 与 completions 默认不再注入特定领域上下文；workload OIDC 现定义用于 `IsolationClaims` 的短期 JWT，且 BFF 不共享 `AGENTOS_JWT_SECRET`。 |
 | **v0.6.0** | 2026-09-08 | 已认证的在线语料任务记录、手动暂存执行器、仅入队的监视器、有限的来源追溯和运行记录、重试与容量控制，以及由 CI 验证的生产写入隔离。 |
 | **v0.5.0** | 2026-09-07 | 受治理的知识工程流程：暂存提取、质量检查和审核、待审批的实体消歧建议、审计证据、健康报告和兼容性门控的本体设计。 |
@@ -148,6 +151,8 @@ configuration。
 - [本体 Action 数据沙箱](docs/15-ontology-action-sandbox.zh.md) — HITL staging、
   guardrail 与 audit
 - [本体 KE Golden Freeze Policy](docs/22-ontology-ke-golden-freeze-policy.zh.md)
+- [Admin control-plane API matrix](docs/23-admin-control-plane-api-matrix.zh.md) —
+  Admin 与内核 API 的当前覆盖范围及访问边界
 - [Outbound A2A adapter](docs/19-a2a-outbound.md)
 - [Private-deployment benchmark](docs/19-private-deploy-benchmark.md)
 - [设计细节](docs/13-DESIGN_DETAIL.zh.md)

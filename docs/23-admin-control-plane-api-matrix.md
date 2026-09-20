@@ -1,0 +1,52 @@
+# 23. Admin Control-Plane ↔ Kernel API Matrix
+
+> *A Chinese version is available in
+> [23-admin-control-plane-api-matrix.zh.md](23-admin-control-plane-api-matrix.zh.md).*
+
+This is the current-`main` (v0.7.0) matrix for the Admin control plane and the
+kernel HTTP API. Hash routes identify Admin screens; they are not kernel paths.
+“Claims required” describes current kernel behavior, not an authorization policy
+inferred from a screen name.
+
+## Status vocabulary
+
+- **Existing** — the listed path is registered on current `main`.
+- **Not doing** — deliberately outside this matrix.
+
+## Matrix
+
+| Admin screen | hash route | kernel method+path | claims required | status |
+| --- | --- | --- | --- | --- |
+| Runs | `#/runs` | `GET /api/v1/tasks` | Verified tenant/project `IsolationClaims`; lists only the caller’s persisted scope. | **Existing** |
+| Runs — task detail | `#/runs` | `GET /api/v1/tasks/:task_iri`, `GET /api/v1/tasks/:task_iri/status`, `GET /api/v1/tasks/:task_iri/details`, `GET /api/v1/tasks/trends` | Verified tenant/project `IsolationClaims`; detail reads require the same persisted task scope as the Runs list, and trends aggregate only that scope. | **Existing** |
+| Agents | `#/agents` | `GET, POST /api/v1/agents`; `PUT, DELETE /api/v1/agents/:id`; `POST /api/v1/agents/:id/chat` | Verified tenant/project `IsolationClaims`; user Agents are listed and mutated only in the caller’s persisted scope. The unscoped platform catalog remains shared runtime metadata. | **Existing** |
+| Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`; `GET /api/v1/skills/manifest`; `POST /api/v1/skills/import-git`; `GET /api/v1/skills/pipeline-runs`; `POST /api/v1/skills/pipeline-rerun` | Skill mutations require `DA`; reads do not have a uniform `IsolationClaims` gate. | **Existing** |
+| KB · Ontology | `#/kb-ontology` | `GET, POST /api/v1/kb/bases`; `GET, POST /api/v1/kb/categories`; `GET, POST /api/v1/knowledge-packs`; `GET /api/v1/ontology/types`; `GET /api/v1/ontology/health` | KB graph/vector ingestion, catalog CRUD, and ontology writes use verified tenant/project `IsolationClaims`; missing claims fail closed. | **Existing** |
+| Isolation | `#/isolation` | No create-tenant HTTP path. Local read-only diagnostic: `scripts/isolation-diagnose --data-root <path>` | JWT verification mints tenant/project claims. The diagnostic CLI needs no JWT and remains a read-only local import/inventory aid; it is not an HTTP endpoint. | **Existing** — no Admin create-tenant form |
+| Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`; `PUT, DELETE /api/v1/api-clients/:id`; `POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`; `GET /api/v1/api-audit`; `GET, PUT /api/v1/config`; `POST /api/v1/models/test`; `POST /api/v1/providers/models`; `POST /api/v1/embedding/activate` | API-client and audit operations require `DA`; config update requires verified JWT claims plus `DA`. Model test/provider discovery/embedding activation have no uniform claims gate on current `main`. | **Existing** — mixed claims coverage |
+| Memory · Blackboard | `#/memory` (also deep-link `#/blackboard`) | `GET /api/v1/blackboard/tasks`; `GET /api/v1/blackboard/nodes?task_iri=…` | Verified tenant/project `IsolationClaims`; legacy records without persisted scope are not returned. | **Existing** |
+| Ops | `#/ops` | `GET /api/v1/batch/agents`; `POST /api/v1/batch/agents/:name/control`; `GET /api/v1/guard/audit`; `GET /api/v1/guard/stats`; `GET /metrics` | Batch control requires `DA`; batch list and metrics have no uniform claims gate. Guard audit/stats require verified tenant/project claims, use the same scoped set, and redact sensitive values. | **Existing** — mixed claims coverage |
+| Online corpus | `#/online-corpus-jobs` | `GET, POST /api/v1/online-corpus-jobs`; `GET /api/v1/online-corpus-jobs/observability`; `GET /api/v1/online-corpus-jobs/:id`; `POST /api/v1/online-corpus-jobs/:id/cancel`; `POST /api/v1/online-corpus-jobs/:id/run` | Verified tenant/project `IsolationClaims`; list, read, transition, runner, and observability data are scoped. | **Existing** |
+| Ontology design studio | `#/ontology-studio` | `GET, POST /api/v1/ontology/type-drafts`; `POST /api/v1/ontology/type-drafts/from-{csv,json-schema,openapi,sql-ddl,induction}`; `POST /api/v1/ontology/type-drafts/:draft_id/promote`; `POST, PUT, DELETE /api/v1/ontology/{object-types,link-types,action-types,function-defs}` | Verified tenant/project `IsolationClaims` for draft and ontology write flows; promotion remains explicit and auditable. | **Existing** |
+| No-Code IDE | — | — | — | **Not doing** |
+| Second Grafana | — | — | — | **Not doing** |
+| Admin create-tenant form | — | — | Tenant scope comes from verified JWT claims, not an Admin tenant-creation API. | **Not doing** |
+| Business orchestration | — | — | — | **Not doing** |
+
+## Interpretation and boundaries
+
+The v0.7.0 release includes the claims-scoped Runs list, redacted and
+claims-scoped Guard audit/statistics, and claims-scoped Blackboard task and node
+browsing ([#221](https://github.com/skaiy/wild_agentos/issues/221),
+[#222](https://github.com/skaiy/wild_agentos/issues/222),
+[#223](https://github.com/skaiy/wild_agentos/issues/223), and
+[#224](https://github.com/skaiy/wild_agentos/issues/224)).
+
+The isolation diagnostic is intentionally still usable
+without a token because it is a local, read-only filesystem tool. It neither
+creates tenants nor grants HTTP access.
+
+See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
+[Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and
+[Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
+for the underlying kernel contracts.

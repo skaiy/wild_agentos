@@ -59,6 +59,12 @@ pub struct GuardAuditEntry {
     pub timestamp: i64,
     pub tool_name: String,
     pub agent_id: String,
+    /// Authenticated scope of the tool call. Legacy rows without both fields
+    /// are deliberately hidden by the HTTP audit endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub pre_injected: bool,
     pub validation_passed: bool,
     pub retry_count: u32,
@@ -71,6 +77,26 @@ pub struct GuardStats {
     pub passed_checks: usize,
     pub failed_checks: usize,
     pub pass_rate: f64,
+}
+
+fn guard_audit_entry(
+    context: &HookContext,
+    tool_name: &str,
+    validation_passed: bool,
+    error: Option<String>,
+) -> GuardAuditEntry {
+    let claims = context.isolation_claims.as_ref();
+    GuardAuditEntry {
+        timestamp: chrono::Utc::now().timestamp(),
+        tool_name: tool_name.to_string(),
+        agent_id: context.agent_id.clone(),
+        tenant_id: claims.map(|claims| claims.tenant_id().to_string()),
+        project_id: claims.map(|claims| claims.project_id().to_string()),
+        pre_injected: true,
+        validation_passed,
+        retry_count: 0,
+        error,
+    }
 }
 
 impl Default for GuardStats {
@@ -560,24 +586,18 @@ impl ToolGuard {
                                     );
                                     ctx.error = Some(error_msg);
 
-                                    post_guard.audit_log.write().push(GuardAuditEntry {
-                                        timestamp: chrono::Utc::now().timestamp(),
-                                        tool_name: tool_name.clone(),
-                                        agent_id: ctx.agent_id.clone(),
-                                        pre_injected: true,
-                                        validation_passed: false,
-                                        retry_count: 0,
-                                        error: Some(msg.clone()),
-                                    });
-                                    GUARD_AUDIT_LOG.write().push(GuardAuditEntry {
-                                        timestamp: chrono::Utc::now().timestamp(),
-                                        tool_name: tool_name.clone(),
-                                        agent_id: ctx.agent_id.clone(),
-                                        pre_injected: true,
-                                        validation_passed: false,
-                                        retry_count: 0,
-                                        error: Some(msg),
-                                    });
+                                    post_guard.audit_log.write().push(guard_audit_entry(
+                                        ctx,
+                                        &tool_name,
+                                        false,
+                                        Some(msg.clone()),
+                                    ));
+                                    GUARD_AUDIT_LOG.write().push(guard_audit_entry(
+                                        ctx,
+                                        &tool_name,
+                                        false,
+                                        Some(msg),
+                                    ));
 
                                     return HookResult::Abort;
                                 }
@@ -592,24 +612,13 @@ impl ToolGuard {
                             }
                         }
 
-                        post_guard.audit_log.write().push(GuardAuditEntry {
-                            timestamp: chrono::Utc::now().timestamp(),
-                            tool_name: tool_name.clone(),
-                            agent_id: ctx.agent_id.clone(),
-                            pre_injected: true,
-                            validation_passed: true,
-                            retry_count: 0,
-                            error: None,
-                        });
-                        GUARD_AUDIT_LOG.write().push(GuardAuditEntry {
-                            timestamp: chrono::Utc::now().timestamp(),
-                            tool_name: tool_name.clone(),
-                            agent_id: ctx.agent_id.clone(),
-                            pre_injected: true,
-                            validation_passed: true,
-                            retry_count: 0,
-                            error: None,
-                        });
+                        post_guard
+                            .audit_log
+                            .write()
+                            .push(guard_audit_entry(ctx, &tool_name, true, None));
+                        GUARD_AUDIT_LOG
+                            .write()
+                            .push(guard_audit_entry(ctx, &tool_name, true, None));
                     }
                 }
 
@@ -1264,6 +1273,8 @@ mod tests {
             timestamp: 0,
             tool_name: "test".to_string(),
             agent_id: "test-agent".to_string(),
+            tenant_id: None,
+            project_id: None,
             pre_injected: true,
             validation_passed: false,
             retry_count: 1,

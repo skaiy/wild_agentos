@@ -90,7 +90,7 @@ graph TB
 
 ### 5.2.1 ToolExecutor — 工具执行器
 
-**文件**: `src/tools/tool_executor.rs`
+**文件**: `src/tools/tool_executor/mod.rs`
 **实现状态**: ✅ 完整
 
 统一工具执行入口，负责工具查找、参数校验和执行。
@@ -468,9 +468,9 @@ AgentRunner::new(...)
 | knowledge_query | SPARQL SELECT 查询 | ✅ |
 | kg_search | 模糊搜索实体 | ✅ |
 | knowledge_neighbors | 1-3 跳邻居遍历 | ✅ |
-| knowledge_import_json | JSON 数据映射为图谱节点 | ❌ |
-| ontology_register | 注册自定义本体术语 | ❌ |
-| knowledge_bridge | 创建知识-技能桥接 | ❌ |
+| knowledge_import_json | JSON 数据映射为图谱节点 | ✅ |
+| ontology_register | 注册自定义本体术语 | ✅ |
+| knowledge_bridge | 创建知识-技能桥接 | ✅ |
 | knowledge_extract_code | tree-sitter 代码 AST 提取（增量） | ✅ |
 
 ## 5.4 工具调用流程

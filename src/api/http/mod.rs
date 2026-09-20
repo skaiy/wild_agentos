@@ -104,7 +104,7 @@ use skills::{
 };
 use tasks::{
     create_task_handler, get_execution_details_handler, get_realtime_status_handler,
-    get_task_handler, list_task_trends_handler, stream_task_handler,
+    get_task_handler, list_task_trends_handler, list_tasks_handler, stream_task_handler,
 };
 
 use api_clients::{
@@ -321,7 +321,10 @@ pub fn build_router(
             "/api/v1/config",
             get(config_handler).put(update_config_handler),
         )
-        .route("/api/v1/tasks", post(create_task_handler))
+        .route(
+            "/api/v1/tasks",
+            get(list_tasks_handler).post(create_task_handler),
+        )
         .route("/api/v1/tasks/:task_iri", get(get_task_handler))
         .route("/api/v1/tasks/stream", post(stream_task_handler))
         .route("/api/v1/tasks/trends", get(list_task_trends_handler))
