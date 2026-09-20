@@ -48,6 +48,17 @@ AGENTOS_JWT_SECRET="$AGENTOS_JWT_SECRET" scripts/claims-smoke.sh
 被拒绝，以及 user agent 与 task detail/list endpoint 的 tenant/project 隔离；不会打印
 或存储 secret。这仅是本地开发的实证检查；生产环境仍使用上文所述 OIDC/JWKS 配置。
 
+## 诚实范围：夹具与生产
+
+夹具检查、本地实证检查和可选演示开关，对于它们实际覆盖的行为是有价值的证据，但不是
+生产切换的证据。具体而言：
+
+- 对夹具命名图的成功检查，不证明已部署服务及其生产数据上的实时 SPARQL 行为。
+- 本地签发的 HS256 token 或测试夹具，不是实时 OIDC provider 或身份提供商集成。
+- Mint 作用域名称，不证明数据已复制或迁移到这些名称。
+- 将 API 描述为 production-grade，不代表每个历史 HTTP path 都已要求 verified claims；
+  当前已强制 claims 的路径见[当前接线](#当前接线)。
+
 ## 业务 BFF 的 workload OIDC 契约 / Workload OIDC contract
 
 业务 BFF 向 AgentOS 发起请求时，必须转发短时效的
