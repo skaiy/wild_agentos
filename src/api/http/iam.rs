@@ -81,6 +81,25 @@ impl UserIdentity {
     pub fn isolation_claims(&self) -> Option<&IsolationClaims> {
         self.isolation_claims.as_ref()
     }
+    /// Require isolation claims that were verified at the authentication boundary.
+    ///
+    /// Control-plane routes must never infer tenant or project scope from
+    /// caller-provided request data.
+    pub(crate) fn require_verified_isolation_claims(
+        &self,
+        resource: &str,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        if self.isolation_claims().is_some() {
+            return Ok(());
+        }
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "verified_isolation_claims_required",
+                "message": format!("verified isolation claims required for {resource}"),
+            })),
+        ))
+    }
     /// 检查调用方是否具有指定角色（任一匹配）。
     pub fn has_role(&self, role: &str) -> bool {
         self.roles.iter().any(|r| r.as_str() == role)
@@ -528,6 +547,29 @@ mod tests {
             "X-Identity is a development simulation, not a trusted claims source"
         );
         restore_strict_mode(previous);
+    }
+
+    #[test]
+    fn verified_isolation_claims_gate_rejects_missing_claims_and_accepts_verified_claims() {
+        let missing_claims = UserIdentity::anonymous();
+        let rejection = missing_claims
+            .require_verified_isolation_claims("control-plane operations")
+            .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+
+        let verified_claims = UserIdentity {
+            user_id: "service".to_string(),
+            tenant_id: "acme".to_string(),
+            roles: vec!["DA".to_string()],
+            auth_method: AuthMethod::Jwt,
+            isolation_claims: Some(
+                crate::isolation::IsolationClaims::from_verified("acme", "default", "service")
+                    .unwrap(),
+            ),
+        };
+        assert!(verified_claims
+            .require_verified_isolation_claims("control-plane operations")
+            .is_ok());
     }
 
     #[tokio::test]

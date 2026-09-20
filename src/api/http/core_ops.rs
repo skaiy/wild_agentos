@@ -406,17 +406,24 @@ pub(crate) fn task_is_in_scope(json_ld: &str, claims: &crate::isolation::Isolati
 /// GET /api/v1/batch/agents — 列出所有批处理 Agent 及其状态/窗口/指标/配置摘要（平台运维态）。
 pub(crate) async fn list_batch_agents_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
 ) -> impl IntoResponse {
+    if let Err(response) = identity.require_verified_isolation_claims("batch agent operations") {
+        return response.into_response();
+    }
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
     let mgr_arc = match &state.batch_manager {
         Some(m) => m.clone(),
         None => {
-            return Json(json!({ "running": false, "count": 0, "agents": [] }));
+            return Json(json!({ "running": false, "count": 0, "agents": [] })).into_response();
         }
     };
     let guard = mgr_arc.lock().await;
     let mgr = match guard.as_ref() {
         Some(m) => m,
-        None => return Json(json!({ "running": false, "count": 0, "agents": [] })),
+        None => return Json(json!({ "running": false, "count": 0, "agents": [] })).into_response(),
     };
     let names: Vec<String> = mgr.list_agents().iter().map(|s| s.to_string()).collect();
     let agents: Vec<Value> = names
@@ -443,6 +450,7 @@ pub(crate) async fn list_batch_agents_handler(
         })
         .collect();
     Json(json!({ "running": mgr.is_running(), "count": agents.len(), "agents": agents }))
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,8 +465,11 @@ pub(crate) async fn control_batch_agent_handler(
     axum::extract::Path(name): axum::extract::Path<String>,
     Json(req): Json<BatchControlRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
-        return e.into_response();
+    if let Err(response) = identity.require_verified_isolation_claims("batch agent operations") {
+        return response.into_response();
+    }
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
     }
     let mgr_arc = match &state.batch_manager {
         Some(m) => m.clone(),
