@@ -231,9 +231,15 @@ const TEST_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAA
 /// Body: { provider_id?, resource_id, modality? }。返回 { ok, http_status, latency_ms, dimension? }。
 /// 绝不回显 api_key;错误信息不含 Authorization。
 pub(crate) async fn test_model_handler(
-    State(_state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<ModelTestRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = identity.require_verified_isolation_claims("model operations") {
+        return response;
+    }
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
     let m = crate::config::settings::Settings::load_models();
     let resource = m
         .resources
@@ -377,9 +383,15 @@ pub(crate) struct ProviderModelsRequest {
 /// POST /api/v1/providers/models — 拉取 provider 的 /v1/models 型号列表（自动加载）。
 /// 返回 { ok, http_status, models:[{id, owned_by}] }。绝不回显 api_key；错误仅取网络层原因。
 pub(crate) async fn provider_models_handler(
-    State(_state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<ProviderModelsRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = identity.require_verified_isolation_claims("model operations") {
+        return response;
+    }
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
     // 端点/密钥解析：内联优先，缺省按 provider_id 回填持久化值。
     let (mut base_url, mut api_key, mut timeout) =
         (req.base_url.trim().to_string(), req.api_key.clone(), 60u64);
@@ -461,8 +473,15 @@ pub(crate) struct EmbeddingActivateRequest {
 /// 热切换向量库并后台重建索引。绝不回显 api_key。
 pub(crate) async fn activate_embedding_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<EmbeddingActivateRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = identity.require_verified_isolation_claims("model operations") {
+        return response;
+    }
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
     let m = crate::config::settings::Settings::load_models();
     let resource = match m.resources.iter().find(|r| r.id == req.resource_id) {
         Some(r) => r.clone(),
