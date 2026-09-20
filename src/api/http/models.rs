@@ -233,7 +233,7 @@ const TEST_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAA
 pub(crate) async fn test_model_handler(
     identity: UserIdentity,
     Json(req): Json<ModelTestRequest>,
-) -> impl IntoResponse {
+) -> Response {
     if let Err(response) = identity.require_verified_isolation_claims("model operations") {
         return response;
     }
@@ -261,13 +261,15 @@ pub(crate) async fn test_model_handler(
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "provider 未找到（检查 provider_id/resource_id）" })),
             )
+                .into_response()
         }
     };
     if provider.base_url.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "provider.base_url 未配置" })),
-        );
+        )
+            .into_response();
     }
     let model = resource
         .as_ref()
@@ -286,7 +288,8 @@ pub(crate) async fn test_model_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "resource.model 为空，无法测试" })),
-        );
+        )
+            .into_response();
     }
     let base = crate::config::settings::normalize_api_base(&provider.base_url);
     let client = match reqwest::Client::builder()
@@ -301,6 +304,7 @@ pub(crate) async fn test_model_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("HTTP 客户端构造失败: {e}") })),
             )
+                .into_response()
         }
     };
     let started = std::time::Instant::now();
@@ -356,7 +360,7 @@ pub(crate) async fn test_model_handler(
                     }
                 }
             }
-            (StatusCode::OK, Json(out))
+            (StatusCode::OK, Json(out)).into_response()
         }
         // 错误信息仅取网络层原因(不含 Authorization/请求头)。
         Err(e) => (
@@ -364,7 +368,8 @@ pub(crate) async fn test_model_handler(
             Json(
                 json!({ "ok": false, "http_status": 0, "latency_ms": latency_ms, "error": e.to_string() }),
             ),
-        ),
+        )
+            .into_response(),
     }
 }
 
@@ -385,7 +390,7 @@ pub(crate) struct ProviderModelsRequest {
 pub(crate) async fn provider_models_handler(
     identity: UserIdentity,
     Json(req): Json<ProviderModelsRequest>,
-) -> impl IntoResponse {
+) -> Response {
     if let Err(response) = identity.require_verified_isolation_claims("model operations") {
         return response;
     }
@@ -411,7 +416,8 @@ pub(crate) async fn provider_models_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "base_url 未配置（提供 base_url 或已保存的 provider_id）" })),
-        );
+        )
+            .into_response();
     }
     let base = crate::config::settings::normalize_api_base(&base_url);
     let client = match reqwest::Client::builder()
@@ -424,6 +430,7 @@ pub(crate) async fn provider_models_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("HTTP 客户端构造失败: {e}") })),
             )
+                .into_response()
         }
     };
     let url = format!("{base}/v1/models");
@@ -454,11 +461,13 @@ pub(crate) async fn provider_models_handler(
                 StatusCode::OK,
                 Json(json!({ "ok": ok, "http_status": http_status, "models": models })),
             )
+                .into_response()
         }
         Err(e) => (
             StatusCode::OK,
             Json(json!({ "ok": false, "http_status": 0, "models": [], "error": e.to_string() })),
-        ),
+        )
+            .into_response(),
     }
 }
 
@@ -475,7 +484,7 @@ pub(crate) async fn activate_embedding_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Json(req): Json<EmbeddingActivateRequest>,
-) -> impl IntoResponse {
+) -> Response {
     if let Err(response) = identity.require_verified_isolation_claims("model operations") {
         return response;
     }
@@ -490,13 +499,15 @@ pub(crate) async fn activate_embedding_handler(
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "resource 未找到" })),
             )
+                .into_response()
         }
     };
     if !resource.modalities.iter().any(|x| x == "embedding") {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "该型号未标注 embedding 模态" })),
-        );
+        )
+            .into_response();
     }
     let dimension = match resource.dimension {
         Some(d) if d > 0 => d,
@@ -505,6 +516,7 @@ pub(crate) async fn activate_embedding_handler(
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "该向量型号未设置 dimension（维度）" })),
             )
+                .into_response()
         }
     };
     let provider = match m.providers.iter().find(|p| p.id == resource.provider_id) {
@@ -514,19 +526,22 @@ pub(crate) async fn activate_embedding_handler(
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "provider 未找到" })),
             )
+                .into_response()
         }
     };
     if provider.base_url.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "provider.base_url 未配置" })),
-        );
+        )
+            .into_response();
     }
     if provider.api_key.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "provider 未配置 api_key，无法作为 OpenAI 兼容向量服务生效" })),
-        );
+        )
+            .into_response();
     }
     // embedding 补丁(oneapi)：base_url/api_key 来自 provider，model/dimension 来自 resource。
     let patch = json!({
@@ -598,4 +613,5 @@ pub(crate) async fn activate_embedding_handler(
             "config": final_info,
         })),
     )
+        .into_response()
 }

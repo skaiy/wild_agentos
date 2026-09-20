@@ -68,7 +68,7 @@ pub(crate) async fn list_api_clients_handler(
     identity: UserIdentity,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -114,7 +114,7 @@ pub(crate) async fn create_api_client_handler(
     Json(req): Json<CreateClientRequest>,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -162,7 +162,7 @@ pub(crate) async fn update_api_client_handler(
     Json(req): Json<UpdateClientRequest>,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -216,7 +216,7 @@ pub(crate) async fn delete_api_client_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -250,7 +250,7 @@ pub(crate) async fn issue_api_key_handler(
     Json(req): Json<IssueKeyRequest>,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -302,7 +302,7 @@ pub(crate) async fn revoke_api_key_handler(
     axum::extract::Path((id, kid)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -340,7 +340,7 @@ pub(crate) async fn list_api_audit_handler(
     Query(q): Query<AuditQuery>,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("API audit access") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
