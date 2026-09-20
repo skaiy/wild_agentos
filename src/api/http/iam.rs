@@ -17,7 +17,6 @@ use axum::{
     async_trait,
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
-    response::IntoResponse,
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
