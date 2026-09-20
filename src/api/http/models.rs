@@ -235,7 +235,7 @@ pub(crate) async fn test_model_handler(
     Json(req): Json<ModelTestRequest>,
 ) -> Response {
     if let Err(response) = identity.require_verified_isolation_claims("model operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -392,7 +392,7 @@ pub(crate) async fn provider_models_handler(
     Json(req): Json<ProviderModelsRequest>,
 ) -> Response {
     if let Err(response) = identity.require_verified_isolation_claims("model operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -486,7 +486,7 @@ pub(crate) async fn activate_embedding_handler(
     Json(req): Json<EmbeddingActivateRequest>,
 ) -> Response {
     if let Err(response) = identity.require_verified_isolation_claims("model operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();

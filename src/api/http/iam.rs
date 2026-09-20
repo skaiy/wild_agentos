@@ -17,7 +17,6 @@ use axum::{
     async_trait,
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
-    response::IntoResponse,
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -89,7 +88,7 @@ impl UserIdentity {
     pub(crate) fn require_verified_isolation_claims(
         &self,
         resource: &str,
-    ) -> Result<(), axum::response::Response> {
+    ) -> Result<(), (StatusCode, Json<Value>)> {
         if self.isolation_claims().is_some() {
             return Ok(());
         }
@@ -99,8 +98,7 @@ impl UserIdentity {
                 "error": "verified_isolation_claims_required",
                 "message": format!("verified isolation claims required for {resource}"),
             })),
-        )
-            .into_response())
+        ))
     }
     /// 检查调用方是否具有指定角色（任一匹配）。
     pub fn has_role(&self, role: &str) -> bool {
@@ -557,7 +555,7 @@ mod tests {
         let rejection = missing_claims
             .require_verified_isolation_claims("control-plane operations")
             .unwrap_err();
-        assert_eq!(rejection.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
 
         let verified_claims = UserIdentity {
             user_id: "service".to_string(),
