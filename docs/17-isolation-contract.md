@@ -63,6 +63,22 @@ isolation for user agents and task detail/list endpoints. It never prints or
 stores the secret. This is an empirical local-development check only;
 production remains the OIDC/JWKS configuration described above.
 
+## Honesty scope: fixtures vs production
+
+Fixture checks, local empirical checks, and optional demo switches are useful
+evidence for the behavior they exercise, but they are not production-cutover
+evidence. In particular:
+
+- Success against a fixture named graph does not prove live SPARQL behavior
+  against a deployed service and its production data.
+- A locally signed HS256 token or test fixture is not a live OIDC provider or
+  identity-provider integration.
+- Minting scoped names does not prove that data has been copied or migrated to
+  those names.
+- Describing an API as production-grade does not mean every historical HTTP
+  path already requires verified claims; the current claims-enforced paths are
+  listed in [Current wiring](#current-wiring).
+
 ## Workload OIDC contract for business BFFs
 
 Business BFFs authenticate to AgentOS by
