@@ -409,7 +409,7 @@ pub(crate) async fn list_batch_agents_handler(
     identity: UserIdentity,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("batch agent operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
@@ -417,13 +417,13 @@ pub(crate) async fn list_batch_agents_handler(
     let mgr_arc = match &state.batch_manager {
         Some(m) => m.clone(),
         None => {
-            return Json(json!({ "running": false, "count": 0, "agents": [] }));
+            return Json(json!({ "running": false, "count": 0, "agents": [] })).into_response();
         }
     };
     let guard = mgr_arc.lock().await;
     let mgr = match guard.as_ref() {
         Some(m) => m,
-        None => return Json(json!({ "running": false, "count": 0, "agents": [] })),
+        None => return Json(json!({ "running": false, "count": 0, "agents": [] })).into_response(),
     };
     let names: Vec<String> = mgr.list_agents().iter().map(|s| s.to_string()).collect();
     let agents: Vec<Value> = names
@@ -450,6 +450,7 @@ pub(crate) async fn list_batch_agents_handler(
         })
         .collect();
     Json(json!({ "running": mgr.is_running(), "count": agents.len(), "agents": agents }))
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,7 +466,7 @@ pub(crate) async fn control_batch_agent_handler(
     Json(req): Json<BatchControlRequest>,
 ) -> impl IntoResponse {
     if let Err(response) = identity.require_verified_isolation_claims("batch agent operations") {
-        return response;
+        return response.into_response();
     }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
