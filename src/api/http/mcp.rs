@@ -253,11 +253,7 @@ async fn read_sse_json_rpc_response(
 
     for line in body.lines().chain(std::iter::once("")) {
         if line.is_empty() {
-            if !data.is_empty()
-                && event_type
-                    .as_deref()
-                    .map_or(true, |event| event == "message")
-            {
+            if !data.is_empty() && event_type.as_deref().is_none_or(|event| event == "message") {
                 let message: Value = serde_json::from_str(&data.join("\n")).map_err(|error| {
                     InvokeHttpMcpError::Transport(format!(
                         "MCP SSE event data was not valid JSON-RPC JSON: {error}"
