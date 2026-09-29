@@ -221,6 +221,7 @@ fn server_uses_bearer_jwt(server: &Value) -> bool {
 const OUTBOUND_MCP_REQUEST_ID: u64 = 1;
 const MAX_OUTBOUND_MCP_SSE_RESPONSE_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug)]
 enum InvokeHttpMcpError {
     Transport(String),
     JsonRpc(Value),
