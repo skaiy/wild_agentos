@@ -75,7 +75,10 @@ use market::{
     install_package_handler, list_packages_handler, publish_package_handler,
     rollback_package_handler, upgrade_package_handler,
 };
-use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
+use mcp::{
+    invoke_mcp_server_handler, list_mcp_servers_handler, load_mcp_servers,
+    register_mcp_server_handler,
+};
 use mcp_skills::{
     delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
     upsert_skill_exposure_handler,
@@ -669,8 +672,12 @@ pub fn build_router(
             "/api/v1/mcp/servers",
             get(list_mcp_servers_handler).post(register_mcp_server_handler),
         )
-        // Published tenant Skills are explicitly opt-in MCP tools. `/mcp`
-        // is the external JSON-RPC endpoint; the management route is DA-only.
+        .route(
+            "/api/v1/mcp/servers/invoke",
+            post(invoke_mcp_server_handler),
+        )
+        // Published tenant Skills are explicitly opt-in MCP tools. `/mcp` is
+        // the external JSON-RPC endpoint, not the catalog MCP invoke proxy.
         .route("/mcp", post(skill_mcp_handler))
         .route(
             "/api/v1/mcp/skill-exposures",
