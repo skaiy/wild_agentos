@@ -64,6 +64,12 @@ Core mints the dedicated MCP JWT, sends
 a JSON-RPC `tools/call` request. A successful response is returned as
 `{"result": ...}`.
 
+For Streamable HTTP compatibility, the outbound request sends
+`Accept: application/json, text/event-stream` and `Content-Type: application/json`.
+Core accepts a JSON response or the matching JSON-RPC message from an SSE
+response. Each invoke is stateless and does not perform an initialize/session
+handshake.
+
 If the catalog entry lacks `auth_kind: "bearer_jwt"`, the signing environment
 is absent, JWT minting fails, or the sidecar rejects the token, invocation
 fails explicitly. Core does not synthesize a successful tool result.
