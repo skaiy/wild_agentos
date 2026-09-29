@@ -844,7 +844,7 @@ impl super::AgentRunner {
                     if !stream_response.tool_calls.is_empty() {
                         let tool_calls = &stream_response.tool_calls;
                         if agent.role == AgentRole::Plan {
-                            let write_tools: Vec<&str> = tool_calls
+                            let disallowed_tools: Vec<&str> = tool_calls
                                 .iter()
                                 .map(|c| c.name.as_str())
                                 .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
@@ -856,12 +856,12 @@ impl super::AgentRunner {
                                     .collect();
                                 tc.should_force_finish(&tc_calls, &agent.role)
                             } else {
-                                !write_tools.is_empty()
+                                !disallowed_tools.is_empty()
                             };
                             if force_finish {
                                 warn!(
-                                    "[PA Streaming] Write operation tool calls blocked: {:?}",
-                                    write_tools
+                                    "[PA Streaming] Disallowed tool calls blocked: {:?}",
+                                    disallowed_tools
                                 );
                                 break;
                             }

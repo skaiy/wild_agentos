@@ -1854,9 +1854,9 @@ Output the summary report directly, not in JSON format."#,
                             calls.iter().map(|c| c.function.name.as_str()).collect();
                         debug!("[tool_calls] {} → {:?}", calls.len(), tool_names);
 
-                        // 🔴 PA role forbidden from calling write tools, but read-only tools allowed
+                        // 🔴 PA role may only call its read-only allowlist.
                         if agent.role == AgentRole::Plan {
-                            let write_tools: Vec<&str> = calls
+                            let disallowed_tools: Vec<&str> = calls
                                 .iter()
                                 .map(|c| c.function.name.as_str())
                                 .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
@@ -1875,15 +1875,15 @@ Output the summary report directly, not in JSON format."#,
                                     .collect();
                                 tc.should_force_finish(&tool_calls, &agent.role)
                             } else {
-                                !write_tools.is_empty()
+                                !disallowed_tools.is_empty()
                             };
 
                             if force_finish {
                                 warn!(
-                                    "[PA] detected write tool call: {:?}, forcing finish",
-                                    write_tools
+                                    "[PA] detected disallowed tool call: {:?}, forcing finish",
+                                    disallowed_tools
                                 );
-                                info!("[ReAct] PA Agent force-ended (write operations prohibited)");
+                                info!("[ReAct] PA Agent force-ended (disallowed tool call)");
 
                                 let (final_summary, output_value) =
                                     if !parsed.content.trim().is_empty() {
