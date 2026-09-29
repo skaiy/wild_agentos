@@ -130,7 +130,7 @@ fn validate_tool_policy(
     allowed_tools: Option<&[String]>,
     write_tools_enabled: Option<bool>,
 ) -> Result<(), &'static str> {
-    if write_tools_enabled == Some(true) && allowed_tools.map_or(true, |tools| tools.is_empty()) {
+    if write_tools_enabled == Some(true) && allowed_tools.is_none_or(|tools| tools.is_empty()) {
         return Err("write_tools_enabled requires a non-empty allowed_tools list");
     }
     let Some(allowed_tools) = allowed_tools else {
