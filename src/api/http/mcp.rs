@@ -426,10 +426,12 @@ mod tests {
 
         let header = seen.lock().unwrap().clone().unwrap();
         let token = header.strip_prefix("Bearer ").unwrap();
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_aud = false;
         let decoded = decode::<OutboundMcpJwtClaims>(
             token,
             &DecodingKey::from_secret(b"outbound-mcp-test-secret"),
-            &Validation::new(Algorithm::HS256),
+            &validation,
         )
         .unwrap();
         assert_eq!(decoded.claims.sub, "catalog-mcp-client");
