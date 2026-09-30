@@ -24,8 +24,8 @@ The default groups are:
 | System | Tool discovery |
 
 Plan receives only read-only groups, including its Web on-demand group. Do has
-the write-capable resident group; Check does not receive shell tools by
-default. Role visibility is separate from execution policy.
+the write-capable resident group; Check receives shell tools on demand rather
+than as resident tools. Role visibility is separate from execution policy.
 
 ## Activation and cache behavior
 

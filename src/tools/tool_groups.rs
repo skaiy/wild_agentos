@@ -138,9 +138,15 @@ impl Default for ToolGroupSettings {
                     "System".to_string(),
                 ],
                 on_demand: vec![
+                    "Workspace".to_string(),
+                    "Write".to_string(),
                     "Web".to_string(),
                     "KnowledgePlan".to_string(),
                     "KnowledgeRead".to_string(),
+                    "KnowledgeWrite".to_string(),
+                    "Ingest".to_string(),
+                    "Skill".to_string(),
+                    "Ontology".to_string(),
                 ],
             },
         );
@@ -562,6 +568,44 @@ mod tests {
             .collect::<Vec<_>>();
         expected.sort();
         assert_eq!(visible, expected);
+    }
+
+    #[test]
+    fn role_groups_preserve_main_fallback_reachability() {
+        let manager = ToolGroupManager::new(None);
+        let executor = crate::tools::tool_executor::ToolExecutor::new();
+        let registered = executor.registered_tool_names();
+        for role in ["Plan", "Do", "Check", "Act"] {
+            let (resident, on_demand) = manager.get_tool_names_for_role(role);
+            let reachable = resident.union(&on_demand).cloned().collect::<HashSet<_>>();
+            let expected: HashSet<String> = match role {
+                "Plan" => crate::tools::tool_executor::ToolExecutor::pa_readonly_tools()
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+                "Act" => [
+                    "file_read",
+                    "file_list",
+                    "tool_search",
+                    "grep_search",
+                    "glob_search",
+                    "rag_search",
+                    "kg_search",
+                    "knowledge_list",
+                    "knowledge_search",
+                    "knowledge_extract_code",
+                ]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+                "Do" | "Check" => registered.iter().cloned().collect(),
+                _ => unreachable!(),
+            };
+            assert!(
+                expected.is_subset(&reachable),
+                "{role} lost fallback reachability"
+            );
+        }
     }
 
     #[test]

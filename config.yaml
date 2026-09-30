@@ -184,7 +184,7 @@ token_optimization:
         on_demand: ["Web", "KnowledgePlan", "KnowledgeRead", "KnowledgeWrite", "Ingest", "Skill", "Ontology"]
       Check:
         default: ["Core", "Search", "System"]
-        on_demand: ["Web", "KnowledgePlan", "KnowledgeRead"]
+        on_demand: ["Workspace", "Write", "Web", "KnowledgePlan", "KnowledgeRead", "KnowledgeWrite", "Ingest", "Skill", "Ontology"]
       Act:
         default: ["Core", "System"]
         on_demand: ["Search", "KnowledgePlan", "KnowledgeRead"]
