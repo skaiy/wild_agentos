@@ -22,6 +22,7 @@ const DEFAULT_OUTBOUND_MCP_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_OUTBOUND_MCP_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_OUTBOUND_MCP_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MCP_CATALOG_ADMIN_ROLE: &str = "mcp_admin";
+const MCP_INVOKE_ROLE: &str = "mcp_invoke";
 const WRITE_CLASS_TOOL_PREFIXES: &[&str] = &[
     "create_",
     "update_",
@@ -799,6 +800,15 @@ pub(crate) async fn invoke_mcp_server_handler(
     identity: UserIdentity,
     Json(request): Json<McpCatalogInvokeRequest>,
 ) -> impl IntoResponse {
+    // This gate is deliberately before catalog lookup, JWT minting, client
+    // construction, and outbound I/O.
+    if !identity.has_role("DA") && !identity.has_role(MCP_INVOKE_ROLE) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "mcp_role_required"})),
+        )
+            .into_response();
+    }
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
@@ -1274,7 +1284,7 @@ mod tests {
     }
 
     fn inbound_identity_token() -> String {
-        inbound_identity_token_with_roles(vec![MCP_CATALOG_ADMIN_ROLE])
+        inbound_identity_token_with_roles(vec!["DA", MCP_CATALOG_ADMIN_ROLE])
     }
 
     fn inbound_identity_token_with_project(project_id: Option<&str>) -> String {
@@ -1357,7 +1367,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token()),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec![MCP_INVOKE_ROLE])
+                ),
             )
             .body(Body::from(
                 json!({
@@ -1390,6 +1403,62 @@ mod tests {
             Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
             None => std::env::remove_var("AGENTOS_AUTH_MODE"),
         }
+    }
+
+    #[tokio::test]
+    async fn invoke_requires_da_or_mcp_invoke_before_outbound_work() {
+        async fn mock_handler(
+            State(requests): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mock = Router::new()
+            .route("/mcp", post(mock_handler))
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let server = json!({
+            "id": "server-id", "name": "catalog-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http", "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "tenantId": "test-tenant", "projectId": "test-project",
+        });
+
+        for roles in [vec![], vec!["mcp_admin"], vec!["unrelated"]] {
+            let app = Router::new()
+                .route("/invoke", post(invoke_mcp_server_handler))
+                .with_state(test_app_state(vec![server.clone()]));
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/invoke")
+                .header("content-type", "application/json")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", inbound_identity_token_with_roles(roles)),
+                )
+                .body(Body::from(
+                    json!({"server": "server-id", "tool_name": "read_status", "arguments": {}})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"error": "mcp_role_required"})
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
