@@ -76,8 +76,8 @@ use market::{
     rollback_package_handler, upgrade_package_handler,
 };
 use mcp::{
-    invoke_mcp_server_handler, list_mcp_servers_handler, load_mcp_servers,
-    register_mcp_server_handler,
+    delete_mcp_server_handler, invoke_mcp_server_handler, list_mcp_servers_handler,
+    load_mcp_servers, register_mcp_server_handler,
 };
 use mcp_skills::{
     delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
@@ -672,6 +672,7 @@ pub fn build_router(
             "/api/v1/mcp/servers",
             get(list_mcp_servers_handler).post(register_mcp_server_handler),
         )
+        .route("/api/v1/mcp/servers/:id", delete(delete_mcp_server_handler))
         .route(
             "/api/v1/mcp/servers/invoke",
             post(invoke_mcp_server_handler),

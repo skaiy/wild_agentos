@@ -2,7 +2,12 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use futures::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -337,6 +342,41 @@ pub(crate) async fn register_mcp_server_handler(
         .into_response()
 }
 
+/// DELETE /api/v1/mcp/servers/:id — remove a catalog MCP server.
+pub(crate) async fn delete_mcp_server_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return missing_isolation_claims().into_response();
+    };
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
+
+    let mut servers = state.mcp_servers.write().await;
+    let Some(position) = servers.iter().position(|server| {
+        server_is_in_scope(server, Some(claims))
+            && server.get("id").and_then(Value::as_str) == Some(id.as_str())
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "catalog MCP server not found"})),
+        )
+            .into_response();
+    };
+    servers.remove(position);
+    if let Err(error) = save_mcp_servers(&servers) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to persist catalog MCP servers", "message": error.to_string()})),
+        )
+            .into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpCatalogInvokeRequest {
@@ -459,6 +499,19 @@ fn outbound_mcp_configured_positive_usize(name: &str, default: usize) -> Result<
     }
 }
 
+fn outbound_mcp_effective_timeout_ms(
+    server_timeout_seconds: Option<u64>,
+    global_timeout_ms: u64,
+) -> Result<u64, String> {
+    match server_timeout_seconds {
+        Some(timeout_seconds) if (1..=300).contains(&timeout_seconds) => {
+            Ok((timeout_seconds * 1_000).min(global_timeout_ms))
+        }
+        Some(_) => Err("catalog MCP timeout_seconds must be between 1 and 300".to_string()),
+        None => Ok(global_timeout_ms),
+    }
+}
+
 fn outbound_mcp_client(
     server_timeout_seconds: Option<u64>,
 ) -> Result<(reqwest::Client, usize), InvokeHttpMcpError> {
@@ -467,19 +520,13 @@ fn outbound_mcp_client(
         DEFAULT_OUTBOUND_MCP_CONNECT_TIMEOUT_MS,
     )
     .map_err(InvokeHttpMcpError::Transport)?;
-    let timeout = match server_timeout_seconds {
-        Some(timeout_seconds) if (1..=300).contains(&timeout_seconds) => timeout_seconds * 1_000,
-        Some(_) => {
-            return Err(InvokeHttpMcpError::Transport(
-                "catalog MCP timeout_seconds must be between 1 and 300".to_string(),
-            ))
-        }
-        None => outbound_mcp_configured_positive_u64(
-            "MCP_OUTBOUND_TIMEOUT_MS",
-            DEFAULT_OUTBOUND_MCP_TIMEOUT_MS,
-        )
-        .map_err(InvokeHttpMcpError::Transport)?,
-    };
+    let global_timeout = outbound_mcp_configured_positive_u64(
+        "MCP_OUTBOUND_TIMEOUT_MS",
+        DEFAULT_OUTBOUND_MCP_TIMEOUT_MS,
+    )
+    .map_err(InvokeHttpMcpError::Transport)?;
+    let timeout = outbound_mcp_effective_timeout_ms(server_timeout_seconds, global_timeout)
+        .map_err(InvokeHttpMcpError::Transport)?;
     let max_response_bytes = outbound_mcp_configured_positive_usize(
         "MCP_OUTBOUND_MAX_RESPONSE_BYTES",
         DEFAULT_OUTBOUND_MCP_MAX_RESPONSE_BYTES,
@@ -639,7 +686,11 @@ async fn invoke_http_mcp(
         .send()
         .await
         .map_err(|error| {
-            InvokeHttpMcpError::Transport(format!("MCP HTTP request failed: {error}"))
+            if error.is_timeout() {
+                InvokeHttpMcpError::Transport("MCP HTTP request timed out".to_string())
+            } else {
+                InvokeHttpMcpError::Transport(format!("MCP HTTP request failed: {error}"))
+            }
         })?;
     let status = response.status();
     let is_sse = response
@@ -677,7 +728,11 @@ fn outbound_mcp_failure_response(error: InvokeHttpMcpError) -> axum::response::R
             (StatusCode::OK, Json(json!({"error": error}))).into_response()
         }
         InvokeHttpMcpError::Transport(error) => (
-            StatusCode::BAD_GATEWAY,
+            if error == "MCP HTTP request timed out" {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
             Json(json!({"error": "outbound_mcp_call_failed", "message": error})),
         )
             .into_response(),
@@ -900,6 +955,20 @@ mod tests {
             check_tool_policy(&json!({"allowed_tools": []}), "read_status"),
             Err(ToolPolicyDenied::ToolNotAllowed)
         );
+    }
+
+    #[test]
+    fn per_server_timeout_is_capped_by_global_timeout() {
+        assert_eq!(outbound_mcp_effective_timeout_ms(None, 15_000), Ok(15_000));
+        assert_eq!(
+            outbound_mcp_effective_timeout_ms(Some(2), 15_000),
+            Ok(2_000)
+        );
+        assert_eq!(
+            outbound_mcp_effective_timeout_ms(Some(30), 5_000),
+            Ok(5_000)
+        );
+        assert!(outbound_mcp_effective_timeout_ms(Some(0), 15_000).is_err());
     }
 
     fn test_app_state(servers: Vec<Value>) -> Arc<AppState> {
@@ -1481,7 +1550,7 @@ mod tests {
             panic!("timeout must be a transport error");
         };
         assert!(oversized.contains("exceeded 32 byte limit"));
-        assert!(timed_out.contains("MCP HTTP request failed"));
+        assert_eq!(timed_out, "MCP HTTP request timed out");
 
         match previous_timeout {
             Some(value) => std::env::set_var("MCP_OUTBOUND_TIMEOUT_MS", value),
@@ -1556,7 +1625,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         async fn slow_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
             requests.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
             Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
         }
 
@@ -1566,18 +1635,29 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-        let state = test_app_state(vec![json!({
-            "id": "slow-server",
-            "name": "slow-server",
-            "endpoint": format!("http://{address}/mcp"),
-            "endpoint_origin": format!("http://{address}"),
-            "protocol": "http",
-            "auth": {"kind": "bearer_jwt"},
-            "allowed_tools": ["read_status"],
-            "write_tools_enabled": false,
-            "tenantId": "test-tenant",
-            "projectId": "test-project",
-        })]);
+        let state = test_app_state(vec![
+            json!({
+                "id": "slow-server",
+                "name": "slow-server",
+                "endpoint": format!("http://{address}/mcp"),
+                "endpoint_origin": format!("http://{address}"),
+                "protocol": "http",
+                "auth": {"kind": "bearer_jwt"},
+                "allowed_tools": ["read_status"],
+                "write_tools_enabled": false,
+                "tenantId": "test-tenant",
+                "projectId": "test-project",
+            }),
+            json!({
+                "id": "delete-server",
+                "name": "delete-server",
+                "endpoint": "http://127.0.0.1:8081/mcp",
+                "endpoint_origin": "http://127.0.0.1:8081",
+                "protocol": "http",
+                "tenantId": "test-tenant",
+                "projectId": "test-project",
+            }),
+        ]);
         let invoke = Router::new()
             .route("/invoke", post(invoke_mcp_server_handler))
             .with_state(state.clone());
@@ -1605,7 +1685,7 @@ mod tests {
         .expect("slow endpoint did not receive the invoke");
         let register = Router::new()
             .route("/servers", post(register_mcp_server_handler))
-            .with_state(state);
+            .with_state(state.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/servers")
@@ -1623,11 +1703,31 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = tokio::time::timeout(Duration::from_millis(200), register.oneshot(request))
+        let response = tokio::time::timeout(Duration::from_secs(1), register.oneshot(request))
             .await
             .expect("registration was blocked by a slow outbound invoke")
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
+        let delete = Router::new()
+            .route(
+                "/servers/:id",
+                axum::routing::delete(delete_mcp_server_handler),
+            )
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/servers/delete-server")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), delete.oneshot(request))
+            .await
+            .expect("deletion was blocked by a slow outbound invoke")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         invoke_task.abort();
 
         match previous_secret {

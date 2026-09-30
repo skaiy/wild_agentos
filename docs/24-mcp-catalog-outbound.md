@@ -55,8 +55,9 @@ The timeout and response-size settings are optional positive integers; the
 values shown are the secure defaults.
 
 An entry may also set `timeout_seconds` to a positive value from 1 through 300.
-It applies as that entry's total outbound request timeout and takes precedence
-over `MCP_OUTBOUND_TIMEOUT_MS`.
+It applies as that entry's total outbound request timeout, capped by
+`MCP_OUTBOUND_TIMEOUT_MS`; when omitted, the global setting or its default is
+used.
 
 ## Register and invoke
 
@@ -83,6 +84,7 @@ The catalog management and invoke endpoints require verified inbound
 `IsolationClaims`; Core scopes lookup to the caller's tenant and project.
 Registering a catalog entry also requires the `DA` administrator role. A caller
 without that role receives `403`, and no catalog file is written.
+Deleting a catalog entry requires the same role and tenant/project scope.
 
 Invoke a registered tool by its catalog `name` (or `id` when names are
 ambiguous):

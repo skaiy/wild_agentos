@@ -49,7 +49,7 @@ endpoint 会在发送任何出站请求前被拒绝。超时和响应大小设�
 上面的值即安全默认值。
 
 条目还可以设置 `timeout_seconds`，取值为 1 至 300 的正整数。它是该条目的总出站
-请求超时，并且优先于 `MCP_OUTBOUND_TIMEOUT_MS`。
+请求超时，但会被 `MCP_OUTBOUND_TIMEOUT_MS` 限制；未设置时使用全局设置或其默认值。
 
 ## 注册和调用
 
@@ -76,6 +76,7 @@ Catalog 管理和调用接口都要求经过验证的入站 `IsolationClaims`；
 限定为调用者所在的租户和项目。
 登记 Catalog 条目还要求 `DA` 管理员角色。没有该角色的调用方会收到 `403`，且不会
 写入 Catalog 文件。
+删除 Catalog 条目同样要求该角色和对应的租户/项目范围。
 
 通过 Catalog MCP 的 `name` 调用一个已注册的工具；当名称有歧义时，请使用
 `id`：
