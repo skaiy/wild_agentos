@@ -3413,7 +3413,7 @@ mod tests {
             ))
             .unwrap();
         let invoke_response = app.clone().oneshot(invoke).await.unwrap();
-        assert_eq!(invoke_response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(invoke_response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         let kb = axum::http::Request::builder()
