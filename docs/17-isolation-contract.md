@@ -4,7 +4,7 @@
 It is not an identity provider (IdP), an OIDC or Keycloak integration, a
 17-state IAM workflow, or a storage migration.
 
-This document describes the state of `main` as of 2026-09-04. It distinguishes
+This document describes the state of `main` as of 2026-09-14 (v0.7.0). It distinguishes
 the storage paths that are wired today from historical paths that remain live.
 Do not treat a minted name as proof that existing data has moved to it.
 
@@ -30,7 +30,9 @@ selected. OIDC mode requires
 accepts only asymmetric OIDC algorithms. JWKS are retrieved from the configured
 endpoint, cached briefly, and refreshed once for an unknown key ID. The default
 `hs256` mode validates with `AGENTOS_JWT_SECRET` and is retained for local
-development only. Startup refuses incomplete OIDC configuration, and OIDC/JWKS
+development only. HS256 startup requires an explicitly configured, non-default
+secret with at least 32 bytes of securely generated key material. Startup refuses
+incomplete OIDC configuration, and OIDC/JWKS
 configuration errors, missing keys, invalid signatures, and invalid
 issuer/audience all fail closed. Unverified requests have no claims and cannot
 use the claims-scoped graph or blob paths. The JWKS URL must be a valid HTTPS
@@ -45,6 +47,89 @@ blob names are minted. In that case `verify_jwt` produces no identity.
 
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
+
+### Local HS256 empirical check
+
+For a running **local** kernel configured for HS256 with an explicitly set,
+non-default `AGENTOS_JWT_SECRET` (at least 32 bytes), run:
+
+```bash
+AGENTOS_JWT_SECRET="$AGENTOS_JWT_SECRET" scripts/claims-smoke.sh
+```
+
+The script does not start or deploy a server. It mints two short-lived local
+HS256 JWTs in-process and verifies anonymous rejection plus tenant/project
+isolation for user agents and task detail/list endpoints. It never prints or
+stores the secret. This is an empirical local-development check only;
+production remains the OIDC/JWKS configuration described above.
+
+## Honesty scope: fixtures vs production
+
+Fixture checks, local empirical checks, and optional demo switches are useful
+evidence for the behavior they exercise, but they are not production-cutover
+evidence. In particular:
+
+- Success against a fixture named graph does not prove live SPARQL behavior
+  against a deployed service and its production data.
+- A locally signed HS256 token or test fixture is not a live OIDC provider or
+  identity-provider integration.
+- Minting scoped names does not prove that data has been copied or migrated to
+  those names.
+- Describing an API as production-grade does not mean every historical HTTP
+  path already requires verified claims; the current claims-enforced paths are
+  listed in [Current wiring](#current-wiring).
+
+## Workload OIDC contract for business BFFs
+
+Business BFFs authenticate to AgentOS by
+forwarding a short-lived workload OIDC access token in
+`Authorization: Bearer <token>`. They do **not** sign a new AgentOS token.
+Configure the AgentOS HTTP service:
+
+```bash
+AGENTOS_ENV=production
+AGENTOS_AUTH_MODE=oidc
+AGENTOS_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
+AGENTOS_OIDC_ISSUER=https://issuer.example.com/
+AGENTOS_OIDC_AUDIENCE=wild-agentos
+```
+
+The issuer must publish an asymmetric signing key at the configured JWKS URL.
+The exact issuer and audience strings must match the token; AgentOS verifies
+the signature, `exp`, `iss`, and `aud` before it mints any isolation scope.
+This is a configuration checklist for a business BFF integration:
+
+1. Obtain a short-lived workload token from the BFF's existing OIDC provider.
+2. Set the token's audience to the configured `AGENTOS_OIDC_AUDIENCE`.
+3. Include the required tenant and project claims below.
+4. Forward the original token unchanged as a Bearer token to AgentOS HTTP
+   APIs, including agent chat. Do not send tenant or project scope in request
+   bodies as an authority substitute.
+
+Minimum token claims:
+
+```json
+{
+  "sub": "workload:example-bff",
+  "tenant_id": "acme",
+  "project_id": "capture-prod",
+  "exp": 1798761600
+}
+```
+
+After verification, AgentOS maps `sub` to `IsolationClaims.actor_id`,
+`tenant_id` to `IsolationClaims.tenant_id`, and `project_id` to
+`IsolationClaims.project_id`. The resulting claims mint
+`graph://acme/capture-prod`, `vector://acme/capture-prod`, the `acme/` object
+prefix, and the `/data/l0/acme` L0 path. `tenant_id` is mandatory; a missing,
+empty, invalid, expired, wrong-issuer, or wrong-audience token produces no
+`IsolationClaims` and is rejected. `project_id` is required for this BFF
+contract; legacy AgentOS tokens that omit it retain the documented `default`
+project compatibility behavior.
+
+**Production ban:** a BFF must never hold `AGENTOS_JWT_SECRET` or self-sign
+HS256 tokens. `AGENTOS_JWT_SECRET` is a local-development-only AgentOS
+configuration. Production AgentOS refuses to boot in HS256 mode.
 
 ## Naming contract, not a migration
 
@@ -201,6 +286,22 @@ L0, or blob keys). Until each historical backend is explicitly migrated and
 verified, production queries must not claim that isolation is complete.
 
 ## Current wiring
+
+### Runtime read lists
+
+`GET /api/v1/tasks` requires verified tenant/project `IsolationClaims` and
+lists only tasks with the caller's persisted scope. `GET /api/v1/guard/audit`
+and `GET /api/v1/guard/stats` also require verified claims; audit entries and
+statistics are scope-limited and sensitive values are redacted. Blackboard
+`GET /api/v1/blackboard/tasks` and
+`GET /api/v1/blackboard/nodes?task_iri=…` require verified claims and exclude
+tasks without matching persisted scope.
+
+Task detail paths (`GET /tasks/:iri`, status, details, and trends) share the
+same verified-claims boundary: single-task reads require the caller's persisted
+scope and return no out-of-scope task data, while trends aggregate only
+checkpoints for tasks in that scope. Records without a complete persisted scope
+remain excluded.
 
 ### Spend gate
 

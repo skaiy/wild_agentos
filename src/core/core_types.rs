@@ -178,7 +178,7 @@ impl SemanticCore {
         user_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<String, CoreError> {
-        self.init_task_with_tenant(
+        self.init_task_with_scope(
             user_input,
             _agent_md_path,
             parent_task_iri,
@@ -200,6 +200,53 @@ impl SemanticCore {
         session_id: Option<&str>,
         tenant_id: Option<&str>,
     ) -> Result<String, CoreError> {
+        self.init_task_with_scope(
+            user_input,
+            _agent_md_path,
+            parent_task_iri,
+            user_id,
+            session_id,
+            tenant_id.map(|tenant_id| (tenant_id, None)),
+        )
+        .await
+    }
+
+    /// Initialize a task carrying the complete verified isolation scope.
+    ///
+    /// Unlike the legacy tenant-only initializer, this persists both tenant
+    /// and project identifiers so claims-scoped readers can fail closed.
+    pub async fn init_task_with_claims(
+        &self,
+        user_input: &str,
+        _agent_md_path: Option<&str>,
+        parent_task_iri: Option<&str>,
+        user_id: Option<&str>,
+        session_id: Option<&str>,
+        claims: &crate::isolation::IsolationClaims,
+    ) -> Result<String, CoreError> {
+        self.init_task_with_scope(
+            user_input,
+            _agent_md_path,
+            parent_task_iri,
+            user_id,
+            session_id,
+            Some((claims.tenant_id(), Some(claims.project_id()))),
+        )
+        .await
+    }
+
+    async fn init_task_with_scope(
+        &self,
+        user_input: &str,
+        _agent_md_path: Option<&str>,
+        parent_task_iri: Option<&str>,
+        user_id: Option<&str>,
+        session_id: Option<&str>,
+        scope: Option<(&str, Option<&str>)>,
+    ) -> Result<String, CoreError> {
+        let (tenant_id, project_id) = scope.map_or((None, None), |(tenant_id, project_id)| {
+            (Some(tenant_id), project_id)
+        });
         let task_iri = format!("iri://task_{}", uuid::Uuid::new_v4().hyphenated());
         let task_node = serde_json::json!({
             "@id": &task_iri,
@@ -211,6 +258,7 @@ impl SemanticCore {
             "user_id": user_id,
             "session_id": session_id,
             "tenant_id": tenant_id,
+            "project_id": project_id,
         });
         let json_ld = serde_json::to_string(&task_node).map_err(|e| CoreError::Internal {
             message: e.to_string(),

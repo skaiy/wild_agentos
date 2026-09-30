@@ -215,7 +215,10 @@ async fn test_mcp_client_connection_failure_is_visible() {
     client.register_server("offline", "http://127.0.0.1:1/mcp");
 
     let result = client.connect("offline").await;
-    assert!(result.is_err(), "unreachable MCP HTTP must surface connect error");
+    assert!(
+        result.is_err(),
+        "unreachable MCP HTTP must surface connect error"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         !err.to_lowercase().contains("simulated"),

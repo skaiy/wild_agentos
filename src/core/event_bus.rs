@@ -17,6 +17,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 /// Event types in the PDCA system
@@ -570,6 +571,38 @@ impl EventBus {
                         tracing::warn!("EventBus consumer lagged by {} events", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// Spawn a runtime-owned consumer that exits with the process supervisor.
+    pub fn spawn_consumer_with_shutdown<F, Fut>(
+        &self,
+        event_types: Vec<String>,
+        handler: F,
+        shutdown: CancellationToken,
+    ) where
+        F: Fn(Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut receiver = self.sender.subscribe();
+        let handler = Arc::new(handler);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    result = receiver.recv() => match result {
+                        Ok(event) => {
+                            if event_types.is_empty() || event_types.contains(&event.event_type) {
+                                handler(event).await;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("EventBus consumer lagged by {} events", n);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    },
                 }
             }
         });

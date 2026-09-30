@@ -11,12 +11,9 @@ ARG MIRROR=docker.io/
 FROM ${MIRROR}library/rust:1-slim-bookworm AS builder
 
 # tonic-build 需 protobuf-compiler；tree-sitter/oxigraph(RocksDB) 需 C/C++ 工具链(gcc/g++)
-# 受限网络: 换用国内 Debian 源(USTC) + apt 重试,避免 deb.debian.org 拉包超时
+# 保留官方 Debian 源，避免 CI 依赖特定第三方镜像的可用性。
 RUN set -eux; \
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/debian.sources; do \
-        [ -f "$f" ] && sed -i 's|deb.debian.org|mirrors.ustc.edu.cn|g; s|security.debian.org|mirrors.ustc.edu.cn|g' "$f" || true; \
-    done; \
-    echo 'Acquire::Retries "8";' > /etc/apt/apt.conf.d/80-retries; \
+    echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries; \
     apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler \
         build-essential \

@@ -19,13 +19,13 @@ flowchart TD
     META --> ROUTER["ResultRouter.route()"]
     ROUTER --> SIZE{"Result size?"}
 
-    SIZE -->|"< 4KB"| PASS["PassThrough<br/>Pass through directly"]
-    SIZE -->|"4KB-50KB"| STRUCT{"Is it JSON?"}
+    SIZE -->|"< 2KB"| PASS["PassThrough<br/>Pass through directly"]
+    SIZE -->|"2KB-8KB"| STRUCT{"Is it JSON?"}
 
     STRUCT -->|"JSON"| TRUNC_J["Truncate<br/>Smart JSON truncation<br/>Keep first N + marker"]
     STRUCT -->|"Not JSON"| TRUNC_T["Truncate<br/>Smart text truncation<br/>Truncate by line + statistics"]
 
-    SIZE -->|"> 50KB"| LARGE_STRUCT{"Is it structured JSON?"}
+    SIZE -->|"> 8KB"| LARGE_STRUCT{"Is it structured JSON?"}
     LARGE_STRUCT -->|"Yes"| GRAPHIFY["Graphify<br/>Store as a graph<br/>+ inject micro-tools"]
     LARGE_STRUCT -->|"No"| SUMMARIZE["Summarize<br/>Head and tail previews<br/>+ read_full_result"]
 

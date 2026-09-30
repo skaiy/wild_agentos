@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +19,7 @@ pub struct GraphifyEngine {
 
 impl GraphifyEngine {
     pub fn new(max_entities: usize) -> Result<Self, String> {
-        let store = KnowledgeGraphStore::new()?;
+        let store = KnowledgeGraphStore::new().map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             max_entities,
@@ -28,7 +30,8 @@ impl GraphifyEngine {
         store: Arc<oxigraph::store::Store>,
         max_entities: usize,
     ) -> Result<Self, String> {
-        let store = KnowledgeGraphStore::with_shared_store(store)?;
+        let store =
+            KnowledgeGraphStore::with_shared_store(store).map_err(|error| error.to_string())?;
         Ok(Self {
             store,
             max_entities,
@@ -88,7 +91,10 @@ impl GraphifyEngine {
         let mapping = RdfMapper::map_extraction(&output, &graph_name);
 
         let write_result = match claims {
-            Some(claims) => self.store.write_quads_for_claims(claims, &mapping.quads),
+            Some(claims) => self
+                .store
+                .write_quads_for_claims(claims, &mapping.quads)
+                .map_err(|error| error.to_string()),
             None => self.store.write_quads(&mapping.quads, &graph_name),
         };
         if let Err(e) = write_result {
@@ -464,10 +470,8 @@ impl GraphifyEngine {
                         relation_types.push(pred_short);
                     }
                     relation_count += 1;
-                } else {
-                    if !property_names.contains(&pred_short) {
-                        property_names.push(pred_short);
-                    }
+                } else if !property_names.contains(&pred_short) {
+                    property_names.push(pred_short);
                 }
             }
         }

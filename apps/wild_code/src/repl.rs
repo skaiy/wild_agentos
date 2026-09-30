@@ -36,7 +36,7 @@ pub async fn run_repl(mut config: CliConfig) -> anyhow::Result<()> {
                     render::user_input(&input);
 
                     let mut renderer = StreamRenderer::new();
-                    renderer.show_task_start(&engine.workspace());
+                    renderer.show_task_start(engine.workspace());
 
                     let mut receiver = engine.subscribe();
                     let done = Arc::new(AtomicBool::new(false));
@@ -74,7 +74,7 @@ pub async fn run_repl(mut config: CliConfig) -> anyhow::Result<()> {
                                 &task_result.summary,
                                 task_result.turn_count,
                                 task_result.tool_call_count,
-                                &engine.workspace(),
+                                engine.workspace(),
                             );
                         }
                         Err(e) => {

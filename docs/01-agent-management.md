@@ -8,6 +8,17 @@ Agent management and scheduling is the system core. It dynamically selects Agent
 
 New user Agents are written with the `tenant_id` and `project_id` from authentication-boundary-verified claims. Internal/scoped chat RAG accepts only Agents that exactly match those verified claims; records without scope, or with mismatched tenant/project values, are rejected. Legacy unscoped Agents are therefore no longer implicitly shared. For the trust boundary and public API-key chat behavior, see [17-isolation-contract.md](17-isolation-contract.md).
 
+Domain-specific chat behavior belongs to an Agent-bound runtime asset or client, not core middleware; `ev-repair` is an optional example asset and bind alias for the persisted `ev-repair-fault-kb` pack, not a middleware requirement.
+
+### Business client chat
+
+A business client calls `POST /api/v1/agents/:id/chat` with verified JWT claims
+and `{"message":"..."}` (optionally `images`); bind ordinary pack IDs through
+the Agent's `knowledge_pack_ids` when creating or updating it. Chat forwards
+the caller context unchanged unless that scoped Agent mounts a known built-in
+runtime asset; domain instructions belong in the client or an optional example
+pack.
+
 ```mermaid
 graph TB
     subgraph Agent Management

@@ -8,7 +8,7 @@
 
 ## Module Architecture
 
-The input sources are unstructured text, code files in nine languages, and structured JSON. `KnowledgeExtractor` performs LLM extraction with three retries and JSON cleanup; `CodeAstExtractor` uses tree-sitter and SHA256-based incremental updates; `knowledge_import_json` maps JSON to RDF. `RdfMapper` converts `NodeDef`/`EdgeDef` to `RdfQuad` and property keys to IRIs, while `OntologyManager` provides 12 built-in ontology terms. `KnowledgeGraphStore` uses an Oxigraph Memory Store and offers SPARQL queries and 1–3 hop entity search. `KnowledgeBridge` bridges knowledge and skills through isolated named graphs, and `UnifiedGraphStore` shares the underlying `Arc<Store>`.
+The input sources are unstructured text, code files in nine languages, and structured JSON. `KnowledgeExtractor` performs LLM extraction with three retries and JSON cleanup; `CodeAstExtractor` uses tree-sitter and SHA256-based incremental updates; `knowledge_import_json` maps JSON to RDF. `RdfMapper` converts `NodeDef`/`EdgeDef` to `RdfQuad` and property keys to IRIs, while `OntologyManager` provides approximately 65 built-in ontology terms across core, engineering, code, business, and relation groups. `KnowledgeGraphStore` uses an Oxigraph Memory Store and offers SPARQL queries and 1–3 hop entity search. `KnowledgeBridge` bridges knowledge and skills through isolated named graphs, and `UnifiedGraphStore` shares the underlying `Arc<Store>`.
 
 ## Core Components
 
@@ -87,9 +87,9 @@ It manages `HasSkill` (`ontology:bridge/hasSkill`), `ApplicableIn` (`ontology:br
 | `knowledge_query` | SPARQL SELECT query | ✅ |
 | `kg_search` | Fuzzy entity search | ✅ |
 | `knowledge_neighbors` | 1–3 hop neighbor traversal | ✅ |
-| `knowledge_import_json` | Map JSON data to graph nodes | ❌ |
-| `ontology_register` | Register a custom ontology term | ❌ |
-| `knowledge_bridge` | Create a knowledge-skill bridge | ❌ |
+| `knowledge_import_json` | Map JSON data to graph nodes | ✅ |
+| `ontology_register` | Register a custom ontology term | ✅ |
+| `knowledge_bridge` | Create a knowledge-skill bridge | ✅ |
 | `knowledge_extract_code` | tree-sitter code AST extraction (incremental) | ✅ |
 
 ## Key Design Decisions

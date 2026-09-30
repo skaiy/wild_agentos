@@ -4,7 +4,8 @@
 > [21-ontology-knowledge-engineering-pipeline.zh.md](21-ontology-knowledge-engineering-pipeline.zh.md).*
 >
 > v0.5.0 completes the bounded Ontology Knowledge Engineering / Graph
-> Engineering milestone documented here. It does not claim a continuous,
+> Engineering milestone documented here. Current `main` adds continuous online
+> job and watcher orchestration, but does not claim an approval-free,
 > fully automated corpus-to-graph service.
 > It complements [Knowledge Ingestion](16-knowledge-ingest-import-graph.md),
 > [Ontology Action Data Sandbox](15-ontology-action-sandbox.md), and the
@@ -12,15 +13,16 @@
 
 ## Status and question answered
 
-**Question:** Do the implemented capabilities in v0.5.0 form a
-complete, online, fully automated ontology knowledge-graph engineering
+**Question:** Do the implemented capabilities form a complete, online,
+approval-free ontology knowledge-graph engineering
 toolchain?
 
 **Answer: No.**
 
-The current code provides bounded ingestion, graph, ontology, staging, quality,
-and human-approval primitives. It does **not** provide an online, fully automatic
-pipeline that extracts ontology-aligned knowledge from a changing corpus,
+The current code provides online job and watcher orchestration alongside bounded
+ingestion, graph, ontology, staging, quality, and human-approval primitives. It
+does **not** provide an approval-free, fully automatic pipeline that extracts
+ontology-aligned knowledge from a changing corpus,
 validates it, resolves entities, promotes schema, and materializes a governed
 warehouse. The design below describes what would be required to make that
 statement true without weakening the current security and governance boundary.
@@ -67,7 +69,7 @@ before a kernel loop can use it as a promoted schema.
 | Optional inference | Limited RDFS query-time expansion is available only when enabled; it is off by default and does not persist inferred triples. |
 | Isolation | `IsolationClaims` determine graph, blob, and vector targets; missing or invalid claims fail closed. Minting a safe target name is **not** historical-data migration. |
 
-### Pending or recently completed work does not close this gap
+### Supporting work and delivered online orchestration
 
 At the time of writing:
 
@@ -79,24 +81,61 @@ At the time of writing:
 - [#132](https://github.com/skaiy/wild_agentos/issues/132), operations
   surfaces for keys, tenant scope, and action auditing, is merged.
 
-These changes improve isolation, authentication, or operations. None supplies
-continuous ontology extraction, automatic promotion, or governed warehouse
-materialization.
+These changes improve isolation, authentication, or operations. The
+authenticated, claims-scoped online job and watcher orchestration is delivered
+below; fully automatic, approval-free corpus-to-graph promotion remains outside
+its scope.
 
-### Explicit gaps
+### v0.6 online job and watcher delivery
 
-The current system has no:
+v0.6 completes the claims-scoped online orchestration over the bounded
+primitives delivered in v0.5.0: constrained
+extraction and canonicalization to staging, `KgQualityGate`, anchored
+materialization, approval-held entity-resolution suggestions, frozen golden
+evaluation, ontology-health reporting, draft-only schema induction, and
+schema-evolution compatibility checks.
 
-1. continuous online corpus-to-graph job pipeline;
-2. ontology-constrained extraction or post-extraction canonicalization and
-   correction;
-3. entity-resolution / deduplication service;
-4. draft-to-instance materialization job;
-5. graph-quality gate such as a GraphJudge/refiner;
-6. schema-evolution CI;
-7. scheduled corpus watchers; or
-8. mechanism for type drafts to invent `LinkType`s or `ActionType`s. Type
-   drafts are deliberately narrower than schema induction.
+Jobs retain a bounded, claims-scoped audit trail linking source version,
+content digest (not source text), canonicalization decision count, quality
+gate/review, ER suggestions, and staging. `GET
+/api/v1/online-corpus-jobs/observability` exposes only scoped queue depth,
+active work, retry counts, oldest queued timestamp, and saturation. Transient
+sidecar failures retry at most three attempts; validation, authentication, and
+policy failures are terminal. Watchers remain enabled by default and emit
+saturation signals without logging corpus payloads or credentials.
+
+### v0.6 delivered scope — online corpus job + watcher
+
+**Delivered**
+
+- A claims-scoped job model with create, list, get, and cancel (or equivalent)
+  operations for configured corpus changes or incremental deltas.
+- A runner that orchestrates the existing
+  extract → canonicalize → quality gate → approval-held entity-resolution suggestion
+  → staging path. It reuses the existing constrained-extraction endpoints,
+  `KgQualityGate`, staging/review records, and anchored materialization
+  boundary rather than creating another KE stack.
+- Enabled-by-default scheduled or event-driven watchers that enqueue jobs.
+  Deployments may explicitly disable their watcher configuration when needed.
+- Job state, retry with backpressure, idempotency, and provenance linking
+  source, candidates, gate result, and decision.
+- Verified `IsolationClaims` only: unauthenticated or invalid-claims requests
+  fail closed. Tests must prove that failed and unauthenticated paths never
+  write production.
+
+**Out / non-goals**
+
+- Silent promotion of a production ontology or automatic entity-resolution
+  merge; materialization remains approval-held and anchored.
+- Replacing Oxigraph/SPARQL, adding Cypher or Nebula, or reimplementing
+  `KgQualityGate`, Morph-KGC/RML, golden freeze, or the Admin design studio.
+- Claiming “fully online automated with governance” merely from job completion;
+  human authority over promotion and materialization remains intact.
+- Mixing separate product or business repositories into this tree.
+
+The delivery closes the online-job, idempotent-runner, default-enabled watcher,
+provenance/observability, and fail-closed isolation CI work. The companion
+Admin job list is delivered separately.
 
 ## Public best-practice signals
 
@@ -363,12 +402,6 @@ and skill loops that use a promoted ontology.
   canonicalizes them against promoted `ObjectType`/`LinkType` definitions, and
   writes accepted triples plus every mapping decision only to a claims-minted
   staging graph. It never promotes types or writes the production graph.
-- Add an ontology-constrained extraction API whose domain is **promoted types
-  only**.
-- Run post-extraction canonicalization against promoted `ObjectType` and
-  `LinkType` definitions.
-- Fail closed and write candidates to a claims-scoped staging graph only.
-- Record source provenance and rejected/ambiguous mappings.
 
 #### P1 — quality gate and review
 
@@ -378,14 +411,6 @@ and skill loops that use a promoted ontology.
   remain attached to the staging `extraction_id` and claims-scoped review
   queue; approve/reject records no production write, and a Judge cannot
   run—or overturn the result—when a deterministic anchor fails.
-
-- [#140](https://github.com/skaiy/wild_agentos/issues/140): make
-  `KgQualityGate` the medium-speed quality supervisory loop, with deterministic
-  `ASK`/SHACL anchors for type, predicate, cardinality, and provenance policy.
-- An optional, source-grounded Judge/refiner follows deterministic checks but
-  never overrides a failed anchor.
-- Add a review queue for staged candidates, evidence, violations, and
-  approve/reject decisions.
 
 #### P1.5 — materialize with anchors
 
@@ -420,8 +445,45 @@ and skill loops that use a promoted ontology.
   GLinker is used as an Apache-2.0 pattern and can be installed only in that
   worker environment; no GLinker code, model weights, or LGPL component is
   linked into the kernel process. Any LGPL linker must remain process-isolated.
-- Add explicitly configured blob-watch/reindex jobs with idempotent cursors,
-  retries, observability, and backpressure.
+- v0.6 delivers the online-job runner and enabled-by-default watcher that
+  schedule these existing primitives. Deployments can explicitly disable
+  watcher configuration when needed. See the delivered scope above.
+
+#### v0.6 — online corpus watcher configuration
+
+`online_corpus_watchers.enabled` is **true by default**. Set it to `false`
+in `config.yaml`, `data/config_override.json`, or the equivalent
+`AGENT_OS_ONLINE_CORPUS_WATCHERS_ENABLED=false` environment configuration to
+stop all watcher polling and enqueueing. Configuration precedence is the
+standard runtime order: environment overrides `data/config_override.json`,
+which overrides `config.yaml`; if none sets this field, watchers remain
+enabled. Disabling does not delete jobs, cursors, reviews, or audit records.
+
+Registrations are deployment-controlled trusted configuration and must name
+`id`, `source_id`, immutable `source_version`, `tenant_id`, `project_id`, and
+`actor_id`. A change in `source_version` is the polling signal. The scheduler
+persists a cursor only after the normal claims-scoped, idempotent job-create
+path accepts that version, so restart/retry and re-enablement do not create a
+second logical job. Jobs are left queued for the authenticated `/run` runner
+path because watcher configuration contains no extraction text or candidates.
+That runner still stages candidates, holds ER suggestions for approval, and
+never materializes or promotes automatically.
+
+```yaml
+online_corpus_watchers:
+  enabled: true # Explicit false disables all polling/enqueueing.
+  poll_interval_seconds: 60
+  max_concurrent_polls: 4
+  queue_capacity: 100
+  registrations:
+    - id: "handbook"
+      source_id: "handbook"
+      source_version: "2026-09-08T00:00:00Z"
+      source_uri: "https://corpus.example.invalid/handbook"
+      tenant_id: "tenant-example"
+      project_id: "project-example"
+      actor_id: "watcher-service"
+```
 
 #### P2b — frozen extraction evaluation and measurement-decay audit
 

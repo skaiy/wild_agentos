@@ -19,13 +19,13 @@ flowchart TD
     META --> ROUTER["ResultRouter.route()"]
     ROUTER --> SIZE{"结果大小?"}
 
-    SIZE -->|"< 4KB"| PASS["PassThrough<br/>直接透传"]
-    SIZE -->|"4KB-50KB"| STRUCT{"是否 JSON?"}
+    SIZE -->|"< 2KB"| PASS["PassThrough<br/>直接透传"]
+    SIZE -->|"2KB-8KB"| STRUCT{"是否 JSON?"}
 
     STRUCT -->|"是 JSON"| TRUNC_J["Truncate<br/>JSON 智能截断<br/>保留前N个+标记"]
     STRUCT -->|"非 JSON"| TRUNC_T["Truncate<br/>文本智能截断<br/>按行截断+统计"]
 
-    SIZE -->|"> 50KB"| LARGE_STRUCT{"是否结构化 JSON?"}
+    SIZE -->|"> 8KB"| LARGE_STRUCT{"是否结构化 JSON?"}
     LARGE_STRUCT -->|"是"| GRAPHIFY["Graphify<br/>图谱化存储<br/>+ 微工具注入"]
     LARGE_STRUCT -->|"否"| SUMMARIZE["Summarize<br/>预览+末尾预览<br/>+ read_full_result"]
 

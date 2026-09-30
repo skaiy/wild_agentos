@@ -88,7 +88,7 @@ graph TB
 
 ### 5.2.1 ToolExecutor — Tool Executor
 
-**File**: `src/tools/tool_executor.rs`
+**File**: `src/tools/tool_executor/mod.rs`
 **Implementation status**: ✅ Complete
 
 The unified entry point for tool execution; it finds tools, validates arguments, and runs them.
@@ -465,9 +465,9 @@ Multiple embedding service providers are supported:
 | knowledge_query | SPARQL SELECT query | ✅ |
 | kg_search | Fuzzy entity search | ✅ |
 | knowledge_neighbors | 1–3-hop neighbor traversal | ✅ |
-| knowledge_import_json | Maps JSON data to graph nodes | ❌ |
-| ontology_register | Registers custom ontology terms | ❌ |
-| knowledge_bridge | Creates knowledge-skill bridges | ❌ |
+| knowledge_import_json | Maps JSON data to graph nodes | ✅ |
+| ontology_register | Registers custom ontology terms | ✅ |
+| knowledge_bridge | Creates knowledge-skill bridges | ✅ |
 | knowledge_extract_code | tree-sitter code AST extraction (incremental) | ✅ |
 
 ## 5.4 Tool-Call Flow

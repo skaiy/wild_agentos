@@ -32,6 +32,8 @@ pub mod artifacts;
 pub mod chat;
 pub mod config;
 pub mod core_ops;
+pub mod corpus_jobs;
+pub mod corpus_watchers;
 pub mod guard;
 pub mod kb;
 pub mod market;
@@ -73,7 +75,10 @@ use market::{
     install_package_handler, list_packages_handler, publish_package_handler,
     rollback_package_handler, upgrade_package_handler,
 };
-use mcp::{list_mcp_servers_handler, load_mcp_servers, register_mcp_server_handler};
+use mcp::{
+    delete_mcp_server_handler, invoke_mcp_server_handler, list_mcp_servers_handler,
+    load_mcp_servers, register_mcp_server_handler, validate_strict_mcp_outbound_configuration,
+};
 use mcp_skills::{
     delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
     upsert_skill_exposure_handler,
@@ -81,20 +86,18 @@ use mcp_skills::{
 use ontology::{
     approve_action_approval_handler, constrained_extraction_handler,
     constrained_extraction_query_handler, constrained_extraction_review_handler,
-    create_entity_resolution_suggestion_handler,
-    create_csv_type_draft_handler, create_json_schema_type_draft_handler,
-    create_openapi_type_draft_handler, create_schema_induction_type_draft_handler,
-    create_sql_ddl_type_draft_handler, delete_action_type_handler, delete_function_def_handler,
-    delete_link_type_handler, delete_object_type_handler, domain_guardrails_handler,
-    invoke_action_handler, list_action_approvals_handler, list_extraction_reviews_handler,
-    materialize_constrained_extraction_handler, ontology_readiness_report_handler,
-    ontology_health_handler, ontology_types_handler, list_type_drafts_handler,
-    promote_type_draft_handler,
+    create_csv_type_draft_handler, create_entity_resolution_suggestion_handler,
+    create_json_schema_type_draft_handler, create_openapi_type_draft_handler,
+    create_schema_induction_type_draft_handler, create_sql_ddl_type_draft_handler,
+    delete_action_type_handler, delete_function_def_handler, delete_link_type_handler,
+    delete_object_type_handler, domain_guardrails_handler, invoke_action_handler,
+    list_action_approvals_handler, list_extraction_reviews_handler, list_type_drafts_handler,
+    materialize_constrained_extraction_handler, ontology_health_handler,
+    ontology_readiness_report_handler, ontology_types_handler, promote_type_draft_handler,
     quality_gate_handler, reject_action_approval_handler, resolve_extraction_review_handler,
-    update_action_type_handler,
-    update_domain_guardrails_handler, update_function_def_handler, update_link_type_handler,
-    update_object_type_handler, upsert_action_type_handler, upsert_function_def_handler,
-    upsert_link_type_handler, upsert_object_type_handler,
+    update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
+    update_link_type_handler, update_object_type_handler, upsert_action_type_handler,
+    upsert_function_def_handler, upsert_link_type_handler, upsert_object_type_handler,
 };
 use runtime::{health_handler, metrics_handler, unified_stats_handler};
 use skills::{
@@ -104,7 +107,7 @@ use skills::{
 };
 use tasks::{
     create_task_handler, get_execution_details_handler, get_realtime_status_handler,
-    get_task_handler, list_task_trends_handler, stream_task_handler,
+    get_task_handler, list_task_trends_handler, list_tasks_handler, stream_task_handler,
 };
 
 use api_clients::{
@@ -120,6 +123,12 @@ use core_ops::{
     list_blackboard_tasks_handler, read_node_handler, stream_batch_events_handler,
     write_node_handler,
 };
+use corpus_jobs::{
+    cancel_online_corpus_job_handler, create_online_corpus_job_handler,
+    get_online_corpus_job_handler, list_online_corpus_jobs_handler, load_online_corpus_jobs,
+    online_corpus_job_observability_handler, run_online_corpus_job_handler,
+};
+use corpus_watchers::run_online_corpus_watcher_scheduler;
 use models::{
     activate_embedding_handler, image_raw_handler, provider_models_handler, test_model_handler,
     upload_image_handler, IMAGE_UPLOAD_MAX_BYTES,
@@ -166,6 +175,14 @@ pub struct AppState {
     pub api_keys: Arc<tokio::sync::RwLock<Vec<ApiKey>>>,
     /// 进程内限流/配额/并发用量状态（对外调用面）。
     pub api_usage: Arc<ApiUsageState>,
+    /// Claims-scoped online corpus orchestration metadata. Jobs never select a
+    /// production graph; later runners use this state store plus staged APIs.
+    pub(crate) online_corpus_jobs: corpus_jobs::OnlineCorpusJobStore,
+    /// Configured queue capacity used only for claims-scoped saturation
+    /// observability; it does not grant any worker production-write authority.
+    pub(crate) online_corpus_queue_capacity: usize,
+    /// Process-wide cancellation propagated by the runtime supervisor.
+    pub(crate) shutdown: tokio_util::sync::CancellationToken,
 }
 /// 流式任务执行规格：由 HTTP 流处理器构造并传入执行器。
 #[derive(Clone)]
@@ -174,6 +191,9 @@ pub struct TaskExecSpec {
     pub task_iri: String,
     pub include_thought: bool,
     pub include_tool_calls: bool,
+    /// Cancel this task's execution, for example when its request timeout
+    /// expires. This remains distinct from the process-wide shutdown token.
+    pub cancellation: tokio_util::sync::CancellationToken,
     /// Claims minted by the verified HTTP authentication boundary. Absent
     /// claims deliberately leave L0 writes on the legacy read-only path.
     pub isolation_claims: Option<crate::isolation::IsolationClaims>,
@@ -234,7 +254,12 @@ pub fn build_router(
     vector_store: SharedVectorStore,
     task_executor: Option<Arc<dyn TaskExecutor>>,
     batch_manager: Option<SharedBatchManager>,
+    online_corpus_watchers: crate::config::OnlineCorpusWatcherSettings,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Router {
+    if let Err(error) = validate_strict_mcp_outbound_configuration() {
+        panic!("invalid MCP outbound configuration: {error}");
+    }
     // 启动时加载用户态注册的技能并重新注册到内存技能表（默认技能由 SemanticCore 播种）。
     for skill in load_user_skills() {
         core.skills.register_skill(skill);
@@ -246,10 +271,20 @@ pub fn build_router(
     let (agents_migrated, packs_migrated) =
         migrate_legacy_agent_graphs(&mut loaded_agents, &mut loaded_packs);
     if agents_migrated {
-        let _ = save_user_agents(&loaded_agents);
+        if let Err(error) = save_user_agents(&loaded_agents) {
+            tracing::error!(
+                error = %error,
+                "Failed to persist migrated user agents; preserving legacy fields requires operator attention"
+            );
+        }
     }
     if packs_migrated {
-        let _ = save_knowledge_packs(&loaded_packs);
+        if let Err(error) = save_knowledge_packs(&loaded_packs) {
+            tracing::error!(
+                error = %error,
+                "Failed to persist migrated knowledge packs; migration will retry at next startup"
+            );
+        }
     }
 
     let state = Arc::new(AppState {
@@ -271,7 +306,15 @@ pub fn build_router(
         api_clients: Arc::new(tokio::sync::RwLock::new(api_gov::load_api_clients())),
         api_keys: Arc::new(tokio::sync::RwLock::new(api_gov::load_api_keys())),
         api_usage: Arc::new(ApiUsageState::default()),
+        online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(load_online_corpus_jobs())),
+        online_corpus_queue_capacity: online_corpus_watchers.queue_capacity,
+        shutdown: shutdown.clone(),
     });
+    tokio::spawn(run_online_corpus_watcher_scheduler(
+        state.online_corpus_jobs.clone(),
+        online_corpus_watchers,
+        shutdown,
+    ));
 
     // 启动首灌：把持久化的 models 注册表灌入 gateway，使进程启动即按多 provider 生效。
     hot_reload_models(&state);
@@ -284,10 +327,34 @@ pub fn build_router(
             "/api/v1/config",
             get(config_handler).put(update_config_handler),
         )
-        .route("/api/v1/tasks", post(create_task_handler))
+        .route(
+            "/api/v1/tasks",
+            get(list_tasks_handler).post(create_task_handler),
+        )
         .route("/api/v1/tasks/:task_iri", get(get_task_handler))
         .route("/api/v1/tasks/stream", post(stream_task_handler))
         .route("/api/v1/tasks/trends", get(list_task_trends_handler))
+        // ── v0.6 online corpus orchestration metadata (no runner or production writes) ──
+        .route(
+            "/api/v1/online-corpus-jobs",
+            get(list_online_corpus_jobs_handler).post(create_online_corpus_job_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/observability",
+            get(online_corpus_job_observability_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/:id",
+            get(get_online_corpus_job_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/:id/cancel",
+            post(cancel_online_corpus_job_handler),
+        )
+        .route(
+            "/api/v1/online-corpus-jobs/:id/run",
+            post(run_online_corpus_job_handler),
+        )
         .route(
             "/api/v1/artifacts",
             get(list_artifacts_handler)
@@ -608,8 +675,13 @@ pub fn build_router(
             "/api/v1/mcp/servers",
             get(list_mcp_servers_handler).post(register_mcp_server_handler),
         )
-        // Published tenant Skills are explicitly opt-in MCP tools. `/mcp`
-        // is the external JSON-RPC endpoint; the management route is DA-only.
+        .route("/api/v1/mcp/servers/:id", delete(delete_mcp_server_handler))
+        .route(
+            "/api/v1/mcp/servers/invoke",
+            post(invoke_mcp_server_handler),
+        )
+        // Published tenant Skills are explicitly opt-in MCP tools. `/mcp` is
+        // the external JSON-RPC endpoint, not the catalog MCP invoke proxy.
         .route("/mcp", post(skill_mcp_handler))
         .route(
             "/api/v1/mcp/skill-exposures",
@@ -708,6 +780,9 @@ mod tests {
             api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
         let router = Router::new()
@@ -750,7 +825,7 @@ mod tests {
                     roles: vec!["DA".to_string()],
                     exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 },
-                &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+                &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
             )
             .unwrap()
         };

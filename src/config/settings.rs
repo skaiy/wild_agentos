@@ -1,3 +1,4 @@
+pub use crate::tools::tool_groups::{RoleToolConfig, ToolGroupSettings};
 use anyhow::Result;
 use config::{Config, ConfigError, Environment};
 use serde::Deserialize;
@@ -27,6 +28,65 @@ pub struct Settings {
     pub admin_policies: AdminPolicySettings,
     #[serde(default)]
     pub a2a: A2aSettings,
+    #[serde(default)]
+    pub online_corpus_watchers: OnlineCorpusWatcherSettings,
+}
+
+/// Deploy-time registrations for the claims-scoped online corpus job watcher.
+///
+/// Watchers are enabled unless this section explicitly sets `enabled: false`.
+/// Each registration supplies a stable source version; changing that version
+/// makes one new job eligible for the registration's declared claims scope.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OnlineCorpusWatcherSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_watcher_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    #[serde(default = "default_watcher_max_concurrent_polls")]
+    pub max_concurrent_polls: usize,
+    #[serde(default = "default_watcher_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default)]
+    pub registrations: Vec<OnlineCorpusWatcherRegistration>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OnlineCorpusWatcherRegistration {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub source_id: String,
+    pub source_version: String,
+    #[serde(default)]
+    pub source_uri: Option<String>,
+    pub tenant_id: String,
+    pub project_id: String,
+    pub actor_id: String,
+}
+
+impl Default for OnlineCorpusWatcherSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_seconds: default_watcher_poll_interval_seconds(),
+            max_concurrent_polls: default_watcher_max_concurrent_polls(),
+            queue_capacity: default_watcher_queue_capacity(),
+            registrations: Vec::new(),
+        }
+    }
+}
+
+fn default_watcher_poll_interval_seconds() -> u64 {
+    60
+}
+
+fn default_watcher_max_concurrent_polls() -> usize {
+    4
+}
+
+fn default_watcher_queue_capacity() -> usize {
+    100
 }
 
 /// Outbound-only A2A transport configuration. This intentionally does not
@@ -808,78 +868,6 @@ pub struct TokenOptimizationSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ToolGroupSettings {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub roles: std::collections::HashMap<String, RoleToolConfig>,
-}
-
-impl Default for ToolGroupSettings {
-    fn default() -> Self {
-        let mut roles = std::collections::HashMap::new();
-        roles.insert(
-            "Plan".to_string(),
-            RoleToolConfig {
-                default: vec![
-                    "Core".to_string(),
-                    "Search".to_string(),
-                    "Knowledge".to_string(),
-                    "System".to_string(),
-                ],
-                on_demand: vec!["Web".to_string(), "Code".to_string(), "Skill".to_string()],
-            },
-        );
-        roles.insert(
-            "Do".to_string(),
-            RoleToolConfig {
-                default: vec![
-                    "Core".to_string(),
-                    "Write".to_string(),
-                    "Search".to_string(),
-                    "Web".to_string(),
-                    "Code".to_string(),
-                    "Skill".to_string(),
-                    "System".to_string(),
-                ],
-                on_demand: vec!["Knowledge".to_string()],
-            },
-        );
-        roles.insert(
-            "Check".to_string(),
-            RoleToolConfig {
-                default: vec![
-                    "Core".to_string(),
-                    "Search".to_string(),
-                    "Knowledge".to_string(),
-                    "System".to_string(),
-                ],
-                on_demand: vec!["Web".to_string(), "Code".to_string()],
-            },
-        );
-        roles.insert(
-            "Act".to_string(),
-            RoleToolConfig {
-                default: vec!["Core".to_string(), "System".to_string()],
-                on_demand: vec!["Search".to_string(), "Knowledge".to_string()],
-            },
-        );
-        Self {
-            enabled: true,
-            roles,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct RoleToolConfig {
-    #[serde(default)]
-    pub default: Vec<String>,
-    #[serde(default)]
-    pub on_demand: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
 pub struct ToolResultCompressorSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1234,6 +1222,7 @@ impl Default for Settings {
             models: ModelsSettings::default(),
             admin_policies: AdminPolicySettings::default(),
             a2a: A2aSettings::default(),
+            online_corpus_watchers: OnlineCorpusWatcherSettings::default(),
         }
     }
 }
@@ -1245,7 +1234,31 @@ fn config_override_path() -> std::path::PathBuf {
         .join("config_override.json")
 }
 
+fn development_config_fallback_enabled(
+    profile: Option<&str>,
+    allow_defaults: Option<&str>,
+) -> bool {
+    profile.is_some_and(|value| value.eq_ignore_ascii_case("development"))
+        || allow_defaults.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+}
+
 impl Settings {
+    /// Whether an explicitly marked development process may start with defaults
+    /// when its configuration cannot be loaded. Production always fails closed.
+    pub fn development_config_fallback_enabled() -> bool {
+        development_config_fallback_enabled(
+            std::env::var("AGENT_OS_CONFIG_PROFILE").ok().as_deref(),
+            std::env::var("AGENT_OS_ALLOW_DEFAULT_CONFIG")
+                .ok()
+                .as_deref(),
+        )
+    }
+
     pub fn load() -> Result<Self, ConfigError> {
         let config = Config::builder()
             .add_source(config::File::with_name("config").required(false))
@@ -1312,6 +1325,15 @@ impl Settings {
                 "a2a.outbound.endpoint must be set when outbound A2A is enabled".to_string(),
             );
         }
+        if self.online_corpus_watchers.poll_interval_seconds == 0
+            || self.online_corpus_watchers.max_concurrent_polls == 0
+            || self.online_corpus_watchers.queue_capacity == 0
+        {
+            return Err(
+                "online_corpus_watchers poll_interval_seconds, max_concurrent_polls, and queue_capacity must be > 0"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -1319,6 +1341,25 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_fallback_requires_explicit_development_opt_in() {
+        assert!(!development_config_fallback_enabled(None, None));
+        assert!(development_config_fallback_enabled(
+            Some("development"),
+            None
+        ));
+        assert!(development_config_fallback_enabled(
+            Some("DEVELOPMENT"),
+            None
+        ));
+        assert!(development_config_fallback_enabled(None, Some("true")));
+        assert!(development_config_fallback_enabled(None, Some("1")));
+        assert!(!development_config_fallback_enabled(
+            Some("production"),
+            Some("false")
+        ));
+    }
 
     #[test]
     fn test_logging_settings_test_default() {
@@ -1506,6 +1547,17 @@ mod tests {
         let settings: GatewaySettings = cfg.try_deserialize().unwrap();
         // 未配置时默认走 chat completions,保持向后兼容
         assert!(!settings.use_responses_api);
+    }
+
+    #[test]
+    fn online_corpus_watchers_are_enabled_by_default_and_can_be_disabled() {
+        let defaults: OnlineCorpusWatcherSettings = serde_json::from_str("{}").unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.poll_interval_seconds, 60);
+
+        let disabled: OnlineCorpusWatcherSettings =
+            serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!disabled.enabled);
     }
 
     #[test]

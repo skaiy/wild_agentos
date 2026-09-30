@@ -1290,6 +1290,8 @@ pub struct VerificationResult {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
 
     #[test]

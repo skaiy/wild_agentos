@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::isolation::IsolationClaims;
+use crate::tools::workspace_path::canonicalize_workspace_path;
 use crate::CoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,13 +635,16 @@ pub fn create_default_mcp_server() -> MCPServer {
         )
         .with_risk_level(MCPToolRiskLevel::Low),
         |args| async move {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = canonicalize_workspace_path(
+                args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+            )
+            .map_err(|message| CoreError::ValidationFailed { message })?;
             let encoding = args
                 .get("encoding")
                 .and_then(|v| v.as_str())
                 .unwrap_or("utf-8");
 
-            match std::fs::read_to_string(path) {
+            match std::fs::read_to_string(&path) {
                 Ok(content) => Ok(json!({"content": content, "path": path, "encoding": encoding})),
                 Err(e) => Err(CoreError::Internal {
                     message: e.to_string(),
@@ -664,10 +668,13 @@ pub fn create_default_mcp_server() -> MCPServer {
         )
         .with_risk_level(MCPToolRiskLevel::High),
         |args| async move {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = canonicalize_workspace_path(
+                args.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+            )
+            .map_err(|message| CoreError::ValidationFailed { message })?;
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
-            match std::fs::write(path, content) {
+            match std::fs::write(&path, content) {
                 Ok(_) => Ok(json!({"success": true, "path": path})),
                 Err(e) => Err(CoreError::Internal {
                     message: e.to_string(),
@@ -818,6 +825,30 @@ mod tests {
             ))
             .await;
         assert_eq!(call_response.error.unwrap().code, -32001);
+    }
+
+    #[tokio::test]
+    async fn default_file_tools_reject_workspace_escape() {
+        let server = create_default_mcp_server();
+        let tenant = claims("tenant-a", "project-a");
+
+        let response = server
+            .handle_message_with_claims(
+                MCPMessage::request(
+                    "tools/call",
+                    Some(json!({"name": "file_read", "arguments": {"path": "/etc/passwd"}})),
+                ),
+                Some(&tenant),
+            )
+            .await;
+
+        let error = response.error.expect("workspace escape must be rejected");
+        assert_eq!(error.code, -32603);
+        assert!(
+            error.message.contains("outside the allowed workspace"),
+            "unexpected error: {}",
+            error.message
+        );
     }
 
     #[test]

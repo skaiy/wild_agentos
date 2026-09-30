@@ -241,10 +241,7 @@ mod tests {
             "Blocked verdict must require execution"
         );
         assert!(
-            verify_aa_needs_execution(&result_with(
-                "task already done",
-                Some(TaskVerdict::Failed)
-            )),
+            verify_aa_needs_execution(&result_with("task already done", Some(TaskVerdict::Failed))),
             "Failed verdict must override a completion-looking summary"
         );
         assert!(

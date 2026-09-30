@@ -110,6 +110,42 @@ Wild AgentOS 是一个 **semantic-kernel AgentOS**：以 Rust PDCA 编排为核�
 design studio 作为独立交付被记录，不改变本仓库范围。持续在线 corpus watching 与
 自动化端到端处理仍不属于这一已完成里程碑。
 
+### v0.6.0 — 已完成：Online Corpus Job + Watcher
+
+这一已交付能力编排既有的、有边界的 KE loop，不新增第二套 KE stack。已认证且
+claims-scoped 的 online job 会将已配置 corpus change 或 incremental delta 经由既有的
+constrained extraction、canonicalization、`KgQualityGate`、必选且 approval-held 的
+entity-resolution suggestion 以及 staging 路径处理。默认开启的 watcher 会将这些 job
+入队；部署可在需要时显式关闭其 watcher configuration。
+
+Job 保留有上限的 provenance 和可观测、claims-scoped 的状态，并提供 idempotency 与
+retry/backpressure。fail-closed CI 证明未认证、无效、跨 scope 或失败路径不能写入
+production 数据。它不静默 promote ontology、不自动 merge entity、不替换
+Oxigraph/SPARQL、不加入 Cypher 或 Nebula，也不将独立 product/business repository 混入
+此代码树。materialization 仍保持 approval-held 和 anchored。配套 Admin job list 已独立交付。
+
+已交付的边界与配置见
+[本体知识工程流水线](21-ontology-knowledge-engineering-pipeline.zh.md)。
+
+### v0.6.1 — 已完成：隔离/认证加固与通用 chat
+
+Workload OIDC identity 可 mint 已验证的 `IsolationClaims`，无需共享仅供本地开发的
+HS256 secret。通用 Agent chat 和 completions 默认保持领域中立：领域上下文须显式选择，
+不会注入每个请求。
+
+### v0.6.2 — 已完成：多模态 P0
+
+Agent chat 图像处理使用既有 vision mount；默认在视觉能力不可用时 fail closed，并限制
+图片数量与 payload 大小。显式的兼容降级路径仍可观测，绝不静默丢弃图片。
+
+### v0.7.0 — 已完成：可选 runtime assets 与有作用域的 runtime operations
+
+内置 `ev-repair-fault-kb` pack（或其 `ev-repair` alias）是 opt-in，不会提供默认 chat
+system context 或 RAG。runtime operations 现包含按 claims 作用域的任务列表、脱敏且按
+claims 作用域的 Guard audit/statistics，以及按 claims 作用域的黑板任务和节点列表。
+任务详情路径和若干 Admin API 仍有已记录的 claims 覆盖不一致；详见
+[Admin 控制面 API 对照矩阵](23-admin-control-plane-api-matrix.zh.md)。
+
 ## 明确非目标
 
 1. 不做第四类“微内核 OS”或裸机 OS。

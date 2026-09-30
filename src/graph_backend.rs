@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 //! Cross-domain graph abstraction layer.
 //!
 //! Three traits that decouple causal analysis, snapshot versioning, and

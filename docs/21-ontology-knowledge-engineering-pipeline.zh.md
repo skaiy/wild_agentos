@@ -5,18 +5,18 @@
 # 21. 本体知识工程流水线
 
 > v0.5.0 已完成本文记录的、有边界的本体知识工程 / Graph Engineering 里程碑；
-> 它不代表已有持续、全自动的 corpus-to-graph 服务。
+> 它不代表已有持续、无需审批的 corpus-to-graph 服务。
 > 参见[知识摄取](16-knowledge-ingest-import-graph.zh.md)、
 > [本体 Action 数据沙箱](15-ontology-action-sandbox.zh.md) 和
 > [Isolation Contract](17-isolation-contract.zh.md)。
 
 ## 状态与回答的问题
 
-**问题：** v0.5.0 已实现能力是否已经构成完整、在线、全自动的本体知识图谱工程工具链？
+**问题：** 已实现能力是否已经构成完整、在线、无需审批的本体知识图谱工程工具链？
 
 **回答：否。**
 
-当前代码提供了有边界的摄取、图谱、本体、暂存、质量与人工审批原语；它**尚未**提供一条在线全自动流水线，用于从持续变化的语料中提取本体对齐知识、验证知识、消解实体、提升 schema，并物化为受治理的知识仓库。以下设计说明了在不削弱现有安全与治理边界的前提下，需要具备哪些能力才能作出这一表述。
+当前代码已提供有边界的在线 job 与 watcher 编排，以及摄取、图谱、本体、暂存、质量与人工审批原语；它**尚未**提供一条无需审批的全自动流水线，用于从持续变化的语料中提取本体对齐知识、验证知识、消解实体、提升 schema，并物化为受治理的知识仓库。以下设计说明了在不削弱现有安全与治理边界的前提下，需要具备哪些能力才能作出这一表述。
 
 ## 双轨：前置本体设计与内核 Graph Engineering
 
@@ -58,7 +58,7 @@ schema 使用。
 | 可选推理 | 有限 RDFS query-time 扩展可选且默认关闭；不持久化推理三元组。 |
 | 隔离 | `IsolationClaims` 决定 graph、blob、vector 目标；缺失或无效 claims 必须 fail closed。mint 安全目标名称**不等于**迁移历史数据。 |
 
-### 待办或近期完成的工作不会填补该缺口
+### 支撑工作与已交付的在线编排
 
 本文编写时：
 
@@ -68,20 +68,52 @@ schema 使用。
 - [#131](https://github.com/skaiy/wild_agentos/issues/131) 的生产 OIDC 已合并。
 - [#132](https://github.com/skaiy/wild_agentos/issues/132) 的密钥、tenant scope 和 action audit 运维能力已合并。
 
-这些工作改进隔离、认证或运维；没有任何一项提供连续本体提取、自动 promote 或受治理的仓库物化。
+这些工作改进隔离、认证或运维。下文已交付已认证、claims-scoped 的在线 job 与 watcher
+编排；无需审批的全自动 corpus-to-graph promotion 仍不在其范围内。
 
-### 明确缺口
+### v0.6 online job 与 watcher 交付
 
-当前系统没有：
+v0.6 在 v0.5.0 已交付的有边界原语之上完成 claims-scoped 的在线编排：将 constrained extraction 与
+canonicalization 写入 staging、`KgQualityGate`、带锚点的 materialization、待审批的
+entity-resolution suggestion、冻结 golden evaluation、ontology-health reporting、
+仅生成 draft 的 schema induction，以及 schema-evolution compatibility check。
 
-1. 连续、在线的 corpus-to-graph job pipeline；
-2. 本体约束提取，或提取后的 canonicalization/correction；
-3. entity resolution / deduplication 服务；
-4. draft-to-instance materialization job；
-5. GraphJudge/refiner 一类图质量 gate；
-6. schema evolution CI；
-7. 定时 corpus watcher；以及
-8. 让 type draft 发明 `LinkType` 或 `ActionType` 的机制。type draft 被刻意限定得比 schema induction 更窄。
+Job 保留有上限且 claims-scoped 的 audit trail，串联 source version、内容摘要（不保存
+source text）、canonicalization decision count、quality gate/review、ER suggestion 与
+staging。`GET /api/v1/online-corpus-jobs/observability` 仅公开当前 scope 的 queue depth、
+active work、retry count、最早 queued 时间和 saturation。transient sidecar failure 最多重试
+三次；validation、authentication 与 policy failure 会终止。Watcher 仍默认开启，并在不记录
+corpus payload 或 credential 的前提下发出 saturation signal。
+
+### v0.6 已交付范围 — online corpus job + watcher
+
+**已交付**
+
+- 面向已配置 corpus change 或 incremental delta 的 claims-scoped job model，提供 create、
+  list、get、cancel（或等价）操作。
+- 一个复用现有
+  extract → canonicalize → quality gate → approval-held entity-resolution suggestion → staging
+  路径的 runner。它调用现有 constrained-extraction endpoint、`KgQualityGate`、
+  staging/review record 与带锚点的 materialization 边界，而不是新增第二套 KE stack。
+- 默认开启的 scheduled 或 event-driven watcher，将 job 入队。部署可在需要时显式关闭其
+  watcher configuration。
+- job state、带 backpressure 的 retry、idempotency，以及串联 source、candidate、gate result
+  和 decision 的 provenance。
+- 仅接受已验证的 `IsolationClaims`：未认证或 claims 无效的请求必须 fail closed。测试必须证明
+  failed 与 unauthenticated path 绝不写入 production。
+
+**范围外 / 非目标**
+
+- 静默 promote production ontology 或自动 merge entity-resolution；materialization 仍须
+  approval-held 并保持 anchored。
+- 替换 Oxigraph/SPARQL、加入 Cypher 或 Nebula，或重做 `KgQualityGate`、Morph-KGC/RML、
+  golden freeze 或 Admin design studio。
+- 仅凭 job 完成就宣称“fully online automated with governance”；人工对 promote 与
+  materialize 的权威仍然保留。
+- 将独立 product 或 business repository 混入此代码树。
+
+本次交付完成 online-job、idempotent runner、默认开启 watcher、provenance/observability
+与 fail-closed isolation CI。配套 Admin job list 已独立交付。
 
 ## 公开最佳实践信号
 
@@ -292,10 +324,6 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   `ObjectType`/`LinkType` 做确定性 canonicalize，并且只将接受的
   triple 及每项 mapping decision 写入 claims mint 的 staging 图；绝不
   promote type，也绝不写 production 图。
-- 增加本体约束 extraction API，其 domain **仅限 promoted type**。
-- 对 promoted `ObjectType` 和 `LinkType` 执行提取后 canonicalization。
-- fail closed，只能把候选写入 claims-scoped staging graph。
-- 记录 source provenance 与被拒绝/有歧义的 mapping。
 
 #### P1 — 质量 gate 与审阅
 
@@ -303,12 +331,6 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   SPARQL `ASK` 锚点与显式启用的 pySHACL sidecar。其带版本的质量/覆盖率仲裁默认
   合规优先；报告附着在 staging `extraction_id` 与 claims-scoped review queue 上，
   approve/reject 只记录人工决定而不写生产图；确定性锚点失败时 Judge 不会运行，也绝不能推翻结果。
-
-- [#140](https://github.com/skaiy/wild_agentos/issues/140)：将 `KgQualityGate`
-  作为中速 quality supervisory loop，使用针对 type、predicate、cardinality 和
-  provenance policy 的确定性 `ASK`/SHACL anchor。
-- 可选、以 source 为依据的 Judge/refiner 位于确定性检查后，但绝不可覆盖失败的 anchor。
-- 增加 review queue，用于暂存候选、证据、违规及 approve/reject decision。
 
 #### P1.5 — 带 anchor 的 materialize
 
@@ -335,7 +357,41 @@ judgment——来约束使用 promoted ontology 的 extraction、materialization
   SPARQL 回读由服务端生成的 anchor；anchor 缺失时返回 `needs_repair` 且保留记录
   以供修复。GLinker 可仅安装在该 worker 环境；kernel process 不链接 GLinker
   代码、模型权重或 LGPL 组件。任何 LGPL linker 必须保持进程隔离。
-- 增加显式配置的 blob-watch/reindex job，并具备 idempotent cursor、retry、observability 和 backpressure。
+- v0.6 已交付编排这些既有原语的 online-job runner 与默认开启的 watcher；
+  部署可在需要时显式关闭 watcher configuration。见上文的已交付范围。
+
+#### v0.6 — online corpus watcher 配置
+
+`online_corpus_watchers.enabled` 的默认值为 **true**。在 `config.yaml`、
+`data/config_override.json` 中将其设为 `false`，或设置等效环境配置
+`AGENT_OS_ONLINE_CORPUS_WATCHERS_ENABLED=false`，即可停止所有 watcher 的轮询和
+入队。配置优先级遵循标准运行期顺序：环境变量覆盖
+`data/config_override.json`，后者覆盖 `config.yaml`；没有任何配置设置该字段时，
+watcher 保持启用。禁用不会删除 job、cursor、review 或 audit record。
+
+注册项是由部署控制的可信配置，必须指定 `id`、`source_id`、不可变的
+`source_version`、`tenant_id`、`project_id` 和 `actor_id`。`source_version` 的变化
+是轮询信号。scheduler 只有在普通的 claims-scoped、幂等 job-create 路径接受该版本后
+才持久化 cursor，因此 restart/retry 或重新启用都不会创建第二个逻辑 job。由于 watcher
+配置不包含 extraction text 或 candidate，job 保持 queued，等待经认证的 `/run` runner
+路径处理。该 runner 仍会将 candidate 写入 staging、将 ER suggestion 保持为待批准状态，
+且绝不会自动 materialize 或 promote。
+
+```yaml
+online_corpus_watchers:
+  enabled: true # 显式设为 false 会禁用所有轮询和入队。
+  poll_interval_seconds: 60
+  max_concurrent_polls: 4
+  queue_capacity: 100
+  registrations:
+    - id: "handbook"
+      source_id: "handbook"
+      source_version: "2026-09-08T00:00:00Z"
+      source_uri: "https://corpus.example.invalid/handbook"
+      tenant_id: "tenant-example"
+      project_id: "project-example"
+      actor_id: "watcher-service"
+```
 
 #### P2b — 冻结提取评测与 measurement-decay 审计
 

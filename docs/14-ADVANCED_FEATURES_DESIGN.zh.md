@@ -2,8 +2,9 @@
 
 > 在 Wild AgentOS 上实现 4 个高级技能图谱特性的设计文档。
 >
-> **状态**：征求意见稿 (Draft for review)
-> **目标模块**：`src/skill_graph/`、`src/causal/`、`src/temporal/`
+> **状态**：当前 `main` 已部分实现；本文保留未完成工作的设计细节。
+> **已实现模块**：`src/skill_graph/`、`src/causal/`、`src/snapshots/` 和
+> `src/graph_features/`
 > **现有依赖**：petgraph 0.6、chrono、serde、uuid、sha2、hyperspace-engine
 
 ---

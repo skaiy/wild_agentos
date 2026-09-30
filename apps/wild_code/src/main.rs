@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(filter_with_suppressions(&log_level))
+                tracing_subscriber::EnvFilter::new(filter_with_suppressions(log_level))
             }),
         )
         .with_writer(shared_log)

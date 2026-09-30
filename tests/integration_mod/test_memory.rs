@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use tempfile::tempdir;
 use wild_agent_os_core::isolation::IsolationClaims;
-use wild_agent_os_core::memory::l0_store::L0Store;
 use wild_agent_os_core::memory::l1_session::L1Session;
 use wild_agent_os_core::memory::l2_blackboard::Blackboard;
 use wild_agent_os_core::memory::l3_projection::ProjectionEngine;

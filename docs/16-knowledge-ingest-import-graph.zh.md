@@ -80,6 +80,14 @@ export AUTHORIZATION='Authorization: Bearer <verified-jwt>'
 
 默认服务根路径以本机部署为准（下文用 `http://127.0.0.1:8080` 占位）。单文件上传/导入体积极限 **60MB**（`KB_UPLOAD_MAX_BYTES`）。
 
+### 在线 corpus 摄取
+
+当前 `main` 还提供位于 `/api/v1/online-corpus-jobs` 的 claims-scoped online corpus
+job，包括 list/create、单 job read、cancel、run 和 `/observability` endpoint。
+watcher 默认开启，并将工作送入同一条受治理的 job 路径；entity-resolution suggestion
+必须审批，绝不 auto-merge。详见
+[本体知识工程流水线](21-ontology-knowledge-engineering-pipeline.zh.md)。
+
 ---
 
 ## 5. 建库

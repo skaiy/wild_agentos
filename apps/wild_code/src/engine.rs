@@ -20,13 +20,13 @@ use wild_agent_os_core::memory::embedding_service::{
     create_embedding_service_from_config, record_embedding_health, FallbackEmbeddingService,
 };
 use wild_agent_os_core::memory::hyperspace_store::HyperspaceStore;
-use wild_agent_os_core::memory::memory_bus::MemoryBus;
-use wild_agent_os_core::memory::scheduler::MemoryScheduler;
 use wild_agent_os_core::memory::l0_store::L0Store;
 use wild_agent_os_core::memory::l1_session::EvictionConfig;
 use wild_agent_os_core::memory::l2_blackboard::Blackboard;
 use wild_agent_os_core::memory::l3_projection::ProjectionEngine;
+use wild_agent_os_core::memory::memory_bus::MemoryBus;
 use wild_agent_os_core::memory::memory_manager::MemoryManager;
+use wild_agent_os_core::memory::scheduler::MemoryScheduler;
 use wild_agent_os_core::skill_graph::discovery::SkillDiscoveryEngine;
 use wild_agent_os_core::skill_graph::evolution::EvolutionProposalStore;
 use wild_agent_os_core::skill_graph::graph_algorithms::SkillGraphAlgorithms;

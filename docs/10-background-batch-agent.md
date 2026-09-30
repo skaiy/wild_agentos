@@ -11,11 +11,11 @@
 Wild AgentOS already provides:
 
 - **Skill graph**: a 7,500+ LOC dynamic semantic network with 6 link types, Learn/Reduce bootstrapping, and conflict detection
-- **Five-layer memory**: L0→L3 hierarchical storage using the MESI consistency protocol
+- **Four-layer memory**: L0→L3 hierarchical storage using the MESI consistency protocol
 - **Execution engine**: a PDCA cycle plus 10 types of perception triggers
 - **Batch Agent framework**: sliding windows, template engine, extraction pipeline, and knowledge persistence (Phases 1–5 complete)
 
-### Gap
+### Remaining maturity gap
 
 The LLM's background curation capabilities have not been fully used. Skill merging/splitting/quality evaluation, knowledge-fragment refinement, cross-session memory consolidation, and failure-pattern mining still rely on simple rules or manual confirmation.
 
@@ -566,14 +566,14 @@ batch:
       lookback_hours: 168
 ```
 
-### 6.3 New SkillGraphStore Interface
+### 6.3 Implemented SkillGraphStore interface
 
 ```rust
 // 所有角色共享的扩展接口
 impl SkillGraphStore {
     pub fn bulk_read_skills(&self, iris: &[&str]) -> Vec<SkillGraphNode>;
     pub fn create_composite_skill(&self, name: &str, children: &[String]) -> Result<...>;
-    pub fn deprecate_skill(&self, iri: &str, reason: &str) -> Result<(), BatchError>;
+    pub fn deprecate_skill(&self, iri: &str) -> Result<(), BatchError>;
     pub fn batch_add_links(&self, links: &[BulkLinkInput]) -> Result<usize, BatchError>;
 }
 ```

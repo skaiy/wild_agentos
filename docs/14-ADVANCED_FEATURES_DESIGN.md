@@ -2,8 +2,10 @@
 
 > Design document for implementing 4 advanced skill graph features on Wild AgentOS.
 >
-> **Status**: Draft for review
-> **Target modules**: `src/skill_graph/`, `src/causal/`, `src/temporal/`
+> **Status**: Partially implemented on current `main`; this document retains
+> design detail for incomplete work.
+> **Implemented modules**: `src/skill_graph/`, `src/causal/`, `src/snapshots/`,
+> and `src/graph_features/`
 > **Existing dependencies**: petgraph 0.6, chrono, serde, uuid, sha2, hyperspace-engine
 
 ---

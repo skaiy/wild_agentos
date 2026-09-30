@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};

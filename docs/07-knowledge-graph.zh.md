@@ -24,7 +24,7 @@
 
     subgraph 映射层
         RDF["RdfMapper<br/>NodeDef/EdgeDef → RdfQuad<br/>属性 key → IRI"]
-        ONT["OntologyManager<br/>12个内置本体术语"]
+        ONT["OntologyManager<br/>约 65 个内置本体术语"]
     end
 
     subgraph 存储层
@@ -154,7 +154,7 @@ pub enum IncrementalResult {
 
 ### OntologyManager — 本体管理
 
-12 个内置本体术语：
+约 65 个内置本体术语，分为核心、工程、代码、业务和关系组：
 
 | 类型 | IRI | 标签 |
 |------|-----|------|
@@ -206,9 +206,9 @@ pub enum IncrementalResult {
 | `knowledge_query` | SPARQL SELECT 查询 | ✅ |
 | `kg_search` | 模糊搜索实体 | ✅ |
 | `knowledge_neighbors` | 1-3 跳邻居遍历 | ✅ |
-| `knowledge_import_json` | JSON 数据映射为图谱节点 | ❌ |
-| `ontology_register` | 注册自定义本体术语 | ❌ |
-| `knowledge_bridge` | 创建知识-技能桥接 | ❌ |
+| `knowledge_import_json` | JSON 数据映射为图谱节点 | ✅ |
+| `ontology_register` | 注册自定义本体术语 | ✅ |
+| `knowledge_bridge` | 创建知识-技能桥接 | ✅ |
    210|| `knowledge_extract_code` | tree-sitter 代码 AST 提取（增量） | ✅ |
 
 ## 关键设计决策

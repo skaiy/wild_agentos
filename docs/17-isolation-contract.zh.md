@@ -5,7 +5,7 @@
 # 17. 隔离契约
 
 `src/isolation/` 是作用域身份和存储名称的内核契约。它不是身份提供商（IdP）、OIDC
-或 Keycloak 集成、17 状态 IAM 工作流，也不是存储迁移。本文件说明 2026-09-04 的
+或 Keycloak 集成、17 状态 IAM 工作流，也不是存储迁移。本文件说明 2026-09-14（v0.7.0）的
 `main`：区分当前已接线的存储路径和仍在使用的历史路径；已 mint 名称不证明已有数据
 已经迁移。
 
@@ -25,7 +25,8 @@ OIDC 模式必须配置 `AGENTOS_OIDC_JWKS_URL`、
 `AGENTOS_OIDC_ISSUER` 和 `AGENTOS_OIDC_AUDIENCE`；issuer 与 audience 是必填，
 且只接受非对称 OIDC 算法。JWKS 从配置 endpoint 获取，短时缓存，遇到未知 key ID
 会刷新一次。默认 `hs256` 模式用 `AGENTOS_JWT_SECRET` 验证，保留给本地开发。
-启动时会拒绝不完整的 OIDC 配置；OIDC/JWKS 配置错误、缺少 key、签名无效、
+HS256 启动时必须显式配置非默认值、且至少 32 字节的安全随机 secret。启动时会拒绝
+不完整的 OIDC 配置；OIDC/JWKS 配置错误、缺少 key、签名无效、
 issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS URL；
 仅本地开发与测试 fixture 可以使用 loopback HTTP，生产环境绝不允许。
 
@@ -33,6 +34,78 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 带 serde default 的 `Option<String>`；缺失或为空时 mint `default` project。非空值
 传入 `IsolationClaims::from_verified`；`.`、`..`、路径分隔符（如 `a/b`）等不安全
 值会 fail closed，`verify_jwt` 不产生 identity。
+
+### 本地 HS256 实证检查
+
+对已使用显式、非默认且至少 32 字节 `AGENTOS_JWT_SECRET` 配置为 HS256 的**运行中**
+本地 kernel，执行：
+
+```bash
+AGENTOS_JWT_SECRET="$AGENTOS_JWT_SECRET" scripts/claims-smoke.sh
+```
+
+该脚本不会启动或部署服务器。它在进程内签发两个短时效本地 HS256 JWT，检查匿名请求
+被拒绝，以及 user agent 与 task detail/list endpoint 的 tenant/project 隔离；不会打印
+或存储 secret。这仅是本地开发的实证检查；生产环境仍使用上文所述 OIDC/JWKS 配置。
+
+## 诚实范围：夹具与生产
+
+夹具检查、本地实证检查和可选演示开关，对于它们实际覆盖的行为是有价值的证据，但不是
+生产切换的证据。具体而言：
+
+- 对夹具命名图的成功检查，不证明已部署服务及其生产数据上的实时 SPARQL 行为。
+- 本地签发的 HS256 token 或测试夹具，不是实时 OIDC provider 或身份提供商集成。
+- Mint 作用域名称，不证明数据已复制或迁移到这些名称。
+- 将 API 描述为 production-grade，不代表每个历史 HTTP path 都已要求 verified claims；
+  当前已强制 claims 的路径见[当前接线](#当前接线)。
+
+## 业务 BFF 的 workload OIDC 契约 / Workload OIDC contract
+
+业务 BFF 向 AgentOS 发起请求时，必须转发短时效的
+workload OIDC access token：`Authorization: Bearer <token>`。BFF **不得**签发新的
+AgentOS token。按以下方式配置 AgentOS HTTP 服务：
+
+```bash
+AGENTOS_ENV=production
+AGENTOS_AUTH_MODE=oidc
+AGENTOS_OIDC_JWKS_URL=https://issuer.example.com/.well-known/jwks.json
+AGENTOS_OIDC_ISSUER=https://issuer.example.com/
+AGENTOS_OIDC_AUDIENCE=wild-agentos
+```
+
+issuer 必须在该 JWKS URL 发布非对称签名公钥；token 的 `iss` 与 `aud` 必须和配置
+精确匹配。只有验过签名、`exp`、`iss` 与 `aud` 后，AgentOS 才会 mint 隔离作用域。
+业务 BFF 可直接采用以下检查表：
+
+1. 从 BFF 现有 OIDC provider 获取短时效 workload token。
+2. 将 token audience 设为 `AGENTOS_OIDC_AUDIENCE`。
+3. 填入下列必需的 tenant 和 project claim。
+4. 向包括 Agent chat 在内的 AgentOS HTTP API 原样转发 Bearer token；不得以请求
+   body 中的 tenant/project 值替代认证授权。
+
+最小 token claims：
+
+```json
+{
+  "sub": "workload:example-bff",
+  "tenant_id": "acme",
+  "project_id": "capture-prod",
+  "exp": 1798761600
+}
+```
+
+验签成功后，`sub` 映射为 `IsolationClaims.actor_id`，`tenant_id` 映射为
+`IsolationClaims.tenant_id`，`project_id` 映射为
+`IsolationClaims.project_id`。因此会 mint
+`graph://acme/capture-prod`、`vector://acme/capture-prod`、`acme/` object prefix
+以及 `/data/l0/acme` L0 path。`tenant_id` 必填；缺失、空值、非法、过期、issuer
+不匹配或 audience 不匹配的 token 都不会产生 `IsolationClaims`，并会被拒绝。
+本 BFF 契约要求提供 `project_id`；旧版 AgentOS token 若缺失该字段，仍按已记录的兼容
+行为使用 `default` project。
+
+**生产禁令：** BFF 绝不能持有 `AGENTOS_JWT_SECRET`，也不能自行签发 HS256 token。
+`AGENTOS_JWT_SECRET` 仅用于 AgentOS 本地开发；生产环境下 AgentOS 会拒绝以 HS256
+模式启动。
 
 ## 命名契约，不是迁移
 
@@ -125,6 +198,19 @@ action 清空它；原 source 仍可用。删除无法自动撤销，因而需�
 同等行为。在每个历史 backend 被显式迁移和验证前，生产查询不得宣称隔离完成。
 
 ## 当前接线
+
+### Runtime read list
+
+`GET /api/v1/tasks` 要求已验证的 tenant/project `IsolationClaims`，且只列出调用方
+持久化作用域内的任务。`GET /api/v1/guard/audit` 和
+`GET /api/v1/guard/stats` 同样要求已验证 claims；audit entry 和 statistics 均受作用域
+限制，敏感值会脱敏。黑板的 `GET /api/v1/blackboard/tasks` 和
+`GET /api/v1/blackboard/nodes?task_iri=…` 要求已验证 claims，并排除没有匹配持久化
+作用域的任务。
+
+任务详情路径（`GET /tasks/:iri`、status、details 和 trends）共享同一 verified-claims
+边界：单任务读取要求调用方的持久化作用域，且不会返回范围外任务数据；trends 仅聚合该作用域
+任务的 checkpoint。没有完整持久化作用域的记录仍会被排除。
 
 ### Spend gate
 

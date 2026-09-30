@@ -34,6 +34,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Check namespace consistency
       run: ./scripts/check_namespace.sh
     # build.rs compiles the gRPC protos via tonic-build, which needs protoc.
@@ -41,12 +43,24 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - name: Cache Cargo artifacts
       uses: Swatinem/rust-cache@v2
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Lint workspace
+      run: cargo clippy --workspace -- -D warnings
     - name: Build
       run: cargo build --workspace --verbose
     - name: Run isolation contract golden suite
       run: cargo test --workspace isolation_contract --verbose
+    - name: Run chat vision and isolation contract gate
+      run: cargo test --lib api::http::chat --verbose
+    - name: Run online corpus fail-closed isolation gate
+      run: cargo test --workspace isolation_contract_online_corpus --verbose
+    - name: Run materialization production-write gate
+      run: cargo test --workspace isolation_contract_materialization --verbose
     - name: Run functional golden evaluation suite
       run: ./scripts/test_golden.sh
+    - name: Run offline tool-selection golden evaluation
+      run: ./scripts/run_tool_selection_eval.sh
     # Record-only: shared CI hardware is not a stable performance baseline.
     - name: Run private deployment micro-benchmark
       run: ./scripts/bench_private_deploy.sh --micro
@@ -58,6 +72,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Install protoc
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - name: Cache Cargo artifacts

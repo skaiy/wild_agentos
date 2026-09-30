@@ -21,6 +21,18 @@ a2a:
     bearer_token: ""
     timeout_seconds: 15
 
+# Online corpus watchers are enabled by default. Set enabled: false to prevent
+# polling and enqueueing without deleting existing jobs or audit state.
+# Registrations are intentionally empty until a deployment declares a trusted,
+# claims-scoped source version. Updating source_version queues one new job;
+# the existing authenticated runner endpoint processes that queued job.
+online_corpus_watchers:
+  enabled: true
+  poll_interval_seconds: 60
+  max_concurrent_polls: 4
+  queue_capacity: 100
+  registrations: []
+
 workspace:
   root: ""
   watch_enabled: true
@@ -161,19 +173,21 @@ token_optimization:
   enabled: true
   tool_groups:
     enabled: true
+    max_tools_per_activation: 5
+    max_activated_tools: 20
     roles:
       Plan:
-        default: ["Core", "Search", "Knowledge", "System"]
-        on_demand: ["Web", "Code", "Skill"]
+        default: ["Core", "Search", "KnowledgePlan", "System"]
+        on_demand: ["Web"]
       Do:
-        default: ["Core", "Write", "Search", "Web", "Code", "Skill", "System"]
-        on_demand: ["Knowledge"]
+        default: ["Core", "Workspace", "Write", "Search", "System"]
+        on_demand: ["Web", "KnowledgePlan", "KnowledgeRead", "KnowledgeWrite", "Ingest", "Skill", "Ontology"]
       Check:
-        default: ["Core", "Search", "Knowledge", "System"]
-        on_demand: ["Web", "Code"]
+        default: ["Core", "Search", "System"]
+        on_demand: ["Workspace", "Write", "Web", "KnowledgePlan", "KnowledgeRead", "KnowledgeWrite", "Ingest", "Skill", "Ontology"]
       Act:
         default: ["Core", "System"]
-        on_demand: ["Search", "Knowledge"]
+        on_demand: ["Search", "KnowledgePlan", "KnowledgeRead"]
   tool_result_compressor:
     enabled: true
     max_full_results: 2

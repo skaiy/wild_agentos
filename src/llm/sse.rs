@@ -232,6 +232,7 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
+                cached_prompt_tokens: cached_prompt_tokens(usage),
             }),
         })));
     }
@@ -395,6 +396,7 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
                 completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
                     as u32,
                 total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                cached_prompt_tokens: cached_prompt_tokens(u),
             });
             Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
                 finish_reason: Some(finish_reason),
@@ -403,6 +405,19 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
         }
         _ => Ok(None),
     }
+}
+
+fn cached_prompt_tokens(usage: &serde_json::Value) -> Option<u32> {
+    usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .map(|tokens| tokens as u32)
 }
 
 #[derive(Debug, Default)]

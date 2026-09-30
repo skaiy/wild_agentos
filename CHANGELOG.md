@@ -1,6 +1,63 @@
 # Changelog
 
-日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.5.0`。
+日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.6.0`。
+
+## [0.7.0] — 2026-09-13
+
+### Middleware chat neutrality
+
+- Generic Agent chat remains domain-neutral by default. EV-repair prompt and
+  FaultCode RAG load only when an Agent mounts the builtin
+  `ev-repair-fault-kb` pack or its `ev-repair` alias; ordinary business packs
+  pass through unchanged. Same-instance coexistence is covered by tests, and
+  missing or invalid claims fail closed. (#207, #210, #208;
+  PR #229, PR #230, PR #231)
+
+### Runtime operations on this tag
+
+- Added claims-scoped task listing, redacted guard audit and statistics,
+  claims-scoped blackboard task and node listing, and the Admin control-plane
+  API matrix documentation. (#221, #222, #223, #224; PR #225, PR #226,
+  PR #227, PR #228)
+
+## [0.6.2] — 2026-09-10
+
+- Hardened multimodal vision handling with fail-closed fallback and payload
+  limits. (#215, PR #219)
+
+## [0.6.1] — 2026-09-09
+
+### Generic chat neutrality and workload identity
+
+- Generic Agent HTTP chat and completions no longer inject the EV-repair
+  system prompt or FaultCode RAG context by default. Domain-specific context
+  remains opt-in for endpoints that explicitly require it. (#206, #212)
+- Defined the workload OIDC contract for short-lived JWTs that mint
+  `IsolationClaims`. Backend-for-frontend services must validate workload
+  tokens and must not share `AGENTOS_JWT_SECRET`. (#211, #213)
+
+## [0.6.0] — 2026-09-08
+
+### Online Corpus Job + Watcher
+
+- Added authenticated, claims-scoped online corpus jobs for configured corpus
+  changes and incremental deltas, with idempotent create, list, get, cancel,
+  and runner paths.
+- Added enabled-by-default corpus watchers that enqueue work through the same
+  idempotent path. Deployments can explicitly disable watcher polling and
+  enqueueing without deleting jobs, cursors, reviews, or audit records.
+- The runner now requires entity-resolution suggestions and retains them for
+  explicit approval; it stages evidence and never auto-merges entities,
+  promotes ontology, or materializes production data.
+- Added bounded provenance and observability for source versions and content
+  digests, canonicalization, quality/review, ER suggestions, queue saturation,
+  retries, and job state. Transient sidecar failures retry at most three times;
+  validation, authentication, and policy failures are terminal.
+- Added fail-closed isolation and production-write CI coverage for online jobs,
+  runners, and watchers. Unauthenticated, invalid, cross-scope, and failed
+  paths cannot write production data.
+- The companion Admin online-corpus job list is delivered separately and does
+  not expand this repository's scope.
 
 ## [0.5.0] — 2026-09-07
 

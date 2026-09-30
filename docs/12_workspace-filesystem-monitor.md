@@ -4,9 +4,10 @@
 
 ## 12.1 Background
 
-### Current pain points
+### Problems addressed by the implemented monitor
 
-wildcode currently has the following problems with file-system operations:
+Without workspace monitoring, file-system operations have the following
+failure modes:
 
 1. **Repeated reads**: Agents repeatedly `file_read` the same file without knowing which files they have already read.
 2. **Blind ls**: Agents repeatedly use `file_list` to explore the directory structure because there is no workspace snapshot.
@@ -25,7 +26,7 @@ wildcode currently has the following problems with file-system operations:
 | **Oxigraph / L2** | `src/memory/l2_blackboard.rs` | RDF Triple Store + SPARQL 1.1 + Named Graph isolation |
 | **L3 Projection** | `src/memory/l3_projection.rs` | SPARQL projection + Materialized View + token-budget control |
 | **EventBus** | `src/core/event_bus.rs` | O(1) bitmap routing + broadcast channel + spawn_consumer |
-| **HookManager** | `src/tools/hooks.rs` | 18 HookPoints and SkillBefore/After tool interception |
+| **HookManager** | `src/tools/hooks.rs` | 21 HookPoints and SkillBefore/After tool interception |
 | **ToolGuard** | `src/tools/tool_guard.rs` | FileCoverage line-range tracking + Pre/Post validation hooks |
 | **ImportScanner** | `src/tools/import_scanner.rs` | Import parsing for 6 languages (Rust/TS/JS/Py/Go/Java/C) |
 | **CodeAst** | `src/knowledge_graph/code_ast.rs` | tree-sitter AST + content-hash cache + `file:` IRI mapping |
@@ -34,8 +35,8 @@ wildcode currently has the following problems with file-system operations:
 | **L0Store** | `src/memory/l0_store.rs` | Persistent storage + MESI state + prefix scan |
 | **MCP Client** | `src/tools/mcp_client.rs` | External tool discovery (can pass file state through to MCP tools) |
 
-**Already included among existing dependencies**: `redb`, `walkdir`, `sha2`.
-**Must be added**: `notify`, `notify-debouncer-mini`, `similar`, `lru`.
+**Included dependencies**: `redb`, `walkdir`, `sha2`, `notify = "6.1"`,
+`notify-debouncer-mini = "0.4"`, `similar = "2.5"`, and `lru = "0.16.3"`.
 **gix is not needed**: see the analysis in section 12.3.4 below.
 
 ---
@@ -531,9 +532,9 @@ event_bus.spawn_consumer(
                 "WORKSPACE_FILE_MODIFIED" => {
                     inv.mark_stale(path).await;
                     cs.invalidate(path);
-                    // 🆕 触发 ImportScanner 重新扫描
+                    // 触发 ImportScanner 重新扫描
                     trigger_import_rescan(path);
-                    // 🆕 触发 CodeAst 重新提取
+                    // 触发 CodeAst 重新提取
                     trigger_ast_reextract(path);
                 }
                 "WORKSPACE_FILE_REMOVED" => {
@@ -674,22 +675,22 @@ PerceptionTrigger::ResourceConflict → "检测到外部进程大量修改工作
 
 ---
 
-## 12.7 New dependencies
+## 12.7 Dependencies in the current implementation
 
 ```toml
 [dependencies]
 # 文件系统监控（跨平台）
-notify = "8"
-notify-debouncer-mini = "0.6"
+notify = "6.1"
+notify-debouncer-mini = "0.4"
 
 # 内容缓存（LRU 淘汰）
-lru = "0.12"
+lru = "0.16.3"
 
 # 文本差分（Myers 算法）
-similar = "2"
+similar = "2.5"
 ```
 
-**No additions needed:**
+**Already present:**
 - `redb = "4.1"` — already a dependency
 - `walkdir = "2.4"` — already a dependency
 - `sha2 = "0.10"` — already a dependency
@@ -702,7 +703,7 @@ similar = "2"
 ```
 src/
 ├── core/
-│   └── event_bus.rs              # 🆕 EventType: WorkspaceFileCreated/Modified/Removed/ScanCompleted/Stale
+│   └── event_bus.rs              # EventType: WorkspaceFileCreated/Modified/Removed/Stale
 ├── tools/
 │   ├── workspace_monitor/
 │   │   ├── mod.rs                # WorkspaceMonitor 初始化 + 全局单例 + Hooks 注册
@@ -712,19 +713,19 @@ src/
 │   │   ├── snapshot.rs           # SnapshotManager (workspace 快照 + 回滚)
 │   │   └── watch_engine.rs       # WatchEngine (notify → EventBus 封装)
 │   ├── hooks.rs                  # 已存在，无需修改（通用框架）
-│   ├── tool_guard.rs             # 🆕 增强：写入前 stale 检查 + FileCoverage → FileState 演进
-│   ├── import_scanner.rs         # 🆕 增强：文件变更时自动重扫描
+│   ├── tool_guard.rs             # 写入前 stale 检查 + FileCoverage → FileState 演进
+│   ├── import_scanner.rs         # 文件变更时自动重扫描
 │   └── tool_executor/
-│       └── builtins.rs           # 🆕 file_read (Diff/Cache) + file_list (快照) 增强
+│       └── builtins.rs           # file_read (Diff/Cache) + file_list (快照) 增强
 ├── memory/
 │   ├── l2_blackboard.rs          # 已存在，无需修改
-│   └── l3_projection.rs          # 🆕 新增 workspace_* 投影帧
+│   └── l3_projection.rs          # workspace_* 投影帧
 ├── knowledge_graph/
-│   └── code_ast.rs               # 🆕 增强：事件驱动的 AST 重提取
+│   └── code_ast.rs               # 事件驱动的 AST 重提取
 ├── batch/
-│   └── manager.rs                # 🆕 增强：WORKSPACE_FILE_MODIFIED 触发
+│   └── manager.rs                # WORKSPACE_FILE_MODIFIED 触发
 └── perception/
-    └── proactive_engine.rs       # 🆕 增强：ResourceConflict 触发检查
+    └── proactive_engine.rs       # ResourceConflict 触发检查
 ```
 
 ---

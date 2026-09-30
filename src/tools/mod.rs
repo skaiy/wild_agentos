@@ -16,6 +16,7 @@ pub mod result_router;
 pub mod sandbox_provider;
 pub mod tool_guard;
 pub mod workspace_monitor;
+pub(crate) mod workspace_path;
 
 pub use hooks::{Hook, HookContext, HookManager, HookPoint, HookResult};
 pub use mcp::{

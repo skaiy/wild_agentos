@@ -97,17 +97,105 @@ fn run_entity_resolution_sidecar(
         "candidates": candidates.iter().map(|(iri, label)| json!({"iri": iri, "label": label})).collect::<Vec<_>>(),
         "min_score": ENTITY_RESOLUTION_THRESHOLD,
     });
-    let mut child = Command::new(command).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+    let mut child = Command::new(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("start entity-resolution sidecar: {error}"))?;
     use std::io::Write;
-    child.stdin.as_mut().ok_or("entity-resolution sidecar stdin unavailable")?
+    child
+        .stdin
+        .as_mut()
+        .ok_or("entity-resolution sidecar stdin unavailable")?
         .write_all(input.to_string().as_bytes())
         .map_err(|error| format!("write entity-resolution sidecar input: {error}"))?;
-    let output = child.wait_with_output().map_err(|error| format!("wait for entity-resolution sidecar: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for entity-resolution sidecar: {error}"))?;
     if !output.status.success() {
-        return Err(format!("entity-resolution sidecar failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "entity-resolution sidecar failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-    serde_json::from_slice(&output.stdout).map_err(|error| format!("entity-resolution sidecar returned invalid JSON: {error}"))
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("entity-resolution sidecar returned invalid JSON: {error}"))
+}
+
+/// Creates an approval-held ER suggestion for an entity in a claims-derived
+/// staging extraction. Candidate retrieval remains confined to the caller's
+/// production graph; no suggestion is merged by this primitive.
+pub(crate) fn create_entity_resolution_suggestion_from_staging(
+    kg: &KnowledgeGraphStore,
+    claims: &IsolationClaims,
+    extraction_id: &str,
+    source_iri: &str,
+    mention: &str,
+) -> Result<Option<String>, String> {
+    if !valid_iri(source_iri) || mention.trim().is_empty() {
+        return Err("source_iri must be a valid IRI and mention is required".into());
+    }
+    let source_exists = kg.query_staging_for_claims(
+        claims,
+        extraction_id,
+        &format!("SELECT ?p WHERE {{ <{source_iri}> ?p ?o }} LIMIT 1"),
+    )?;
+    if source_exists.is_empty() {
+        return Err("source entity is not present in the staged extraction".into());
+    }
+    let candidates = kg.query_sparql_for_claims(
+        claims,
+        &format!("SELECT DISTINCT ?candidate ?label WHERE {{ ?candidate <{RDFS_LABEL}> ?label . FILTER(?candidate != <{source_iri}>) }} LIMIT 50"),
+    )
+    .map_err(|error| error.to_string())?;
+    let candidates: Vec<(String, String)> = candidates
+        .into_iter()
+        .filter_map(|row| {
+            Some((
+                row.get("?candidate")?.as_str()?.to_owned(),
+                row.get("?label")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let result = run_entity_resolution_sidecar(source_iri, mention, &candidates)?;
+    let Some(target_label) = candidates
+        .iter()
+        .find(|(iri, _)| iri == &result.target_iri)
+        .map(|(_, label)| label.clone())
+    else {
+        return Ok(None);
+    };
+    if result.score < ENTITY_RESOLUTION_THRESHOLD || !valid_iri(&result.target_iri) {
+        return Ok(None);
+    }
+    let approval_id = uuid::Uuid::new_v4().simple().to_string();
+    let evidence_iri = format!("{ENTITY_RESOLUTION_PROVENANCE_NS}suggestion/{approval_id}");
+    let triples = format!(
+        "<{source_iri}> <{OWL_SAME_AS}> <{}> . <{evidence_iri}> <{ENTITY_RESOLUTION_PROVENANCE_NS}sourceEntity> <{source_iri}> ; <{ENTITY_RESOLUTION_PROVENANCE_NS}targetEntity> <{}> ; <{ENTITY_RESOLUTION_PROVENANCE_NS}mention> \"{}\" ; <{ENTITY_RESOLUTION_PROVENANCE_NS}targetLabel> \"{}\" ; <{ENTITY_RESOLUTION_PROVENANCE_NS}score> \"{}\" ; <{ENTITY_RESOLUTION_PROVENANCE_NS}matcher> \"glinker-sidecar-v1\" .",
+        result.target_iri, result.target_iri, sparql_literal(mention), sparql_literal(&target_label), result.score,
+    );
+    kg.update_staging_for_claims(
+        claims,
+        &approval_id,
+        &ClaimsGraphUpdate::insert_data(triples),
+    )?;
+    kg.create_action_approval_for_claims(
+        claims,
+        &PendingActionApproval {
+            approval_id: approval_id.clone(),
+            staging_id: approval_id.clone(),
+            staging_graph: kg.staging_graph_iri_for_claims(claims, &approval_id)?,
+            action_id: "entity-resolution".into(),
+            anchor_query: Some(format!(
+                "SELECT ?same WHERE {{ <{source_iri}> <{OWL_SAME_AS}> <{}> }} LIMIT 1",
+                result.target_iri
+            )),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            expires_at: (chrono::Utc::now() + chrono::Duration::hours(ACTION_APPROVAL_TTL_HOURS))
+                .to_rfc3339(),
+        },
+    )?;
+    Ok(Some(approval_id))
 }
 
 /// POST /api/v1/ontology/entity-resolution/suggestions.
@@ -186,12 +274,25 @@ pub(crate) async fn create_entity_resolution_suggestion_handler(
             Some((candidate, label))
         })
         .collect();
-    let result = match run_entity_resolution_sidecar(&request.source_iri, &request.mention, &candidates) {
-        Ok(result) => result,
-        Err(error) => return (StatusCode::BAD_GATEWAY, Json(json!({"error": error, "production_write": false}))).into_response(),
-    };
-    let target_label = candidates.iter().find(|(iri, _)| iri == &result.target_iri).map(|(_, label)| label.clone());
-    if result.score < ENTITY_RESOLUTION_THRESHOLD || target_label.is_none() || !valid_iri(&result.target_iri) {
+    let result =
+        match run_entity_resolution_sidecar(&request.source_iri, &request.mention, &candidates) {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": error, "production_write": false})),
+                )
+                    .into_response()
+            }
+        };
+    let target_label = candidates
+        .iter()
+        .find(|(iri, _)| iri == &result.target_iri)
+        .map(|(_, label)| label.clone());
+    if result.score < ENTITY_RESOLUTION_THRESHOLD
+        || target_label.is_none()
+        || !valid_iri(&result.target_iri)
+    {
         return (StatusCode::OK, Json(json!({
             "status": "not_presented", "reason": "no candidate met the frozen conservative threshold",
             "threshold": ENTITY_RESOLUTION_THRESHOLD, "production_write": false,
@@ -1216,7 +1317,7 @@ pub(crate) async fn materialize_constrained_extraction_handler(
         .into_response()
 }
 
-fn persist_quality_gate_report(
+pub(crate) fn persist_quality_gate_report(
     kg: &KnowledgeGraphStore,
     claims: &IsolationClaims,
     report: &QualityGateReport,
@@ -2111,6 +2212,7 @@ struct MaterializationAuditEvent<'a> {
     timestamp: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_materialization_audit(
     state: &AppState,
     claims: &IsolationClaims,
@@ -3106,6 +3208,9 @@ mod ontology_crud_tests {
             api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -3119,7 +3224,7 @@ mod ontology_crud_tests {
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
-            &EncodingKey::from_secret(b"agentos-dev-secret-change-in-prod"),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap()
     }
@@ -3949,7 +4054,7 @@ mod ontology_crud_tests {
     }
 
     #[tokio::test]
-    async fn materialization_requires_confirmation_claims_and_gate_then_returns_anchor() {
+    async fn isolation_contract_materialization_requires_claims_confirmation_gate_and_anchor() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!(
             "agentos_materialize_extraction_{}",
@@ -3959,8 +4064,18 @@ mod ontology_crud_tests {
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         let state = make_state(&tmp);
         let claims = IsolationClaims::from_verified("tenant-a", "repair", "tester").unwrap();
+        let other_claims = IsolationClaims::from_verified("tenant-b", "repair", "tester").unwrap();
         let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
         let token = test_jwt("tenant-a");
+        let other_token = test_jwt("tenant-b");
+        let production_before = kg
+            .query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
+        let other_production_before = kg
+            .query_sparql_for_claims(&other_claims, "SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .len();
         let mut audits = state.core.events.subscribe();
         let app = Router::new()
             .route(
@@ -3970,6 +4085,18 @@ mod ontology_crud_tests {
             .route(
                 "/api/v1/ontology/constrained-extractions/:id/materialize",
                 post(materialize_constrained_extraction_handler),
+            )
+            .route(
+                "/api/v1/ontology/entity-resolution/suggestions",
+                post(create_entity_resolution_suggestion_handler),
+            )
+            .route(
+                "/api/v1/ontology/extraction-reviews",
+                get(list_extraction_reviews_handler),
+            )
+            .route(
+                "/api/v1/ontology/extraction-reviews/:id/:decision",
+                post(resolve_extraction_review_handler),
             )
             .with_state(state.clone());
         let post = |uri: String, token: Option<&str>, body: Value| {
@@ -3997,6 +4124,57 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(no_claims.status(), StatusCode::UNAUTHORIZED);
+        let invalid_claims = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/no-claims/materialize".into(),
+                Some(&test_jwt("tenant/a")),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_claims.status(), StatusCode::UNAUTHORIZED);
+        for request in [
+            post(
+                "/api/v1/ontology/entity-resolution/suggestions".into(),
+                None,
+                json!({"source_iri": "urn:source", "mention": "Source"}),
+            ),
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/v1/ontology/extraction-reviews")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            post(
+                "/api/v1/ontology/extraction-reviews/review-1/approve".into(),
+                None,
+                json!({}),
+            ),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "ER and review boundaries must reject missing claims before reading or writing"
+            );
+        }
+        for request in [
+            post(
+                "/api/v1/ontology/entity-resolution/suggestions".into(),
+                Some(&test_jwt("tenant/a")),
+                json!({"source_iri": "urn:source", "mention": "Source"}),
+            ),
+            post(
+                "/api/v1/ontology/extraction-reviews/review-1/approve".into(),
+                Some(&test_jwt("tenant/a")),
+                json!({}),
+            ),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "ER and review boundaries must reject invalid claims"
+            );
+        }
         let no_confirm = app
             .clone()
             .oneshot(post(
@@ -4024,6 +4202,16 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(failed_gate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let cross_scope = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/blocked/materialize".into(),
+                Some(&other_token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_scope.status(), StatusCode::CONFLICT);
         let blocked = app
             .clone()
             .oneshot(post(
@@ -4040,6 +4228,60 @@ mod ontology_crud_tests {
                 .is_empty(),
             "a failed gate must never materialize staging"
         );
+        assert_eq!(
+            kg.query_sparql_for_claims(&claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            production_before,
+            "missing, invalid, blocked, and cross-scope materialization must not write production"
+        );
+        assert_eq!(
+            kg.query_sparql_for_claims(&other_claims, "SELECT ?s WHERE { ?s ?p ?o }")
+                .unwrap()
+                .len(),
+            other_production_before,
+            "a client path extraction id cannot materialize into another tenant graph"
+        );
+        kg.update_for_claims(
+            &claims,
+            &ClaimsGraphUpdate::insert_data(
+                "<urn:cross-source> <http://www.w3.org/2000/01/rdf-schema#label> \"Source\" .",
+            ),
+        )
+        .unwrap();
+        let cross_scope_er = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/entity-resolution/suggestions".into(),
+                Some(&other_token),
+                json!({"source_iri": "urn:cross-source", "mention": "Source"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_scope_er.status(), StatusCode::NOT_FOUND);
+        kg.create_extraction_review_for_claims(
+            &claims,
+            &PendingExtractionReview {
+                review_id: "review-1".into(),
+                extraction_id: "blocked".into(),
+                staging_graph: kg.staging_graph_iri_for_claims(&claims, "blocked").unwrap(),
+                gate_status: "blocked".into(),
+                report_json: "{}".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decision: "pending".into(),
+            },
+        )
+        .unwrap();
+        let cross_scope_review = app
+            .clone()
+            .oneshot(post(
+                "/api/v1/ontology/extraction-reviews/review-1/approve".into(),
+                Some(&other_token),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cross_scope_review.status(), StatusCode::BAD_REQUEST);
 
         kg.update_staging_for_claims(
             &claims,
@@ -4065,6 +4307,7 @@ mod ontology_crud_tests {
             "a passed gate report must be available to materialization"
         );
         let materialized = app
+            .clone()
             .oneshot(post(
                 "/api/v1/ontology/constrained-extractions/approved/materialize".into(),
                 Some(&token),
@@ -4098,6 +4341,44 @@ mod ontology_crud_tests {
                 .is_empty(),
             "HTTP success requires production evidence from the SPARQL anchor"
         );
+        kg.update_staging_for_claims(
+            &claims,
+            "human-override",
+            &ClaimsGraphUpdate::insert_data("<urn:human-override> <urn:p> <urn:o> ."),
+        )
+        .unwrap();
+        kg.create_extraction_review_for_claims(
+            &claims,
+            &PendingExtractionReview {
+                review_id: "human-override-review".into(),
+                extraction_id: "human-override".into(),
+                staging_graph: kg
+                    .staging_graph_iri_for_claims(&claims, "human-override")
+                    .unwrap(),
+                gate_status: "failed".into(),
+                report_json: "{}".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decision: "approved".into(),
+            },
+        )
+        .unwrap();
+        let override_materialized = app
+            .oneshot(post(
+                "/api/v1/ontology/constrained-extractions/human-override/materialize".into(),
+                Some(&token),
+                json!({"confirm": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(override_materialized.status(), StatusCode::OK);
+        let override_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(override_materialized.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(override_body["authority"], "recorded_human_override");
+        assert_eq!(override_body["anchor"]["passed"], true);
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);

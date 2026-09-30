@@ -516,7 +516,7 @@ impl ProactiveEngine {
                                 &iri,
                                 &hs_content,
                                 &hs_tags,
-                                Some(experience.success_rating as f32),
+                                Some(experience.success_rating),
                                 Some(&["Experience".to_string()]),
                                 None,
                             )
