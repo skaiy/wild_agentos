@@ -18,8 +18,14 @@ MCP_JWT_SUB=mcp-client            # optional; default shown
 `MCP_JWT_SECRET` is required. The service mints a short-lived (five minute) HS256 JWT
 for each outbound request. The issuer and subject defaults are neutral examples
 and can be overridden with their respective environment variables. The JWT
-`aud` is always the registered catalog server ID, so credentials for different
-servers cannot share an audience.
+`aud` defaults to the registered catalog server ID, so credentials for different
+servers cannot share an audience by default. Set `audience_env` on an entry to
+the name of an environment variable whose value is that entry's audience. The
+value is read only when invoking and is never stored in the catalog. A missing
+or empty named variable fails the invoke before it is sent.
+
+The JWT `sub` identifies the signing service. It defaults to `wao-core` and can
+be overridden with `MCP_JWT_SUBJECT`.
 
 Secrets are never accepted in catalog JSON. To opt a catalog entry into this
 flow, register it with `auth_kind: "bearer_jwt"`. The persisted catalog record
@@ -48,6 +54,10 @@ allowed. Invalid or changed endpoints are rejected before any outbound request.
 The timeout and response-size settings are optional positive integers; the
 values shown are the secure defaults.
 
+An entry may also set `timeout_seconds` to a positive value from 1 through 300.
+It applies as that entry's total outbound request timeout and takes precedence
+over `MCP_OUTBOUND_TIMEOUT_MS`.
+
 ## Register and invoke
 
 Register an HTTP MCP endpoint:
@@ -62,6 +72,8 @@ Content-Type: application/json
   "endpoint": "http://host.docker.internal:5008/mcp",
   "protocol": "http",
   "auth_kind": "bearer_jwt",
+  "audience_env": "EXAMPLE_MCP_AUDIENCE",
+  "timeout_seconds": 15,
   "allowed_tools": ["health_check", "list_reports"],
   "write_tools_enabled": false
 }
@@ -136,4 +148,10 @@ catalog registrations and it does not route catalog tools. Its Skill exposure
 and write-gate policies are unchanged.
 
 Inbound `IsolationClaims` authorize the service's catalog lookup only. They are never
-serialized or forwarded as an outbound MCP Bearer credential.
+used as a bearer credential, but their verified `tenant_id` and `project_id`
+are included as claims in the minted outbound JWT. If either value is absent,
+the service fails closed and does not invoke the endpoint. There is no separate
+administrator bypass path.
+
+MCP sidecars must verify the JWT signature and validate `aud`, `tenant_id`, and
+`project_id` before accepting a request.

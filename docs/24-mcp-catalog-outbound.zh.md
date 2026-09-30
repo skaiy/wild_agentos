@@ -16,8 +16,13 @@ MCP_JWT_SUB=mcp-client            # 可选；此处为默认值
 
 `MCP_JWT_SECRET` 为必填项。服务会为每一个出站请求签发一个短期（五分钟）
 HS256 JWT。签发者和主体的默认值是中性示例，并且可通过各自的环境变量覆盖。
-JWT 的 `aud` 始终为已登记的 Catalog server ID，因此不同 server 的凭据不会
-共享同一个受众。
+JWT 的 `aud` 默认是已登记的 Catalog server ID，因此不同 server 的凭据默认不会
+共享同一个受众。可在条目中设置 `audience_env`，其值是保存该条目 audience 的环境
+变量名称。调用时才读取该值，Catalog 中不会保存 audience 值；该变量缺失或为空时，
+会在发送请求前失败。
+
+JWT 的 `sub` 用于标识签名服务，默认值是 `wao-core`，可通过
+`MCP_JWT_SUBJECT` 覆盖。
 
 Catalog JSON 永不接收密钥。若要让一个 Catalog 条目使用此流程，请在注册时设置
 `auth_kind: "bearer_jwt"`。持久化的 Catalog 记录只包含固定的环境变量引用
@@ -43,6 +48,9 @@ MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
 endpoint 会在发送任何出站请求前被拒绝。超时和响应大小设置均为可选的正整数；
 上面的值即安全默认值。
 
+条目还可以设置 `timeout_seconds`，取值为 1 至 300 的正整数。它是该条目的总出站
+请求超时，并且优先于 `MCP_OUTBOUND_TIMEOUT_MS`。
+
 ## 注册和调用
 
 注册一个 HTTP MCP 端点：
@@ -57,6 +65,8 @@ Content-Type: application/json
   "endpoint": "http://host.docker.internal:5008/mcp",
   "protocol": "http",
   "auth_kind": "bearer_jwt",
+  "audience_env": "EXAMPLE_MCP_AUDIENCE",
+  "timeout_seconds": 15,
   "allowed_tools": ["health_check", "list_reports"],
   "write_tools_enabled": false
 }
@@ -123,5 +133,9 @@ Core 可以接收 JSON 响应，或从 SSE 响应中读取匹配的 JSON-RPC 消
 暴露的租户 Skill。它**不是** Catalog 注册项的代理，也不会路由 Catalog 工具。
 其 Skill 暴露和写闸策略保持不变。
 
-入站 `IsolationClaims` 只用于授权服务进行 Catalog 查找；它们绝不会被序列化
-或作为出站 MCP Bearer 凭据转发。
+入站 `IsolationClaims` 只用于授权服务进行 Catalog 查找；它们绝不会作为 Bearer
+凭据转发，但其中已验证的 `tenant_id` 和 `project_id` 会写入签发的出站 JWT。任一
+值缺失时，服务会 fail-closed，且不会调用 endpoint。没有单独的管理员绕过路径。
+
+MCP sidecar 在接受请求前必须验证 JWT 签名，并校验 `aud`、`tenant_id` 和
+`project_id`。
