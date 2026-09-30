@@ -220,7 +220,12 @@ fn configured_outbound_mcp_origins() -> Result<Option<HashSet<String>>, &'static
 pub(crate) fn validate_strict_mcp_outbound_configuration() -> Result<(), &'static str> {
     let strict_mode = std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true");
     let legacy_subject_is_set = std::env::var_os("MCP_JWT_SUB").is_some();
-    let current_subject_is_set = std::env::var_os("MCP_JWT_SUBJECT").is_some();
+    let current_subject_is_set = std::env::var("MCP_JWT_SUBJECT")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if strict_mode {
+        configured_mcp_jwt_subject()?;
+    }
     if legacy_subject_is_set && !current_subject_is_set {
         if strict_mode {
             return Err(
@@ -238,6 +243,55 @@ pub(crate) fn validate_strict_mcp_outbound_configuration() -> Result<(), &'stati
         );
     }
     Ok(())
+}
+
+fn is_valid_mcp_jwt_subject(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn configured_mcp_jwt_subject() -> Result<String, &'static str> {
+    const SUBJECT_ENV: &str = "MCP_JWT_SUBJECT";
+    const DEFAULT_SUBJECT: &str = "wao-core";
+
+    let strict_mode = std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true");
+    let value = match std::env::var(SUBJECT_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(DEFAULT_SUBJECT.to_owned()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            if strict_mode {
+                return Err("MCP_JWT_SUBJECT is invalid");
+            }
+            tracing::warn!(
+                subject_env = SUBJECT_ENV,
+                "MCP JWT subject is invalid; using the default"
+            );
+            return Ok(DEFAULT_SUBJECT.to_owned());
+        }
+    };
+    let trimmed = value.trim();
+    if strict_mode {
+        if trimmed != value || !is_valid_mcp_jwt_subject(value.as_str()) {
+            return Err("MCP_JWT_SUBJECT is invalid");
+        }
+        return Ok(value);
+    }
+    if is_valid_mcp_jwt_subject(trimmed) {
+        if trimmed != value {
+            tracing::warn!(
+                subject_env = SUBJECT_ENV,
+                "MCP JWT subject was trimmed before use"
+            );
+        }
+        return Ok(trimmed.to_owned());
+    }
+    tracing::warn!(
+        subject_env = SUBJECT_ENV,
+        "MCP JWT subject is invalid; using the default"
+    );
+    Ok(DEFAULT_SUBJECT.to_owned())
 }
 
 fn validate_outbound_mcp_endpoint(server: &Value) -> Result<(), &'static str> {
@@ -473,7 +527,7 @@ fn mint_outbound_mcp_jwt(
     let claims = OutboundMcpJwtClaims {
         iss: mcp_env("MCP_JWT_ISSUER", Some("wild-agentos-core"))?,
         aud: audience.to_string(),
-        sub: mcp_env("MCP_JWT_SUBJECT", Some("wao-core"))?,
+        sub: configured_mcp_jwt_subject()?.to_owned(),
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         iat: now,
@@ -2444,6 +2498,11 @@ mod tests {
         assert!(validate_strict_mcp_outbound_configuration()
             .unwrap_err()
             .contains("MCP_JWT_SUB"));
+        std::env::set_var("MCP_JWT_SUB", "");
+        assert!(validate_strict_mcp_outbound_configuration()
+            .unwrap_err()
+            .contains("MCP_JWT_SUB"));
+        std::env::set_var("MCP_JWT_SUB", "legacy-subject-value");
         std::env::set_var("MCP_JWT_SUBJECT", "current-subject");
         std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", "https://mcp.example.test");
         assert!(validate_strict_mcp_outbound_configuration().is_ok());
@@ -2538,6 +2597,185 @@ mod tests {
         match previous_secret {
             Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
             None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+    }
+
+    #[test]
+    fn non_strict_whitespace_subject_warns_with_legacy_subject_without_values() {
+        struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CapturedWriter {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        let previous_subject = std::env::var_os("MCP_JWT_SUBJECT");
+        let previous_legacy_subject = std::env::var_os("MCP_JWT_SUB");
+        let legacy_subject = "legacy-subject-sentinel-7f3a";
+        let whitespace_subject = "  \t  ";
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::set_var("MCP_JWT_SUBJECT", whitespace_subject);
+        std::env::set_var("MCP_JWT_SUB", legacy_subject);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedWriter(output.clone())
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(validate_strict_mcp_outbound_configuration().is_ok());
+            assert_eq!(configured_mcp_jwt_subject(), Ok("wao-core".to_owned()));
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("legacy_env=\"MCP_JWT_SUB\"").count(), 1);
+        assert_eq!(output.matches("subject_env=\"MCP_JWT_SUBJECT\"").count(), 1);
+        assert!(!output.contains(legacy_subject));
+        assert!(!output.contains(whitespace_subject));
+
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+        match previous_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUBJECT", value),
+            None => std::env::remove_var("MCP_JWT_SUBJECT"),
+        }
+        match previous_legacy_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUB", value),
+            None => std::env::remove_var("MCP_JWT_SUB"),
+        }
+    }
+
+    #[test]
+    fn strict_mode_rejects_invalid_mcp_jwt_subject_values_without_echoing_them() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        let previous_origins = std::env::var_os("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let previous_subject = std::env::var_os("MCP_JWT_SUBJECT");
+        let previous_legacy_subject = std::env::var_os("MCP_JWT_SUB");
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", "https://mcp.example.test");
+        std::env::remove_var("MCP_JWT_SUB");
+
+        let invalid_subjects = vec![
+            " leading-subject".to_owned(),
+            "trailing-subject ".to_owned(),
+            String::new(),
+            " \t ".to_owned(),
+            "subject/with-slash".to_owned(),
+            "subject@with-at".to_owned(),
+            "subject-雪".to_owned(),
+            "a".repeat(65),
+        ];
+        for subject in &invalid_subjects {
+            std::env::set_var("MCP_JWT_SUBJECT", subject);
+            let error = validate_strict_mcp_outbound_configuration().unwrap_err();
+            assert_eq!(error, "MCP_JWT_SUBJECT is invalid");
+            if !subject.is_empty() {
+                assert!(!error.contains(subject));
+            }
+        }
+
+        std::env::set_var("MCP_JWT_SUBJECT", "a".repeat(64));
+        assert!(validate_strict_mcp_outbound_configuration().is_ok());
+
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+        match previous_origins {
+            Some(value) => std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", value),
+            None => std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS"),
+        }
+        match previous_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUBJECT", value),
+            None => std::env::remove_var("MCP_JWT_SUBJECT"),
+        }
+        match previous_legacy_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUB", value),
+            None => std::env::remove_var("MCP_JWT_SUB"),
+        }
+    }
+
+    #[test]
+    fn non_strict_mcp_jwt_subject_trims_or_falls_back_without_logging_values() {
+        struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CapturedWriter {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        let previous_subject = std::env::var_os("MCP_JWT_SUBJECT");
+        let trimmed_subject = "  trimmed-subject-sentinel  ";
+        let invalid_subject = "invalid@subject-sentinel";
+        let whitespace_subject = " \t ";
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedWriter(output.clone())
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            std::env::set_var("MCP_JWT_SUBJECT", trimmed_subject);
+            assert_eq!(
+                configured_mcp_jwt_subject(),
+                Ok("trimmed-subject-sentinel".to_owned())
+            );
+
+            std::env::set_var("MCP_JWT_SUBJECT", invalid_subject);
+            assert_eq!(configured_mcp_jwt_subject(), Ok("wao-core".to_owned()));
+
+            std::env::set_var("MCP_JWT_SUBJECT", whitespace_subject);
+            assert_eq!(configured_mcp_jwt_subject(), Ok("wao-core".to_owned()));
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("MCP_JWT_SUBJECT"));
+        assert!(!output.contains(trimmed_subject));
+        assert!(!output.contains("trimmed-subject-sentinel"));
+        assert!(!output.contains(invalid_subject));
+        assert!(!output.contains(whitespace_subject));
+
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+        match previous_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUBJECT", value),
+            None => std::env::remove_var("MCP_JWT_SUBJECT"),
         }
     }
 
