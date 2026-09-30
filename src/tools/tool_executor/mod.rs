@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::debug;
 
+use crate::core::agent_instance::AgentRole;
+use crate::core::tool_controller::ToolController;
 use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::skill_graph::security::{SecurityContext, SecurityDecision, SecurityEngine};
@@ -33,6 +35,14 @@ tokio::task_local! {
     /// serve concurrent tenants without one call's identity leaking into
     /// another call.
     static TOOL_ISOLATION_CLAIMS: Option<IsolationClaims>;
+}
+
+tokio::task_local! {
+    /// The role is supplied exclusively by the runtime security boundary.
+    ///
+    /// Keeping it task-local prevents model-controlled tool arguments from
+    /// selecting another role and keeps concurrent runs isolated.
+    static TOOL_SEARCH_CALLER_ROLE: Option<String>;
 }
 
 pub(super) fn require_isolation_claims() -> Result<IsolationClaims, String> {
@@ -423,13 +433,19 @@ impl ToolExecutor {
         );
         self.register(
             "tool_search",
-            "Search available tools by name.",
+            "Find tools relevant to a task before choosing a tool. Searches tool names, descriptions, parameters, and groups; returns only tools visible to the runtime role. Do not use to execute a tool or change permissions.",
             json!({
-                "properties": {"query": {"type":"string"},"max_results": {"type":"integer"}},
+                "properties": {
+                    "query": {"type":"string", "description":"Task or capability to find; include operation and relevant parameter terms."},
+                    "max_results": {"type":"integer", "description":"Optional result count from 0 to 10; defaults to 5."}
+                },
                 "required": ["query"]
             }),
-            Arc::new(|input: Value| {
-                Box::pin(async move { builtins::execute_tool_search(input).await })
+            Arc::new(|_| {
+                Box::pin(async {
+                    Err("tool_search must be dispatched through the runtime security context"
+                        .to_string())
+                })
             }),
             all,
         );
@@ -1267,25 +1283,40 @@ impl ToolExecutor {
             }
         }
 
-        // Use the fallback-aware lookup so routing every caller through the
-        // permission/hook/syscall gates does not break micro-tool dispatch.
-        let handler = match self.try_get_handler(name) {
-            Some(h) => h,
-            None => {
-                return Err(ToolExecutionError::NotFound {
+        let result = if name == "tool_search" {
+            let role = TOOL_SEARCH_CALLER_ROLE
+                .try_with(|role| role.clone())
+                .ok()
+                .flatten()
+                .ok_or_else(|| ToolExecutionError::ExecutionFailed {
                     name: name.to_string(),
+                    message: "tool_search requires a verified runtime role".to_string(),
+                })?;
+            self.search_tools_for_role(&role, input).map_err(|message| {
+                ToolExecutionError::ExecutionFailed {
+                    name: name.to_string(),
+                    message,
+                }
+            })
+        } else {
+            // Use the fallback-aware lookup so routing every caller through the
+            // permission/hook/syscall gates does not break micro-tool dispatch.
+            let handler = match self.try_get_handler(name) {
+                Some(h) => h,
+                None => {
+                    return Err(ToolExecutionError::NotFound {
+                        name: name.to_string(),
+                    })
+                }
+            };
+            debug!(tool = %name, "Executing tool");
+            handler(input)
+                .await
+                .map_err(|message| ToolExecutionError::ExecutionFailed {
+                    name: name.to_string(),
+                    message,
                 })
-            }
         };
-        debug!(tool = %name, "Executing tool");
-
-        // Execute and capture result for post-hooks
-        let result = handler(input)
-            .await
-            .map_err(|message| ToolExecutionError::ExecutionFailed {
-                name: name.to_string(),
-                message,
-            });
 
         // Post-tool-use hook
         if let Some(ref runner) = self.hook_runner {
@@ -1391,7 +1422,12 @@ impl ToolExecutor {
             }
         }
 
-        self.execute_with_claims(name, input, claims).await
+        TOOL_SEARCH_CALLER_ROLE
+            .scope(
+                Some(context.agent_role),
+                self.execute_with_claims(name, input, claims),
+            )
+            .await
     }
 
     /// Get tool handler (avoid holding lock across await)
@@ -1679,29 +1715,155 @@ impl ToolExecutor {
         Self::pa_readonly_tools().contains(&name)
     }
 
-    /// ToolSearch needs access to the tool list
-    pub fn search_tools(&self, query: &str, max_results: Option<usize>) -> Value {
-        let query_lower = query.to_lowercase();
-        let max = max_results.unwrap_or(10);
-        let matches: Vec<Value> = self
+    /// Searches the live registry for tools visible to a verified runtime role.
+    ///
+    /// The lexical stage is deliberately deterministic. Vector retrieval is
+    /// intentionally not enabled here: its index must be server-owned and
+    /// separate from tenant vector stores before it can participate in fusion.
+    pub fn search_tools_for_role(&self, role: &str, input: Value) -> Result<Value, String> {
+        let params: ToolSearchInput =
+            serde_json::from_value(input).map_err(|error| format!("Invalid input: {error}"))?;
+        let role = parse_runtime_role(role)?;
+        let role_name = canonical_role_name(role);
+        let manager = self
+            .tool_group_manager
+            .as_ref()
+            .filter(|manager| manager.is_enabled())
+            .cloned()
+            .unwrap_or_else(|| ToolGroupManager::new(None));
+        let (resident, on_demand) = manager.get_tool_names_for_role(role_name);
+        let controller = ToolController::new();
+        let query_terms = search_terms(&params.query);
+        let max_results = params.max_results.unwrap_or(5).min(10);
+
+        let mut matches: Vec<(i64, String, Value)> = self
             .tool_descriptions
             .iter()
-            .filter(|t| {
-                t.name.to_lowercase().contains(&query_lower)
-                    || t.description.to_lowercase().contains(&query_lower)
-            })
-            .take(max)
-            .map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
+            .filter(|tool| !Self::is_micro_tool_name(&tool.name))
+            .filter(|tool| resident.contains(&tool.name) || on_demand.contains(&tool.name))
+            .filter(|tool| controller.is_tool_allowed_for_role(&tool.name, &role))
+            .filter_map(|tool| {
+                let group = manager.group_for_tool(&tool.name)?;
+                let score = lexical_score(tool, &group.to_string(), &query_terms);
+                (score > 0).then(|| {
+                    let status = if resident.contains(&tool.name) {
+                        "resident"
+                    } else {
+                        "on_demand"
+                    };
+                    (
+                        score,
+                        tool.name.clone(),
+                        json!({
+                            "name": tool.name,
+                            "group": group.to_string(),
+                            "description": one_line_description(&tool.description),
+                            "status": status,
+                            "retrieval": "lexical",
+                        }),
+                    )
                 })
             })
             .collect();
-        json!({
+        matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let matches: Vec<Value> = matches
+            .into_iter()
+            .take(max_results)
+            .map(|(_, _, value)| value)
+            .collect();
+        let count = matches.len();
+        Ok(json!({
             "matches": matches,
-            "count": matches.len(),
-            "query": query,
+            "count": count,
+            "query": params.query,
+        }))
+    }
+
+    /// Marks search results with the current per-run activation state. This is
+    /// presentation-only; activation remains constrained by the group manager.
+    pub fn mark_search_results_activation(&self, result: &mut Value, activated: &ActivatedTools) {
+        let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for tool in matches {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                if activated.names().iter().any(|active| active == name) {
+                    tool["status"] = json!("activated");
+                }
+            }
+        }
+    }
+}
+
+fn parse_runtime_role(role: &str) -> Result<AgentRole, String> {
+    role.parse::<AgentRole>()
+        .map_err(|_| "tool_search requires a recognized runtime role".to_string())
+}
+
+fn canonical_role_name(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Plan => "Plan",
+        AgentRole::Do => "Do",
+        AgentRole::Check => "Check",
+        AgentRole::Act => "Act",
+    }
+}
+
+fn search_terms(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_lowercase())
+        .collect()
+}
+
+fn field_score(field: &str, query_terms: &[String], weight: i64) -> i64 {
+    let field_lower = field.to_lowercase();
+    let terms = search_terms(field);
+    query_terms
+        .iter()
+        .map(|query| {
+            if terms.iter().any(|term| term == query) {
+                weight
+            } else if field_lower.contains(query) {
+                weight / 2
+            } else {
+                0
+            }
         })
+        .sum()
+}
+
+fn lexical_score(tool: &ToolDescription, group: &str, query_terms: &[String]) -> i64 {
+    if query_terms.is_empty() {
+        return 0;
+    }
+    let name_lower = tool.name.to_lowercase();
+    let query = query_terms.join("_");
+    let mut score = field_score(&tool.name, query_terms, 20)
+        + field_score(&tool.description, query_terms, 6)
+        + field_score(group, query_terms, 3);
+    if name_lower == query {
+        score += 100;
+    } else if name_lower.starts_with(&query) {
+        score += 50;
+    }
+    if let Some(properties) = tool.parameters.get("properties").and_then(Value::as_object) {
+        for (name, schema) in properties {
+            score += field_score(name, query_terms, 12);
+            if let Some(description) = schema.get("description").and_then(Value::as_str) {
+                score += field_score(description, query_terms, 5);
+            }
+        }
+    }
+    score
+}
+
+fn one_line_description(description: &str) -> String {
+    let line = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= 160 {
+        line
+    } else {
+        format!("{}…", line.chars().take(159).collect::<String>())
     }
 }
