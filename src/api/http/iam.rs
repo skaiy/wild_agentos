@@ -37,6 +37,7 @@ use crate::isolation::IsolationClaims;
 pub struct JwtClaims {
     /// Subject = user_id
     pub sub: String,
+    #[serde(default)]
     pub tenant_id: String,
     /// Project scope for isolation. Legacy tokens without this claim use
     /// the `default` project.
@@ -65,6 +66,7 @@ pub struct UserIdentity {
     pub roles: Vec<String>,
     pub auth_method: AuthMethod,
     isolation_claims: Option<IsolationClaims>,
+    incomplete_scope_field: Option<&'static str>,
 }
 
 impl UserIdentity {
@@ -75,11 +77,17 @@ impl UserIdentity {
             roles: vec![],
             auth_method: AuthMethod::Anonymous,
             isolation_claims: None,
+            incomplete_scope_field: None,
         }
     }
     /// Returns claims only when the authentication boundary verified them.
     pub fn isolation_claims(&self) -> Option<&IsolationClaims> {
         self.isolation_claims.as_ref()
+    }
+    /// Returns the missing or invalid JWT scope field, if JWT verification
+    /// succeeded but a safe isolation scope could not be constructed.
+    pub fn incomplete_scope_field(&self) -> Option<&'static str> {
+        self.incomplete_scope_field
     }
     /// 检查调用方是否具有指定角色（任一匹配）。
     pub fn has_role(&self, role: &str) -> bool {
@@ -150,6 +158,7 @@ impl<S: Send + Sync> FromRequestParts<S> for UserIdentity {
                             roles: arr_field(&claims, "roles"),
                             auth_method: AuthMethod::Base64Header,
                             isolation_claims: None,
+                            incomplete_scope_field: None,
                         });
                     }
                 }
@@ -318,14 +327,32 @@ async fn jwks_for(config: &OidcConfig, refresh: bool) -> Option<Arc<JwkSet>> {
 }
 
 pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
+    let incomplete_scope_field = if claims.tenant_id.trim().is_empty() {
+        Some("tenant_id")
+    } else if claims
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id.trim().is_empty())
+    {
+        Some("project_id")
+    } else {
+        None
+    };
+    if let Some(incomplete_scope_field) = incomplete_scope_field {
+        return Some(UserIdentity {
+            user_id: claims.sub,
+            tenant_id: claims.tenant_id,
+            roles: claims.roles,
+            auth_method: AuthMethod::Jwt,
+            isolation_claims: None,
+            incomplete_scope_field: Some(incomplete_scope_field),
+        });
+    }
     let (project_id, explicit_project_id) = match claims.project_id.as_deref() {
         Some(project_id) if !project_id.trim().is_empty() => (project_id, true),
-        Some(_) => return None,
+        Some(_) => unreachable!("empty project IDs return above"),
         None => ("default", false),
     };
-    if claims.tenant_id.trim().is_empty() {
-        return None;
-    }
     let isolation_claims = IsolationClaims::from_verified_jwt(
         claims.tenant_id.clone(),
         project_id,
@@ -340,6 +367,7 @@ pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
         roles: claims.roles,
         auth_method: AuthMethod::Jwt,
         isolation_claims: Some(isolation_claims),
+        incomplete_scope_field: None,
     })
 }
 
@@ -610,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jwt_with_empty_project_claim_uses_default_project() {
+    async fn jwt_with_empty_project_claim_is_rejected() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_mode = std::env::var_os("AGENTOS_AUTH_MODE");
         std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
@@ -627,13 +655,9 @@ mod tests {
         )
         .unwrap();
 
-        let claims = verify_jwt(&token)
-            .await
-            .unwrap()
-            .isolation_claims()
-            .unwrap()
-            .clone();
-        assert_eq!(claims.project_id(), "default");
+        let identity = verify_jwt(&token).await.unwrap();
+        assert_eq!(identity.incomplete_scope_field(), Some("project_id"));
+        assert!(identity.isolation_claims().is_none());
         restore_env("AGENTOS_AUTH_MODE", previous_mode);
     }
 

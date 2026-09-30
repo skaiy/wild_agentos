@@ -143,6 +143,8 @@ Core 可以接收 JSON 响应，或从 SSE 响应中读取匹配的 JSON-RPC 消
 值缺失时，服务会 fail-closed，且不会调用 endpoint。没有单独的管理员绕过路径。
 对于出站调用，这两个范围 claim 都必须在入站 token 中明确出现；旧 token 的默认
 project scope 不足以授权。明确命名为 `default` 的项目仍然有效。
+不完整的已验证范围 claim 会返回带有 `mcp_claims_incomplete` 的 `403`，且只返回
+缺失字段名称；不会发送任何出站请求。
 
 MCP sidecar 在接受请求前必须验证 JWT 签名，并校验 `aud`、`tenant_id` 和
 `project_id`。

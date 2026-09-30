@@ -260,6 +260,16 @@ pub(crate) async fn register_mcp_server_handler(
     identity: UserIdentity,
     Json(req): Json<McpServerRegisterRequest>,
 ) -> impl IntoResponse {
+    if let Some(missing_field) = identity.incomplete_scope_field() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "mcp_claims_incomplete",
+                "missing_field": missing_field,
+            })),
+        )
+            .into_response();
+    }
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
@@ -788,12 +798,19 @@ pub(crate) async fn invoke_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
-    if !claims.explicit_tenant_id() || !claims.explicit_project_id() {
+    let missing_scope_field = if !claims.explicit_tenant_id() {
+        Some("tenant_id")
+    } else if !claims.explicit_project_id() {
+        Some("project_id")
+    } else {
+        None
+    };
+    if let Some(missing_field) = missing_scope_field {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "explicit_isolation_claims_required",
-                "message": "Outbound MCP invocation requires explicit tenant_id and project_id claims",
+                "error": "mcp_claims_incomplete",
+                "missing_field": missing_field,
             })),
         )
             .into_response();
@@ -1816,7 +1833,7 @@ mod tests {
         }));
         assert_eq!(
             invoke(without_project).await.status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::FORBIDDEN
         );
         let without_tenant = raw_inbound_identity_token(json!({
             "sub": "test-user",
@@ -1824,10 +1841,7 @@ mod tests {
             "roles": [],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
-        assert_eq!(
-            invoke(without_tenant).await.status(),
-            StatusCode::UNAUTHORIZED
-        );
+        assert_eq!(invoke(without_tenant).await.status(), StatusCode::FORBIDDEN);
         let empty_project = raw_inbound_identity_token(json!({
             "sub": "test-user",
             "tenant_id": "test-tenant",
@@ -1835,10 +1849,7 @@ mod tests {
             "roles": [],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
-        assert_eq!(
-            invoke(empty_project).await.status(),
-            StatusCode::UNAUTHORIZED
-        );
+        assert_eq!(invoke(empty_project).await.status(), StatusCode::FORBIDDEN);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         let explicit_default = raw_inbound_identity_token(json!({
