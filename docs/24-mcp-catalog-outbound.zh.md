@@ -22,14 +22,18 @@ JWT 的 `aud` 默认是已登记的 Catalog server ID，因此不同 server 的�
 会在发送请求前失败。
 
 JWT 的 `sub` 用于标识签名服务，默认值是 `wao-core`，可通过
-`MCP_JWT_SUBJECT` 覆盖。
+`MCP_JWT_SUBJECT` 覆盖。主体值必须为 1–64 个 ASCII 字符，且仅可使用
+`A-Z`、`a-z`、`0-9`、`.`、`_` 和 `-`。非严格模式会去除首尾空白；空值或
+无效值会发出警告并回退到 `wao-core`。严格鉴权下，空值、带首尾空白或无效的值
+会阻止启动。两种模式下，变量未设置时都保持默认值 `wao-core`。
 
 Catalog JSON 永不接收密钥。若要让一个 Catalog 条目使用此流程，请在注册时设置
 `auth_kind: "bearer_jwt"`。持久化的 Catalog 记录只包含固定的环境变量引用
 （`MCP_JWT_SECRET`、`MCP_JWT_ISSUER` 和 `MCP_JWT_SUBJECT`）。
 
-`MCP_JWT_SUB` 已弃用。严格鉴权下，如果只设置该旧变量，启动会被拒绝。如果两个
-变量都已设置，`MCP_JWT_SUBJECT` 优先。
+`MCP_JWT_SUB` 已弃用。严格鉴权下，如果只设置该旧变量，启动会被拒绝；在此检查
+中，空值或全空白的主体变量视为未设置。如果两个变量都已设置，
+`MCP_JWT_SUBJECT` 优先。
 
 ## 配置出站边界
 

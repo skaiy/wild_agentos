@@ -25,7 +25,12 @@ value is read only when invoking and is never stored in the catalog. A missing
 or empty named variable fails the invoke before it is sent.
 
 The JWT `sub` identifies the signing service. It defaults to `wao-core` and can
-be overridden with `MCP_JWT_SUBJECT`.
+be overridden with `MCP_JWT_SUBJECT`. Subject values must be 1–64 ASCII
+characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. In non-strict mode,
+surrounding whitespace is trimmed; an empty or invalid value warns and falls
+back to `wao-core`. In strict authentication, an empty, whitespace-padded, or
+invalid value prevents startup. When the variable is unset in either mode, the
+default remains `wao-core`.
 
 Secrets are never accepted in catalog JSON. To opt a catalog entry into this
 flow, register it with `auth_kind: "bearer_jwt"`. The persisted catalog record
@@ -33,8 +38,9 @@ contains only the fixed environment-variable references (`MCP_JWT_SECRET`,
 `MCP_JWT_ISSUER`, and `MCP_JWT_SUBJECT`).
 
 `MCP_JWT_SUB` is deprecated. Under strict authentication, startup refuses a
-configuration that sets only that legacy variable. If both variables are set,
-`MCP_JWT_SUBJECT` takes precedence.
+configuration that sets only that legacy variable; empty or whitespace-only
+subject variables are treated as unset for this check. If both variables are
+set, `MCP_JWT_SUBJECT` takes precedence.
 
 ## Configure outbound boundaries
 
