@@ -9,7 +9,8 @@
 
 | 分组 | 用途 |
 | --- | --- |
-| Core | 文件读取、工作区状态和前序 Agent 输出 |
+| Core | 文件读取 |
+| Workspace | 工作区状态和前序 Agent 输出 |
 | Write | 文件修改和 shell 命令 |
 | Search | 文件与索引文档搜索 |
 | Web | 公共网页搜索和读取 |

@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolGroup {
     Core,
+    Workspace,
     Write,
     Search,
     Web,
@@ -19,6 +20,7 @@ impl std::fmt::Display for ToolGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ToolGroup::Core => write!(f, "Core"),
+            ToolGroup::Workspace => write!(f, "Workspace"),
             ToolGroup::Write => write!(f, "Write"),
             ToolGroup::Search => write!(f, "Search"),
             ToolGroup::Web => write!(f, "Web"),
@@ -38,6 +40,7 @@ impl std::str::FromStr for ToolGroup {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "core" => Ok(ToolGroup::Core),
+            "workspace" => Ok(ToolGroup::Workspace),
             "write" => Ok(ToolGroup::Write),
             "search" => Ok(ToolGroup::Search),
             "web" => Ok(ToolGroup::Web),
@@ -106,6 +109,7 @@ impl Default for ToolGroupSettings {
             RoleToolConfig {
                 default: vec![
                     "Core".to_string(),
+                    "Workspace".to_string(),
                     "Write".to_string(),
                     "Search".to_string(),
                     "System".to_string(),
@@ -231,9 +235,11 @@ impl ToolGroupManager {
 
         map.insert(
             ToolGroup::Core,
+            HashSet::from(["file_read".to_string(), "file_list".to_string()]),
+        );
+        map.insert(
+            ToolGroup::Workspace,
             HashSet::from([
-                "file_read".to_string(),
-                "file_list".to_string(),
                 "workspace_status".to_string(),
                 "read_agent_output".to_string(),
             ]),

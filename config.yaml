@@ -180,7 +180,7 @@ token_optimization:
         default: ["Core", "Search", "KnowledgeRead", "System"]
         on_demand: ["Web"]
       Do:
-        default: ["Core", "Write", "Search", "System"]
+        default: ["Core", "Workspace", "Write", "Search", "System"]
         on_demand: ["Web", "KnowledgeRead", "KnowledgeWrite", "Ingest", "Skill", "Ontology"]
       Check:
         default: ["Core", "Search", "System"]

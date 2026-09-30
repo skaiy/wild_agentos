@@ -206,24 +206,22 @@ mod tests {
             "knowledge_extract_code",
         ];
 
-        for role in [
-            AgentRole::Plan,
-            AgentRole::Do,
-            AgentRole::Check,
-            AgentRole::Act,
-        ] {
-            let actual: Vec<&str> = registered
+        let allowed_for = |role: AgentRole| {
+            registered
                 .iter()
                 .map(String::as_str)
                 .filter(|tool| tc.is_tool_allowed_for_role(tool, &role))
-                .collect();
-            let expected: Vec<&str> = if role == AgentRole::Plan {
-                plan_main.to_vec()
-            } else {
-                registered.iter().map(String::as_str).collect()
-            };
-            assert_eq!(actual, expected, "{role:?} execution permissions changed");
-        }
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let all_registered = registered.iter().map(String::as_str).collect();
+
+        assert_eq!(
+            allowed_for(AgentRole::Plan),
+            plan_main.into_iter().collect()
+        );
+        assert_eq!(allowed_for(AgentRole::Do), all_registered);
+        assert_eq!(allowed_for(AgentRole::Check), all_registered);
+        assert_eq!(allowed_for(AgentRole::Act), all_registered);
     }
 
     #[test]

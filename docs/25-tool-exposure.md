@@ -10,7 +10,8 @@ The default groups are:
 
 | Group | Purpose |
 | --- | --- |
-| Core | File reading, workspace status, and prior-agent output |
+| Core | File reading |
+| Workspace | Workspace status and prior-agent output |
 | Write | File changes and shell commands |
 | Search | File and indexed-document search |
 | Web | Public web search and retrieval |
