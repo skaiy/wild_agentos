@@ -3,7 +3,7 @@
 This evaluation measures the first tool-selection response for Plan, Do, and
 Check roles. It does not execute the selected tools.
 
-The cases live in `eval/tool_selection/cases.json`, separate from product
+The cases live in `evals/golden/tool-selection.json`, separate from product
 fixtures. The current set has 63 cases: 23 Do cases and 20 each for Plan and
 Check. Across all roles it
 includes 15 correct-tool choices, 9 on-demand discovery cases, 6 MCP/skill
@@ -22,8 +22,21 @@ connection or credentials:
 cargo run --bin tool_selection_eval -- --offline
 ```
 
-The JSON report and short Markdown summary are written to
-`target/tool-selection-eval/`. CI runs the offline command.
+The JSON report, comparison, and short Markdown summary are written to
+`target/tool-selection-eval/`. CI runs this offline command through
+`./scripts/test_golden.sh`.
+
+`evals/golden/tool-selection.baseline.json` is the committed deterministic
+mock-layer baseline. Compare a run with:
+
+```bash
+cargo run --bin tool_selection_eval -- --offline \
+  --compare evals/golden/tool-selection.baseline.json
+```
+
+The comparison fails only when a tracked metric regresses. Expected-fail
+coverage gaps stay record-only while they still fail, and appear as
+`unexpected-pass` when they improve.
 
 For a live baseline, supply all configuration through the environment:
 
@@ -67,7 +80,7 @@ team's approved results store.
 
 ## Add a case
 
-Add an object to `eval/tool_selection/cases.json` with a unique `id`, one of
+Add an object to `evals/golden/tool-selection.json` with a unique `id`, one of
 `Plan`, `Do`, or `Check`, category, task, optional context and injected tool
 results, `expected_tools`, `forbidden_tools`, and `no_tool_correct`.
 

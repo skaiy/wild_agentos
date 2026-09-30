@@ -74,6 +74,7 @@ struct CaseResult {
     role: String,
     category: String,
     baseline_expected_failure: bool,
+    expected_failure_status: Option<String>,
     called_tools: Vec<String>,
     expected_tools: Vec<String>,
     forbidden_tools: Vec<String>,
@@ -169,13 +170,15 @@ struct Args {
     offline: bool,
     cases: PathBuf,
     output: PathBuf,
+    compare: Option<PathBuf>,
 }
 
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut offline = false;
-        let mut cases = PathBuf::from("eval/tool_selection/cases.json");
+        let mut cases = PathBuf::from("evals/golden/tool-selection.json");
         let mut output = PathBuf::from("target/tool-selection-eval");
+        let mut compare = None;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -183,6 +186,11 @@ impl Args {
                 "--cases" => cases = PathBuf::from(args.next().ok_or("--cases requires a path")?),
                 "--output" => {
                     output = PathBuf::from(args.next().ok_or("--output requires a path")?)
+                }
+                "--compare" => {
+                    compare = Some(PathBuf::from(
+                        args.next().ok_or("--compare requires a path")?,
+                    ))
                 }
                 "--help" | "-h" => {
                     return Err(
@@ -197,6 +205,7 @@ impl Args {
             offline,
             cases,
             output,
+            compare,
         })
     }
 }
@@ -263,14 +272,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             calls_by_turn.push(calls);
         }
-        results.push(score_case(
+        let mut result = score_case(
             case,
             &turns,
             calls_by_turn,
             token_estimate,
             prefix_stable,
             cache_proxy,
-        ));
+        );
+        if case.baseline_expected_failure {
+            let forbidden_is_visible = result
+                .forbidden_tools
+                .iter()
+                .any(|tool| tool_names.contains(tool));
+            result.expected_failure_status = Some(if forbidden_is_visible {
+                "still-failing".to_string()
+            } else {
+                "unexpected-pass".to_string()
+            });
+        }
+        results.push(result);
     }
 
     let report = Report {
@@ -294,6 +315,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::to_vec_pretty(&report)?,
     )?;
     fs::write(args.output.join("summary.md"), markdown_summary(&report))?;
+    if let Some(baseline) = args.compare {
+        compare_report(&report, &baseline, &args.output)?;
+    }
     println!(
         "tool-selection evaluation passed: {} cases ({})",
         report.case_results.len(),
@@ -389,6 +413,100 @@ fn registry_coverage(executor: &ToolExecutor) -> RegistryCoverage {
         expected_baseline_gap: !unreachable_tools.is_empty(),
         unreachable_tools,
     }
+}
+
+fn compare_report(
+    report: &Report,
+    baseline_path: &PathBuf,
+    output: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let baseline: Value = serde_json::from_str(&fs::read_to_string(baseline_path)?)?;
+    let current = serde_json::to_value(report)?;
+    let metrics = [
+        ("top-1", "top1_correct_tool_rate", true),
+        ("recall", "required_tool_recall", true),
+        ("over-call", "over_call_rate", false),
+        ("wrong-tool", "wrong_tool_rate", false),
+        ("forbidden-attempts", "forbidden_tool_attempt_count", false),
+        ("tool_search-hit@3", "tool_search_hit_at_3", true),
+        (
+            "cross-turn-taint",
+            "cross_turn_taint_violation_attempt_count",
+            false,
+        ),
+        (
+            "tool-definition-tokens",
+            "average_tool_definition_and_menu_tokens_estimate",
+            false,
+        ),
+        ("tools-array-prefix", "tools_array_prefix_stability", true),
+        ("cache-hit-proxy", "prompt_cache_hit_proxy", true),
+    ];
+    let mut lines = vec![
+        "# Tool-selection baseline comparison".to_string(),
+        String::new(),
+    ];
+    let mut regressions = Vec::new();
+    for (label, key, higher_is_better) in metrics {
+        let before = number_at(&baseline, key);
+        let after = number_at(&current, key);
+        let regression = match (before, after) {
+            (Some(before), Some(after)) if higher_is_better => after + f64::EPSILON < before,
+            (Some(before), Some(after)) => after > before + f64::EPSILON,
+            _ => false,
+        };
+        lines.push(format!(
+            "- {label}: {} -> {}{}",
+            format_metric(before),
+            format_metric(after),
+            if regression { " **REGRESSION**" } else { "" }
+        ));
+        if regression {
+            regressions.push(label);
+        }
+    }
+    let baseline_unreachable = baseline["registry_coverage"]["unreachable_tools"]
+        .as_array()
+        .map_or(usize::MAX, Vec::len);
+    let current_unreachable = report.registry_coverage.unreachable_tools.len();
+    if current_unreachable > baseline_unreachable {
+        regressions.push("registry-reachability");
+    }
+    lines.push(format!(
+        "- registry reachability: {baseline_unreachable} -> {current_unreachable}{}",
+        if current_unreachable == 0 {
+            " **UNEXPECTED PASS: flip the expected-fail marker**"
+        } else {
+            ""
+        }
+    ));
+    for result in &report.case_results {
+        if result.expected_failure_status.as_deref() == Some("unexpected-pass") {
+            lines.push(format!(
+                "- {}: **UNEXPECTED PASS: flip the expected-fail marker**",
+                result.id
+            ));
+        }
+    }
+    fs::write(output.join("compare.md"), lines.join("\n") + "\n")?;
+    if regressions.is_empty() {
+        println!("baseline comparison passed");
+        Ok(())
+    } else {
+        Err(format!("baseline regressions: {}", regressions.join(", ")).into())
+    }
+}
+
+fn number_at(value: &Value, key: &str) -> Option<f64> {
+    value["overall"][key]
+        .as_f64()
+        .or_else(|| value["overall"][key].as_u64().map(|value| value as f64))
+}
+
+fn format_metric(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 fn require_live_env() -> Result<(), Box<dyn std::error::Error>> {
@@ -537,6 +655,7 @@ fn score_case(
         role: case.role.clone(),
         category: case.category.clone(),
         baseline_expected_failure: case.baseline_expected_failure,
+        expected_failure_status: None,
         called_tools: calls.clone(),
         expected_tools,
         forbidden_tools,

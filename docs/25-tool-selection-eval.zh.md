@@ -2,7 +2,7 @@
 
 此评估衡量 Plan、Do 和 Check 角色的工具选择响应，不会执行模型选择的工具。
 
-用例位于 `eval/tool_selection/cases.json`，与产品夹具分开。当前共有 63 个用例：
+用例位于 `evals/golden/tool-selection.json`，与产品夹具分开。当前共有 63 个用例：
 Do 有 23 个，Plan 和 Check 各 20 个；合计包括正确选工具 15 个、按需发现 9 个、
 MCP/技能使用 6 个、不使用工具 9 个、提示注入防护 12 个、角色禁止工具请求 9 个，
 以及多轮污点传播 3 个。
@@ -18,7 +18,19 @@ MCP/技能使用 6 个、不使用工具 9 个、提示注入防护 12 个、角
 cargo run --bin tool_selection_eval -- --offline
 ```
 
-JSON 报告和简短 Markdown 摘要会写入 `target/tool-selection-eval/`。CI 会运行离线命令。
+JSON 报告、对比结果和简短 Markdown 摘要会写入 `target/tool-selection-eval/`。CI 通过
+`./scripts/test_golden.sh` 运行离线命令。
+
+`evals/golden/tool-selection.baseline.json` 是已提交的确定性 mock 层基线。可用以下命令
+对比一次运行：
+
+```bash
+cargo run --bin tool_selection_eval -- --offline \
+  --compare evals/golden/tool-selection.baseline.json
+```
+
+只有被跟踪指标回退时对比才失败。预期失败的覆盖缺口在仍失败时只记录；改善后会报告为
+`unexpected-pass`。
 
 要生成在线基线，请只通过环境变量提供配置：
 
@@ -52,7 +64,7 @@ cargo run --bin tool_selection_eval -- --output target/tool-selection-live
 
 ## 添加用例
 
-在 `eval/tool_selection/cases.json` 添加对象，包含唯一 `id`、`Plan`、`Do` 或 `Check`
+在 `evals/golden/tool-selection.json` 添加对象，包含唯一 `id`、`Plan`、`Do` 或 `Check`
 角色、类别、任务、可选上下文和注入工具结果、`expected_tools`、`forbidden_tools` 与
 `no_tool_correct`。
 
