@@ -790,7 +790,7 @@ pub(crate) async fn invoke_mcp_server_handler(
     };
     if !claims.explicit_tenant_id() || !claims.explicit_project_id() {
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "error": "explicit_isolation_claims_required",
                 "message": "Outbound MCP invocation requires explicit tenant_id and project_id claims",
@@ -952,6 +952,23 @@ mod tests {
             IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap();
         assert!(mint_outbound_mcp_jwt("server-id", &claims).is_err());
         match previous {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+    }
+
+    #[test]
+    fn non_jwt_scope_claims_cannot_mint_outbound_mcp_credentials() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        let defaulted_scope =
+            IsolationClaims::from_verified("test-tenant", "default", "test-actor").unwrap();
+        let error = mint_outbound_mcp_jwt("server-id", &defaulted_scope).unwrap_err();
+        assert!(error.contains("explicitly include tenant_id and project_id"));
+        match previous_secret {
             Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
             None => std::env::remove_var("MCP_JWT_SECRET"),
         }
@@ -1220,7 +1237,17 @@ mod tests {
     }
 
     fn test_isolation_claims() -> IsolationClaims {
-        IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap()
+        crate::api::http::iam::claims_identity(crate::api::http::iam::JwtClaims {
+            sub: "test-actor".into(),
+            tenant_id: "test-tenant".into(),
+            project_id: Some("test-project".into()),
+            roles: vec![],
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        })
+        .unwrap()
+        .isolation_claims()
+        .unwrap()
+        .clone()
     }
 
     #[tokio::test]
@@ -1441,8 +1468,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let isolation =
-            IsolationClaims::from_verified("tenant-not-mcp", "project", "actor").unwrap();
+        let isolation = test_isolation_claims();
         let bearer = mint_outbound_mcp_jwt("server-id", &isolation).unwrap();
         let result = invoke_http_mcp(
             &format!("http://{address}/mcp"),
@@ -1679,6 +1705,11 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_catalog_endpoint_is_rejected_before_outbound_request() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
         let requests = Arc::new(AtomicUsize::new(0));
         async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
             requests.fetch_add(1, Ordering::SeqCst);
@@ -1721,6 +1752,10 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
     }
 
     #[tokio::test]
@@ -1781,7 +1816,7 @@ mod tests {
         }));
         assert_eq!(
             invoke(without_project).await.status(),
-            StatusCode::UNPROCESSABLE_ENTITY
+            StatusCode::SERVICE_UNAVAILABLE
         );
         let without_tenant = raw_inbound_identity_token(json!({
             "sub": "test-user",
@@ -1791,6 +1826,17 @@ mod tests {
         }));
         assert_eq!(
             invoke(without_tenant).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let empty_project = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "tenant_id": "test-tenant",
+            "project_id": "",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        assert_eq!(
+            invoke(empty_project).await.status(),
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(requests.load(Ordering::SeqCst), 0);

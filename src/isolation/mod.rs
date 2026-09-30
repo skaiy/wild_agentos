@@ -57,8 +57,9 @@ pub enum IsolationError {
 impl IsolationClaims {
     /// Builds claims from values that an authentication boundary has verified.
     ///
-    /// This is intentionally the sole public constructor. Verification itself
-    /// belongs to an upstream authentication boundary, not this kernel module.
+    /// This constructor is for verified scopes that did not originate from an
+    /// inbound JWT. Such scopes are intentionally not eligible for outbound
+    /// MCP credential minting.
     pub fn from_verified(
         tenant_id: impl Into<String>,
         project_id: impl Into<String>,
@@ -72,32 +73,12 @@ impl IsolationClaims {
         assert_project_id(&project_id)?;
         assert_actor_id(&actor_id)?;
 
-        Self::from_verified_with_provenance(tenant_id, project_id, actor_id, true, true)
-    }
-
-    /// Builds verified claims while preserving whether the authentication
-    /// boundary received each scope value explicitly instead of defaulting it.
-    pub fn from_verified_with_provenance(
-        tenant_id: impl Into<String>,
-        project_id: impl Into<String>,
-        actor_id: impl Into<String>,
-        explicit_tenant_id: bool,
-        explicit_project_id: bool,
-    ) -> Result<Self, IsolationError> {
-        let tenant_id = tenant_id.into();
-        let project_id = project_id.into();
-        let actor_id = actor_id.into();
-
-        assert_tenant_id(&tenant_id)?;
-        assert_project_id(&project_id)?;
-        assert_actor_id(&actor_id)?;
-
         Ok(Self {
             tenant_id,
             project_id,
             actor_id,
-            explicit_tenant_id,
-            explicit_project_id,
+            explicit_tenant_id: false,
+            explicit_project_id: false,
         })
     }
 
@@ -124,6 +105,23 @@ impl IsolationClaims {
     /// Whether the verified token explicitly contained `project_id`.
     pub fn explicit_project_id(&self) -> bool {
         self.explicit_project_id
+    }
+
+    /// Marks scope provenance only after JWT verification has completed.
+    ///
+    /// This is crate-private so non-authentication callers cannot mint
+    /// outbound credentials by asserting claim provenance.
+    pub(crate) fn from_verified_jwt(
+        tenant_id: impl Into<String>,
+        project_id: impl Into<String>,
+        actor_id: impl Into<String>,
+        explicit_tenant_id: bool,
+        explicit_project_id: bool,
+    ) -> Result<Self, IsolationError> {
+        let mut claims = Self::from_verified(tenant_id, project_id, actor_id)?;
+        claims.explicit_tenant_id = explicit_tenant_id;
+        claims.explicit_project_id = explicit_project_id;
+        Ok(claims)
     }
 
     /// Mints the tenant/project graph IRI without accessing a graph store.
