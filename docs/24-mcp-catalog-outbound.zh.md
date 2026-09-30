@@ -31,9 +31,9 @@ Catalog JSON 永不接收密钥。若要让一个 Catalog 条目使用此流程�
 `auth_kind: "bearer_jwt"`。持久化的 Catalog 记录只包含固定的环境变量引用
 （`MCP_JWT_SECRET`、`MCP_JWT_ISSUER` 和 `MCP_JWT_SUBJECT`）。
 
-`MCP_JWT_SUB` 已弃用。严格鉴权下，如果只设置该旧变量，启动会被拒绝；在此检查
-中，空值或全空白的主体变量视为未设置。如果两个变量都已设置，
-`MCP_JWT_SUBJECT` 优先。
+`MCP_JWT_SUB` 已弃用。严格鉴权下，如果设置该旧变量但没有有效的
+`MCP_JWT_SUBJECT`，启动会被拒绝；即使旧变量的值为空或全为空白，也同样如此。
+如果两个变量都已设置，`MCP_JWT_SUBJECT` 优先。
 
 ## 配置出站边界
 

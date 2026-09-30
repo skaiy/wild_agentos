@@ -38,9 +38,9 @@ contains only the fixed environment-variable references (`MCP_JWT_SECRET`,
 `MCP_JWT_ISSUER`, and `MCP_JWT_SUBJECT`).
 
 `MCP_JWT_SUB` is deprecated. Under strict authentication, startup refuses a
-configuration that sets only that legacy variable; empty or whitespace-only
-subject variables are treated as unset for this check. If both variables are
-set, `MCP_JWT_SUBJECT` takes precedence.
+configuration that sets that legacy variable without a valid
+`MCP_JWT_SUBJECT`, including when the legacy value is empty or whitespace-only.
+If both variables are set, `MCP_JWT_SUBJECT` takes precedence.
 
 ## Configure outbound boundaries
 
