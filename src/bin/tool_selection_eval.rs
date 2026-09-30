@@ -232,7 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_live_env()?;
     }
 
-    let executor = ToolExecutor::new();
+    // Mirror production exposure: only resident tools are present until an
+    // on-demand group is activated for the run.
+    let mut executor = ToolExecutor::new();
+    executor.set_tool_group_manager(ToolGroupManager::new(None));
     let client = reqwest::Client::new();
     let mut previous_surface: HashMap<String, (Vec<String>, String)> = HashMap::new();
     let mut results = Vec::with_capacity(case_file.cases.len());

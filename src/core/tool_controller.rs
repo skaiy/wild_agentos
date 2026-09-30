@@ -187,6 +187,44 @@ mod tests {
     }
 
     #[test]
+    fn role_execution_permissions_match_main_snapshot() {
+        let executor = crate::tools::tool_executor::ToolExecutor::new();
+        let registered = executor.registered_tool_names();
+        let tc = ToolController::new();
+        let plan_main = [
+            "file_read",
+            "file_list",
+            "grep_search",
+            "glob_search",
+            "tool_search",
+            "web_search",
+            "web_fetch",
+            "rag_search",
+            "knowledge_list",
+            "knowledge_search",
+            "kg_search",
+            "knowledge_extract_code",
+        ];
+
+        let allowed_for = |role: AgentRole| {
+            registered
+                .iter()
+                .map(String::as_str)
+                .filter(|tool| tc.is_tool_allowed_for_role(tool, &role))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let all_registered = registered.iter().map(String::as_str).collect();
+
+        assert_eq!(
+            allowed_for(AgentRole::Plan),
+            plan_main.into_iter().collect()
+        );
+        assert_eq!(allowed_for(AgentRole::Do), all_registered);
+        assert_eq!(allowed_for(AgentRole::Check), all_registered);
+        assert_eq!(allowed_for(AgentRole::Act), all_registered);
+    }
+
+    #[test]
     fn test_list_available_tools() {
         let tc = ToolController::new();
         let plan_tools = tc.list_available_tools(&AgentRole::Plan);

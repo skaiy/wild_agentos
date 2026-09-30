@@ -614,6 +614,7 @@ Output the summary report directly, not in JSON format."#,
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
+                cached_prompt_tokens: u.cached_prompt_tokens,
             });
 
         Ok(crate::gateway::unified_gateway::ChatCompletionResponse {
@@ -756,7 +757,17 @@ Output the summary report directly, not in JSON format."#,
         );
 
         // Region 5: Tools area (built-in tools + dynamic tools)
-        let tool_menu = self.build_readable_tool_menu(&agent.role);
+        let mut tool_menu = self.build_readable_tool_menu(&agent.role);
+        let group_directory = self
+            .tool_executor
+            .read()
+            .build_tool_group_summary(&agent.role.to_string());
+        if !group_directory.is_empty() {
+            if !tool_menu.is_empty() {
+                tool_menu.push_str("\n\n");
+            }
+            tool_menu.push_str(&group_directory);
+        }
         if !tool_menu.is_empty() {
             prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
         }
@@ -880,10 +891,11 @@ Output the summary report directly, not in JSON format."#,
             reasoning_content: None,
         });
 
+        let mut activated_tools = self.tool_executor.read().activated_tools();
         let tools = self
             .tool_executor
             .read()
-            .tool_definitions_for_role(&agent.role.to_string());
+            .tool_definitions_for_turn(&agent.role.to_string(), &activated_tools);
 
         info!(
             "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}",
@@ -1378,7 +1390,7 @@ Output the summary report directly, not in JSON format."#,
             let current_tools = self
                 .tool_executor
                 .read()
-                .tool_definitions_for_role(&agent.role.to_string());
+                .tool_definitions_for_turn(&agent.role.to_string(), &activated_tools);
             let advertised_tools: Vec<String> = current_tools
                 .iter()
                 .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
@@ -1388,6 +1400,15 @@ Output the summary report directly, not in JSON format."#,
             } else {
                 Some(current_tools)
             };
+            tracing::info!(
+                tools_exposed = advertised_tools.len(),
+                tools_schema_bytes = tools
+                    .as_ref()
+                    .and_then(|definitions| serde_json::to_vec(definitions).ok())
+                    .map_or(0, |bytes| bytes.len()),
+                activation_events = activated_tools.activation_events(),
+                "tool exposure for turn"
+            );
             // 流式调用：逐 token 推送 LLM_CONTENT 供任务控制台「逐字输出」，
             // 聚合回完整响应后主循环逻辑保持不变；失败自动回退非流式。
             let response = self
@@ -1400,10 +1421,26 @@ Output the summary report directly, not in JSON format."#,
                     .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
                 self.total_completion_tokens
                     .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+                if let Some(cached) = usage.cached_prompt_tokens {
+                    self.total_cached_prompt_tokens
+                        .fetch_add(cached as u64, Ordering::Relaxed);
+                }
                 self.last_prompt_tokens
                     .store(usage.prompt_tokens as u64, Ordering::Relaxed);
                 self.last_completion_tokens
                     .store(usage.completion_tokens as u64, Ordering::Relaxed);
+                let prompt = self.total_prompt_tokens.load(Ordering::Relaxed);
+                let cached = self.total_cached_prompt_tokens.load(Ordering::Relaxed);
+                tracing::info!(
+                    prompt_tokens = prompt,
+                    cached_prompt_tokens = cached,
+                    cache_hit_rate = if prompt == 0 {
+                        0.0
+                    } else {
+                        cached as f64 / prompt as f64
+                    },
+                    "token usage"
+                );
             }
 
             {
@@ -2057,7 +2094,7 @@ Output the summary report directly, not in JSON format."#,
                             // also applies executor security, permission, hook and
                             // syscall policies.
                             let executor = self.tool_executor.read().clone();
-                            let result = executor
+                            let mut result = executor
                                 .execute_with_security_context_and_claims(
                                     name,
                                     args,
@@ -2071,6 +2108,25 @@ Output the summary report directly, not in JSON format."#,
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));
+                            if name == "tool_search" {
+                                let activation = executor.activate_on_demand_from_search(
+                                    &agent.role.to_string(),
+                                    &mut activated_tools,
+                                    &result,
+                                );
+                                if let Some(object) = result.as_object_mut() {
+                                    object.insert(
+                                        "activated".to_string(),
+                                        json!(activation.activated),
+                                    );
+                                    if !activation.skipped.is_empty() {
+                                        object.insert(
+                                            "activation_skipped".to_string(),
+                                            json!(activation.skipped),
+                                        );
+                                    }
+                                }
+                            }
                             action_tracker.record(
                                 name,
                                 &args_clone,
