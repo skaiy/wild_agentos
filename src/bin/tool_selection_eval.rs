@@ -414,7 +414,7 @@ fn validate_case(case: &GoldenCase) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("{} has an unsupported role", case.id).into());
     }
     for turn in case.turns_or_default() {
-        if turn.no_tool_correct == turn.expected_tools.is_empty() {
+        if turn.no_tool_correct != turn.expected_tools.is_empty() {
             return Err(format!(
                 "{} must have expected tools xor no_tool_correct on every turn",
                 case.id
