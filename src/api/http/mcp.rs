@@ -943,7 +943,13 @@ mod tests {
         Json, Router,
     };
     use jsonwebtoken::{decode, DecodingKey, Validation};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        io::Write,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
@@ -2460,6 +2466,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn non_strict_legacy_subject_warning_omits_value_and_mints_default_subject() {
+        struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CapturedWriter {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        let previous_subject = std::env::var_os("MCP_JWT_SUBJECT");
+        let previous_legacy_subject = std::env::var_os("MCP_JWT_SUB");
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let sentinel = "legacy-subject-sentinel-7f3a";
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("MCP_JWT_SUBJECT");
+        std::env::set_var("MCP_JWT_SUB", sentinel);
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedWriter(output.clone())
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(validate_strict_mcp_outbound_configuration().is_ok());
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("MCP_JWT_SUB").count(), 1);
+        assert!(!output.contains(sentinel));
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_aud = false;
+        let token = mint_outbound_mcp_jwt("catalog-server", &test_isolation_claims()).unwrap();
+        let claims = decode::<OutboundMcpJwtClaims>(
+            &token,
+            &DecodingKey::from_secret(b"outbound-mcp-test-secret"),
+            &validation,
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(claims.sub, "wao-core");
+
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+        match previous_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUBJECT", value),
+            None => std::env::remove_var("MCP_JWT_SUBJECT"),
+        }
+        match previous_legacy_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUB", value),
+            None => std::env::remove_var("MCP_JWT_SUB"),
+        }
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+    }
+
     #[tokio::test]
     async fn oversized_json_response_returns_a_clear_bounded_error() {
         let _guard = crate::api::http::TEST_ENV_LOCK
@@ -2571,7 +2652,7 @@ mod tests {
                 "/servers/:id",
                 axum::routing::delete(delete_mcp_server_handler),
             )
-            .with_state(state);
+            .with_state(state.clone());
         let request = axum::http::Request::builder()
             .method("DELETE")
             .uri("/servers/catalog-server")
@@ -2585,6 +2666,11 @@ mod tests {
             delete.oneshot(request).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
+        let catalog = state.mcp_servers.read().await;
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog
+            .iter()
+            .any(|server| server["name"].as_str() == Some("catalog-server")));
         match previous_data_dir {
             Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
             None => std::env::remove_var("AGENTOS_DATA_DIR"),
