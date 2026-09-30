@@ -103,7 +103,10 @@ impl ToolPolicy {
         let mut cap: HashSet<String> = resident.union(&on_demand).cloned().collect();
 
         match role {
-            AgentRole::Plan | AgentRole::Act => {
+            AgentRole::Plan => {
+                cap.retain(|name| Self::plan_readonly_tools().contains(&name.as_str()));
+            }
+            AgentRole::Act => {
                 cap.retain(|name| Self::is_readonly_tool(name));
             }
             AgentRole::Check => {
@@ -139,6 +142,9 @@ impl ToolPolicy {
             || name.starts_with("get_entity_details_")
             || name.starts_with("expand_relation_")
         {
+            if *role == AgentRole::Plan {
+                return false;
+            }
             return self
                 .visible_tools(role, agent_id)
                 .iter()
@@ -151,6 +157,10 @@ impl ToolPolicy {
 
     pub fn is_executable(&self, role: &AgentRole, agent_id: &str, name: &str) -> bool {
         self.is_visible(role, agent_id, name)
+    }
+
+    pub fn check_bash_enabled(&self) -> bool {
+        self.check_bash_enabled
     }
 
     /// Apply a trusted restriction for this run. Values outside the role cap
@@ -187,7 +197,11 @@ mod tests {
             assert!(!policy.is_executable(&role, "agent", "knowledge_delete"));
             assert!(!policy.is_executable(&role, "agent", "ontology_register"));
             assert!(!policy.is_executable(&role, "agent", "not_registered"));
-            assert!(policy.is_executable(&role, "agent", "read_full_result_test"));
+            assert_eq!(
+                policy.is_executable(&role, "agent", "read_full_result_test"),
+                role != AgentRole::Plan,
+                "{role:?}"
+            );
         }
         assert!(!policy.is_executable(&AgentRole::Check, "agent", "bash"));
         assert!(ToolPolicy::new()
@@ -202,5 +216,20 @@ mod tests {
         assert!(policy.is_executable(&AgentRole::Do, "agent", "file_read"));
         assert!(!policy.is_executable(&AgentRole::Do, "agent", "file_write"));
         assert!(!policy.is_executable(&AgentRole::Plan, "agent", "bash"));
+    }
+
+    #[test]
+    fn plan_cap_ignores_extra_configured_groups() {
+        let mut settings = crate::tools::tool_groups::ToolGroupSettings::default();
+        settings
+            .roles
+            .get_mut("Plan")
+            .unwrap()
+            .default
+            .push("Workspace".to_string());
+        let policy =
+            ToolPolicy::new().with_tool_group_manager(ToolGroupManager::new(Some(settings)));
+        assert!(!policy.is_executable(&AgentRole::Plan, "agent", "workspace_status"));
+        assert!(!policy.is_executable(&AgentRole::Plan, "agent", "read_full_result_test"));
     }
 }

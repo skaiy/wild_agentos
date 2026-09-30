@@ -13,6 +13,7 @@ use crate::jsonld::{generate_iri, validate_jsonld_node, JsonLdContext, JsonLdNod
 use crate::memory::l1_session::L1Session;
 use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
+use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
 use super::{
@@ -743,8 +744,10 @@ impl super::AgentRunner {
             },
         ];
 
+        let restriction_guard = self.begin_tool_restriction_run(&ctx.task_iri);
+        let run_id = restriction_guard.run_id().to_string();
         let mut activated_tools = self.tool_executor.read().activated_tools();
-        if let Some(allowed) = self.run_tool_restriction(&ctx.task_iri) {
+        if let Some(allowed) = self.run_tool_restriction(&run_id) {
             activated_tools.restrict_tools(&agent.agent_id, allowed);
         }
         let tools = self
@@ -791,7 +794,7 @@ impl super::AgentRunner {
 
             // The schema payload is the authoritative executable set for this
             // turn. Keep its names for tool-call validation after the response.
-            if let Some(allowed) = self.run_tool_restriction(&ctx.task_iri) {
+            if let Some(allowed) = self.run_tool_restriction(&run_id) {
                 activated_tools.restrict_tools(&agent.agent_id, allowed);
             }
             let current_tools = self
@@ -896,13 +899,7 @@ impl super::AgentRunner {
                             let disallowed_tools: Vec<&str> = tool_calls
                                 .iter()
                                 .map(|c| c.name.as_str())
-                                .filter(|name| {
-                                    !activated_tools.policy().is_executable(
-                                        &agent.role,
-                                        &agent.agent_id,
-                                        name,
-                                    )
-                                })
+                                .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
                                 .collect();
                             let force_finish = !disallowed_tools.is_empty();
                             if force_finish {

@@ -1994,17 +1994,24 @@ mod tests {
         let without_project = raw_inbound_identity_token(json!({
             "sub": "test-user",
             "tenant_id": "test-tenant",
-            "roles": [],
+            "roles": ["DA"],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
+        let response = invoke(without_project).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            invoke(without_project).await.status(),
-            StatusCode::FORBIDDEN
+            serde_json::from_slice::<Value>(
+                &axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"error": "mcp_claims_incomplete", "missing_field": "project_id"})
         );
         let without_tenant = raw_inbound_identity_token(json!({
             "sub": "test-user",
             "project_id": "default",
-            "roles": [],
+            "roles": ["DA"],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
         assert_eq!(
@@ -2015,10 +2022,20 @@ mod tests {
             "sub": "test-user",
             "tenant_id": "test-tenant",
             "project_id": "",
-            "roles": [],
+            "roles": ["DA"],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
-        assert_eq!(invoke(empty_project).await.status(), StatusCode::FORBIDDEN);
+        let response = invoke(empty_project).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"error": "mcp_claims_incomplete", "missing_field": "project_id"})
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         let explicit_default = raw_inbound_identity_token(json!({

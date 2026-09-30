@@ -1601,7 +1601,7 @@ impl ToolExecutor {
             _ => role,
         };
 
-        let (resident_tools, on_demand_tools) = if let Some(manager) = self
+        let (mut resident_tools, on_demand_tools) = if let Some(manager) = self
             .tool_group_manager
             .as_ref()
             .filter(|manager| manager.is_enabled())
@@ -1648,6 +1648,9 @@ impl ToolExecutor {
         let agent_role = role.parse::<AgentRole>().unwrap_or(AgentRole::Act);
         let policy_is_allowed =
             |name: &str| activated.policy().is_visible(&agent_role, agent_id, name);
+        if agent_role == AgentRole::Check && activated.policy().check_bash_enabled() {
+            resident_tools.insert("bash".to_string());
+        }
         let role_is_allowed = |td: &ToolDescription| {
             td.allowed_roles.is_empty()
                 || td.allowed_roles.iter().any(|allowed| {

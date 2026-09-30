@@ -28,6 +28,13 @@ impl ToolController {
     pub fn list_available_tools(&self, role: &AgentRole) -> Vec<String> {
         self.policy.visible_tools(role, "")
     }
+
+    pub fn should_force_finish(&self, tool_names: &[&str], role: &AgentRole) -> bool {
+        *role == AgentRole::Plan
+            && tool_names
+                .iter()
+                .any(|name| !crate::tools::tool_executor::ToolExecutor::is_pa_readonly_tool(name))
+    }
 }
 
 impl Default for ToolController {
@@ -99,6 +106,10 @@ mod tests {
             allowed_for(AgentRole::Plan),
             plan_main.into_iter().collect()
         );
+        assert!(!tc.is_tool_allowed_for_role("read_full_result_test", &AgentRole::Plan));
+        for role in [AgentRole::Do, AgentRole::Check, AgentRole::Act] {
+            assert!(tc.is_tool_allowed_for_role("read_full_result_test", &role));
+        }
         assert_eq!(
             allowed_for(AgentRole::Do),
             [
@@ -197,5 +208,19 @@ mod tests {
         assert!(!plan_tools.contains(&"file_write".to_string()));
         let do_tools = tc.list_available_tools(&AgentRole::Do);
         assert!(do_tools.contains(&"file_write".to_string()));
+    }
+
+    #[test]
+    fn test_should_force_finish_plan() {
+        let tc = ToolController::new();
+        for name in [
+            "file_write",
+            "bash",
+            "not_in_plan_allowlist",
+            "read_full_result_x",
+        ] {
+            assert!(tc.should_force_finish(&[name], &AgentRole::Plan), "{name}");
+        }
+        assert!(!tc.should_force_finish(&["file_read"], &AgentRole::Plan));
     }
 }

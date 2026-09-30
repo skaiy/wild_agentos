@@ -62,7 +62,14 @@ impl WhitelistManager {
     }
 
     pub fn add_tool(&mut self, role: AgentRole, tool_name: &str) {
-        warn!(role = %role, tool = %tool_name, "Ignoring attempt to widen role whitelist");
+        if crate::core::tool_policy::ToolPolicy::new().is_executable(&role, "", tool_name) {
+            self.role_whitelist
+                .entry(role)
+                .or_default()
+                .insert(tool_name.to_string());
+        } else {
+            warn!(role = %role, tool = %tool_name, "Ignoring attempt to widen role whitelist");
+        }
     }
 
     pub fn remove_tool(&mut self, role: &AgentRole, tool_name: &str) {
@@ -362,10 +369,11 @@ mod tests {
     #[test]
     fn test_whitelist_manager_add_remove() {
         let mut wm = WhitelistManager::new();
-        assert!(!wm.check_permission(&AgentRole::Plan, "custom_new_tool"));
+        wm.remove_tool(&AgentRole::Plan, "file_read");
+        assert!(!wm.check_permission(&AgentRole::Plan, "file_read"));
+        wm.add_tool(AgentRole::Plan, "file_read");
+        assert!(wm.check_permission(&AgentRole::Plan, "file_read"));
         wm.add_tool(AgentRole::Plan, "custom_new_tool");
-        assert!(!wm.check_permission(&AgentRole::Plan, "custom_new_tool"));
-        wm.remove_tool(&AgentRole::Plan, "custom_new_tool");
         assert!(!wm.check_permission(&AgentRole::Plan, "custom_new_tool"));
     }
 

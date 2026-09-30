@@ -46,7 +46,9 @@ handler。
 Plan、Check 与 Act 默认只读。只有在明确开启服务端
 `token_optimization.tool_groups.check_bash_enabled` 时，Check 才能执行 `bash`。
 此开关有风险：shell 命令可能执行不可信工作区内容并改变环境；除非 operator 接受该
-风险，应保持默认值 `false`。审计 warning 只包含 agent、角色与工具名，不包含工具参数。
+风险，应保持默认值 `false`。开启时仅将 `bash` 加入 Check 的广告和可执行集合，不会
+启用 Write 组或其他 shell/编辑工具。审计 warning 只包含 agent、角色与工具名，不包含
+工具参数。
 
 ## 激活和缓存行为
 

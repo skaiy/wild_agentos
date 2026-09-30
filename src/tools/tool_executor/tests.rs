@@ -191,6 +191,11 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .all(ToolExecutor::is_pa_readonly_tool));
 
+        let check = executor
+            .search_tools_for_role("Check", json!({"query": "write file shell command"}))
+            .unwrap();
+        assert_eq!(check["count"], 0);
+
         let do_results = executor
             .search_tools_for_role("Do", json!({"query": "write file shell command"}))
             .unwrap();
@@ -300,6 +305,38 @@ mod tests {
         executor.set_tool_group_manager(ToolGroupManager::new(None));
         definitions_exclude_bash(&executor, "Plan");
         definitions_exclude_bash(&executor, "PA");
+    }
+
+    #[test]
+    fn check_bash_switch_exposes_only_bash_when_enabled() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+
+        let disabled = executor.activated_tools();
+        let disabled_names: Vec<&str> = executor
+            .tool_definitions_for_turn("Check", &disabled)
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(!disabled_names.contains(&"bash"));
+        assert!(!disabled
+            .policy()
+            .is_executable(&AgentRole::Check, "", "bash"));
+
+        let enabled = executor
+            .activated_tools()
+            .with_policy(ToolPolicy::new().with_check_bash_enabled(true));
+        let enabled_names: Vec<&str> = executor
+            .tool_definitions_for_turn("Check", &enabled)
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(enabled_names.contains(&"bash"));
+        assert!(!enabled_names.contains(&"file_write"));
+        assert!(!enabled_names.contains(&"powershell"));
+        assert!(enabled
+            .policy()
+            .is_executable(&AgentRole::Check, "", "bash"));
     }
 
     #[test]
@@ -569,6 +606,25 @@ mod tests {
                 unadvertised["error"],
                 "Tool not advertised for this turn: file_read"
             );
+        });
+    }
+
+    #[test]
+    fn check_returns_structured_role_denial_without_invoking_handler() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let result = executor
+                .execute_with_security_context(
+                    "bash",
+                    json!({"command": "must not execute"}),
+                    SecurityContext::new("agent:check", "CA"),
+                    &["bash".to_string()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["error"], "Tool not allowed for role");
+            assert_eq!(result["tool"], "bash");
+            assert_eq!(result["role"], "CA");
         });
     }
 

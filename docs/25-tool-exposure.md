@@ -51,8 +51,10 @@ Plan, Check, and Act are read-only by default. Check may execute `bash` only
 when the server-owned `token_optimization.tool_groups.check_bash_enabled`
 switch is explicitly enabled. This is risky: shell commands can execute
 untrusted workspace content and may change the environment, so keep the
-default `false` unless an operator accepts that risk. Audit warnings include
-only the agent, role, and tool name—never tool arguments.
+default `false` unless an operator accepts that risk. When enabled, this adds
+only `bash` to Check's advertised and executable set; it does not enable the
+Write group or other shell/editing tools. Audit warnings include only the
+agent, role, and tool name—never tool arguments.
 
 ## Activation and cache behavior
 
