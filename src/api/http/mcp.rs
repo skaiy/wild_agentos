@@ -1954,4 +1954,633 @@ mod tests {
             None => std::env::remove_var("AGENTOS_DATA_DIR"),
         }
     }
+
+    #[tokio::test]
+    async fn audience_isolated_sidecars_reject_a_token_for_another_server() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_audience = std::env::var_os("MCP_TEST_AUDIENCE_A");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("MCP_TEST_AUDIENCE_A", "sidecar-a");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        async fn audience_handler(
+            State(expected_audience): State<&'static str>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let Some(token) = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+            else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            let mut validation = Validation::new(Algorithm::HS256);
+            validation.set_audience(&[expected_audience]);
+            if decode::<OutboundMcpJwtClaims>(
+                token,
+                &DecodingKey::from_secret(b"outbound-mcp-test-secret"),
+                &validation,
+            )
+            .is_err()
+            {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": {"ok": true}}))
+                .into_response()
+        }
+
+        async fn start_audience_sidecar(audience: &'static str) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/mcp", post(audience_handler))
+                .with_state(audience);
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{address}/mcp")
+        }
+
+        let sidecar_a = start_audience_sidecar("sidecar-a").await;
+        let sidecar_b = start_audience_sidecar("sidecar-b").await;
+        let server_a = json!({
+            "id": "catalog-a",
+            "name": "catalog-a",
+            "endpoint": sidecar_a,
+            "endpoint_origin": endpoint_origin(&sidecar_a).unwrap(),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "audience_env": "MCP_TEST_AUDIENCE_A",
+            "allowed_tools": ["read_status"],
+            "write_tools_enabled": false,
+            "tenantId": "test-tenant",
+            "projectId": "test-project",
+        });
+        let audience = outbound_mcp_audience(&server_a).unwrap();
+        assert_eq!(audience, "sidecar-a");
+        let bearer = mint_outbound_mcp_jwt(&audience, &test_isolation_claims()).unwrap();
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_aud = false;
+        assert_eq!(
+            decode::<OutboundMcpJwtClaims>(
+                &bearer,
+                &DecodingKey::from_secret(b"outbound-mcp-test-secret"),
+                &validation,
+            )
+            .unwrap()
+            .claims
+            .aud,
+            "sidecar-a"
+        );
+        assert!(
+            invoke_http_mcp(&sidecar_a, &bearer, "read_status", json!({}), None)
+                .await
+                .is_ok()
+        );
+        let cross_audience = invoke_http_mcp(&sidecar_b, &bearer, "read_status", json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(cross_audience, InvokeHttpMcpError::Transport(message) if message.contains("401"))
+        );
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_audience {
+            Some(value) => std::env::set_var("MCP_TEST_AUDIENCE_A", value),
+            None => std::env::remove_var("MCP_TEST_AUDIENCE_A"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_empty_audience_environment_fails_closed_before_request() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_audience = std::env::var_os("MCP_TEST_REQUIRED_AUDIENCE");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests_for_server = requests.clone();
+        let endpoint = format!("http://{address}/mcp");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/mcp", post(mock_handler))
+                    .with_state(requests_for_server),
+            )
+            .await
+            .unwrap()
+        });
+        let server = json!({
+            "id": "catalog-server",
+            "name": "catalog-server",
+            "endpoint": endpoint,
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "audience_env": "MCP_TEST_REQUIRED_AUDIENCE",
+            "allowed_tools": ["read_status"],
+            "write_tools_enabled": false,
+            "tenantId": "test-tenant",
+            "projectId": "test-project",
+        });
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![server]));
+        for value in [None, Some("")] {
+            match value {
+                Some(value) => std::env::set_var("MCP_TEST_REQUIRED_AUDIENCE", value),
+                None => std::env::remove_var("MCP_TEST_REQUIRED_AUDIENCE"),
+            }
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/invoke")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", inbound_identity_token()))
+                .body(Body::from(
+                    json!({"server": "catalog-server", "tool_name": "read_status", "arguments": {}})
+                        .to_string(),
+                ))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+        }
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_audience {
+            Some(value) => std::env::set_var("MCP_TEST_REQUIRED_AUDIENCE", value),
+            None => std::env::remove_var("MCP_TEST_REQUIRED_AUDIENCE"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
+    #[test]
+    fn outbound_jwt_subject_defaults_and_is_overridable() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_subject = std::env::var_os("MCP_JWT_SUBJECT");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::remove_var("MCP_JWT_SUBJECT");
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_aud = false;
+        let decoding_key = DecodingKey::from_secret(b"outbound-mcp-test-secret");
+        assert_eq!(
+            decode::<OutboundMcpJwtClaims>(
+                &mint_outbound_mcp_jwt("catalog-server", &test_isolation_claims()).unwrap(),
+                &decoding_key,
+                &validation,
+            )
+            .unwrap()
+            .claims
+            .sub,
+            "wao-core"
+        );
+        std::env::set_var("MCP_JWT_SUBJECT", "custom-mcp-subject");
+        assert_eq!(
+            decode::<OutboundMcpJwtClaims>(
+                &mint_outbound_mcp_jwt("catalog-server", &test_isolation_claims()).unwrap(),
+                &decoding_key,
+                &validation,
+            )
+            .unwrap()
+            .claims
+            .sub,
+            "custom-mcp-subject"
+        );
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUBJECT", value),
+            None => std::env::remove_var("MCP_JWT_SUBJECT"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_json_response_returns_a_clear_bounded_error() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_limit = std::env::var_os("MCP_OUTBOUND_MAX_RESPONSE_BYTES");
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("MCP_OUTBOUND_MAX_RESPONSE_BYTES", "64");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        async fn large_response(Json(body): Json<Value>) -> Json<Value> {
+            Json(
+                json!({"jsonrpc": "2.0", "id": body["id"], "result": {"payload": "x".repeat(4096)}}),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/mcp", post(large_response)))
+                .await
+                .unwrap()
+        });
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![json!({
+                "id": "large-server", "name": "large-server",
+                "endpoint": format!("http://{address}/mcp"),
+                "endpoint_origin": format!("http://{address}"),
+                "protocol": "http", "auth": {"kind": "bearer_jwt"},
+                "allowed_tools": ["read_status"], "write_tools_enabled": false,
+                "tenantId": "test-tenant", "projectId": "test-project",
+            })]));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({"server": "large-server", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("exceeded 64 byte limit"));
+
+        match previous_limit {
+            Some(value) => std::env::set_var("MCP_OUTBOUND_MAX_RESPONSE_BYTES", value),
+            None => std::env::remove_var("MCP_OUTBOUND_MAX_RESPONSE_BYTES"),
+        }
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "expected-fail until #257 restricts catalog mutation to a dedicated MCP admin role"]
+    async fn da_service_token_cannot_register_mcp_server() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", data_dir.path());
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        let state = test_app_state(vec![]);
+        let app = Router::new()
+            .route("/servers", post(register_mcp_server_handler))
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/servers")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])))
+            .body(Body::from(
+                json!({"name": "catalog-server", "endpoint": "http://127.0.0.1:8080/mcp", "protocol": "http"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        match previous_data_dir {
+            Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+            None => std::env::remove_var("AGENTOS_DATA_DIR"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "expected-fail until #257 disables outbound redirects"]
+    async fn redirect_to_non_allowlisted_origin_is_not_followed() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved: Vec<_> = [
+            "MCP_JWT_SECRET",
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            "AGENTOS_AUTH_MODE",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        let redirected_requests = Arc::new(AtomicUsize::new(0));
+        async fn destination(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+        let destination_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_address = destination_listener.local_addr().unwrap();
+        let redirected_requests_for_server = redirected_requests.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                destination_listener,
+                Router::new()
+                    .route("/mcp", post(destination))
+                    .with_state(redirected_requests_for_server),
+            )
+            .await
+            .unwrap()
+        });
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let location = format!("http://{destination_address}/mcp");
+        tokio::spawn(async move {
+            axum::serve(
+                redirect_listener,
+                Router::new().route(
+                    "/mcp",
+                    post(move || {
+                        let location = location.clone();
+                        async move {
+                            (
+                                StatusCode::TEMPORARY_REDIRECT,
+                                [(axum::http::header::LOCATION, location)],
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap()
+        });
+        std::env::set_var(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            format!("http://{redirect_address}"),
+        );
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![json!({
+                "id": "redirect-server", "name": "redirect-server",
+                "endpoint": format!("http://{redirect_address}/mcp"),
+                "endpoint_origin": format!("http://{redirect_address}"),
+                "protocol": "http", "auth": {"kind": "bearer_jwt"},
+                "allowed_tools": ["read_status"], "write_tools_enabled": false,
+                "tenantId": "test-tenant", "projectId": "test-project",
+            })]));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({"server": "redirect-server", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_development_allows_unset_outbound_origin_allowlist() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved: Vec<_> = [
+            "AGENTOS_AUTH_STRICT",
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            "MCP_JWT_SECRET",
+            "AGENTOS_AUTH_MODE",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        let data_dir = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var("AGENTOS_DATA_DIR", data_dir.path());
+        assert_eq!(configured_outbound_mcp_origins().unwrap(), None);
+
+        async fn mock_handler() -> Json<Value> {
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/mcp", post(mock_handler)))
+                .await
+                .unwrap()
+        });
+        let state = test_app_state(vec![]);
+        let register = Router::new()
+            .route("/servers", post(register_mcp_server_handler))
+            .with_state(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/servers")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+            )
+            .body(Body::from(
+                json!({
+                    "name": "local-server",
+                    "endpoint": format!("http://{address}/mcp"),
+                    "protocol": "http",
+                    "auth_kind": "bearer_jwt",
+                    "allowed_tools": ["read_status"],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            register.oneshot(request).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let invoke = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+            )
+            .body(Body::from(
+                json!({"server": "local-server", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            invoke.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        match previous_data_dir {
+            Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+            None => std::env::remove_var("AGENTOS_DATA_DIR"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "expected-fail until #257 requires a non-empty outbound origin allowlist in strict mode"]
+    async fn strict_mode_requires_allowlist_and_refuses_catalog_operations_without_it() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved: Vec<_> = [
+            "AGENTOS_AUTH_STRICT",
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            "MCP_JWT_SECRET",
+            "AGENTOS_AUTH_MODE",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        let data_dir = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var("AGENTOS_DATA_DIR", data_dir.path());
+
+        async fn mock_handler() -> Json<Value> {
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/mcp", post(mock_handler)))
+                .await
+                .unwrap()
+        });
+        let server = json!({
+            "id": "strict-server", "name": "strict-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http", "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"], "write_tools_enabled": false,
+            "tenantId": "test-tenant", "projectId": "test-project",
+        });
+        let register = Router::new()
+            .route("/servers", post(register_mcp_server_handler))
+            .with_state(test_app_state(vec![]));
+        let register_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/servers")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+            )
+            .body(Body::from(
+                json!({
+                    "name": "strict-server",
+                    "endpoint": format!("http://{address}/mcp"),
+                    "protocol": "http",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let invoke = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![server]));
+        let invoke_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+            )
+            .body(Body::from(
+                json!({"server": "strict-server", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let register_status = register.oneshot(register_request).await.unwrap().status();
+        let invoke_status = invoke.oneshot(invoke_request).await.unwrap().status();
+        assert_eq!(register_status, StatusCode::FORBIDDEN);
+        assert_eq!(invoke_status, StatusCode::FORBIDDEN);
+
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        match previous_data_dir {
+            Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+            None => std::env::remove_var("AGENTOS_DATA_DIR"),
+        }
+    }
 }
