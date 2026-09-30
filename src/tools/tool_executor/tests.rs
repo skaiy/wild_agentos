@@ -313,8 +313,8 @@ mod tests {
         executor.set_tool_group_manager(ToolGroupManager::new(None));
 
         let disabled = executor.activated_tools();
-        let disabled_names: Vec<&str> = executor
-            .tool_definitions_for_turn("Check", &disabled)
+        let disabled_definitions = executor.tool_definitions_for_turn("Check", &disabled);
+        let disabled_names: Vec<&str> = disabled_definitions
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
@@ -326,8 +326,8 @@ mod tests {
         let enabled = executor
             .activated_tools()
             .with_policy(ToolPolicy::new().with_check_bash_enabled(true));
-        let enabled_names: Vec<&str> = executor
-            .tool_definitions_for_turn("Check", &enabled)
+        let enabled_definitions = executor.tool_definitions_for_turn("Check", &enabled);
+        let enabled_names: Vec<&str> = enabled_definitions
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
