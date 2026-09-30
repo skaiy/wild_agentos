@@ -163,6 +163,9 @@ in the inbound token; a legacy defaulted project scope is not sufficient. A
 project explicitly named `default` remains valid. Incomplete verified scope
 claims return `403` with `mcp_claims_incomplete` and only the missing field
 name; no outbound request is sent.
+JWTs without a tenant claim fail authentication with `401` before catalog
+lookup. A missing or empty project claim keeps the existing default-scope
+compatibility for other endpoints, but remains ineligible for outbound MCP.
 Scopes originating from deployment configuration, including watcher and
 migration processing, are not JWT-verified and return `403
 mcp_claims_unverified` if used for outbound MCP.

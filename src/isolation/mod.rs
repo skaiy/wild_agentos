@@ -58,14 +58,12 @@ pub(crate) enum IsolationScopeProvenance {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IsolationScopeField {
-    TenantId,
     ProjectId,
 }
 
 impl IsolationScopeField {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::TenantId => "tenant_id",
             Self::ProjectId => "project_id",
         }
     }
