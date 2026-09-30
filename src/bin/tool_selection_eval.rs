@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use wild_agent_os_core::tools::{ToolExecutor, ToolGroupManager};
 
@@ -418,7 +418,7 @@ fn registry_coverage(executor: &ToolExecutor) -> RegistryCoverage {
 fn compare_report(
     report: &Report,
     baseline_path: &PathBuf,
-    output: &PathBuf,
+    output: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let baseline: Value = serde_json::from_str(&fs::read_to_string(baseline_path)?)?;
     let current = serde_json::to_value(report)?;
