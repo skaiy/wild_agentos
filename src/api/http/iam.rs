@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::isolation::IsolationClaims;
+use crate::isolation::{IsolationClaims, IsolationScopeField, IsolationScopeProvenance};
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 
@@ -37,6 +37,7 @@ use crate::isolation::IsolationClaims;
 pub struct JwtClaims {
     /// Subject = user_id
     pub sub: String,
+    #[serde(default)]
     pub tenant_id: String,
     /// Project scope for isolation. Legacy tokens without this claim use
     /// the `default` project.
@@ -331,15 +332,32 @@ async fn jwks_for(config: &OidcConfig, refresh: bool) -> Option<Arc<JwkSet>> {
     Some(keys)
 }
 
-fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
-    let project_id = claims
-        .project_id
-        .as_deref()
-        .filter(|project_id| !project_id.is_empty())
-        .unwrap_or("default");
-    let isolation_claims =
-        IsolationClaims::from_verified(claims.tenant_id.clone(), project_id, claims.sub.clone())
-            .ok()?;
+pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
+    let (tenant_id, missing_scope_field) = if claims.tenant_id.trim().is_empty() {
+        ("default", Some(IsolationScopeField::TenantId))
+    } else {
+        (claims.tenant_id.as_str(), None)
+    };
+    let (project_id, missing_scope_field) = match claims.project_id.as_deref() {
+        Some(project_id) if !project_id.trim().is_empty() => (project_id, missing_scope_field),
+        _ => (
+            "default",
+            missing_scope_field.or(Some(IsolationScopeField::ProjectId)),
+        ),
+    };
+    let provenance = if missing_scope_field.is_none() {
+        IsolationScopeProvenance::VerifiedExplicit
+    } else {
+        IsolationScopeProvenance::VerifiedDefaulted
+    };
+    let isolation_claims = IsolationClaims::from_verified_jwt(
+        tenant_id,
+        project_id,
+        claims.sub.clone(),
+        provenance,
+        missing_scope_field,
+    )
+    .ok()?;
     Some(UserIdentity {
         user_id: claims.sub,
         tenant_id: claims.tenant_id,
@@ -457,7 +475,10 @@ mod tests {
         validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims, UserIdentity,
         DEFAULT_HS256_SECRET,
     };
-    use crate::api::http::TEST_ENV_LOCK;
+    use crate::{
+        api::http::TEST_ENV_LOCK,
+        isolation::{IsolationScopeField, IsolationScopeProvenance},
+    };
 
     #[tokio::test]
     async fn strict_mode_rejects_forged_x_identity_before_claims_are_created() {
@@ -616,7 +637,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jwt_with_empty_project_claim_uses_default_project() {
+    async fn jwt_with_empty_project_claim_is_rejected() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_mode = std::env::var_os("AGENTOS_AUTH_MODE");
         std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
@@ -633,13 +654,16 @@ mod tests {
         )
         .unwrap();
 
-        let claims = verify_jwt(&token)
-            .await
-            .unwrap()
-            .isolation_claims()
-            .unwrap()
-            .clone();
-        assert_eq!(claims.project_id(), "default");
+        let identity = verify_jwt(&token).await.unwrap();
+        let claims = identity.isolation_claims().unwrap();
+        assert_eq!(
+            claims.provenance(),
+            IsolationScopeProvenance::VerifiedDefaulted
+        );
+        assert_eq!(
+            claims.missing_scope_field(),
+            Some(IsolationScopeField::ProjectId)
+        );
         restore_env("AGENTOS_AUTH_MODE", previous_mode);
     }
 
@@ -955,9 +979,12 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
             &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
         )
         .unwrap();
-        assert!(
-            verify_jwt(&missing_tenant).await.is_none(),
-            "an OIDC token without tenant_id must not mint claims"
+        let identity = verify_jwt(&missing_tenant)
+            .await
+            .expect("a verified OIDC token keeps defaulted scope provenance");
+        assert_eq!(
+            identity.isolation_claims().unwrap().provenance(),
+            IsolationScopeProvenance::VerifiedDefaulted
         );
 
         std::env::set_var("AGENTOS_OIDC_ISSUER", "https://other-issuer.example.test");

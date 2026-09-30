@@ -158,6 +158,14 @@ used as a bearer credential, but their verified `tenant_id` and `project_id`
 are included as claims in the minted outbound JWT. If either value is absent,
 the service fails closed and does not invoke the endpoint. There is no separate
 administrator bypass path.
+For outbound invocation, both scope claims must have been explicitly present
+in the inbound token; a legacy defaulted project scope is not sufficient. A
+project explicitly named `default` remains valid. Incomplete verified scope
+claims return `403` with `mcp_claims_incomplete` and only the missing field
+name; no outbound request is sent.
+Scopes originating from deployment configuration, including watcher and
+migration processing, are not JWT-verified and return `403
+mcp_claims_unverified` if used for outbound MCP.
 
 MCP sidecars must verify the JWT signature and validate `aud`, `tenant_id`, and
 `project_id` before accepting a request.

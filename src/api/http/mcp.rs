@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{data_dir, iam::UserIdentity, AppState};
+use crate::isolation::IsolationScopeProvenance;
 
 const MAX_ALLOWED_TOOLS: usize = 64;
 const MAX_TOOL_NAME_LENGTH: usize = 128;
@@ -444,6 +445,12 @@ fn mint_outbound_mcp_jwt(
     isolation_claims: &crate::isolation::IsolationClaims,
 ) -> Result<String, String> {
     let secret = mcp_env("MCP_JWT_SECRET", None)?;
+    if isolation_claims.provenance() != IsolationScopeProvenance::VerifiedExplicit {
+        return Err(
+            "verified isolation claims must explicitly include tenant_id and project_id"
+                .to_string(),
+        );
+    }
     let tenant_id = isolation_claims.tenant_id();
     let project_id = isolation_claims.project_id();
     if tenant_id.trim().is_empty() || project_id.trim().is_empty() {
@@ -782,6 +789,30 @@ pub(crate) async fn invoke_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
+    match claims.provenance() {
+        IsolationScopeProvenance::VerifiedExplicit => {}
+        IsolationScopeProvenance::VerifiedDefaulted => {
+            let missing_field = claims
+                .missing_scope_field()
+                .map(|field| field.as_str())
+                .unwrap_or("project_id");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "mcp_claims_incomplete",
+                    "missing_field": missing_field,
+                })),
+            )
+                .into_response();
+        }
+        IsolationScopeProvenance::DeploymentConfig => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "mcp_claims_unverified"})),
+            )
+                .into_response()
+        }
+    }
     if let Err(error) = validate_strict_mcp_outbound_configuration() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -936,6 +967,23 @@ mod tests {
             IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap();
         assert!(mint_outbound_mcp_jwt("server-id", &claims).is_err());
         match previous {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+    }
+
+    #[test]
+    fn non_jwt_scope_claims_cannot_mint_outbound_mcp_credentials() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        let defaulted_scope =
+            IsolationClaims::from_verified("test-tenant", "default", "test-actor").unwrap();
+        let error = mint_outbound_mcp_jwt("server-id", &defaulted_scope).unwrap_err();
+        assert!(error.contains("explicitly include tenant_id and project_id"));
+        match previous_secret {
             Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
             None => std::env::remove_var("MCP_JWT_SECRET"),
         }
@@ -1196,6 +1244,15 @@ mod tests {
         .unwrap()
     }
 
+    fn raw_inbound_identity_token(claims: Value) -> String {
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
     fn inbound_identity_token() -> String {
         inbound_identity_token_with_roles(vec![MCP_CATALOG_ADMIN_ROLE])
     }
@@ -1220,7 +1277,17 @@ mod tests {
     }
 
     fn test_isolation_claims() -> IsolationClaims {
-        IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap()
+        crate::api::http::iam::claims_identity(crate::api::http::iam::JwtClaims {
+            sub: "test-actor".into(),
+            tenant_id: "test-tenant".into(),
+            project_id: Some("test-project".into()),
+            roles: vec![],
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        })
+        .unwrap()
+        .isolation_claims()
+        .unwrap()
+        .clone()
     }
 
     #[tokio::test]
@@ -1441,8 +1508,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let isolation =
-            IsolationClaims::from_verified("tenant-not-mcp", "project", "actor").unwrap();
+        let isolation = test_isolation_claims();
         let bearer = mint_outbound_mcp_jwt("server-id", &isolation).unwrap();
         let result = invoke_http_mcp(
             &format!("http://{address}/mcp"),
@@ -1682,6 +1748,8 @@ mod tests {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
         let requests = Arc::new(AtomicUsize::new(0));
         async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
             requests.fetch_add(1, Ordering::SeqCst);
@@ -1724,6 +1792,116 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_invoke_requires_explicit_inbound_scope_claims() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mock = Router::new()
+            .route("/mcp", post(mock_handler))
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let server = json!({
+            "id": "server-id",
+            "name": "catalog-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "tenantId": "test-tenant",
+            "projectId": "default",
+        });
+
+        let invoke = |token: String| {
+            let app = Router::new()
+                .route("/invoke", post(invoke_mcp_server_handler))
+                .with_state(test_app_state(vec![server.clone()]));
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/invoke")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({"server": "server-id", "tool_name": "read_status", "arguments": {}})
+                        .to_string(),
+                ))
+                .unwrap();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+
+        let without_project = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "tenant_id": "test-tenant",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        assert_eq!(
+            invoke(without_project).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let without_tenant = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "project_id": "default",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_aud = false;
+        let decoded = decode::<crate::api::http::iam::JwtClaims>(
+            &without_tenant,
+            &DecodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+            &validation,
+        )
+        .unwrap();
+        assert!(decoded.claims.tenant_id.is_empty());
+        assert_eq!(invoke(without_tenant).await.status(), StatusCode::FORBIDDEN);
+        let empty_project = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "tenant_id": "test-tenant",
+            "project_id": "",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        assert_eq!(invoke(empty_project).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let explicit_default = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "tenant_id": "test-tenant",
+            "project_id": "default",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        assert_eq!(invoke(explicit_default).await.status(), StatusCode::OK);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
     }
 
     #[tokio::test]
