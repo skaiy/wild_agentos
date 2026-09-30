@@ -76,8 +76,8 @@ use market::{
     rollback_package_handler, upgrade_package_handler,
 };
 use mcp::{
-    invoke_mcp_server_handler, list_mcp_servers_handler, load_mcp_servers,
-    register_mcp_server_handler,
+    delete_mcp_server_handler, invoke_mcp_server_handler, list_mcp_servers_handler,
+    load_mcp_servers, register_mcp_server_handler, validate_strict_mcp_outbound_configuration,
 };
 use mcp_skills::{
     delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
@@ -257,6 +257,9 @@ pub fn build_router(
     online_corpus_watchers: crate::config::OnlineCorpusWatcherSettings,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Router {
+    if let Err(error) = validate_strict_mcp_outbound_configuration() {
+        panic!("invalid MCP outbound configuration: {error}");
+    }
     // 启动时加载用户态注册的技能并重新注册到内存技能表（默认技能由 SemanticCore 播种）。
     for skill in load_user_skills() {
         core.skills.register_skill(skill);
@@ -672,6 +675,7 @@ pub fn build_router(
             "/api/v1/mcp/servers",
             get(list_mcp_servers_handler).post(register_mcp_server_handler),
         )
+        .route("/api/v1/mcp/servers/:id", delete(delete_mcp_server_handler))
         .route(
             "/api/v1/mcp/servers/invoke",
             post(invoke_mcp_server_handler),
