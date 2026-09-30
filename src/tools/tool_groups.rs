@@ -382,6 +382,13 @@ impl ToolGroupManager {
         tools
     }
 
+    /// Returns the stable group assigned to a registered built-in tool.
+    pub fn group_for_tool(&self, tool_name: &str) -> Option<ToolGroup> {
+        self.group_tools
+            .iter()
+            .find_map(|(group, tools)| tools.contains(tool_name).then_some(*group))
+    }
+
     pub fn grouped_tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .group_tools

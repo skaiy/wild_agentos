@@ -985,6 +985,8 @@ impl super::AgentRunner {
                                     &mut activated_tools,
                                     &result,
                                 );
+                                executor
+                                    .mark_search_results_activation(&mut result, &activated_tools);
                                 if let Some(object) = result.as_object_mut() {
                                     object.insert(
                                         "activated".to_string(),
