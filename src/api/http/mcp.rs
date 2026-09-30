@@ -2920,7 +2920,7 @@ mod tests {
                 "authorization",
                 format!(
                     "Bearer {}",
-                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                    inbound_identity_token_with_roles(vec!["DA", "mcp_admin"])
                 ),
             )
             .body(Body::from(
