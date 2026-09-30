@@ -256,8 +256,8 @@ mod tests {
             .activated
             .iter()
             .all(|name| { ToolExecutor::is_pa_readonly_tool(name) }));
-        let names: Vec<&str> = executor
-            .tool_definitions_for_turn("Plan", &activated)
+        let definitions = executor.tool_definitions_for_turn("Plan", &activated);
+        let names: Vec<&str> = definitions
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
