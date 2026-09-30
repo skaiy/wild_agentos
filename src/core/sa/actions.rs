@@ -53,9 +53,10 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
                 Ok(())
             })
         })),
-        InterventionAction::RestrictTools { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::RestrictTools { .. } => Some(Box::new(|sa, params, task_iri| {
             Box::pin(async move {
                 let tools = params.allowed_tools.clone().unwrap_or_default();
+                sa.runner.restrict_tools_for_run(task_iri, tools.clone());
                 info!("Intervention: restrict tools to {:?}", tools);
                 Ok(())
             })

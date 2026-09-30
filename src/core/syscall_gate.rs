@@ -25,55 +25,16 @@ impl Default for WhitelistManager {
 
 impl WhitelistManager {
     pub fn new() -> Self {
+        let policy = crate::core::tool_policy::ToolPolicy::new();
         let mut map = HashMap::new();
-        map.insert(AgentRole::Plan, {
-            let mut s = HashSet::new();
-            s.insert("file_read".to_string());
-            s.insert("file_list".to_string());
-            s.insert("grep_search".to_string());
-            s.insert("glob_search".to_string());
-            s.insert("tool_search".to_string());
-            s.insert("web_search".to_string());
-            s.insert("web_fetch".to_string());
-            s
-        });
-        map.insert(AgentRole::Do, {
-            let mut s = HashSet::new();
-            s.insert("file_read".to_string());
-            s.insert("file_write".to_string());
-            s.insert("file_list".to_string());
-            s.insert("bash".to_string());
-            s.insert("grep_search".to_string());
-            s.insert("glob_search".to_string());
-            s.insert("http_request".to_string());
-            s.insert("tool_search".to_string());
-            s.insert("web_search".to_string());
-            s.insert("web_fetch".to_string());
-            s.insert("code_execute".to_string());
-            s.insert("rag_search".to_string());
-            s.insert("rag_index".to_string());
-            s
-        });
-        map.insert(AgentRole::Check, {
-            let mut s = HashSet::new();
-            s.insert("file_read".to_string());
-            s.insert("file_list".to_string());
-            s.insert("bash".to_string());
-            s.insert("grep_search".to_string());
-            s.insert("glob_search".to_string());
-            s.insert("tool_search".to_string());
-            s.insert("jsonld_validate".to_string());
-            s.insert("rag_search".to_string());
-            s
-        });
-        map.insert(AgentRole::Act, {
-            let mut s = HashSet::new();
-            s.insert("file_read".to_string());
-            s.insert("file_write".to_string());
-            s.insert("http_request".to_string());
-            s.insert("tool_search".to_string());
-            s
-        });
+        for role in [
+            AgentRole::Plan,
+            AgentRole::Do,
+            AgentRole::Check,
+            AgentRole::Act,
+        ] {
+            map.insert(role, policy.visible_tools(&role, "").into_iter().collect());
+        }
         Self {
             role_whitelist: map,
             custom_whitelist: HashMap::new(),
@@ -96,18 +57,13 @@ impl WhitelistManager {
         tool_name: &str,
     ) -> bool {
         if let Some(custom) = self.custom_whitelist.get(agent_id) {
-            if custom.contains(tool_name) {
-                return true;
-            }
+            return custom.contains(tool_name) && self.check_permission(role, tool_name);
         }
         self.check_permission(role, tool_name)
     }
 
     pub fn add_tool(&mut self, role: AgentRole, tool_name: &str) {
-        self.role_whitelist
-            .entry(role)
-            .or_default()
-            .insert(tool_name.to_string());
+        warn!(role = %role, tool = %tool_name, "Ignoring attempt to widen role whitelist");
     }
 
     pub fn remove_tool(&mut self, role: &AgentRole, tool_name: &str) {
@@ -387,10 +343,10 @@ mod tests {
         assert!(wm.check_permission(&AgentRole::Do, "bash"));
         assert!(wm.check_permission(&AgentRole::Do, "rag_search"));
 
-        assert!(wm.check_permission(&AgentRole::Check, "bash"));
+        assert!(!wm.check_permission(&AgentRole::Check, "bash"));
         assert!(!wm.check_permission(&AgentRole::Check, "file_write"));
 
-        assert!(wm.check_permission(&AgentRole::Act, "file_write"));
+        assert!(!wm.check_permission(&AgentRole::Act, "file_write"));
         assert!(!wm.check_permission(&AgentRole::Act, "bash"));
     }
 
@@ -399,7 +355,7 @@ mod tests {
         let mut wm = WhitelistManager::new();
         wm.add_custom_whitelist("special_agent", vec!["custom_tool".to_string()]);
 
-        assert!(wm.check_permission_for_agent("special_agent", &AgentRole::Plan, "custom_tool"));
+        assert!(!wm.check_permission_for_agent("special_agent", &AgentRole::Plan, "custom_tool"));
         assert!(wm.check_permission_for_agent("special_agent", &AgentRole::Plan, "file_read"));
         assert!(!wm.check_permission_for_agent("normal_agent", &AgentRole::Plan, "custom_tool"));
     }
@@ -409,7 +365,7 @@ mod tests {
         let mut wm = WhitelistManager::new();
         assert!(!wm.check_permission(&AgentRole::Plan, "custom_new_tool"));
         wm.add_tool(AgentRole::Plan, "custom_new_tool");
-        assert!(wm.check_permission(&AgentRole::Plan, "custom_new_tool"));
+        assert!(!wm.check_permission(&AgentRole::Plan, "custom_new_tool"));
         wm.remove_tool(&AgentRole::Plan, "custom_new_tool");
         assert!(!wm.check_permission(&AgentRole::Plan, "custom_new_tool"));
     }

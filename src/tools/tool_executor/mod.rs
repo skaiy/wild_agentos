@@ -9,7 +9,7 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::core::agent_instance::AgentRole;
-use crate::core::tool_controller::ToolController;
+use crate::core::tool_policy::ToolPolicy;
 use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::skill_graph::security::{SecurityContext, SecurityDecision, SecurityEngine};
@@ -43,6 +43,16 @@ tokio::task_local! {
     /// Keeping it task-local prevents model-controlled tool arguments from
     /// selecting another role and keeps concurrent runs isolated.
     static TOOL_SEARCH_CALLER_ROLE: Option<String>;
+}
+
+tokio::task_local! {
+    /// Runtime identity for legacy syscall-gate checks.
+    static TOOL_CALLER_CONTEXT: Option<SecurityContext>;
+}
+
+tokio::task_local! {
+    /// Caller-owned run policy used by tool discovery during one invocation.
+    static TOOL_RUN_POLICY: Option<ToolPolicy>;
 }
 
 pub(super) fn require_isolation_claims() -> Result<IsolationClaims, String> {
@@ -1278,7 +1288,15 @@ impl ToolExecutor {
         }
 
         if let Some(ref gate) = self.syscall_gate {
-            if let Err(e) = gate.validate_tool_with_5w2h(name, "unknown", None) {
+            let context = TOOL_CALLER_CONTEXT
+                .try_with(|context| context.clone())
+                .ok()
+                .flatten();
+            let role = context
+                .as_ref()
+                .map(|context| context.agent_role.as_str())
+                .unwrap_or("");
+            if let Err(e) = gate.validate_tool_with_5w2h(name, role, None) {
                 return Ok(json!({"error": format!("SyscallGate rejected: {}", e)}));
             }
         }
@@ -1292,12 +1310,21 @@ impl ToolExecutor {
                     name: name.to_string(),
                     message: "tool_search requires a verified runtime role".to_string(),
                 })?;
-            self.search_tools_for_role(&role, input).map_err(|message| {
-                ToolExecutionError::ExecutionFailed {
+            let policy = TOOL_RUN_POLICY
+                .try_with(|policy| policy.clone())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let agent_id = TOOL_CALLER_CONTEXT
+                .try_with(|context| context.as_ref().map(|context| context.agent_id.clone()))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            self.search_tools_for_role_with_policy(&role, &agent_id, &policy, input)
+                .map_err(|message| ToolExecutionError::ExecutionFailed {
                     name: name.to_string(),
                     message,
-                }
-            })
+                })
         } else {
             // Use the fallback-aware lookup so routing every caller through the
             // permission/hook/syscall gates does not break micro-tool dispatch.
@@ -1372,10 +1399,50 @@ impl ToolExecutor {
         advertised_tools: &[String],
         claims: Option<IsolationClaims>,
     ) -> Result<Value, ToolExecutionError> {
+        self.execute_with_security_context_and_claims_and_policy(
+            name,
+            input,
+            context,
+            advertised_tools,
+            claims,
+            &ToolPolicy::new(),
+        )
+        .await
+    }
+
+    /// Executes a tool under the caller-owned per-run role policy.
+    pub async fn execute_with_security_context_and_claims_and_policy(
+        &self,
+        name: &str,
+        input: Value,
+        context: SecurityContext,
+        advertised_tools: &[String],
+        claims: Option<IsolationClaims>,
+        policy: &ToolPolicy,
+    ) -> Result<Value, ToolExecutionError> {
         if !advertised_tools.iter().any(|tool| tool == name) {
             return Ok(json!({
                 "error": format!("Tool not advertised for this turn: {}", name),
                 "tool": name,
+            }));
+        }
+        let role = context.agent_role.parse::<AgentRole>().map_err(|_| {
+            ToolExecutionError::ExecutionFailed {
+                name: name.to_string(),
+                message: "runtime security context has an unknown role".to_string(),
+            }
+        })?;
+        if !policy.is_executable(&role, &context.agent_id, name) {
+            tracing::warn!(
+                agent = %context.agent_id,
+                role = %context.agent_role,
+                tool = %name,
+                "Role tool policy denied execution"
+            );
+            return Ok(json!({
+                "error": "Tool not allowed for role",
+                "tool": name,
+                "role": context.agent_role,
             }));
         }
 
@@ -1422,10 +1489,15 @@ impl ToolExecutor {
             }
         }
 
-        TOOL_SEARCH_CALLER_ROLE
+        let role = context.agent_role.clone();
+        TOOL_CALLER_CONTEXT
             .scope(
-                Some(context.agent_role),
-                self.execute_with_claims(name, input, claims),
+                Some(context),
+                TOOL_RUN_POLICY.scope(
+                    Some(policy.clone()),
+                    TOOL_SEARCH_CALLER_ROLE
+                        .scope(Some(role), self.execute_with_claims(name, input, claims)),
+                ),
             )
             .await
     }
@@ -1511,6 +1583,16 @@ impl ToolExecutor {
     /// registration order; activated on-demand definitions are appended in the
     /// order they were activated; dynamic micro-tools always remain at the tail.
     pub fn tool_definitions_for_turn(&self, role: &str, activated: &ActivatedTools) -> Vec<Value> {
+        self.tool_definitions_for_turn_with_policy(role, "", activated)
+    }
+
+    /// Build one turn's schema after applying the caller-owned run policy.
+    pub fn tool_definitions_for_turn_with_policy(
+        &self,
+        role: &str,
+        agent_id: &str,
+        activated: &ActivatedTools,
+    ) -> Vec<Value> {
         let role_name = match role {
             "PA" | "Plan" => "Plan",
             "DA" | "Do" => "Do",
@@ -1529,7 +1611,7 @@ impl ToolExecutor {
             let is_pa = role == "Plan" || role == "PA";
             let is_aa = role == "Act" || role == "AA";
             if is_pa {
-                let default: HashSet<String> = Self::pa_readonly_tools()
+                let default: HashSet<String> = ToolPolicy::readonly_tools()
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
@@ -1563,6 +1645,9 @@ impl ToolExecutor {
             }
         };
 
+        let agent_role = role.parse::<AgentRole>().unwrap_or(AgentRole::Act);
+        let policy_is_allowed =
+            |name: &str| activated.policy().is_visible(&agent_role, agent_id, name);
         let role_is_allowed = |td: &ToolDescription| {
             td.allowed_roles.is_empty()
                 || td.allowed_roles.iter().any(|allowed| {
@@ -1592,7 +1677,11 @@ impl ToolExecutor {
             .tool_descriptions
             .iter()
             .filter(|td| !Self::is_micro_tool_name(&td.name))
-            .filter(|td| resident_tools.contains(&td.name) && role_is_allowed(td))
+            .filter(|td| {
+                resident_tools.contains(&td.name)
+                    && role_is_allowed(td)
+                    && policy_is_allowed(&td.name)
+            })
             .map(definition)
             .collect();
 
@@ -1601,7 +1690,10 @@ impl ToolExecutor {
                 continue;
             }
             if let Some(description) = self.tool_descriptions.iter().find(|td| {
-                td.name == *name && !Self::is_micro_tool_name(&td.name) && role_is_allowed(td)
+                td.name == *name
+                    && !Self::is_micro_tool_name(&td.name)
+                    && role_is_allowed(td)
+                    && policy_is_allowed(&td.name)
             }) {
                 result.push(definition(description));
             }
@@ -1613,7 +1705,7 @@ impl ToolExecutor {
                 .filter(|td| {
                     Self::is_micro_tool_name(&td.name)
                         && role_is_allowed(td)
-                        && (role_name != "Plan" || Self::is_pa_readonly_tool(&td.name))
+                        && policy_is_allowed(&td.name)
                 })
                 .map(definition),
         );
@@ -1695,24 +1787,11 @@ impl ToolExecutor {
     }
 
     pub fn pa_readonly_tools() -> &'static [&'static str] {
-        &[
-            "file_read",
-            "file_list",
-            "glob_search",
-            "grep_search",
-            "web_search",
-            "web_fetch",
-            "tool_search",
-            "rag_search",
-            "knowledge_list",
-            "knowledge_search",
-            "kg_search",
-            "knowledge_extract_code",
-        ]
+        ToolPolicy::readonly_tools()
     }
 
     pub fn is_pa_readonly_tool(name: &str) -> bool {
-        Self::pa_readonly_tools().contains(&name)
+        ToolPolicy::is_readonly_tool(name)
     }
 
     /// Searches the live registry for tools visible to a verified runtime role.
@@ -1721,6 +1800,23 @@ impl ToolExecutor {
     /// intentionally not enabled here: its index must be server-owned and
     /// separate from tenant vector stores before it can participate in fusion.
     pub fn search_tools_for_role(&self, role: &str, input: Value) -> Result<Value, String> {
+        let manager = self
+            .tool_group_manager
+            .as_ref()
+            .filter(|manager| manager.is_enabled())
+            .cloned()
+            .unwrap_or_else(|| ToolGroupManager::new(None));
+        let policy = ToolPolicy::new().with_tool_group_manager(manager);
+        self.search_tools_for_role_with_policy(role, "", &policy, input)
+    }
+
+    fn search_tools_for_role_with_policy(
+        &self,
+        role: &str,
+        agent_id: &str,
+        policy: &ToolPolicy,
+        input: Value,
+    ) -> Result<Value, String> {
         let params: ToolSearchInput =
             serde_json::from_value(input).map_err(|error| format!("Invalid input: {error}"))?;
         let role = parse_runtime_role(role)?;
@@ -1732,7 +1828,6 @@ impl ToolExecutor {
             .cloned()
             .unwrap_or_else(|| ToolGroupManager::new(None));
         let (resident, on_demand) = manager.get_tool_names_for_role(role_name);
-        let controller = ToolController::new();
         let query_terms = search_terms(&params.query);
         let max_results = params.max_results.unwrap_or(5).min(10);
 
@@ -1741,7 +1836,7 @@ impl ToolExecutor {
             .iter()
             .filter(|tool| !Self::is_micro_tool_name(&tool.name))
             .filter(|tool| resident.contains(&tool.name) || on_demand.contains(&tool.name))
-            .filter(|tool| controller.is_tool_allowed_for_role(&tool.name, &role))
+            .filter(|tool| policy.is_executable(&role, agent_id, &tool.name))
             .filter_map(|tool| {
                 let group = manager.group_for_tool(&tool.name)?;
                 let score = lexical_score(tool, &group.to_string(), &query_terms);

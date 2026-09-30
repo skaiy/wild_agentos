@@ -522,6 +522,57 @@ mod tests {
     }
 
     #[test]
+    fn advertised_and_role_policy_gates_are_independent() {
+        rt().block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = calls.clone();
+            let mut executor = ToolExecutor::new();
+            executor.register(
+                "counted_tool",
+                "Counts handler calls.",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(move |_| {
+                    let handler_calls = handler_calls.clone();
+                    Box::pin(async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"ok": true}))
+                    })
+                }),
+                &[],
+            );
+
+            let denied = executor
+                .execute_with_security_context(
+                    "counted_tool",
+                    json!({"role": "DA"}),
+                    SecurityContext::new("agent:plan", "PA"),
+                    &["counted_tool".to_string()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied["error"], "Tool not allowed for role");
+            assert_eq!(denied["role"], "PA");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let unadvertised = executor
+                .execute_with_security_context(
+                    "file_read",
+                    json!({}),
+                    SecurityContext::new("agent:plan", "PA"),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                unadvertised["error"],
+                "Tool not advertised for this turn: file_read"
+            );
+        });
+    }
+
+    #[test]
     fn advertised_bash_file_read_and_file_write_execute() {
         rt().block_on(async {
             let executor = ToolExecutor::new();

@@ -23,7 +23,30 @@
 | System | 工具发现 |
 
 Plan 只获得只读组，其中包括 Web 按需组。Do 的常驻组包含可写工具；
-Check 将 shell 工具作为按需工具，而不是常驻工具。角色可见性与执行策略是两道独立的门。
+Check 默认只读。角色可见性与执行策略是两道独立的门。
+
+## 角色策略与执行
+
+每次调用都会经过两道独立的门。首先，工具名必须存在于当前轮实际广告的 schema；
+其次，运行时安全上下文必须满足角色策略。执行器仅从该上下文取得角色和 agent
+身份，绝不从工具参数或模型输出取得。被拒绝的调用会返回结构化工具结果，不会调用
+handler。
+
+有效集合只能收窄：角色上限 ∩ 可信的每 agent 限制 ∩ 生效中的 supervisor 限制。
+`tools_allowed` 等 Plan 元数据只是规划提示，不是执行控制。限制和按需激活状态只属于
+一次运行，不会保存到共享执行器中。
+
+| 角色 | 默认可见且可执行的工具 |
+| --- | --- |
+| Plan | `file_read`、`file_list`、`glob_search`、`grep_search`、`web_search`、`web_fetch`、`tool_search`、`rag_search`、`knowledge_list`、`knowledge_search`、`kg_search`、`knowledge_extract_code` |
+| Do | 已配置角色分组中的每个已注册内置工具 |
+| Check | `file_read`、`file_list`、`workspace_status`、`read_agent_output`、`glob_search`、`grep_search`、`rag_search`、`kg_search`、`web_search`、`web_fetch`、`tool_search`、`knowledge_list`、`knowledge_search`、`knowledge_extract_code`、`knowledge_query`、`knowledge_neighbors`、`kb_vector_search` |
+| Act | `file_read`、`file_list`、`glob_search`、`grep_search`、`rag_search`、`kg_search`、`tool_search`、`knowledge_list`、`knowledge_search`、`knowledge_extract_code`、`knowledge_query`、`knowledge_neighbors`、`kb_vector_search` |
+
+Plan、Check 与 Act 默认只读。只有在明确开启服务端
+`token_optimization.tool_groups.check_bash_enabled` 时，Check 才能执行 `bash`。
+此开关有风险：shell 命令可能执行不可信工作区内容并改变环境；除非 operator 接受该
+风险，应保持默认值 `false`。审计 warning 只包含 agent、角色与工具名，不包含工具参数。
 
 ## 激活和缓存行为
 

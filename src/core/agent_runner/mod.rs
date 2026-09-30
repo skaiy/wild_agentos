@@ -366,7 +366,6 @@ pub struct AgentRunner {
     pub scheduler: Option<Arc<MemoryScheduler>>,
     pub prefetch_engine: Option<Arc<PrefetchEngine>>,
     pub unified_graph_store: Option<Arc<oxigraph::store::Store>>,
-    pub tool_controller: Option<crate::core::tool_controller::ToolController>,
     /// Process-local tenant spend gate for LLM-initiated tool invocations.
     pub tenant_spend_gate: Arc<TenantSpendGate>,
     pub total_prompt_tokens: Arc<AtomicU64>,
@@ -391,6 +390,9 @@ pub struct AgentRunner {
     pub relevance_tracker: Option<Arc<std::sync::Mutex<RelevanceTracker>>>,
     /// Workspace root directory path (all Agent file operations are restricted to this scope)
     pub workspace_root: Option<PathBuf>,
+    /// Trusted supervisor restrictions keyed by an active task/run. This is
+    /// deliberately runner-owned, never shared executor or global state.
+    pub run_tool_restrictions: Arc<dashmap::DashMap<String, Vec<String>>>,
 }
 
 impl AgentRunner {
@@ -454,7 +456,6 @@ impl AgentRunner {
             scheduler: None,
             prefetch_engine: None,
             unified_graph_store: None,
-            tool_controller: None,
             tenant_spend_gate: Arc::new(TenantSpendGate::from_env()),
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
@@ -472,6 +473,7 @@ impl AgentRunner {
             embedder: None,
             relevance_tracker: None,
             workspace_root: None,
+            run_tool_restrictions: Arc::new(dashmap::DashMap::new()),
         };
         runner.init_context_compressors();
         runner
@@ -538,14 +540,6 @@ impl AgentRunner {
         self
     }
 
-    pub fn with_tool_controller(
-        mut self,
-        tc: crate::core::tool_controller::ToolController,
-    ) -> Self {
-        self.tool_controller = Some(tc);
-        self
-    }
-
     /// Configure tool exposure for this runner before it is shared by agents.
     /// The manager itself is immutable; per-run activation remains local to each
     /// execution loop.
@@ -572,6 +566,20 @@ impl AgentRunner {
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
         self
+    }
+
+    /// Narrow the active task's tools from trusted supervisor code.
+    pub fn restrict_tools_for_run(&self, task_iri: &str, tools: Vec<String>) {
+        self.run_tool_restrictions
+            .entry(task_iri.to_string())
+            .and_modify(|current| current.retain(|tool| tools.contains(tool)))
+            .or_insert(tools);
+    }
+
+    pub fn run_tool_restriction(&self, task_iri: &str) -> Option<Vec<String>> {
+        self.run_tool_restrictions
+            .get(task_iri)
+            .map(|tools| tools.clone())
     }
 
     pub fn with_hook_manager(mut self, hook_manager: HookManager) -> Self {

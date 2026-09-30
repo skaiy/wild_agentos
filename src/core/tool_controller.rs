@@ -1,111 +1,32 @@
-use serde_json::Value;
-use tracing::warn;
-
 use crate::core::agent_instance::AgentRole;
+use crate::core::tool_policy::ToolPolicy;
 
 #[derive(Clone)]
 pub struct ToolController {
-    readonly_tools: Vec<&'static str>,
-    write_tools: Vec<&'static str>,
+    policy: ToolPolicy,
 }
 
 impl ToolController {
     pub fn new() -> Self {
         Self {
-            readonly_tools: vec![
-                "file_read",
-                "file_list",
-                "grep_search",
-                "glob_search",
-                "tool_search",
-                "web_search",
-                "web_fetch",
-                "rag_search",
-                "knowledge_list",
-                "knowledge_search",
-                "kg_search",
-                "knowledge_extract_code",
-            ],
-            write_tools: vec![
-                "file_write",
-                "bash",
-                "code_execute",
-                "http_request",
-                "rag_index",
-                "rag_chunk",
-            ],
+            policy: ToolPolicy::new(),
         }
     }
 
     pub fn is_readonly_tool(&self, tool_name: &str) -> bool {
-        self.readonly_tools.contains(&tool_name)
+        ToolPolicy::is_readonly_tool(tool_name)
     }
 
     pub fn is_write_tool(&self, tool_name: &str) -> bool {
-        self.write_tools.contains(&tool_name)
+        !self.is_readonly_tool(tool_name)
     }
 
     pub fn is_tool_allowed_for_role(&self, tool_name: &str, role: &AgentRole) -> bool {
-        match role {
-            AgentRole::Plan => self.is_readonly_tool(tool_name),
-            AgentRole::Do | AgentRole::Check | AgentRole::Act => true,
-        }
-    }
-
-    pub fn filter_tools_for_role(
-        &self,
-        tool_calls: &[(String, Value)],
-        role: &AgentRole,
-    ) -> Vec<(String, Value)> {
-        match role {
-            AgentRole::Plan => {
-                let disallowed_calls: Vec<String> = tool_calls
-                    .iter()
-                    .filter(|(name, _)| !self.is_tool_allowed_for_role(name, role))
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                if !disallowed_calls.is_empty() {
-                    warn!(
-                        "[PA] Detected disallowed tool calls: {:?}, filtered",
-                        disallowed_calls
-                    );
-                }
-                tool_calls
-                    .iter()
-                    .filter(|(name, _)| self.is_tool_allowed_for_role(name, role))
-                    .cloned()
-                    .collect()
-            }
-            AgentRole::Do | AgentRole::Check | AgentRole::Act => tool_calls.to_vec(),
-        }
-    }
-
-    pub fn should_force_finish(&self, tool_calls: &[(String, Value)], role: &AgentRole) -> bool {
-        match role {
-            AgentRole::Plan => tool_calls
-                .iter()
-                .any(|(name, _)| !self.is_tool_allowed_for_role(name, role)),
-            AgentRole::Act => false,
-            AgentRole::Do => false,
-            AgentRole::Check => false,
-        }
+        self.policy.is_executable(role, "", tool_name)
     }
 
     pub fn list_available_tools(&self, role: &AgentRole) -> Vec<String> {
-        match role {
-            AgentRole::Plan => self.readonly_tools.iter().map(|s| s.to_string()).collect(),
-            AgentRole::Do | AgentRole::Check | AgentRole::Act => {
-                let mut tools: Vec<String> = self
-                    .readonly_tools
-                    .iter()
-                    .chain(self.write_tools.iter())
-                    .map(|s| s.to_string())
-                    .collect();
-                tools.sort();
-                tools.dedup();
-                tools
-            }
-        }
+        self.policy.visible_tools(role, "")
     }
 }
 
@@ -134,45 +55,6 @@ mod tests {
         assert!(tc.is_write_tool("file_write"));
         assert!(tc.is_write_tool("bash"));
         assert!(!tc.is_write_tool("file_read"));
-    }
-
-    #[test]
-    fn test_filter_tools_for_plan() {
-        let tc = ToolController::new();
-        let calls = vec![
-            ("file_read".to_string(), Value::String("test".to_string())),
-            ("file_write".to_string(), Value::String("test".to_string())),
-            ("bash".to_string(), Value::String("test".to_string())),
-            ("grep_search".to_string(), Value::String("test".to_string())),
-        ];
-        let filtered = tc.filter_tools_for_role(&calls, &AgentRole::Plan);
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].0, "file_read");
-        assert_eq!(filtered[1].0, "grep_search");
-    }
-
-    #[test]
-    fn test_filter_tools_for_do() {
-        let tc = ToolController::new();
-        let calls = vec![
-            ("file_read".to_string(), Value::String("test".to_string())),
-            ("file_write".to_string(), Value::String("test".to_string())),
-        ];
-        let filtered = tc.filter_tools_for_role(&calls, &AgentRole::Do);
-        assert_eq!(filtered.len(), 2);
-    }
-
-    #[test]
-    fn test_should_force_finish_plan() {
-        let tc = ToolController::new();
-        let calls = vec![("file_write".to_string(), Value::Null)];
-        assert!(tc.should_force_finish(&calls, &AgentRole::Plan));
-        let calls = vec![("bash".to_string(), Value::Null)];
-        assert!(tc.should_force_finish(&calls, &AgentRole::Plan));
-        let calls = vec![("not_in_plan_allowlist".to_string(), Value::Null)];
-        assert!(tc.should_force_finish(&calls, &AgentRole::Plan));
-        let calls2 = vec![("file_read".to_string(), Value::Null)];
-        assert!(!tc.should_force_finish(&calls2, &AgentRole::Plan));
     }
 
     #[test]
@@ -220,8 +102,10 @@ mod tests {
             plan_main.into_iter().collect()
         );
         assert_eq!(allowed_for(AgentRole::Do), all_registered);
-        assert_eq!(allowed_for(AgentRole::Check), all_registered);
-        assert_eq!(allowed_for(AgentRole::Act), all_registered);
+        assert!(allowed_for(AgentRole::Check).is_subset(&all_registered));
+        assert!(allowed_for(AgentRole::Act).is_subset(&all_registered));
+        assert!(!allowed_for(AgentRole::Check).contains("bash"));
+        assert!(!allowed_for(AgentRole::Act).contains("file_write"));
     }
 
     #[test]

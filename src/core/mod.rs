@@ -17,6 +17,7 @@ pub mod syscall_gate;
 pub mod system_prompt;
 pub mod timeline;
 pub mod tool_controller;
+pub mod tool_policy;
 pub mod tool_result_aging;
 pub mod tracked_action;
 pub mod validation;
@@ -40,6 +41,7 @@ pub use supplementary_store::{SupplementEntry, SupplementaryInputStore};
 pub use syscall_gate::{SyscallGate, WhitelistManager};
 pub use system_prompt::{SystemPromptBuilder, SystemPromptRegion, ToolRegionContent};
 pub use tool_controller::ToolController;
+pub use tool_policy::ToolPolicy;
 pub use tool_result_aging::ToolResultAging;
 pub use validation::{
     JsonLdValidator, MetaValidator, SignatureVerifier, ValidationEngine, ValidationResult,
