@@ -2,4 +2,5 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-exec cargo test --workspace golden --verbose
+cargo test --workspace golden --verbose
+./scripts/run_tool_selection_eval.sh

@@ -508,7 +508,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(wal.len() > 0, "WAL should contain written bytes");
+        assert!(!wal.is_empty(), "WAL should contain written bytes");
     }
 
     #[test]
