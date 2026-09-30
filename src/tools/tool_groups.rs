@@ -243,7 +243,6 @@ impl ToolGroupManager {
             ToolGroup::Write,
             HashSet::from([
                 "file_write".to_string(),
-                "file_delete".to_string(),
                 "bash".to_string(),
                 "powershell".to_string(),
                 "file_edit".to_string(),
@@ -490,7 +489,6 @@ mod tests {
         let tools = manager.get_tools_for_groups(&[ToolGroup::Write]);
 
         assert!(tools.contains("file_write"));
-        assert!(tools.contains("file_delete"));
         assert!(tools.contains("bash"));
         assert!(tools.contains("powershell"));
         assert!(!tools.contains("file_read"));

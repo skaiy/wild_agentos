@@ -23,13 +23,8 @@ impl ToolController {
                 "rag_search",
                 "knowledge_list",
                 "knowledge_search",
-                "knowledge_query",
-                "knowledge_neighbors",
                 "kg_search",
-                "kb_vector_search",
                 "knowledge_extract_code",
-                "workspace_status",
-                "read_agent_output",
             ],
             write_tools: vec![
                 "file_write",
@@ -189,6 +184,46 @@ mod tests {
         }
         assert!(!tc.is_tool_allowed_for_role("bash", &AgentRole::Plan));
         assert!(!tc.is_tool_allowed_for_role("file_write", &AgentRole::Plan));
+    }
+
+    #[test]
+    fn role_execution_permissions_match_main_snapshot() {
+        let executor = crate::tools::tool_executor::ToolExecutor::new();
+        let registered = executor.registered_tool_names();
+        let tc = ToolController::new();
+        let plan_main = [
+            "file_read",
+            "file_list",
+            "grep_search",
+            "glob_search",
+            "tool_search",
+            "web_search",
+            "web_fetch",
+            "rag_search",
+            "knowledge_list",
+            "knowledge_search",
+            "kg_search",
+            "knowledge_extract_code",
+        ];
+
+        for role in [
+            AgentRole::Plan,
+            AgentRole::Do,
+            AgentRole::Check,
+            AgentRole::Act,
+        ] {
+            let actual: Vec<&str> = registered
+                .iter()
+                .map(String::as_str)
+                .filter(|tool| tc.is_tool_allowed_for_role(tool, &role))
+                .collect();
+            let expected: Vec<&str> = if role == AgentRole::Plan {
+                plan_main.to_vec()
+            } else {
+                registered.iter().map(String::as_str).collect()
+            };
+            assert_eq!(actual, expected, "{role:?} execution permissions changed");
+        }
     }
 
     #[test]

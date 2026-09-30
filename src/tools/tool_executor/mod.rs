@@ -1666,13 +1666,8 @@ impl ToolExecutor {
             "rag_search",
             "knowledge_list",
             "knowledge_search",
-            "knowledge_query",
-            "knowledge_neighbors",
             "kg_search",
-            "kb_vector_search",
             "knowledge_extract_code",
-            "workspace_status",
-            "read_agent_output",
         ]
     }
 
