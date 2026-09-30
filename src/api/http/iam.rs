@@ -462,7 +462,7 @@ fn arr_field(v: &Value, key: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use axum::{
         extract::FromRequestParts,
         http::{Request, StatusCode},
@@ -828,7 +828,7 @@ mod tests {
         exp: usize,
     }
 
-    const TEST_RSA_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+    pub(crate) const TEST_RSA_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAhURhZoOh6atOtKyK4W56CRODmWSVKPNA6zF96o9G/+WXpfeI
 64BASV9IFnad820UY9eHeXmOP6zmJl/emcRBh5i5UKLWXVQ1NrvMBUpF7+HQU9Zr
 ulbPsgnhMII1vLMAp6Wdfj+ejj0YzjSrx/peId0S2fOlJg64ENwUzRZm+w01ch2s
@@ -855,7 +855,7 @@ wgsA9QKBgBMCSFjZWXNyoglccresoPzUcahcofydurIOHoaWzelJaafNiGDYXqW3
 vX/Fd5UxB4QtKVYIN7dTj+xzNCeotUwPJCx22JnqC40gUiQ2qZtyF9LQTSZuATUQ
 rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
 -----END RSA PRIVATE KEY-----";
-    const TEST_RSA_N: &str = "hURhZoOh6atOtKyK4W56CRODmWSVKPNA6zF96o9G_-WXpfeI64BASV9IFnad820UY9eHeXmOP6zmJl_emcRBh5i5UKLWXVQ1NrvMBUpF7-HQU9ZrulbPsgnhMII1vLMAp6Wdfj-ejj0YzjSrx_peId0S2fOlJg64ENwUzRZm-w01ch2s1myb5Vci3MPCPDMiygTBRH-ixZeuOjgQUJeTXzwvaHPJviXPFEtZ-72j4ZQ7lDtM9sQqP9UT-HXTAgeWgWbtrK8bIhkWVPT3CGwQpi_YIc5OSDD0IP7HPBamQw7si4iasaKypFMstSWwT3fJc0Pl1aPvAjrcPOFIigr2Jw";
+    pub(crate) const TEST_RSA_N: &str = "hURhZoOh6atOtKyK4W56CRODmWSVKPNA6zF96o9G_-WXpfeI64BASV9IFnad820UY9eHeXmOP6zmJl_emcRBh5i5UKLWXVQ1NrvMBUpF7-HQU9ZrulbPsgnhMII1vLMAp6Wdfj-ejj0YzjSrx_peId0S2fOlJg64ENwUzRZm-w01ch2s1myb5Vci3MPCPDMiygTBRH-ixZeuOjgQUJeTXzwvaHPJviXPFEtZ-72j4ZQ7lDtM9sQqP9UT-HXTAgeWgWbtrK8bIhkWVPT3CGwQpi_YIc5OSDD0IP7HPBamQw7si4iasaKypFMstSWwT3fJc0Pl1aPvAjrcPOFIigr2Jw";
 
     #[tokio::test]
     async fn oidc_jwks_verifies_claims_and_fails_closed_for_invalid_claims() {
