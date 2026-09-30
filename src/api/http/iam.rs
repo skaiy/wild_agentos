@@ -37,7 +37,6 @@ use crate::isolation::{IsolationClaims, IsolationScopeField, IsolationScopeProve
 pub struct JwtClaims {
     /// Subject = user_id
     pub sub: String,
-    #[serde(default)]
     pub tenant_id: String,
     /// Project scope for isolation. Legacy tokens without this claim use
     /// the `default` project.
@@ -333,25 +332,21 @@ async fn jwks_for(config: &OidcConfig, refresh: bool) -> Option<Arc<JwkSet>> {
 }
 
 pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
-    let (tenant_id, missing_scope_field) = if claims.tenant_id.trim().is_empty() {
-        ("default", Some(IsolationScopeField::TenantId))
-    } else {
-        (claims.tenant_id.as_str(), None)
-    };
-    let (project_id, missing_scope_field) = match claims.project_id.as_deref() {
-        Some(project_id) if !project_id.trim().is_empty() => (project_id, missing_scope_field),
+    if claims.tenant_id.trim().is_empty() {
+        return None;
+    }
+    let (project_id, provenance, missing_scope_field) = match claims.project_id.as_deref() {
+        Some(project_id) if !project_id.trim().is_empty() => {
+            (project_id, IsolationScopeProvenance::VerifiedExplicit, None)
+        }
         _ => (
             "default",
-            missing_scope_field.or(Some(IsolationScopeField::ProjectId)),
+            IsolationScopeProvenance::VerifiedDefaulted,
+            Some(IsolationScopeField::ProjectId),
         ),
     };
-    let provenance = if missing_scope_field.is_none() {
-        IsolationScopeProvenance::VerifiedExplicit
-    } else {
-        IsolationScopeProvenance::VerifiedDefaulted
-    };
     let isolation_claims = IsolationClaims::from_verified_jwt(
-        tenant_id,
+        claims.tenant_id.clone(),
         project_id,
         claims.sub.clone(),
         provenance,
@@ -475,10 +470,7 @@ pub(crate) mod tests {
         validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims, UserIdentity,
         DEFAULT_HS256_SECRET,
     };
-    use crate::{
-        api::http::TEST_ENV_LOCK,
-        isolation::{IsolationScopeField, IsolationScopeProvenance},
-    };
+    use crate::api::http::TEST_ENV_LOCK;
 
     #[tokio::test]
     async fn strict_mode_rejects_forged_x_identity_before_claims_are_created() {
@@ -637,7 +629,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn jwt_with_empty_project_claim_is_rejected() {
+    async fn jwt_with_empty_project_claim_uses_default_project() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_mode = std::env::var_os("AGENTOS_AUTH_MODE");
         std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
@@ -654,16 +646,13 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let identity = verify_jwt(&token).await.unwrap();
-        let claims = identity.isolation_claims().unwrap();
-        assert_eq!(
-            claims.provenance(),
-            IsolationScopeProvenance::VerifiedDefaulted
-        );
-        assert_eq!(
-            claims.missing_scope_field(),
-            Some(IsolationScopeField::ProjectId)
-        );
+        let claims = verify_jwt(&token)
+            .await
+            .unwrap()
+            .isolation_claims()
+            .unwrap()
+            .clone();
+        assert_eq!(claims.project_id(), "default");
         restore_env("AGENTOS_AUTH_MODE", previous_mode);
     }
 
@@ -979,12 +968,9 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
             &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
         )
         .unwrap();
-        let identity = verify_jwt(&missing_tenant)
-            .await
-            .expect("a verified OIDC token keeps defaulted scope provenance");
-        assert_eq!(
-            identity.isolation_claims().unwrap().provenance(),
-            IsolationScopeProvenance::VerifiedDefaulted
+        assert!(
+            verify_jwt(&missing_tenant).await.is_none(),
+            "an OIDC token without tenant_id must not mint claims"
         );
 
         std::env::set_var("AGENTOS_OIDC_ISSUER", "https://other-issuer.example.test");

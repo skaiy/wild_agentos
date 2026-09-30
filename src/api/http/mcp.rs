@@ -1864,16 +1864,10 @@ mod tests {
             "roles": [],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_aud = false;
-        let decoded = decode::<crate::api::http::iam::JwtClaims>(
-            &without_tenant,
-            &DecodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
-            &validation,
-        )
-        .unwrap();
-        assert!(decoded.claims.tenant_id.is_empty());
-        assert_eq!(invoke(without_tenant).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            invoke(without_tenant).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
         let empty_project = raw_inbound_identity_token(json!({
             "sub": "test-user",
             "tenant_id": "test-tenant",
