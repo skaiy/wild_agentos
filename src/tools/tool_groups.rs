@@ -243,6 +243,7 @@ impl ToolGroupManager {
             ToolGroup::Write,
             HashSet::from([
                 "file_write".to_string(),
+                "file_delete".to_string(),
                 "bash".to_string(),
                 "powershell".to_string(),
                 "file_edit".to_string(),
