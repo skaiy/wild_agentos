@@ -43,7 +43,7 @@ belong to one run; they are not shared executor state.
 | Role | Default visible and executable tools |
 | --- | --- |
 | Plan | `file_read`, `file_list`, `glob_search`, `grep_search`, `web_search`, `web_fetch`, `tool_search`, `rag_search`, `knowledge_list`, `knowledge_search`, `kg_search`, `knowledge_extract_code` |
-| Do | Every registered built-in tool in the configured role groups |
+| Do | Registered built-ins in the configured role groups except `knowledge_delete` and `ontology_register` |
 | Check | `file_read`, `file_list`, `workspace_status`, `read_agent_output`, `glob_search`, `grep_search`, `rag_search`, `kg_search`, `web_search`, `web_fetch`, `tool_search`, `knowledge_list`, `knowledge_search`, `knowledge_extract_code`, `knowledge_query`, `knowledge_neighbors`, `kb_vector_search` |
 | Act | `file_read`, `file_list`, `glob_search`, `grep_search`, `rag_search`, `kg_search`, `tool_search`, `knowledge_list`, `knowledge_search`, `knowledge_extract_code`, `knowledge_query`, `knowledge_neighbors`, `kb_vector_search` |
 

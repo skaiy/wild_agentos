@@ -52,13 +52,12 @@ impl WhitelistManager {
 
     pub fn check_permission_for_agent(
         &self,
-        agent_id: &str,
+        _agent_id: &str,
         role: &AgentRole,
         tool_name: &str,
     ) -> bool {
-        if let Some(custom) = self.custom_whitelist.get(agent_id) {
-            return custom.contains(tool_name) && self.check_permission(role, tool_name);
-        }
+        // The legacy custom list must not widen a role's policy. Per-run
+        // narrowing is enforced by ToolPolicy in the AgentRunner.
         self.check_permission(role, tool_name)
     }
 

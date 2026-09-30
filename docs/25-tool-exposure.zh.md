@@ -39,7 +39,7 @@ handler。
 | 角色 | 默认可见且可执行的工具 |
 | --- | --- |
 | Plan | `file_read`、`file_list`、`glob_search`、`grep_search`、`web_search`、`web_fetch`、`tool_search`、`rag_search`、`knowledge_list`、`knowledge_search`、`kg_search`、`knowledge_extract_code` |
-| Do | 已配置角色分组中的每个已注册内置工具 |
+| Do | 已配置角色分组中的已注册内置工具，但 `knowledge_delete` 与 `ontology_register` 除外 |
 | Check | `file_read`、`file_list`、`workspace_status`、`read_agent_output`、`glob_search`、`grep_search`、`rag_search`、`kg_search`、`web_search`、`web_fetch`、`tool_search`、`knowledge_list`、`knowledge_search`、`knowledge_extract_code`、`knowledge_query`、`knowledge_neighbors`、`kb_vector_search` |
 | Act | `file_read`、`file_list`、`glob_search`、`grep_search`、`rag_search`、`kg_search`、`tool_search`、`knowledge_list`、`knowledge_search`、`knowledge_extract_code`、`knowledge_query`、`knowledge_neighbors`、`kb_vector_search` |
 

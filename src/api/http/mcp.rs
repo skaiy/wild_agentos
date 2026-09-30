@@ -1174,7 +1174,7 @@ mod tests {
                 "authorization",
                 format!(
                     "Bearer {}",
-                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                    inbound_identity_token_with_roles(vec!["DA", "mcp_admin"])
                 ),
             )
             .body(Body::from(
@@ -1971,7 +1971,7 @@ mod tests {
             "sub": "test-user",
             "tenant_id": "test-tenant",
             "project_id": "default",
-            "roles": [],
+            "roles": ["DA"],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
         assert_eq!(invoke(explicit_default).await.status(), StatusCode::OK);
@@ -2194,7 +2194,7 @@ mod tests {
                 "authorization",
                 format!(
                     "Bearer {}",
-                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                    inbound_identity_token_with_roles(vec!["DA", "mcp_admin"])
                 ),
             )
             .body(Body::from(
@@ -2224,7 +2224,7 @@ mod tests {
                 "authorization",
                 format!(
                     "Bearer {}",
-                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                    inbound_identity_token_with_roles(vec!["DA", "mcp_admin"])
                 ),
             )
             .body(Body::empty())
@@ -2891,7 +2891,7 @@ mod tests {
                 "authorization",
                 format!(
                     "Bearer {}",
-                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                    inbound_identity_token_with_roles(vec!["DA", "mcp_admin"])
                 ),
             )
             .body(Body::from(
@@ -3024,7 +3024,7 @@ mod tests {
                 "authorization",
                 format!(
                     "Bearer {}",
-                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                    inbound_identity_token_with_roles(vec!["DA", "mcp_admin"])
                 ),
             )
             .body(Body::from(

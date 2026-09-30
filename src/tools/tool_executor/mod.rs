@@ -1432,20 +1432,6 @@ impl ToolExecutor {
                 message: "runtime security context has an unknown role".to_string(),
             }
         })?;
-        if !policy.is_executable(&role, &context.agent_id, name) {
-            tracing::warn!(
-                agent = %context.agent_id,
-                role = %context.agent_role,
-                tool = %name,
-                "Role tool policy denied execution"
-            );
-            return Ok(json!({
-                "error": "Tool not allowed for role",
-                "tool": name,
-                "role": context.agent_role,
-            }));
-        }
-
         let security_engine = { self.security_engine.read().clone() };
         if let Some(engine) = security_engine {
             let skill_iri = {
@@ -1487,6 +1473,20 @@ impl ToolExecutor {
                     );
                 }
             }
+        }
+
+        if !policy.is_executable(&role, &context.agent_id, name) {
+            tracing::warn!(
+                agent = %context.agent_id,
+                role = %context.agent_role,
+                tool = %name,
+                "Role tool policy denied execution"
+            );
+            return Ok(json!({
+                "error": "Tool not allowed for role",
+                "tool": name,
+                "role": context.agent_role,
+            }));
         }
 
         let role = context.agent_role.clone();

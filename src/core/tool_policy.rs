@@ -91,6 +91,10 @@ impl ToolPolicy {
             }
             AgentRole::Do => {}
         }
+        // Destructive knowledge deletion and ontology registration are never
+        // granted by the default PDCA execution policy.
+        cap.remove("knowledge_delete");
+        cap.remove("ontology_register");
         cap
     }
 
