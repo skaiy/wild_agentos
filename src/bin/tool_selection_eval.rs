@@ -481,10 +481,16 @@ fn compare_report(
         }
     ));
     for result in &report.case_results {
-        if result.expected_failure_status.as_deref() == Some("unexpected-pass") {
+        if let Some(status) = &result.expected_failure_status {
             lines.push(format!(
-                "- {}: **UNEXPECTED PASS: flip the expected-fail marker**",
-                result.id
+                "- {}: {}{}",
+                result.id,
+                status,
+                if status == "unexpected-pass" {
+                    " **flip the expected-fail marker**"
+                } else {
+                    ""
+                }
             ));
         }
     }
