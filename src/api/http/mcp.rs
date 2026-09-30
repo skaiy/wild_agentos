@@ -2323,10 +2323,7 @@ mod tests {
             .uri("/servers/catalog-server")
             .header(
                 "authorization",
-                format!(
-                    "Bearer {}",
-                    inbound_identity_token_with_roles(vec!["mcp_admin"])
-                ),
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
             )
             .body(Body::empty())
             .unwrap();
