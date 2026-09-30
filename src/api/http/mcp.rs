@@ -1539,4 +1539,108 @@ mod tests {
             None => std::env::remove_var("AGENTOS_AUTH_MODE"),
         }
     }
+
+    #[tokio::test]
+    async fn slow_invoke_releases_catalog_lock_before_outbound_io() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var("AGENTOS_DATA_DIR", data_dir.path());
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        async fn slow_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let mock = Router::new()
+            .route("/mcp", post(slow_handler))
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let state = test_app_state(vec![json!({
+            "id": "slow-server",
+            "name": "slow-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "write_tools_enabled": false,
+            "tenantId": "test-tenant",
+            "projectId": "test-project",
+        })]);
+        let invoke = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({"server": "slow-server", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let invoke_task = tokio::spawn(invoke.oneshot(request));
+
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while requests.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow endpoint did not receive the invoke");
+        let register = Router::new()
+            .route("/servers", post(register_mcp_server_handler))
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/servers")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({
+                    "name": "new-server",
+                    "endpoint": "http://127.0.0.1:8080/mcp",
+                    "protocol": "http",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_millis(200), register.oneshot(request))
+            .await
+            .expect("registration was blocked by a slow outbound invoke")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        invoke_task.abort();
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+        match previous_data_dir {
+            Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+            None => std::env::remove_var("AGENTOS_DATA_DIR"),
+        }
+    }
 }
