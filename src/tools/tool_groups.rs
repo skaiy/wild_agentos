@@ -119,6 +119,7 @@ impl Default for ToolGroupSettings {
                 ],
                 on_demand: vec![
                     "Web".to_string(),
+                    "KnowledgePlan".to_string(),
                     "KnowledgeRead".to_string(),
                     "KnowledgeWrite".to_string(),
                     "Ingest".to_string(),
@@ -136,7 +137,11 @@ impl Default for ToolGroupSettings {
                     "Search".to_string(),
                     "System".to_string(),
                 ],
-                on_demand: vec!["Web".to_string(), "KnowledgeRead".to_string()],
+                on_demand: vec![
+                    "Web".to_string(),
+                    "KnowledgePlan".to_string(),
+                    "KnowledgeRead".to_string(),
+                ],
             },
         );
 
@@ -144,7 +149,11 @@ impl Default for ToolGroupSettings {
             "Act".to_string(),
             RoleToolConfig {
                 default: vec!["Core".to_string(), "System".to_string()],
-                on_demand: vec!["Search".to_string(), "KnowledgeRead".to_string()],
+                on_demand: vec![
+                    "Search".to_string(),
+                    "KnowledgePlan".to_string(),
+                    "KnowledgeRead".to_string(),
+                ],
             },
         );
 
@@ -277,15 +286,17 @@ impl ToolGroupManager {
             ToolGroup::KnowledgeRead,
             HashSet::from([
                 "knowledge_query".to_string(),
-                "knowledge_list".to_string(),
-                "knowledge_search".to_string(),
                 "knowledge_neighbors".to_string(),
                 "kb_vector_search".to_string(),
             ]),
         );
         map.insert(
             ToolGroup::KnowledgePlan,
-            HashSet::from(["knowledge_list".to_string(), "knowledge_search".to_string()]),
+            HashSet::from([
+                "knowledge_list".to_string(),
+                "knowledge_search".to_string(),
+                "knowledge_extract_code".to_string(),
+            ]),
         );
 
         map.insert(
@@ -295,7 +306,6 @@ impl ToolGroupManager {
                 "knowledge_delete".to_string(),
                 "knowledge_extract".to_string(),
                 "knowledge_bridge".to_string(),
-                "knowledge_extract_code".to_string(),
             ]),
         );
         map.insert(
@@ -538,6 +548,20 @@ mod tests {
                 "{name} must not be visible to Plan"
             );
         }
+    }
+
+    #[test]
+    fn plan_can_reach_exactly_main_readonly_tools() {
+        let manager = ToolGroupManager::new(None);
+        let (resident, on_demand) = manager.get_tool_names_for_role("Plan");
+        let mut visible: Vec<String> = resident.union(&on_demand).cloned().collect();
+        visible.sort();
+        let mut expected = crate::tools::tool_executor::ToolExecutor::pa_readonly_tools()
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(visible, expected);
     }
 
     #[test]
