@@ -2262,8 +2262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "expected-fail until #257 restricts catalog mutation to a dedicated MCP admin role"]
-    async fn da_service_token_cannot_register_mcp_server() {
+    async fn da_service_token_cannot_mutate_mcp_catalog() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -2272,10 +2271,18 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", data_dir.path());
         std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
-        let state = test_app_state(vec![]);
-        let app = Router::new()
+        let state = test_app_state(vec![json!({
+            "id": "catalog-server",
+            "name": "catalog-server",
+            "endpoint": "http://127.0.0.1:8080/mcp",
+            "endpoint_origin": "http://127.0.0.1:8080",
+            "protocol": "http",
+            "tenantId": "test-tenant",
+            "projectId": "test-project",
+        })]);
+        let register = Router::new()
             .route("/servers", post(register_mcp_server_handler))
-            .with_state(state);
+            .with_state(state.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/servers")
@@ -2286,7 +2293,26 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            app.oneshot(request).await.unwrap().status(),
+            register.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let delete = Router::new()
+            .route(
+                "/servers/:id",
+                axum::routing::delete(delete_mcp_server_handler),
+            )
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/servers/catalog-server")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            delete.oneshot(request).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
         match previous_data_dir {
@@ -2300,7 +2326,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "expected-fail until #257 disables outbound redirects"]
     async fn redirect_to_non_allowlisted_origin_is_not_followed() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
@@ -2490,7 +2515,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "expected-fail until #257 requires a non-empty outbound origin allowlist in strict mode"]
     async fn strict_mode_requires_allowlist_and_refuses_catalog_operations_without_it() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
@@ -2511,6 +2535,10 @@ mod tests {
         std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
         std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
         std::env::set_var("AGENTOS_DATA_DIR", data_dir.path());
+        assert_eq!(
+            validate_strict_mcp_outbound_configuration(),
+            Err("MCP_OUTBOUND_ALLOWED_ORIGINS must be configured when AGENTOS_AUTH_STRICT=true")
+        );
 
         async fn mock_handler() -> Json<Value> {
             Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
@@ -2567,10 +2595,38 @@ mod tests {
                     .to_string(),
             ))
             .unwrap();
+        let delete = Router::new()
+            .route(
+                "/servers/:id",
+                axum::routing::delete(delete_mcp_server_handler),
+            )
+            .with_state(test_app_state(vec![json!({
+                "id": "strict-server",
+                "name": "strict-server",
+                "endpoint": format!("http://{address}/mcp"),
+                "endpoint_origin": format!("http://{address}"),
+                "protocol": "http",
+                "tenantId": "test-tenant",
+                "projectId": "test-project",
+            })]));
+        let delete_request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/servers/strict-server")
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
+            )
+            .body(Body::empty())
+            .unwrap();
         let register_status = register.oneshot(register_request).await.unwrap().status();
         let invoke_status = invoke.oneshot(invoke_request).await.unwrap().status();
-        assert_eq!(register_status, StatusCode::FORBIDDEN);
-        assert_eq!(invoke_status, StatusCode::FORBIDDEN);
+        let delete_status = delete.oneshot(delete_request).await.unwrap().status();
+        assert_eq!(register_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(invoke_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(delete_status, StatusCode::SERVICE_UNAVAILABLE);
 
         for (name, value) in saved {
             match value {
