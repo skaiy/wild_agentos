@@ -158,6 +158,9 @@ used as a bearer credential, but their verified `tenant_id` and `project_id`
 are included as claims in the minted outbound JWT. If either value is absent,
 the service fails closed and does not invoke the endpoint. There is no separate
 administrator bypass path.
+For outbound invocation, both scope claims must have been explicitly present
+in the inbound token; a legacy defaulted project scope is not sufficient. A
+project explicitly named `default` remains valid.
 
 MCP sidecars must verify the JWT signature and validate `aud`, `tenant_id`, and
 `project_id` before accepting a request.

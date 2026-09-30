@@ -141,6 +141,8 @@ Core 可以接收 JSON 响应，或从 SSE 响应中读取匹配的 JSON-RPC 消
 入站 `IsolationClaims` 只用于授权服务进行 Catalog 查找；它们绝不会作为 Bearer
 凭据转发，但其中已验证的 `tenant_id` 和 `project_id` 会写入签发的出站 JWT。任一
 值缺失时，服务会 fail-closed，且不会调用 endpoint。没有单独的管理员绕过路径。
+对于出站调用，这两个范围 claim 都必须在入站 token 中明确出现；旧 token 的默认
+project scope 不足以授权。明确命名为 `default` 的项目仍然有效。
 
 MCP sidecar 在接受请求前必须验证 JWT 签名，并校验 `aud`、`tenant_id` 和
 `project_id`。

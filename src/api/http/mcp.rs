@@ -444,6 +444,12 @@ fn mint_outbound_mcp_jwt(
     isolation_claims: &crate::isolation::IsolationClaims,
 ) -> Result<String, String> {
     let secret = mcp_env("MCP_JWT_SECRET", None)?;
+    if !isolation_claims.explicit_tenant_id() || !isolation_claims.explicit_project_id() {
+        return Err(
+            "verified isolation claims must explicitly include tenant_id and project_id"
+                .to_string(),
+        );
+    }
     let tenant_id = isolation_claims.tenant_id();
     let project_id = isolation_claims.project_id();
     if tenant_id.trim().is_empty() || project_id.trim().is_empty() {
@@ -782,6 +788,16 @@ pub(crate) async fn invoke_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
+    if !claims.explicit_tenant_id() || !claims.explicit_project_id() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "explicit_isolation_claims_required",
+                "message": "Outbound MCP invocation requires explicit tenant_id and project_id claims",
+            })),
+        )
+            .into_response();
+    }
     if let Err(error) = validate_strict_mcp_outbound_configuration() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1185,6 +1201,15 @@ mod tests {
                 roles: roles.into_iter().map(str::to_owned).collect(),
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
+    fn raw_inbound_identity_token(claims: Value) -> String {
+        encode(
+            &Header::default(),
+            &claims,
             &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap()
@@ -1696,6 +1721,98 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_invoke_requires_explicit_inbound_scope_claims() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mock = Router::new()
+            .route("/mcp", post(mock_handler))
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let server = json!({
+            "id": "server-id",
+            "name": "catalog-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "tenantId": "test-tenant",
+            "projectId": "default",
+        });
+
+        let invoke = |token: String| {
+            let app = Router::new()
+                .route("/invoke", post(invoke_mcp_server_handler))
+                .with_state(test_app_state(vec![server.clone()]));
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/invoke")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    json!({"server": "server-id", "tool_name": "read_status", "arguments": {}})
+                        .to_string(),
+                ))
+                .unwrap();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+
+        let without_project = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "tenant_id": "test-tenant",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        assert_eq!(
+            invoke(without_project).await.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let without_tenant = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "project_id": "default",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        assert_eq!(
+            invoke(without_tenant).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let explicit_default = raw_inbound_identity_token(json!({
+            "sub": "test-user",
+            "tenant_id": "test-tenant",
+            "project_id": "default",
+            "roles": [],
+            "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        }));
+        assert_eq!(invoke(explicit_default).await.status(), StatusCode::OK);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
     }
 
     #[tokio::test]

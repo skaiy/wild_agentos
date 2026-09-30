@@ -41,6 +41,8 @@ pub struct IsolationClaims {
     tenant_id: String,
     project_id: String,
     actor_id: String,
+    explicit_tenant_id: bool,
+    explicit_project_id: bool,
 }
 
 /// Reasons a tenant isolation identifier or minted name was rejected.
@@ -70,10 +72,32 @@ impl IsolationClaims {
         assert_project_id(&project_id)?;
         assert_actor_id(&actor_id)?;
 
+        Self::from_verified_with_provenance(tenant_id, project_id, actor_id, true, true)
+    }
+
+    /// Builds verified claims while preserving whether the authentication
+    /// boundary received each scope value explicitly instead of defaulting it.
+    pub fn from_verified_with_provenance(
+        tenant_id: impl Into<String>,
+        project_id: impl Into<String>,
+        actor_id: impl Into<String>,
+        explicit_tenant_id: bool,
+        explicit_project_id: bool,
+    ) -> Result<Self, IsolationError> {
+        let tenant_id = tenant_id.into();
+        let project_id = project_id.into();
+        let actor_id = actor_id.into();
+
+        assert_tenant_id(&tenant_id)?;
+        assert_project_id(&project_id)?;
+        assert_actor_id(&actor_id)?;
+
         Ok(Self {
             tenant_id,
             project_id,
             actor_id,
+            explicit_tenant_id,
+            explicit_project_id,
         })
     }
 
@@ -90,6 +114,16 @@ impl IsolationClaims {
     /// Returns the verified actor identifier.
     pub fn actor_id(&self) -> &str {
         &self.actor_id
+    }
+
+    /// Whether the verified token explicitly contained `tenant_id`.
+    pub fn explicit_tenant_id(&self) -> bool {
+        self.explicit_tenant_id
+    }
+
+    /// Whether the verified token explicitly contained `project_id`.
+    pub fn explicit_project_id(&self) -> bool {
+        self.explicit_project_id
     }
 
     /// Mints the tenant/project graph IRI without accessing a graph store.

@@ -318,14 +318,23 @@ async fn jwks_for(config: &OidcConfig, refresh: bool) -> Option<Arc<JwkSet>> {
 }
 
 fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
+    let explicit_project_id = claims
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| !project_id.is_empty());
     let project_id = claims
         .project_id
         .as_deref()
         .filter(|project_id| !project_id.is_empty())
         .unwrap_or("default");
-    let isolation_claims =
-        IsolationClaims::from_verified(claims.tenant_id.clone(), project_id, claims.sub.clone())
-            .ok()?;
+    let isolation_claims = IsolationClaims::from_verified_with_provenance(
+        claims.tenant_id.clone(),
+        project_id,
+        claims.sub.clone(),
+        true,
+        explicit_project_id,
+    )
+    .ok()?;
     Some(UserIdentity {
         user_id: claims.sub,
         tenant_id: claims.tenant_id,
