@@ -234,10 +234,7 @@ pub(crate) async fn test_model_handler(
     identity: UserIdentity,
     Json(req): Json<ModelTestRequest>,
 ) -> Response {
-    if let Err(response) = identity.require_verified_isolation_claims("model operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("model operations") {
         return error.into_response();
     }
     let m = crate::config::settings::Settings::load_models();
@@ -391,10 +388,7 @@ pub(crate) async fn provider_models_handler(
     identity: UserIdentity,
     Json(req): Json<ProviderModelsRequest>,
 ) -> Response {
-    if let Err(response) = identity.require_verified_isolation_claims("model operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("model operations") {
         return error.into_response();
     }
     // 端点/密钥解析：内联优先，缺省按 provider_id 回填持久化值。
@@ -485,10 +479,7 @@ pub(crate) async fn activate_embedding_handler(
     identity: UserIdentity,
     Json(req): Json<EmbeddingActivateRequest>,
 ) -> Response {
-    if let Err(response) = identity.require_verified_isolation_claims("model operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("model operations") {
         return error.into_response();
     }
     let m = crate::config::settings::Settings::load_models();

@@ -67,10 +67,7 @@ pub(crate) async fn list_api_clients_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
     let clients = state.api_clients.read().await;
@@ -113,10 +110,7 @@ pub(crate) async fn create_api_client_handler(
     identity: UserIdentity,
     Json(req): Json<CreateClientRequest>,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
     if req.name.trim().is_empty() {
@@ -161,10 +155,7 @@ pub(crate) async fn update_api_client_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<UpdateClientRequest>,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
     let mut guard = state.api_clients.write().await;
@@ -215,10 +206,7 @@ pub(crate) async fn delete_api_client_handler(
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
     let mut clients = state.api_clients.write().await;
@@ -249,10 +237,7 @@ pub(crate) async fn issue_api_key_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<IssueKeyRequest>,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
     let tenant = {
@@ -301,10 +286,7 @@ pub(crate) async fn revoke_api_key_handler(
     identity: UserIdentity,
     axum::extract::Path((id, kid)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("API client operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
     let mut guard = state.api_keys.write().await;
@@ -339,10 +321,7 @@ pub(crate) async fn list_api_audit_handler(
     identity: UserIdentity,
     Query(q): Query<AuditQuery>,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("API audit access") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("API audit access") {
         return error.into_response();
     }
     let limit = q.limit.unwrap_or(200).min(1000);
