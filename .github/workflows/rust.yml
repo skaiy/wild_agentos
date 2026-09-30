@@ -56,6 +56,8 @@ jobs:
       run: cargo test --workspace isolation_contract_materialization --verbose
     - name: Run functional golden evaluation suite
       run: ./scripts/test_golden.sh
+    - name: Run offline tool-selection golden evaluation
+      run: ./scripts/run_tool_selection_eval.sh
     # Record-only: shared CI hardware is not a stable performance baseline.
     - name: Run private deployment micro-benchmark
       run: ./scripts/bench_private_deploy.sh --micro

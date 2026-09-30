@@ -13,6 +13,10 @@ Current inventory:
 - `golden/agent-plans.json`: heuristic Agent task classification and PDCA role plans.
 - `golden/skill-markdown.json`: static Skill Markdown parsing, including required and optional parameters.
 - `golden/action-invocation.json`: Action dry-run response and the guardrail ownership boundary.
+- `golden/tool-selection.json`: offline and optional live tool-selection cases
+  for Plan, Do, and Check. `golden/tool-selection.baseline.json` is the
+  deterministic mock-layer baseline; the golden script compares the offline
+  report against it without network access or credentials.
 - `../tests/fixtures/ontology_ke_golden/golden.json`: frozen ontology-constrained
   extract/canonicalize/`KgQualityGate` scorecard. Run
   `./scripts/check_ontology_ke_golden.sh` and

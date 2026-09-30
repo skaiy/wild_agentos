@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::isolation::IsolationClaims;
+use crate::isolation::{IsolationClaims, IsolationScopeField, IsolationScopeProvenance};
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 
@@ -122,6 +122,20 @@ impl UserIdentity {
                 "hint": "Set AGENTOS_AUTH_STRICT=false to bypass role checks in dev mode",
             })),
         ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_identity_from_verified_claims(
+    claims: IsolationClaims,
+    roles: Vec<String>,
+) -> UserIdentity {
+    UserIdentity {
+        user_id: claims.actor_id().to_string(),
+        tenant_id: claims.tenant_id().to_string(),
+        roles,
+        auth_method: AuthMethod::Jwt,
+        isolation_claims: Some(claims),
     }
 }
 
@@ -336,15 +350,28 @@ async fn jwks_for(config: &OidcConfig, refresh: bool) -> Option<Arc<JwkSet>> {
     Some(keys)
 }
 
-fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
-    let project_id = claims
-        .project_id
-        .as_deref()
-        .filter(|project_id| !project_id.is_empty())
-        .unwrap_or("default");
-    let isolation_claims =
-        IsolationClaims::from_verified(claims.tenant_id.clone(), project_id, claims.sub.clone())
-            .ok()?;
+pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
+    if claims.tenant_id.trim().is_empty() {
+        return None;
+    }
+    let (project_id, provenance, missing_scope_field) = match claims.project_id.as_deref() {
+        Some(project_id) if !project_id.trim().is_empty() => {
+            (project_id, IsolationScopeProvenance::VerifiedExplicit, None)
+        }
+        _ => (
+            "default",
+            IsolationScopeProvenance::VerifiedDefaulted,
+            Some(IsolationScopeField::ProjectId),
+        ),
+    };
+    let isolation_claims = IsolationClaims::from_verified_jwt(
+        claims.tenant_id.clone(),
+        project_id,
+        claims.sub.clone(),
+        provenance,
+        missing_scope_field,
+    )
+    .ok()?;
     Some(UserIdentity {
         user_id: claims.sub,
         tenant_id: claims.tenant_id,
@@ -449,7 +476,7 @@ fn arr_field(v: &Value, key: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use axum::{
         extract::FromRequestParts,
         http::{Request, StatusCode},
@@ -832,7 +859,7 @@ mod tests {
         exp: usize,
     }
 
-    const TEST_RSA_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+    pub(crate) const TEST_RSA_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAhURhZoOh6atOtKyK4W56CRODmWSVKPNA6zF96o9G/+WXpfeI
 64BASV9IFnad820UY9eHeXmOP6zmJl/emcRBh5i5UKLWXVQ1NrvMBUpF7+HQU9Zr
 ulbPsgnhMII1vLMAp6Wdfj+ejj0YzjSrx/peId0S2fOlJg64ENwUzRZm+w01ch2s
@@ -859,7 +886,7 @@ wgsA9QKBgBMCSFjZWXNyoglccresoPzUcahcofydurIOHoaWzelJaafNiGDYXqW3
 vX/Fd5UxB4QtKVYIN7dTj+xzNCeotUwPJCx22JnqC40gUiQ2qZtyF9LQTSZuATUQ
 rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
 -----END RSA PRIVATE KEY-----";
-    const TEST_RSA_N: &str = "hURhZoOh6atOtKyK4W56CRODmWSVKPNA6zF96o9G_-WXpfeI64BASV9IFnad820UY9eHeXmOP6zmJl_emcRBh5i5UKLWXVQ1NrvMBUpF7-HQU9ZrulbPsgnhMII1vLMAp6Wdfj-ejj0YzjSrx_peId0S2fOlJg64ENwUzRZm-w01ch2s1myb5Vci3MPCPDMiygTBRH-ixZeuOjgQUJeTXzwvaHPJviXPFEtZ-72j4ZQ7lDtM9sQqP9UT-HXTAgeWgWbtrK8bIhkWVPT3CGwQpi_YIc5OSDD0IP7HPBamQw7si4iasaKypFMstSWwT3fJc0Pl1aPvAjrcPOFIigr2Jw";
+    pub(crate) const TEST_RSA_N: &str = "hURhZoOh6atOtKyK4W56CRODmWSVKPNA6zF96o9G_-WXpfeI64BASV9IFnad820UY9eHeXmOP6zmJl_emcRBh5i5UKLWXVQ1NrvMBUpF7-HQU9ZrulbPsgnhMII1vLMAp6Wdfj-ejj0YzjSrx_peId0S2fOlJg64ENwUzRZm-w01ch2s1myb5Vci3MPCPDMiygTBRH-ixZeuOjgQUJeTXzwvaHPJviXPFEtZ-72j4ZQ7lDtM9sQqP9UT-HXTAgeWgWbtrK8bIhkWVPT3CGwQpi_YIc5OSDD0IP7HPBamQw7si4iasaKypFMstSWwT3fJc0Pl1aPvAjrcPOFIigr2Jw";
 
     #[tokio::test]
     async fn oidc_jwks_verifies_claims_and_fails_closed_for_invalid_claims() {

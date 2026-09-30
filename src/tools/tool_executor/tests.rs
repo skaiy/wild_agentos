@@ -143,12 +143,134 @@ mod tests {
     }
 
     #[test]
-    fn test_pa_readonly_tools_includes_bash() {
-        assert!(ToolExecutor::is_pa_readonly_tool("bash"));
+    fn test_pa_readonly_tools_excludes_bash() {
+        assert!(!ToolExecutor::is_pa_readonly_tool("bash"));
         assert!(ToolExecutor::is_pa_readonly_tool("file_read"));
         assert!(ToolExecutor::is_pa_readonly_tool("grep_search"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_write"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_edit"));
+    }
+
+    #[test]
+    fn plan_and_pa_tool_definitions_exclude_bash_with_or_without_group_manager() {
+        let definitions_exclude_bash = |executor: &ToolExecutor, role: &str| {
+            assert!(
+                !executor
+                    .tool_definitions_for_role(role)
+                    .iter()
+                    .filter_map(|tool| tool["function"]["name"].as_str())
+                    .any(|name| name == "bash"),
+                "{role} must not be offered bash"
+            );
+        };
+
+        let executor = ToolExecutor::new();
+        definitions_exclude_bash(&executor, "Plan");
+        definitions_exclude_bash(&executor, "PA");
+
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        definitions_exclude_bash(&executor, "Plan");
+        definitions_exclude_bash(&executor, "PA");
+    }
+
+    #[test]
+    fn on_demand_definitions_are_append_only_and_keep_resident_prefix_stable() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        let mut activated = executor.activated_tools();
+        let first = executor.tool_definitions_for_turn("Do", &activated);
+        let first_bytes = serde_json::to_vec(&first).unwrap();
+
+        let search_result = json!({
+            "matches": [
+                {"name": "web_fetch"},
+                {"name": "knowledge_search"},
+                {"name": "web_fetch"}
+            ]
+        });
+        let activation =
+            executor.activate_on_demand_from_search("Do", &mut activated, &search_result);
+        assert_eq!(activation.activated, vec!["web_fetch", "knowledge_search"]);
+
+        let second = executor.tool_definitions_for_turn("Do", &activated);
+        let second_bytes = serde_json::to_vec(&second[..first.len()]).unwrap();
+        assert_eq!(first_bytes, second_bytes);
+
+        let repeat = executor.activate_on_demand_from_search("Do", &mut activated, &search_result);
+        assert!(repeat.activated.is_empty());
+        assert_eq!(second, executor.tool_definitions_for_turn("Do", &activated));
+    }
+
+    #[test]
+    fn on_demand_tools_are_not_advertised_until_activated() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        let activated = executor.activated_tools();
+        let definitions = executor.tool_definitions_for_turn("Do", &activated);
+        let names: Vec<&str> = definitions
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"web_fetch"));
+        assert!(!names.contains(&"knowledge_search"));
+    }
+
+    #[test]
+    fn production_tool_definitions_never_exceed_role_execution_permissions() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        executor.register(
+            "read_full_result_test",
+            "Test dynamic result reader.",
+            json!({"type": "object", "properties": {}}),
+            Arc::new(|_| Box::pin(async { Ok(json!({})) })),
+            &[],
+        );
+        let controller = crate::core::tool_controller::ToolController::new();
+        for (role, agent_role) in [
+            ("Plan", crate::core::agent_instance::AgentRole::Plan),
+            ("Do", crate::core::agent_instance::AgentRole::Do),
+            ("Check", crate::core::agent_instance::AgentRole::Check),
+            ("Act", crate::core::agent_instance::AgentRole::Act),
+        ] {
+            let activated = executor.activated_tools();
+            for tool in executor.tool_definitions_for_turn(role, &activated) {
+                let name = tool["function"]["name"].as_str().unwrap();
+                assert!(
+                    controller.is_tool_allowed_for_role(name, &agent_role),
+                    "{name} must not be visible to {role}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_execution_rejects_direct_calls_outside_the_role_allowlist() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let advertised_tools: Vec<String> = executor
+                .tool_definitions_for_role("Plan")
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect();
+
+            for name in ["bash", "file_write"] {
+                let result = executor
+                    .execute_with_security_context(
+                        name,
+                        json!({}),
+                        security_context(),
+                        &advertised_tools,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result["error"],
+                    format!("Tool not advertised for this turn: {name}")
+                );
+            }
+        });
     }
 
     fn security_context() -> SecurityContext {

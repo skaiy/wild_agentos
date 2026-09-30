@@ -679,7 +679,17 @@ impl super::AgentRunner {
             crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
         );
 
-        let tool_menu = self.build_readable_tool_menu(&agent.role);
+        let mut tool_menu = self.build_readable_tool_menu(&agent.role);
+        let group_directory = self
+            .tool_executor
+            .read()
+            .build_tool_group_summary(&agent.role.to_string());
+        if !group_directory.is_empty() {
+            if !tool_menu.is_empty() {
+                tool_menu.push_str("\n\n");
+            }
+            tool_menu.push_str(&group_directory);
+        }
         if !tool_menu.is_empty() {
             prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
         }
@@ -734,10 +744,11 @@ impl super::AgentRunner {
             },
         ];
 
+        let mut activated_tools = self.tool_executor.read().activated_tools();
         let tools = self
             .tool_executor
             .read()
-            .tool_definitions_for_role(&agent.role.to_string());
+            .tool_definitions_for_turn(&agent.role.to_string(), &activated_tools);
 
         info!(
             "AgentRunner streaming started: role={}, model={}, tools={}",
@@ -777,7 +788,7 @@ impl super::AgentRunner {
             let current_tools = self
                 .tool_executor
                 .read()
-                .tool_definitions_for_role(&agent.role.to_string());
+                .tool_definitions_for_turn(&agent.role.to_string(), &activated_tools);
             let advertised_tools: Vec<String> = current_tools
                 .iter()
                 .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
@@ -787,6 +798,15 @@ impl super::AgentRunner {
             } else {
                 Some(current_tools)
             };
+            tracing::info!(
+                tools_exposed = advertised_tools.len(),
+                tools_schema_bytes = tools
+                    .as_ref()
+                    .and_then(|definitions| serde_json::to_vec(definitions).ok())
+                    .map_or(0, |bytes| bytes.len()),
+                activation_events = activated_tools.activation_events(),
+                "tool exposure for turn"
+            );
             let mut stream = match self
                 .gateway
                 .stream_chat_with_params(&model, running_messages.clone(), None, None, tools, None)
@@ -827,10 +847,26 @@ impl super::AgentRunner {
                     .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
                 self.total_completion_tokens
                     .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+                if let Some(cached) = usage.cached_prompt_tokens {
+                    self.total_cached_prompt_tokens
+                        .fetch_add(cached as u64, Ordering::Relaxed);
+                }
                 self.last_prompt_tokens
                     .store(usage.prompt_tokens as u64, Ordering::Relaxed);
                 self.last_completion_tokens
                     .store(usage.completion_tokens as u64, Ordering::Relaxed);
+                let prompt = self.total_prompt_tokens.load(Ordering::Relaxed);
+                let cached = self.total_cached_prompt_tokens.load(Ordering::Relaxed);
+                tracing::info!(
+                    prompt_tokens = prompt,
+                    cached_prompt_tokens = cached,
+                    cache_hit_rate = if prompt == 0 {
+                        0.0
+                    } else {
+                        cached as f64 / prompt as f64
+                    },
+                    "token usage"
+                );
             }
 
             let parsed = self.parse_llm_response(
@@ -844,7 +880,7 @@ impl super::AgentRunner {
                     if !stream_response.tool_calls.is_empty() {
                         let tool_calls = &stream_response.tool_calls;
                         if agent.role == AgentRole::Plan {
-                            let write_tools: Vec<&str> = tool_calls
+                            let disallowed_tools: Vec<&str> = tool_calls
                                 .iter()
                                 .map(|c| c.name.as_str())
                                 .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
@@ -856,12 +892,12 @@ impl super::AgentRunner {
                                     .collect();
                                 tc.should_force_finish(&tc_calls, &agent.role)
                             } else {
-                                !write_tools.is_empty()
+                                !disallowed_tools.is_empty()
                             };
                             if force_finish {
                                 warn!(
-                                    "[PA Streaming] Write operation tool calls blocked: {:?}",
-                                    write_tools
+                                    "[PA Streaming] Disallowed tool calls blocked: {:?}",
+                                    disallowed_tools
                                 );
                                 break;
                             }
@@ -929,7 +965,7 @@ impl super::AgentRunner {
                             // also applies executor security, permission, hook and
                             // syscall policies.
                             let executor = self.tool_executor.read().clone();
-                            let result = executor
+                            let mut result = executor
                                 .execute_with_security_context_and_claims(
                                     name,
                                     args,
@@ -943,6 +979,25 @@ impl super::AgentRunner {
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));
+                            if name == "tool_search" {
+                                let activation = executor.activate_on_demand_from_search(
+                                    &agent.role.to_string(),
+                                    &mut activated_tools,
+                                    &result,
+                                );
+                                if let Some(object) = result.as_object_mut() {
+                                    object.insert(
+                                        "activated".to_string(),
+                                        json!(activation.activated),
+                                    );
+                                    if !activation.skipped.is_empty() {
+                                        object.insert(
+                                            "activation_skipped".to_string(),
+                                            json!(activation.skipped),
+                                        );
+                                    }
+                                }
+                            }
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
                             let mut result_str =
                                 self.route_tool_result(&raw_result_str, name, &c.id).await;

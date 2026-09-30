@@ -450,7 +450,8 @@ impl super::AgentRunner {
                 let w2h_success = context_data.get("five_w2h_success_criteria").cloned().unwrap_or_else(|| "(not specified)".to_string());
                 let w2h_deadline = context_data.get("five_w2h_deadline").cloned().unwrap_or_else(|| "(not specified)".to_string());
                 let w2h_env = context_data.get("five_w2h_execution_env").cloned().unwrap_or_else(|| "(not specified)".to_string());
-                format!("You are the Plan Agent (PA). Your responsibility is to analyze user tasks and create execution plans.\n\n🔴 Strictly Prohibited:\n1. Do not call write-operation tools (file_write, file_edit, etc.)\n2. Do not perform concrete work (create files, modify code, etc.)\n3. Do not use bash for write operations (e.g., writing files, installing packages, deleting)\n\n✅ Allowed Operations:\n1. You may call read-only tools to gather information (file_read, file_list, grep_search, etc.)\n2. You may use bash for read-only commands (e.g., ls, cat, grep, find, which, pwd, echo) to explore the environment\n3. Analyze user task requirements\n4. Create clear execution steps\n5. Output a JSON-formatted plan\n\n📋 Task Metadata (5W2H — Must Reference):\n- What: {}\n- Why: {}\n- Success Criteria: {}\n- Deadline: {}\n- Execution Environment: {}\n\nCreate a plan under the above metadata constraints. If you find information that needs to be supplemented, explain it in the plan.\n\nAfter planning, it is recommended to backfill the How and Where dimensions (optional):\n{{\"five_w2h_updates\": {{\"how\": {{\"planIRI\": \"Plan IRI\", \"preferredSkills\": [...], \"requiredSteps\": \"...\"}}, \"where\": {{\"dataSources\": [...], \"executionEnvironment\": \"...\"}}}}}}", w2h_what, w2h_why, w2h_success, w2h_deadline, w2h_env)
+                let role_constraints = "Do not invoke tools outside the provided read-only tool list. Use only the provided read-only tools to gather information.";
+                format!("You are the Plan Agent (PA). Your responsibility is to analyze user tasks and create execution plans.\n\n🔴 Strictly Prohibited:\n1. Do not call write-operation tools (file_write, file_edit, etc.)\n2. Do not perform concrete work (create files, modify code, etc.)\n3. {}\n\n✅ Allowed Operations:\n1. Analyze user task requirements\n2. Create clear execution steps\n3. Output a JSON-formatted plan\n\n📋 Task Metadata (5W2H — Must Reference):\n- What: {}\n- Why: {}\n- Success Criteria: {}\n- Deadline: {}\n- Execution Environment: {}\n\nCreate a plan under the above metadata constraints. If you find information that needs to be supplemented, explain it in the plan.\n\nAfter planning, it is recommended to backfill the How and Where dimensions (optional):\n{{\"five_w2h_updates\": {{\"how\": {{\"planIRI\": \"Plan IRI\", \"preferredSkills\": [...], \"requiredSteps\": \"...\"}}, \"where\": {{\"dataSources\": [...], \"executionEnvironment\": \"...\"}}}}}}", role_constraints, w2h_what, w2h_why, w2h_success, w2h_deadline, w2h_env)
             }
             AgentRole::Do => "You are the Do Agent (DA). Your responsibility is to execute tasks concretely.\n\n🔴 Strictly Prohibited:\n1. Do not execute recursive searches in the current directory (e.g., grep -r, find /) — this will cause timeout\n2. Do not use relative paths; you must use the absolute paths specified in the task\n3. Do not perform operations unrelated to the task\n\n✅ Execution Requirements:\n1. Create/modify files strictly according to the paths specified in the task\n2. If the task requires creating a directory, create the directory first, then create the file\n3. Verify the result after every step\n4. Call finish immediately after completing the task\n5. For research tasks requiring the latest information, prioritize using web_search to fetch data. If the network tool still fails after multiple attempts, answer based on your own knowledge\n\n📋 Output Management Rules (Must Follow):\n1. When executing commands that may return large output (ls, find, grep, cat large files, etc.), use | head -N to limit output lines\n2. Prefer precise searches (grep + path restriction, glob filtering), avoid scanning entire directories\n3. When you only need to confirm a command result, use | grep keyword or | tail to filter key information — do not view the full output\n4. The system will automatically truncate output exceeding 16KB, and results over 2KB will be summarized — actively control output volume to avoid information loss\n5. If a tool returns results showing an \"output truncated\" or \"archived\" indicator, the output is too large — re-run with a more precise command\n\nExample Flow:\n1. Task requires creating /tmp/test/file.txt → First use Bash to create the directory, then use file_write to write\n2. Task requires modifying a file → Use file_read to read, process, then use file_write to write\n3. Task requires verification → Use file_read to read and check the content\n4. Search tool fails → After 1 attempt, if still failing, answer based on your own knowledge".to_string(),
             AgentRole::Check => {
@@ -536,34 +537,9 @@ impl super::AgentRunner {
     }
 
     pub(super) fn build_readable_tool_menu(&self, role: &AgentRole) -> String {
-        let role_str = role.to_string();
-        let tool_defs = self
-            .tool_executor
+        self.tool_executor
             .read()
-            .tool_definitions_for_role(&role_str);
-
-        if tool_defs.is_empty() {
-            return String::new();
-        }
-
-        let os_hint = if cfg!(target_os = "windows") {
-            "[Platform: Windows | bash tool actually uses PowerShell]"
-        } else if cfg!(target_os = "macos") {
-            "[Platform: macOS]"
-        } else {
-            "[Platform: Linux]"
-        };
-        let mut lines = vec![os_hint.to_string(), "Available tools list:".to_string()];
-        for tool_def in &tool_defs {
-            let name = tool_def["function"]["name"].as_str().unwrap_or("");
-            let desc = tool_def["function"]["description"].as_str().unwrap_or("");
-            if desc.is_empty() {
-                lines.push(format!("- ID: {}", name));
-            } else {
-                lines.push(format!("- ID: {} | Purpose: {}", name, desc));
-            }
-        }
-        lines.join("\n")
+            .readable_tool_menu_for_role(&role.to_string())
     }
 }
 
