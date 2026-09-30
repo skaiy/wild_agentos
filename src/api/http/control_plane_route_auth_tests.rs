@@ -648,6 +648,90 @@ async fn metrics_remains_unauthenticated() {
     assert!(body.get("embedding_health").is_some());
 }
 
+#[derive(Debug)]
+struct DefaultedClaimsObservation {
+    statuses: Vec<(&'static str, StatusCode)>,
+    outbound_request_delta: usize,
+    api_state_unchanged: bool,
+    config_unchanged: bool,
+    vector_store_unchanged: bool,
+}
+
+async fn observe_control_plane_requests(
+    token: &str,
+    data_dir: &std::path::Path,
+    outbound_requests: &AtomicUsize,
+    address: std::net::SocketAddr,
+) -> DefaultedClaimsObservation {
+    let state = test_state(data_dir);
+    let router = app(state.clone());
+    let original_api_state = api_state(&state).await;
+    let original_config = state.config_info.read().await.clone();
+    let outbound_before = outbound_requests.load(std::sync::atomic::Ordering::SeqCst);
+    let mut statuses = Vec::new();
+    for (method, uri, body) in [
+        (Method::GET, "/api/v1/batch/agents", json!(null)),
+        (
+            Method::POST,
+            "/api/v1/batch/agents/example/control",
+            json!({"action": "start"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/models/test",
+            json!({"resource_id": "missing"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/providers/models",
+            json!({"base_url": format!("http://{address}")}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/embedding/activate",
+            json!({"resource_id": "embedding-a"}),
+        ),
+        (Method::GET, "/api/v1/api-clients", json!(null)),
+        (
+            Method::POST,
+            "/api/v1/api-clients",
+            json!({"name": "created"}),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/api-clients/missing",
+            json!({"name": "changed"}),
+        ),
+        (Method::DELETE, "/api/v1/api-clients/missing", json!(null)),
+        (
+            Method::POST,
+            "/api/v1/api-clients/missing/keys",
+            json!({"name": "new-key"}),
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/api-clients/missing/keys/missing",
+            json!(null),
+        ),
+        (Method::GET, "/api/v1/api-audit", json!(null)),
+    ] {
+        statuses.push((
+            uri,
+            request(&router, method, uri, body, Some(token)).await.0,
+        ));
+    }
+
+    let observation = DefaultedClaimsObservation {
+        statuses,
+        outbound_request_delta: outbound_requests.load(std::sync::atomic::Ordering::SeqCst)
+            - outbound_before,
+        api_state_unchanged: api_state(&state).await == original_api_state,
+        config_unchanged: *state.config_info.read().await == original_config,
+        vector_store_unchanged: state.vector_store.load_full().is_none(),
+    };
+    observation
+}
+
 // The established `VerifiedDefaulted` convention rejects incomplete JWT scope
 // with 403 (see `invoke_mcp_server_handler`). #241 only checks that claims are
 // present, so a missing project currently proceeds to normal results:
@@ -656,10 +740,8 @@ async fn metrics_remains_unauthenticated() {
 // /api/v1/embedding/activate=200 (and hot-swaps); /api/v1/api-clients and
 // /api/v1/api-audit=200; POST /api/v1/api-clients=201; PUT/DELETE
 // /api/v1/api-clients/:id and POST/DELETE /api/v1/api-clients/:id/keys(/:kid)=404.
-// Current IAM rejects a raw JWT with no tenant_id at extraction as 401, because
-// JwtClaims.tenant_id is required; the expected post-#241-fix result is 403.
 #[tokio::test]
-#[ignore = "control-plane routes accept VerifiedDefaulted claims; see the route-specific observed statuses above"]
+#[ignore = "missing-project VerifiedDefaulted claims reach control-plane handlers; see observed statuses above"]
 async fn control_plane_routes_reject_defaulted_verified_claims() {
     let _lock = TEST_ENV_LOCK
         .lock()
@@ -693,133 +775,78 @@ async fn control_plane_routes_reject_defaulted_verified_claims() {
     tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
     write_models_override(data_dir.path(), &format!("http://{address}"));
 
-    #[derive(Debug)]
-    struct DefaultedClaimsObservation {
-        field: &'static str,
-        statuses: Vec<(&'static str, StatusCode)>,
-        outbound_request_delta: usize,
-        api_state_unchanged: bool,
-        config_unchanged: bool,
-        vector_store_unchanged: bool,
-    }
-
-    async fn assert_defaulted_claims_are_forbidden(
-        token: &str,
-        defaulted_field: &'static str,
-        data_dir: &std::path::Path,
-        outbound_requests: &AtomicUsize,
-        address: std::net::SocketAddr,
-    ) -> DefaultedClaimsObservation {
-        let state = test_state(data_dir);
-        let router = app(state.clone());
-        let original_api_state = api_state(&state).await;
-        let original_config = state.config_info.read().await.clone();
-        let outbound_before = outbound_requests.load(std::sync::atomic::Ordering::SeqCst);
-        let mut statuses = Vec::new();
-        for (method, uri, body) in [
-            (Method::GET, "/api/v1/batch/agents", json!(null)),
-            (
-                Method::POST,
-                "/api/v1/batch/agents/example/control",
-                json!({"action": "start"}),
-            ),
-            (
-                Method::POST,
-                "/api/v1/models/test",
-                json!({"resource_id": "missing"}),
-            ),
-            (
-                Method::POST,
-                "/api/v1/providers/models",
-                json!({"base_url": format!("http://{address}")}),
-            ),
-            (
-                Method::POST,
-                "/api/v1/embedding/activate",
-                json!({"resource_id": "embedding-a"}),
-            ),
-            (Method::GET, "/api/v1/api-clients", json!(null)),
-            (
-                Method::POST,
-                "/api/v1/api-clients",
-                json!({"name": "created"}),
-            ),
-            (
-                Method::PUT,
-                "/api/v1/api-clients/missing",
-                json!({"name": "changed"}),
-            ),
-            (Method::DELETE, "/api/v1/api-clients/missing", json!(null)),
-            (
-                Method::POST,
-                "/api/v1/api-clients/missing/keys",
-                json!({"name": "new-key"}),
-            ),
-            (
-                Method::DELETE,
-                "/api/v1/api-clients/missing/keys/missing",
-                json!(null),
-            ),
-            (Method::GET, "/api/v1/api-audit", json!(null)),
-        ] {
-            statuses.push((
-                uri,
-                request(&router, method, uri, body, Some(token)).await.0,
-            ));
-        }
-
-        let observation = DefaultedClaimsObservation {
-            field: defaulted_field,
-            statuses,
-            outbound_request_delta: outbound_requests.load(std::sync::atomic::Ordering::SeqCst)
-                - outbound_before,
-            api_state_unchanged: api_state(&state).await == original_api_state,
-            config_unchanged: *state.config_info.read().await == original_config,
-            vector_store_unchanged: state.vector_store.load_full().is_none(),
-        };
-        observation
-    }
-
-    let project_defaulted = assert_defaulted_claims_are_forbidden(
+    let observation = observe_control_plane_requests(
         &jwt(&["DA"], None),
-        "project_id",
         data_dir.path(),
         &outbound_requests,
         address,
     )
     .await;
-    let tenant_defaulted = assert_defaulted_claims_are_forbidden(
+    assert!(
+        observation
+            .statuses
+            .iter()
+            .all(|(_, status)| *status == StatusCode::FORBIDDEN),
+        "a DA token with a defaulted project_id must be rejected: {:?}",
+        observation.statuses
+    );
+    assert_eq!(observation.outbound_request_delta, 0);
+    assert!(observation.api_state_unchanged);
+    assert!(observation.config_unchanged);
+    assert!(observation.vector_store_unchanged);
+}
+
+#[tokio::test]
+async fn control_plane_routes_reject_missing_tenant_claims_before_side_effects() {
+    let _lock = TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let data_dir = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set(&[
+        ("AGENTOS_AUTH_MODE", "hs256".into()),
+        (
+            "AGENTOS_JWT_SECRET",
+            String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        ),
+        (
+            "AGENTOS_DATA_DIR",
+            data_dir.path().to_string_lossy().into_owned(),
+        ),
+    ]);
+    let outbound_requests = Arc::new(AtomicUsize::new(0));
+    let mock_requests = outbound_requests.clone();
+    let mock = Router::new().route(
+        "/v1/models",
+        get(move || {
+            let requests = mock_requests.clone();
+            async move {
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(json!({"data": []}))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    write_models_override(data_dir.path(), &format!("http://{address}"));
+
+    let observation = observe_control_plane_requests(
         &jwt_without_tenant(&["DA"]),
-        "tenant_id",
         data_dir.path(),
         &outbound_requests,
         address,
     )
     .await;
-    for observation in [project_defaulted, tenant_defaulted] {
-        assert!(
-            observation
-                .statuses
-                .iter()
-                .all(|(_, status)| *status == StatusCode::FORBIDDEN),
-            "a DA token with a defaulted {} must be rejected: {:?}",
-            observation.field,
-            observation.statuses
-        );
-        assert_eq!(
-            observation.outbound_request_delta, 0,
-            "a DA token with a defaulted {} must not reach provider_models",
-            observation.field
-        );
-        assert!(
-            observation.api_state_unchanged,
-            "a DA token with a defaulted {} must not modify API client/key state",
-            observation.field
-        );
-        assert!(
-            observation.config_unchanged && observation.vector_store_unchanged,
-            "a DA token with a defaulted {} must not activate embeddings or reindex",
-            observation.field
-        );
-    }
+    assert!(
+        observation
+            .statuses
+            .iter()
+            .all(|(_, status)| *status == StatusCode::UNAUTHORIZED),
+        "a JWT with no tenant_id must fail closed as 401 for every route: {:?}",
+        observation.statuses
+    );
+    assert_eq!(observation.outbound_request_delta, 0);
+    assert!(observation.api_state_unchanged);
+    assert!(observation.config_unchanged);
+    assert!(observation.vector_store_unchanged);
 }
