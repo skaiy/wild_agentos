@@ -523,8 +523,8 @@ pub(crate) mod tests {
     use serde::Serialize;
 
     use super::{
-        validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims, UserIdentity,
-        DEFAULT_HS256_SECRET,
+        claims_identity, validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims,
+        UserIdentity, DEFAULT_HS256_SECRET,
     };
     use crate::api::http::TEST_ENV_LOCK;
 
