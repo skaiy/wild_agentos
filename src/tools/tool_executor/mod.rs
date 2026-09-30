@@ -1621,6 +1621,7 @@ impl ToolExecutor {
             .map(|manager| manager.get_tool_names_for_role(role_name).1)
             .unwrap_or_default();
         activated.activate(&candidates, &on_demand)
+    }
 
     /// Human-readable mirror of the function definitions sent to the model.
     ///
