@@ -7,7 +7,7 @@ use crate::tools::tool_groups::ToolGroupManager;
 ///
 /// The policy is instantiated for each run. Agent restrictions only intersect
 /// with a role's cap; they can never add a capability.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ToolPolicy {
     groups: ToolGroupManager,
     check_bash_enabled: bool,

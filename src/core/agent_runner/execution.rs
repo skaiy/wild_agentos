@@ -14,7 +14,6 @@ use crate::jsonld::{JsonLdContext, JsonLdNode};
 use crate::memory::l1_session::L1Session;
 use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
-use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
 use super::{
