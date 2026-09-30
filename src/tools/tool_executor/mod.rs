@@ -1483,8 +1483,9 @@ impl ToolExecutor {
             _ => role,
         };
 
-        let (resident_tools, on_demand_tools) = if let Some(ref manager) = self
+        let (resident_tools, on_demand_tools) = if let Some(manager) = self
             .tool_group_manager
+            .as_ref()
             .filter(|manager| manager.is_enabled())
         {
             manager.get_tool_names_for_role(role_name)

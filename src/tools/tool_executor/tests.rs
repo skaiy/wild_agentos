@@ -207,8 +207,8 @@ mod tests {
         let mut executor = ToolExecutor::new();
         executor.set_tool_group_manager(ToolGroupManager::new(None));
         let activated = executor.activated_tools();
-        let names: Vec<&str> = executor
-            .tool_definitions_for_turn("Do", &activated)
+        let definitions = executor.tool_definitions_for_turn("Do", &activated);
+        let names: Vec<&str> = definitions
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
             .collect();
