@@ -1,13 +1,39 @@
 //! MCP server catalog and authenticated outbound invocation surface.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use futures::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{data_dir, iam::UserIdentity, AppState};
+
+const MAX_ALLOWED_TOOLS: usize = 64;
+const MAX_TOOL_NAME_LENGTH: usize = 128;
+const WRITE_CLASS_TOOL_PREFIXES: &[&str] = &[
+    "create_",
+    "update_",
+    "delete_",
+    "generate_",
+    "execute_",
+    "add_",
+    "remove_",
+    "apply_",
+    "duplicate_",
+    "restore_",
+    "save_",
+    "manage_",
+    "set_",
+    "write_",
+    "insert_",
+    "drop_",
+    "upsert_",
+    "import_",
+    "publish_",
+    "send_",
+];
 
 /// MCP 服务器注册表的持久化文件路径。
 fn mcp_servers_store_path() -> std::path::PathBuf {
@@ -85,6 +111,47 @@ pub struct McpServerRegisterRequest {
     /// environment. The catalog stores only the fixed environment references,
     /// never credential values.
     pub auth_kind: Option<String>,
+    /// Exact, case-sensitive tool names allowed for this server. An empty
+    /// array explicitly denies every tool.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Write-class tools require both an allowlist entry and this explicit
+    /// opt-in. Omitted values remain disabled.
+    pub write_tools_enabled: Option<bool>,
+}
+
+fn is_valid_tool_name(tool_name: &str) -> bool {
+    !tool_name.is_empty()
+        && tool_name.len() <= MAX_TOOL_NAME_LENGTH
+        && tool_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+}
+
+fn validate_tool_policy(
+    allowed_tools: Option<&[String]>,
+    write_tools_enabled: Option<bool>,
+) -> Result<(), &'static str> {
+    if write_tools_enabled == Some(true) && allowed_tools.is_none_or(|tools| tools.is_empty()) {
+        return Err("write_tools_enabled requires a non-empty allowed_tools list");
+    }
+    let Some(allowed_tools) = allowed_tools else {
+        return Ok(());
+    };
+    if allowed_tools.len() > MAX_ALLOWED_TOOLS {
+        return Err("allowed_tools exceeds the maximum number of entries");
+    }
+    let mut seen = HashSet::with_capacity(allowed_tools.len());
+    for tool_name in allowed_tools {
+        if !is_valid_tool_name(tool_name) {
+            return Err(
+                "allowed_tools entries must be 1-128 ASCII letters, digits, '.', '_', '-' or '/'",
+            );
+        }
+        if !seen.insert(tool_name) {
+            return Err("allowed_tools entries must be unique");
+        }
+    }
+    Ok(())
 }
 
 fn catalog_auth(kind: Option<&str>) -> Result<Value, &'static str> {
@@ -134,6 +201,11 @@ pub(crate) async fn register_mcp_server_handler(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
         }
     };
+    if let Err(message) =
+        validate_tool_policy(req.allowed_tools.as_deref(), req.write_tools_enabled)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
+    }
     let server = json!({
         "id": uuid::Uuid::new_v4().hyphenated().to_string(),
         "name": req.name,
@@ -141,6 +213,8 @@ pub(crate) async fn register_mcp_server_handler(
         "endpoint": req.endpoint,
         "protocol": protocol,
         "auth": auth,
+        "allowed_tools": req.allowed_tools,
+        "write_tools_enabled": req.write_tools_enabled.unwrap_or(false),
         "status": "active",
         "tenantId": claims.tenant_id(),
         "projectId": claims.project_id(),
@@ -195,9 +269,9 @@ fn mint_outbound_mcp_jwt() -> Result<String, String> {
     let secret = mcp_env("MCP_JWT_SECRET", None)?;
     let now = chrono::Utc::now().timestamp() as usize;
     let claims = OutboundMcpJwtClaims {
-        iss: mcp_env("MCP_JWT_ISSUER", Some("wodp-demo"))?,
-        aud: mcp_env("MCP_JWT_AUDIENCE", Some("wodp-mcp"))?,
-        sub: mcp_env("MCP_JWT_SUB", Some("wodp_agent"))?,
+        iss: mcp_env("MCP_JWT_ISSUER", Some("wild-agentos-core"))?,
+        aud: mcp_env("MCP_JWT_AUDIENCE", Some("example-mcp"))?,
+        sub: mcp_env("MCP_JWT_SUB", Some("mcp-client"))?,
         iat: now,
         exp: now + 300,
     };
@@ -217,38 +291,196 @@ fn server_uses_bearer_jwt(server: &Value) -> bool {
         == Some("bearer_jwt")
 }
 
+const OUTBOUND_MCP_REQUEST_ID: u64 = 1;
+const MAX_OUTBOUND_MCP_SSE_RESPONSE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+enum InvokeHttpMcpError {
+    Transport(String),
+    JsonRpc(Value),
+}
+
+async fn read_sse_json_rpc_response(
+    response: reqwest::Response,
+    request_id: u64,
+) -> Result<Value, InvokeHttpMcpError> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            InvokeHttpMcpError::Transport(format!("MCP SSE response read failed: {error}"))
+        })?;
+        if body.len() + chunk.len() > MAX_OUTBOUND_MCP_SSE_RESPONSE_BYTES {
+            return Err(InvokeHttpMcpError::Transport(format!(
+                "MCP SSE response exceeded {MAX_OUTBOUND_MCP_SSE_RESPONSE_BYTES} byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let body = std::str::from_utf8(&body).map_err(|error| {
+        InvokeHttpMcpError::Transport(format!("MCP SSE response was not valid UTF-8: {error}"))
+    })?;
+    let mut event_type = None;
+    let mut data = Vec::new();
+
+    for line in body.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if !data.is_empty() && event_type.as_deref().is_none_or(|event| event == "message") {
+                let message: Value = serde_json::from_str(&data.join("\n")).map_err(|error| {
+                    InvokeHttpMcpError::Transport(format!(
+                        "MCP SSE event data was not valid JSON-RPC JSON: {error}"
+                    ))
+                })?;
+                if message.get("id") == Some(&json!(request_id)) {
+                    return Ok(message);
+                }
+            }
+            event_type = None;
+            data.clear();
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event_type = Some(value.to_string()),
+            "data" => data.push(value.to_string()),
+            _ => {}
+        }
+    }
+
+    Err(InvokeHttpMcpError::Transport(
+        "MCP SSE response did not include a JSON-RPC message for the request".to_string(),
+    ))
+}
+
+fn is_write_class_tool(name: &str) -> bool {
+    WRITE_CLASS_TOOL_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ToolPolicyDenied {
+    ToolNotAllowed,
+    WriteToolBlocked,
+}
+
+fn check_tool_policy(server: &Value, tool_name: &str) -> Result<(), ToolPolicyDenied> {
+    match server.get("allowed_tools") {
+        Some(Value::Array(allowed_tools)) => {
+            let listed = allowed_tools
+                .iter()
+                .any(|allowed_tool| allowed_tool.as_str() == Some(tool_name));
+            if !listed {
+                return Err(ToolPolicyDenied::ToolNotAllowed);
+            }
+            if is_write_class_tool(tool_name)
+                && server.get("write_tools_enabled").and_then(Value::as_bool) != Some(true)
+            {
+                return Err(ToolPolicyDenied::WriteToolBlocked);
+            }
+        }
+        Some(Value::Null) | None => {
+            if is_write_class_tool(tool_name) {
+                return Err(ToolPolicyDenied::WriteToolBlocked);
+            }
+            tracing::warn!(
+                server_id = server
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                "catalog MCP server has no allowed_tools policy; add an allowlist"
+            );
+        }
+        Some(_) => return Err(ToolPolicyDenied::ToolNotAllowed),
+    }
+    Ok(())
+}
+
+fn tool_policy_denied_response(
+    denied: ToolPolicyDenied,
+    tool_name: &str,
+) -> (StatusCode, Json<Value>) {
+    let error = match denied {
+        ToolPolicyDenied::ToolNotAllowed => "mcp_tool_not_allowed",
+        ToolPolicyDenied::WriteToolBlocked => "mcp_write_tool_blocked",
+    };
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": error, "tool_name": tool_name})),
+    )
+}
+
 async fn invoke_http_mcp(
     endpoint: &str,
     bearer: &str,
     tool_name: &str,
     arguments: Value,
-) -> Result<Value, String> {
+) -> Result<Value, InvokeHttpMcpError> {
     let response = reqwest::Client::new()
         .post(endpoint)
         .bearer_auth(bearer)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": OUTBOUND_MCP_REQUEST_ID,
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": arguments},
         }))
         .send()
         .await
-        .map_err(|error| format!("MCP HTTP request failed: {error}"))?;
+        .map_err(|error| {
+            InvokeHttpMcpError::Transport(format!("MCP HTTP request failed: {error}"))
+        })?;
     let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("MCP response parse failed: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("MCP HTTP request failed with status {status}"));
-    }
+    let is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let body = if is_sse {
+        read_sse_json_rpc_response(response, OUTBOUND_MCP_REQUEST_ID).await?
+    } else {
+        response.json().await.map_err(|error| {
+            InvokeHttpMcpError::Transport(format!("MCP response parse failed: {error}"))
+        })?
+    };
     if let Some(error) = body.get("error") {
-        return Err(format!("MCP tools/call returned error: {error}"));
+        return Err(InvokeHttpMcpError::JsonRpc(error.clone()));
     }
-    body.get("result")
-        .cloned()
-        .ok_or_else(|| "MCP tools/call response did not include a result".to_string())
+    if !status.is_success() {
+        return Err(InvokeHttpMcpError::Transport(format!(
+            "MCP HTTP request failed with status {status}"
+        )));
+    }
+    body.get("result").cloned().ok_or_else(|| {
+        InvokeHttpMcpError::Transport(
+            "MCP tools/call response did not include a result".to_string(),
+        )
+    })
+}
+
+fn outbound_mcp_failure_response(error: InvokeHttpMcpError) -> axum::response::Response {
+    match error {
+        InvokeHttpMcpError::JsonRpc(error) => {
+            (StatusCode::OK, Json(json!({"error": error}))).into_response()
+        }
+        InvokeHttpMcpError::Transport(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "outbound_mcp_call_failed", "message": error})),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /api/v1/mcp/servers/invoke — invoke a tool on a catalog HTTP MCP.
@@ -308,6 +540,9 @@ pub(crate) async fn invoke_mcp_server_handler(
         )
             .into_response();
     }
+    if let Err(denied) = check_tool_policy(server, &request.tool_name) {
+        return tool_policy_denied_response(denied, &request.tool_name).into_response();
+    }
     let bearer = match mint_outbound_mcp_jwt() {
         Ok(token) => token,
         Err(error) => {
@@ -321,11 +556,7 @@ pub(crate) async fn invoke_mcp_server_handler(
     let endpoint = server["endpoint"].as_str().unwrap_or_default();
     match invoke_http_mcp(endpoint, &bearer, &request.tool_name, request.arguments).await {
         Ok(result) => (StatusCode::OK, Json(json!({"result": result}))).into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "outbound_mcp_call_failed", "message": error})),
-        )
-            .into_response(),
+        Err(error) => outbound_mcp_failure_response(error),
     }
 }
 
@@ -334,13 +565,20 @@ mod tests {
     use super::*;
     use crate::isolation::IsolationClaims;
     use axum::{
+        body::Body,
         extract::State,
-        http::{HeaderMap, StatusCode},
+        http::{
+            header::{ACCEPT, CONTENT_TYPE},
+            HeaderMap, StatusCode,
+        },
+        response::IntoResponse,
         routing::post,
         Json, Router,
     };
     use jsonwebtoken::{decode, DecodingKey, Validation};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
+    use tower::ServiceExt;
 
     #[test]
     fn mcp_server_catalog_is_scoped_to_verified_claims() {
@@ -378,6 +616,292 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tool_policy_registration_validation_rejects_invalid_values() {
+        assert!(validate_tool_policy(Some(&["read_status".into()]), None).is_ok());
+        assert!(validate_tool_policy(None, None).is_ok());
+        assert!(validate_tool_policy(Some(&[]), None).is_ok());
+        assert!(validate_tool_policy(Some(&["".into()]), None).is_err());
+        assert!(validate_tool_policy(Some(&["a".repeat(MAX_TOOL_NAME_LENGTH + 1)]), None).is_err());
+        assert!(validate_tool_policy(Some(&["invalid tool".into()]), None).is_err());
+        assert!(
+            validate_tool_policy(Some(&["read_status".into(), "read_status".into()]), None)
+                .is_err()
+        );
+        assert!(validate_tool_policy(
+            Some(&vec!["read_status".into(); MAX_ALLOWED_TOOLS + 1]),
+            None
+        )
+        .is_err());
+        assert!(validate_tool_policy(None, Some(true)).is_err());
+        assert!(validate_tool_policy(Some(&[]), Some(true)).is_err());
+        assert!(validate_tool_policy(Some(&["create_report".into()]), Some(true)).is_ok());
+    }
+
+    #[test]
+    fn tool_policy_enforces_allowlist_and_write_gate() {
+        let allowlist = json!({
+            "allowed_tools": ["read_status", "create_report"],
+            "write_tools_enabled": false,
+        });
+        assert_eq!(check_tool_policy(&allowlist, "read_status"), Ok(()));
+        assert_eq!(
+            check_tool_policy(&allowlist, "not_listed"),
+            Err(ToolPolicyDenied::ToolNotAllowed)
+        );
+        assert_eq!(
+            check_tool_policy(&allowlist, "create_report"),
+            Err(ToolPolicyDenied::WriteToolBlocked)
+        );
+
+        let write_enabled = json!({
+            "allowed_tools": ["create_report"],
+            "write_tools_enabled": true,
+        });
+        assert_eq!(check_tool_policy(&write_enabled, "create_report"), Ok(()));
+        assert_eq!(
+            check_tool_policy(&json!({}), "delete_report"),
+            Err(ToolPolicyDenied::WriteToolBlocked)
+        );
+        assert_eq!(check_tool_policy(&json!({}), "read_status"), Ok(()));
+        assert_eq!(
+            check_tool_policy(&json!({"allowed_tools": []}), "read_status"),
+            Err(ToolPolicyDenied::ToolNotAllowed)
+        );
+    }
+
+    fn test_app_state(servers: Vec<Value>) -> Arc<AppState> {
+        use crate::{
+            core::core_types::{CoreConfig, SemanticCore},
+            gateway::unified_gateway::UnifiedGateway,
+            tools::prompt_registry::PromptRegistry,
+        };
+
+        let temp_dir = std::env::temp_dir().join(format!("mcp-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let core = Arc::new(
+            SemanticCore::new(CoreConfig {
+                max_node_size: 1024,
+                max_projection_size: 2048,
+                l0_storage_path: temp_dir.join("l0").to_string_lossy().into_owned(),
+                event_buffer_size: 10,
+                enable_metrics: false,
+                eviction_config: None,
+            })
+            .unwrap(),
+        );
+        let gateway = Arc::new(
+            UnifiedGateway::new(&crate::config::GatewaySettings {
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                default_model: "test-model".into(),
+                timeout_seconds: 30,
+                max_retries: 1,
+                retry_base_ms: 500,
+                use_responses_api: false,
+                model_mapping: std::collections::HashMap::new(),
+            })
+            .unwrap(),
+        );
+        Arc::new(AppState {
+            core,
+            gateway,
+            kg_store: Arc::new(oxigraph::store::Store::new().unwrap()),
+            config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
+            agents_info: json!({}),
+            mcp_servers: Arc::new(tokio::sync::RwLock::new(servers)),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![])),
+            prompts: Arc::new(PromptRegistry::new()),
+            kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            blob_store: None,
+            task_executor: None,
+            batch_manager: None,
+            api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_usage: Arc::new(crate::api::http::api_gov::ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 1,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    fn inbound_identity_token() -> String {
+        encode(
+            &Header::default(),
+            &crate::api::http::iam::JwtClaims {
+                sub: "test-user".into(),
+                tenant_id: "test-tenant".into(),
+                project_id: Some("test-project".into()),
+                roles: vec!["DA".into()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_tools_do_not_mint_or_send_outbound_requests() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::remove_var("MCP_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        async fn mock_handler(
+            State(requests): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mock = Router::new()
+            .route("/mcp", post(mock_handler))
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let server = json!({
+            "id": "server-id",
+            "name": "catalog-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "write_tools_enabled": false,
+            "tenantId": "test-tenant",
+            "projectId": "test-project",
+        });
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![server]));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({
+                    "server": "catalog-server",
+                    "tool_name": "delete_report",
+                    "arguments": {"must_not_echo": "value"},
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            json!({"error": "mcp_tool_not_allowed", "tool_name": "delete_report"})
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_tools_are_forwarded() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        async fn mock_handler(
+            State(requests): State<Arc<AtomicUsize>>,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mock = Router::new()
+            .route("/mcp", post(mock_handler))
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let server = json!({
+            "id": "server-id",
+            "name": "catalog-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "write_tools_enabled": false,
+            "tenantId": "test-tenant",
+            "projectId": "test-project",
+        });
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![server]));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({
+                    "server": "catalog-server",
+                    "tool_name": "read_status",
+                    "arguments": {},
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"result": {"ok": true}}));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
     #[tokio::test]
     async fn outbound_call_sends_minted_bearer_not_isolation_claims() {
         let _guard = crate::api::http::TEST_ENV_LOCK
@@ -388,22 +912,46 @@ mod tests {
         std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
         std::env::set_var("MCP_JWT_SUB", "catalog-mcp-client");
 
+        #[derive(Default)]
+        struct SeenHeaders {
+            authorization: Option<String>,
+            accept: Option<String>,
+            content_type: Option<String>,
+        }
+
         async fn mock_handler(
-            State(seen): State<Arc<std::sync::Mutex<Option<String>>>>,
+            State(seen): State<Arc<std::sync::Mutex<SeenHeaders>>>,
             headers: HeaderMap,
             Json(body): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            *seen.lock().unwrap() = headers
+        ) -> axum::response::Response {
+            let mut seen = seen.lock().unwrap();
+            seen.authorization = headers
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
+            seen.accept = headers
+                .get(ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            seen.content_type = headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if !seen
+                .accept
+                .as_deref()
+                .is_some_and(|value| value.contains("text/event-stream"))
+            {
+                return StatusCode::NOT_ACCEPTABLE.into_response();
+            }
             (
                 StatusCode::OK,
                 Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": {"ok": true}})),
             )
+                .into_response()
         }
 
-        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::new(std::sync::Mutex::new(SeenHeaders::default()));
         let app = Router::new()
             .route("/mcp", post(mock_handler))
             .with_state(seen.clone());
@@ -424,7 +972,8 @@ mod tests {
         .unwrap();
         assert_eq!(result, json!({"ok": true}));
 
-        let header = seen.lock().unwrap().clone().unwrap();
+        let seen = seen.lock().unwrap();
+        let header = seen.authorization.as_deref().unwrap();
         let token = header.strip_prefix("Bearer ").unwrap();
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_aud = false;
@@ -437,6 +986,10 @@ mod tests {
         assert_eq!(decoded.claims.sub, "catalog-mcp-client");
         assert_ne!(decoded.claims.sub, isolation.actor_id());
         assert!(!token.contains(isolation.tenant_id()));
+        let accept = seen.accept.as_deref().unwrap();
+        assert!(accept.contains("application/json"));
+        assert!(accept.contains("text/event-stream"));
+        assert_eq!(seen.content_type.as_deref(), Some("application/json"));
 
         match previous_secret {
             Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
@@ -446,5 +999,91 @@ mod tests {
             Some(value) => std::env::set_var("MCP_JWT_SUB", value),
             None => std::env::remove_var("MCP_JWT_SUB"),
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_call_accepts_json_and_sse_streamable_http_responses() {
+        async fn mock_handler(
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let accepts_streaming = headers
+                .get(ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value.contains("application/json") && value.contains("text/event-stream")
+                });
+            if !accepts_streaming {
+                return StatusCode::NOT_ACCEPTABLE.into_response();
+            }
+
+            let id = body["id"].clone();
+            match body["params"]["name"].as_str() {
+                Some("sse_result") => (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\ndata: \"id\":{id},\"result\":{{\"transport\":\"sse\"}}}}\n\n"
+                    ),
+                )
+                    .into_response(),
+                _ => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"transport": "json"},
+                }))
+                .into_response(),
+            }
+        }
+
+        let app = Router::new().route("/mcp", post(mock_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = format!("http://{address}/mcp");
+
+        assert_eq!(
+            invoke_http_mcp(&endpoint, "test-token", "json_result", json!({}))
+                .await
+                .unwrap(),
+            json!({"transport": "json"})
+        );
+        assert_eq!(
+            invoke_http_mcp(&endpoint, "test-token", "sse_result", json!({}))
+                .await
+                .unwrap(),
+            json!({"transport": "sse"})
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_call_surfaces_sse_json_rpc_errors() {
+        async fn mock_handler(Json(body): Json<Value>) -> axum::response::Response {
+            (
+                [(CONTENT_TYPE, "text/event-stream")],
+                format!(
+                    "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32001,\"message\":\"upstream denied\"}}}}\n\n",
+                    body["id"]
+                ),
+            )
+                .into_response()
+        }
+
+        let app = Router::new().route("/mcp", post(mock_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("http://{address}/mcp");
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = invoke_http_mcp(&endpoint, "test-token", "error_result", json!({}))
+            .await
+            .unwrap_err();
+        let InvokeHttpMcpError::JsonRpc(error) = error else {
+            panic!("SSE JSON-RPC error must not be converted to a transport failure");
+        };
+        assert_eq!(error["code"], -32001);
+        assert_eq!(error["message"], "upstream denied");
+
+        let response = outbound_mcp_failure_response(InvokeHttpMcpError::JsonRpc(error));
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

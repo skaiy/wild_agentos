@@ -21,6 +21,10 @@ impl ToolController {
                 "web_search",
                 "web_fetch",
                 "rag_search",
+                "knowledge_list",
+                "knowledge_search",
+                "kg_search",
+                "knowledge_extract_code",
             ],
             write_tools: vec![
                 "file_write",
@@ -41,6 +45,13 @@ impl ToolController {
         self.write_tools.contains(&tool_name)
     }
 
+    pub fn is_tool_allowed_for_role(&self, tool_name: &str, role: &AgentRole) -> bool {
+        match role {
+            AgentRole::Plan => self.is_readonly_tool(tool_name),
+            AgentRole::Do | AgentRole::Check | AgentRole::Act => true,
+        }
+    }
+
     pub fn filter_tools_for_role(
         &self,
         tool_calls: &[(String, Value)],
@@ -48,20 +59,20 @@ impl ToolController {
     ) -> Vec<(String, Value)> {
         match role {
             AgentRole::Plan => {
-                let write_calls: Vec<String> = tool_calls
+                let disallowed_calls: Vec<String> = tool_calls
                     .iter()
-                    .filter(|(name, _)| self.is_write_tool(name))
+                    .filter(|(name, _)| !self.is_tool_allowed_for_role(name, role))
                     .map(|(name, _)| name.clone())
                     .collect();
-                if !write_calls.is_empty() {
+                if !disallowed_calls.is_empty() {
                     warn!(
-                        "[PA] Detected write tool calls: {:?}, filtered",
-                        write_calls
+                        "[PA] Detected disallowed tool calls: {:?}, filtered",
+                        disallowed_calls
                     );
                 }
                 tool_calls
                     .iter()
-                    .filter(|(name, _)| self.is_readonly_tool(name))
+                    .filter(|(name, _)| self.is_tool_allowed_for_role(name, role))
                     .cloned()
                     .collect()
             }
@@ -71,7 +82,9 @@ impl ToolController {
 
     pub fn should_force_finish(&self, tool_calls: &[(String, Value)], role: &AgentRole) -> bool {
         match role {
-            AgentRole::Plan => tool_calls.iter().any(|(name, _)| self.is_write_tool(name)),
+            AgentRole::Plan => tool_calls
+                .iter()
+                .any(|(name, _)| !self.is_tool_allowed_for_role(name, role)),
             AgentRole::Act => false,
             AgentRole::Do => false,
             AgentRole::Check => false,
@@ -154,8 +167,23 @@ mod tests {
         let tc = ToolController::new();
         let calls = vec![("file_write".to_string(), Value::Null)];
         assert!(tc.should_force_finish(&calls, &AgentRole::Plan));
+        let calls = vec![("bash".to_string(), Value::Null)];
+        assert!(tc.should_force_finish(&calls, &AgentRole::Plan));
+        let calls = vec![("not_in_plan_allowlist".to_string(), Value::Null)];
+        assert!(tc.should_force_finish(&calls, &AgentRole::Plan));
         let calls2 = vec![("file_read".to_string(), Value::Null)];
         assert!(!tc.should_force_finish(&calls2, &AgentRole::Plan));
+    }
+
+    #[test]
+    fn test_plan_allowlist_matches_pa_readonly_tools() {
+        let tc = ToolController::new();
+
+        for tool in crate::tools::tool_executor::ToolExecutor::pa_readonly_tools() {
+            assert!(tc.is_tool_allowed_for_role(tool, &AgentRole::Plan));
+        }
+        assert!(!tc.is_tool_allowed_for_role("bash", &AgentRole::Plan));
+        assert!(!tc.is_tool_allowed_for_role("file_write", &AgentRole::Plan));
     }
 
     #[test]

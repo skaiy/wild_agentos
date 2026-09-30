@@ -1575,7 +1575,6 @@ impl ToolExecutor {
             "knowledge_search",
             "kg_search",
             "knowledge_extract_code",
-            "bash",
         ]
     }
 
