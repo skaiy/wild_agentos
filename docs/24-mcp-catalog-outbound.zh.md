@@ -64,6 +64,11 @@ Content-Type: application/json
 `Authorization: Bearer <minted JWT>`，并转发 JSON-RPC `tools/call` 请求。
 成功响应的形式为 `{"result": ...}`。
 
+为兼容 Streamable HTTP，出站请求会发送
+`Accept: application/json, text/event-stream` 和 `Content-Type: application/json`。
+Core 可以接收 JSON 响应，或从 SSE 响应中读取匹配的 JSON-RPC 消息。每次调用都是
+无状态的，不执行 initialize/session 握手。
+
 如果 Catalog 条目缺少 `auth_kind: "bearer_jwt"`、签名环境变量未配置、JWT 签发
 失败，或远端服务拒绝令牌，调用会明确失败。服务不会伪造成功的工具结果。
 
