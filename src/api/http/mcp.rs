@@ -1660,6 +1660,9 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_catalog_endpoint_is_rejected_before_outbound_request() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let requests = Arc::new(AtomicUsize::new(0));
         async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
             requests.fetch_add(1, Ordering::SeqCst);
