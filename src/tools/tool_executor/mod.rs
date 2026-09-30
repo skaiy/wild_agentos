@@ -1831,6 +1831,19 @@ impl ToolExecutor {
             .cloned()
             .unwrap_or_else(|| ToolGroupManager::new(None));
         let (resident, on_demand) = manager.get_tool_names_for_role(role_name);
+        let exact_query = params.query.trim();
+        if self
+            .tool_descriptions
+            .iter()
+            .any(|tool| tool.name == exact_query)
+            && !policy.is_executable(&role, agent_id, exact_query)
+        {
+            return Ok(json!({
+                "matches": [],
+                "count": 0,
+                "query": params.query,
+            }));
+        }
         let query_terms = search_terms(&params.query);
         let max_results = params.max_results.unwrap_or(5).min(10);
 

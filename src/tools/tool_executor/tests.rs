@@ -190,9 +190,13 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .all(ToolExecutor::is_pa_readonly_tool));
+        let plan_denied = executor
+            .search_tools_for_role("Plan", json!({"query": "bash"}))
+            .unwrap();
+        assert_eq!(plan_denied["count"], 0);
 
         let check = executor
-            .search_tools_for_role("Check", json!({"query": "write file shell command"}))
+            .search_tools_for_role("Check", json!({"query": "bash"}))
             .unwrap();
         assert_eq!(check["count"], 0);
 
