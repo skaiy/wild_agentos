@@ -2870,7 +2870,6 @@ mod tests {
 
     #[tokio::test]
     // #257 gap: IAM normalizes a missing project_id to "default", allowing minting and outbound I/O.
-    #[ignore = "expected-fail until #257 rejects inbound identities without project_id"]
     async fn missing_inbound_project_id_does_not_mint_or_call_sidecar() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
@@ -3105,7 +3104,6 @@ mod tests {
 
     #[tokio::test]
     // #257 gap: IAM normalizes an empty project_id to "default", allowing minting and outbound I/O.
-    #[ignore = "expected-fail until #257 records whether project_id was explicitly present"]
     async fn empty_inbound_project_id_does_not_mint_or_call_sidecar() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
@@ -3187,7 +3185,6 @@ mod tests {
 
     #[test]
     // #257 gap: from_verified cannot record that a default project originated outside a JWT claim.
-    #[ignore = "expected-fail until #257 tracks IsolationClaims field presence"]
     fn default_project_from_verified_does_not_mint() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
@@ -3204,7 +3201,6 @@ mod tests {
 
     #[tokio::test]
     // #257 gap: watcher-built deploy-config claims cannot yet carry their non-token provenance.
-    #[ignore = "expected-fail until #257 refuses deploy-config claims for MCP minting"]
     async fn watcher_style_default_claims_are_refused_before_mcp_outbound() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
@@ -3273,6 +3269,109 @@ mod tests {
         assert!(!body.contains("default"));
         assert!(!body.contains("outbound-mcp-test-secret"));
         assert_eq!(requests.load(Ordering::SeqCst), 0);
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_tenant_jwt_cannot_invoke_mcp_or_read_default_tenant_kb() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved: Vec<_> = ["MCP_JWT_SECRET", "AGENTOS_AUTH_MODE", "AGENTOS_AUTH_STRICT"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        let requests = Arc::new(AtomicUsize::new(0));
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests_for_server = requests.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/mcp", post(mock_handler))
+                    .with_state(requests_for_server),
+            )
+            .await
+            .unwrap()
+        });
+        let state = test_app_state(vec![json!({
+            "id": "missing-tenant-server",
+            "name": "missing-tenant-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "write_tools_enabled": false,
+            "tenantId": "default",
+            "projectId": "test-project",
+        })]);
+        state.knowledge_bases.write().await.push(json!({
+            "id": "default-tenant-kb",
+            "name": "Default tenant record",
+            "tenant_id": "default",
+            "project_id": "test-project",
+        }));
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .route(
+                "/kb",
+                axum::routing::get(crate::api::http::kb::list_knowledge_bases_handler),
+            )
+            .with_state(state);
+        let token = encode(
+            &Header::default(),
+            &json!({
+                "sub": "test-user",
+                "project_id": "test-project",
+                "roles": ["DA"],
+                "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+            }),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap();
+        let invoke = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({"server": "missing-tenant-server", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let invoke_response = app.clone().oneshot(invoke).await.unwrap();
+        assert_eq!(invoke_response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let kb = axum::http::Request::builder()
+            .method("GET")
+            .uri("/kb")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let kb_response = app.oneshot(kb).await.unwrap();
+        assert_eq!(kb_response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(kb_response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(!std::str::from_utf8(&body)
+            .unwrap()
+            .contains("default-tenant-kb"));
         for (name, value) in saved {
             match value {
                 Some(value) => std::env::set_var(name, value),
