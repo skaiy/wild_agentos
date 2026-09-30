@@ -1067,7 +1067,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token()),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::from(
                 json!({
@@ -1091,7 +1094,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token()),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::from(
                 json!({"server": "server-id", "tool_name": "read_status", "arguments": {}})
@@ -1903,7 +1909,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token()),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::from(
                 json!({
@@ -1930,7 +1939,10 @@ mod tests {
             .uri("/servers/delete-server")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token()),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::empty())
             .unwrap();
@@ -1988,7 +2000,11 @@ mod tests {
             )
             .is_err()
             {
-                return StatusCode::UNAUTHORIZED.into_response();
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": {}})),
+                )
+                    .into_response();
             }
             Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": {"ok": true}}))
                 .into_response()
@@ -2307,7 +2323,10 @@ mod tests {
             .uri("/servers/catalog-server")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::empty())
             .unwrap();
@@ -2409,7 +2428,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             app.oneshot(request).await.unwrap().status(),
-            StatusCode::FORBIDDEN
+            StatusCode::BAD_GATEWAY
         );
         assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
         for (name, value) in saved {
@@ -2464,7 +2483,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::from(
                 json!({
@@ -2490,7 +2512,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::from(
                 json!({"server": "local-server", "tool_name": "read_status", "arguments": {}})
@@ -2568,7 +2593,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::from(
                 json!({
@@ -2588,7 +2616,10 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+                format!(
+                    "Bearer {}",
+                    inbound_identity_token_with_roles(vec!["mcp_admin"])
+                ),
             )
             .body(Body::from(
                 json!({"server": "strict-server", "tool_name": "read_status", "arguments": {}})
