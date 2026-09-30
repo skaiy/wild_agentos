@@ -11,7 +11,7 @@ allowlist，写类工具只有在明确启用后才能调用。
 ```sh
 MCP_JWT_SECRET=...           # 必填的 HS256 签名密钥
 MCP_JWT_ISSUER=wild-agentos-core  # 可选；此处为默认值
-MCP_JWT_SUB=mcp-client            # 可选；此处为默认值
+MCP_JWT_SUBJECT=wao-core          # 可选；此处为默认值
 ```
 
 `MCP_JWT_SECRET` 为必填项。服务会为每一个出站请求签发一个短期（五分钟）
@@ -26,7 +26,10 @@ JWT 的 `sub` 用于标识签名服务，默认值是 `wao-core`，可通过
 
 Catalog JSON 永不接收密钥。若要让一个 Catalog 条目使用此流程，请在注册时设置
 `auth_kind: "bearer_jwt"`。持久化的 Catalog 记录只包含固定的环境变量引用
-（`MCP_JWT_SECRET`、`MCP_JWT_ISSUER` 和 `MCP_JWT_SUB`）。
+（`MCP_JWT_SECRET`、`MCP_JWT_ISSUER` 和 `MCP_JWT_SUBJECT`）。
+
+`MCP_JWT_SUB` 已弃用。严格鉴权下，如果只设置该旧变量，启动会被拒绝。如果两个
+变量都已设置，`MCP_JWT_SUBJECT` 优先。
 
 ## 配置出站边界
 

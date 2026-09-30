@@ -181,7 +181,7 @@ fn catalog_auth(kind: Option<&str>) -> Result<Value, &'static str> {
             "kind": "bearer_jwt",
             "secret_env": "MCP_JWT_SECRET",
             "issuer_env": "MCP_JWT_ISSUER",
-            "subject_env": "MCP_JWT_SUB",
+            "subject_env": "MCP_JWT_SUBJECT",
         })),
         Some(_) => Err("auth_kind must be 'bearer_jwt' when supplied"),
         None => Ok(Value::Null),
@@ -219,6 +219,19 @@ fn configured_outbound_mcp_origins() -> Result<Option<HashSet<String>>, &'static
 
 pub(crate) fn validate_strict_mcp_outbound_configuration() -> Result<(), &'static str> {
     let strict_mode = std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true");
+    let legacy_subject_is_set = std::env::var_os("MCP_JWT_SUB").is_some();
+    let current_subject_is_set = std::env::var_os("MCP_JWT_SUBJECT").is_some();
+    if legacy_subject_is_set && !current_subject_is_set {
+        if strict_mode {
+            return Err(
+                "MCP_JWT_SUB is deprecated; configure MCP_JWT_SUBJECT instead when AGENTOS_AUTH_STRICT=true",
+            );
+        }
+        tracing::warn!(
+            legacy_env = "MCP_JWT_SUB",
+            "deprecated MCP subject environment variable is set"
+        );
+    }
     if strict_mode && configured_outbound_mcp_origins()?.is_none() {
         return Err(
             "MCP_OUTBOUND_ALLOWED_ORIGINS must be configured when AGENTOS_AUTH_STRICT=true",
@@ -953,6 +966,7 @@ mod tests {
     fn catalog_bearer_auth_stores_only_environment_references() {
         let auth = catalog_auth(Some("bearer_jwt")).unwrap();
         assert_eq!(auth["secret_env"], "MCP_JWT_SECRET");
+        assert_eq!(auth["subject_env"], "MCP_JWT_SUBJECT");
         assert!(auth.get("secret").is_none());
     }
 
@@ -2361,8 +2375,10 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let previous_secret = std::env::var_os("MCP_JWT_SECRET");
         let previous_subject = std::env::var_os("MCP_JWT_SUBJECT");
+        let previous_legacy_subject = std::env::var_os("MCP_JWT_SUB");
         std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
         std::env::remove_var("MCP_JWT_SUBJECT");
+        std::env::remove_var("MCP_JWT_SUB");
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_aud = false;
         let decoding_key = DecodingKey::from_secret(b"outbound-mcp-test-secret");
@@ -2378,6 +2394,7 @@ mod tests {
             "wao-core"
         );
         std::env::set_var("MCP_JWT_SUBJECT", "custom-mcp-subject");
+        std::env::set_var("MCP_JWT_SUB", "legacy-mcp-subject");
         assert_eq!(
             decode::<OutboundMcpJwtClaims>(
                 &mint_outbound_mcp_jwt("catalog-server", &test_isolation_claims()).unwrap(),
@@ -2397,6 +2414,49 @@ mod tests {
         match previous_subject {
             Some(value) => std::env::set_var("MCP_JWT_SUBJECT", value),
             None => std::env::remove_var("MCP_JWT_SUBJECT"),
+        }
+        match previous_legacy_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUB", value),
+            None => std::env::remove_var("MCP_JWT_SUB"),
+        }
+    }
+
+    #[test]
+    fn legacy_mcp_subject_is_rejected_in_strict_mode_and_warned_otherwise() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        let previous_origins = std::env::var_os("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let previous_subject = std::env::var_os("MCP_JWT_SUBJECT");
+        let previous_legacy_subject = std::env::var_os("MCP_JWT_SUB");
+        std::env::remove_var("MCP_JWT_SUBJECT");
+        std::env::set_var("MCP_JWT_SUB", "legacy-subject-value");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        assert!(validate_strict_mcp_outbound_configuration().is_ok());
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        assert!(validate_strict_mcp_outbound_configuration()
+            .unwrap_err()
+            .contains("MCP_JWT_SUB"));
+        std::env::set_var("MCP_JWT_SUBJECT", "current-subject");
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", "https://mcp.example.test");
+        assert!(validate_strict_mcp_outbound_configuration().is_ok());
+
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+        match previous_origins {
+            Some(value) => std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", value),
+            None => std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS"),
+        }
+        match previous_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUBJECT", value),
+            None => std::env::remove_var("MCP_JWT_SUBJECT"),
+        }
+        match previous_legacy_subject {
+            Some(value) => std::env::set_var("MCP_JWT_SUB", value),
+            None => std::env::remove_var("MCP_JWT_SUB"),
         }
     }
 

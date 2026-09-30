@@ -12,7 +12,7 @@ The process that runs Core must set the following environment variables:
 ```sh
 MCP_JWT_SECRET=...           # required HS256 signing secret
 MCP_JWT_ISSUER=wild-agentos-core  # optional; default shown
-MCP_JWT_SUB=mcp-client            # optional; default shown
+MCP_JWT_SUBJECT=wao-core          # optional; default shown
 ```
 
 `MCP_JWT_SECRET` is required. The service mints a short-lived (five minute) HS256 JWT
@@ -30,7 +30,11 @@ be overridden with `MCP_JWT_SUBJECT`.
 Secrets are never accepted in catalog JSON. To opt a catalog entry into this
 flow, register it with `auth_kind: "bearer_jwt"`. The persisted catalog record
 contains only the fixed environment-variable references (`MCP_JWT_SECRET`,
-`MCP_JWT_ISSUER`, and `MCP_JWT_SUB`).
+`MCP_JWT_ISSUER`, and `MCP_JWT_SUBJECT`).
+
+`MCP_JWT_SUB` is deprecated. Under strict authentication, startup refuses a
+configuration that sets only that legacy variable. If both variables are set,
+`MCP_JWT_SUBJECT` takes precedence.
 
 ## Configure outbound boundaries
 
