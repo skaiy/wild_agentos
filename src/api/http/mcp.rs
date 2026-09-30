@@ -2963,6 +2963,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn defaulted_project_jwt_provenance_is_rejected_by_mcp_invoke() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let claims = crate::api::http::iam::claims_identity(crate::api::http::iam::JwtClaims {
+            sub: "test-user".into(),
+            tenant_id: "test-tenant".into(),
+            project_id: None,
+            roles: vec!["DA".into()],
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        })
+        .expect("verified JWT claims should produce an identity");
+        assert_eq!(
+            format!("{:?}", claims.isolation_claims().unwrap().provenance()),
+            "VerifiedDefaulted"
+        );
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sidecar_requests = requests.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/mcp", post(mock_handler))
+                    .with_state(sidecar_requests),
+            )
+            .await
+            .unwrap()
+        });
+        let response = invoke_mcp_server_handler(
+            State(test_app_state(vec![json!({
+                "id": "defaulted-project-server", "name": "defaulted-project-server",
+                "endpoint": format!("http://{address}/mcp"),
+                "endpoint_origin": format!("http://{address}"),
+                "protocol": "http", "auth": {"kind": "bearer_jwt"},
+                "allowed_tools": ["read_status"], "write_tools_enabled": false,
+                "tenantId": "test-tenant", "projectId": "default",
+            })])),
+            claims,
+            Json(McpCatalogInvokeRequest {
+                server: "defaulted-project-server".into(),
+                tool_name: "read_status".into(),
+                arguments: json!({}),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("mcp_claims_incomplete"));
+        assert!(body.contains("\"missing_field\":\"project_id\""));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn missing_inbound_tenant_id_is_rejected_by_iam_before_sidecar() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
