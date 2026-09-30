@@ -455,4 +455,104 @@ mod tests {
         .await
         .expect("cancelled scheduler should exit promptly");
     }
+
+    #[tokio::test]
+    async fn watcher_config_ignores_claim_presence_markers_and_only_enqueues_jobs() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+        let settings: OnlineCorpusWatcherSettings = serde_json::from_value(serde_json::json!({
+            "registrations": [{
+                "id": "watch-config",
+                "source_id": "docs",
+                "source_version": "v1",
+                "tenant_id": "tenant-config",
+                "project_id": "project-config",
+                "actor_id": "watcher-service",
+                "explicit": true,
+                "project_explicit": true,
+            }],
+        }))
+        .unwrap();
+        let registration = &settings.registrations[0];
+        assert_eq!(registration.tenant_id, "tenant-config");
+        assert_eq!(registration.project_id, "project-config");
+
+        let store = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let report = tick_online_corpus_watchers(&store, &settings).await;
+        assert_eq!(report.enqueued, 1);
+        let jobs = store.read().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].tenant_id, "tenant-config");
+        assert_eq!(jobs[0].project_id, "project-config");
+        assert_eq!(jobs[0].state, OnlineCorpusJobState::Queued);
+        std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn watcher_tick_does_not_mutate_configured_scope_or_accept_patch_data() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+        let settings: OnlineCorpusWatcherSettings = serde_json::from_value(serde_json::json!({
+            "registrations": [{
+                "id": "watch-static",
+                "source_id": "docs",
+                "source_version": "v1",
+                "tenant_id": "tenant-original",
+                "project_id": "project-original",
+                "actor_id": "watcher-service",
+                "patch": {
+                    "tenant_id": "tenant-replaced",
+                    "project_id": "project-replaced",
+                    "project_explicit": true,
+                },
+            }],
+        }))
+        .unwrap();
+        let store = Arc::new(tokio::sync::RwLock::new(vec![]));
+        tick_online_corpus_watchers(&store, &settings).await;
+        assert_eq!(settings.registrations[0].tenant_id, "tenant-original");
+        assert_eq!(settings.registrations[0].project_id, "project-original");
+        let jobs = store.read().await;
+        assert_eq!(jobs[0].tenant_id, "tenant-original");
+        assert_eq!(jobs[0].project_id, "project-original");
+        std::env::remove_var("AGENTOS_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn watcher_queued_job_uses_the_registration_scope() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+        let settings = OnlineCorpusWatcherSettings {
+            registrations: vec![registration_for_scope(
+                "watch-explicit-scope",
+                "docs",
+                "v1",
+                "tenant-t1",
+                "project-p1",
+            )],
+            ..Default::default()
+        };
+        let store = Arc::new(tokio::sync::RwLock::new(vec![]));
+        assert_eq!(
+            tick_online_corpus_watchers(&store, &settings)
+                .await
+                .enqueued,
+            1
+        );
+        let jobs = store.read().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].tenant_id, "tenant-t1");
+        assert_eq!(jobs[0].project_id, "project-p1");
+        assert_eq!(jobs[0].state, OnlineCorpusJobState::Queued);
+        std::env::remove_var("AGENTOS_DATA_DIR");
+    }
 }
