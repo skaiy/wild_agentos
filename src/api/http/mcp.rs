@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{data_dir, iam::UserIdentity, AppState};
+use crate::isolation::IsolationScopeProvenance;
 
 const MAX_ALLOWED_TOOLS: usize = 64;
 const MAX_TOOL_NAME_LENGTH: usize = 128;
@@ -260,16 +261,6 @@ pub(crate) async fn register_mcp_server_handler(
     identity: UserIdentity,
     Json(req): Json<McpServerRegisterRequest>,
 ) -> impl IntoResponse {
-    if let Some(missing_field) = identity.incomplete_scope_field() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "mcp_claims_incomplete",
-                "missing_field": missing_field,
-            })),
-        )
-            .into_response();
-    }
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
@@ -454,7 +445,7 @@ fn mint_outbound_mcp_jwt(
     isolation_claims: &crate::isolation::IsolationClaims,
 ) -> Result<String, String> {
     let secret = mcp_env("MCP_JWT_SECRET", None)?;
-    if !isolation_claims.explicit_tenant_id() || !isolation_claims.explicit_project_id() {
+    if isolation_claims.provenance() != IsolationScopeProvenance::VerifiedExplicit {
         return Err(
             "verified isolation claims must explicitly include tenant_id and project_id"
                 .to_string(),
@@ -798,22 +789,29 @@ pub(crate) async fn invoke_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
-    let missing_scope_field = if !claims.explicit_tenant_id() {
-        Some("tenant_id")
-    } else if !claims.explicit_project_id() {
-        Some("project_id")
-    } else {
-        None
-    };
-    if let Some(missing_field) = missing_scope_field {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "mcp_claims_incomplete",
-                "missing_field": missing_field,
-            })),
-        )
-            .into_response();
+    match claims.provenance() {
+        IsolationScopeProvenance::VerifiedExplicit => {}
+        IsolationScopeProvenance::VerifiedDefaulted => {
+            let missing_field = claims
+                .missing_scope_field()
+                .map(|field| field.as_str())
+                .unwrap_or("project_id");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "mcp_claims_incomplete",
+                    "missing_field": missing_field,
+                })),
+            )
+                .into_response();
+        }
+        IsolationScopeProvenance::DeploymentConfig => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "mcp_claims_unverified"})),
+            )
+                .into_response()
+        }
     }
     if let Err(error) = validate_strict_mcp_outbound_configuration() {
         return (
@@ -1841,6 +1839,15 @@ mod tests {
             "roles": [],
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_aud = false;
+        let decoded = decode::<crate::api::http::iam::JwtClaims>(
+            &without_tenant,
+            &DecodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+            &validation,
+        )
+        .unwrap();
+        assert!(decoded.claims.tenant_id.is_empty());
         assert_eq!(invoke(without_tenant).await.status(), StatusCode::FORBIDDEN);
         let empty_project = raw_inbound_identity_token(json!({
             "sub": "test-user",

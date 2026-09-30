@@ -41,8 +41,34 @@ pub struct IsolationClaims {
     tenant_id: String,
     project_id: String,
     actor_id: String,
-    explicit_tenant_id: bool,
-    explicit_project_id: bool,
+    provenance: IsolationScopeProvenance,
+    missing_scope_field: Option<IsolationScopeField>,
+}
+
+/// Origin of the tenant/project scope carried by [`IsolationClaims`].
+///
+/// This is crate-private so only the authentication boundary can classify
+/// verified JWT scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IsolationScopeProvenance {
+    VerifiedExplicit,
+    VerifiedDefaulted,
+    DeploymentConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IsolationScopeField {
+    TenantId,
+    ProjectId,
+}
+
+impl IsolationScopeField {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::TenantId => "tenant_id",
+            Self::ProjectId => "project_id",
+        }
+    }
 }
 
 /// Reasons a tenant isolation identifier or minted name was rejected.
@@ -77,8 +103,8 @@ impl IsolationClaims {
             tenant_id,
             project_id,
             actor_id,
-            explicit_tenant_id: false,
-            explicit_project_id: false,
+            provenance: IsolationScopeProvenance::DeploymentConfig,
+            missing_scope_field: None,
         })
     }
 
@@ -97,30 +123,26 @@ impl IsolationClaims {
         &self.actor_id
     }
 
-    /// Whether the verified token explicitly contained `tenant_id`.
-    pub fn explicit_tenant_id(&self) -> bool {
-        self.explicit_tenant_id
+    pub(crate) fn provenance(&self) -> IsolationScopeProvenance {
+        self.provenance
     }
 
-    /// Whether the verified token explicitly contained `project_id`.
-    pub fn explicit_project_id(&self) -> bool {
-        self.explicit_project_id
+    pub(crate) fn missing_scope_field(&self) -> Option<IsolationScopeField> {
+        self.missing_scope_field
     }
 
-    /// Marks scope provenance only after JWT verification has completed.
-    ///
-    /// This is crate-private so non-authentication callers cannot mint
-    /// outbound credentials by asserting claim provenance.
+    /// Builds JWT-derived claims after the authentication boundary has
+    /// verified the token. Only the IAM path calls this constructor.
     pub(crate) fn from_verified_jwt(
         tenant_id: impl Into<String>,
         project_id: impl Into<String>,
         actor_id: impl Into<String>,
-        explicit_tenant_id: bool,
-        explicit_project_id: bool,
+        provenance: IsolationScopeProvenance,
+        missing_scope_field: Option<IsolationScopeField>,
     ) -> Result<Self, IsolationError> {
         let mut claims = Self::from_verified(tenant_id, project_id, actor_id)?;
-        claims.explicit_tenant_id = explicit_tenant_id;
-        claims.explicit_project_id = explicit_project_id;
+        claims.provenance = provenance;
+        claims.missing_scope_field = missing_scope_field;
         Ok(claims)
     }
 

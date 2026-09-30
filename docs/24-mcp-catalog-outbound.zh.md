@@ -145,6 +145,8 @@ Core 可以接收 JSON 响应，或从 SSE 响应中读取匹配的 JSON-RPC 消
 project scope 不足以授权。明确命名为 `default` 的项目仍然有效。
 不完整的已验证范围 claim 会返回带有 `mcp_claims_incomplete` 的 `403`，且只返回
 缺失字段名称；不会发送任何出站请求。
+来自部署配置的范围（包括 watcher 和 migration 处理）并非 JWT 验证范围；若用于
+出站 MCP，会返回带有 `mcp_claims_unverified` 的 `403`。
 
 MCP sidecar 在接受请求前必须验证 JWT 签名，并校验 `aud`、`tenant_id` 和
 `project_id`。

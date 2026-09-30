@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::isolation::IsolationClaims;
+use crate::isolation::{IsolationClaims, IsolationScopeField, IsolationScopeProvenance};
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 
@@ -66,7 +66,6 @@ pub struct UserIdentity {
     pub roles: Vec<String>,
     pub auth_method: AuthMethod,
     isolation_claims: Option<IsolationClaims>,
-    incomplete_scope_field: Option<&'static str>,
 }
 
 impl UserIdentity {
@@ -77,17 +76,11 @@ impl UserIdentity {
             roles: vec![],
             auth_method: AuthMethod::Anonymous,
             isolation_claims: None,
-            incomplete_scope_field: None,
         }
     }
     /// Returns claims only when the authentication boundary verified them.
     pub fn isolation_claims(&self) -> Option<&IsolationClaims> {
         self.isolation_claims.as_ref()
-    }
-    /// Returns the missing or invalid JWT scope field, if JWT verification
-    /// succeeded but a safe isolation scope could not be constructed.
-    pub fn incomplete_scope_field(&self) -> Option<&'static str> {
-        self.incomplete_scope_field
     }
     /// 检查调用方是否具有指定角色（任一匹配）。
     pub fn has_role(&self, role: &str) -> bool {
@@ -158,7 +151,6 @@ impl<S: Send + Sync> FromRequestParts<S> for UserIdentity {
                             roles: arr_field(&claims, "roles"),
                             auth_method: AuthMethod::Base64Header,
                             isolation_claims: None,
-                            incomplete_scope_field: None,
                         });
                     }
                 }
@@ -327,38 +319,29 @@ async fn jwks_for(config: &OidcConfig, refresh: bool) -> Option<Arc<JwkSet>> {
 }
 
 pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
-    let incomplete_scope_field = if claims.tenant_id.trim().is_empty() {
-        Some("tenant_id")
-    } else if claims
-        .project_id
-        .as_deref()
-        .is_some_and(|project_id| project_id.trim().is_empty())
-    {
-        Some("project_id")
+    let (tenant_id, missing_scope_field) = if claims.tenant_id.trim().is_empty() {
+        ("default", Some(IsolationScopeField::TenantId))
     } else {
-        None
+        (claims.tenant_id.as_str(), None)
     };
-    if let Some(incomplete_scope_field) = incomplete_scope_field {
-        return Some(UserIdentity {
-            user_id: claims.sub,
-            tenant_id: claims.tenant_id,
-            roles: claims.roles,
-            auth_method: AuthMethod::Jwt,
-            isolation_claims: None,
-            incomplete_scope_field: Some(incomplete_scope_field),
-        });
-    }
-    let (project_id, explicit_project_id) = match claims.project_id.as_deref() {
-        Some(project_id) if !project_id.trim().is_empty() => (project_id, true),
-        Some(_) => unreachable!("empty project IDs return above"),
-        None => ("default", false),
+    let (project_id, missing_scope_field) = match claims.project_id.as_deref() {
+        Some(project_id) if !project_id.trim().is_empty() => (project_id, missing_scope_field),
+        _ => (
+            "default",
+            missing_scope_field.or(Some(IsolationScopeField::ProjectId)),
+        ),
+    };
+    let provenance = if missing_scope_field.is_none() {
+        IsolationScopeProvenance::VerifiedExplicit
+    } else {
+        IsolationScopeProvenance::VerifiedDefaulted
     };
     let isolation_claims = IsolationClaims::from_verified_jwt(
-        claims.tenant_id.clone(),
+        tenant_id,
         project_id,
         claims.sub.clone(),
-        true,
-        explicit_project_id,
+        provenance,
+        missing_scope_field,
     )
     .ok()?;
     Some(UserIdentity {
@@ -367,7 +350,6 @@ pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
         roles: claims.roles,
         auth_method: AuthMethod::Jwt,
         isolation_claims: Some(isolation_claims),
-        incomplete_scope_field: None,
     })
 }
 
@@ -479,7 +461,10 @@ mod tests {
         validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims, UserIdentity,
         DEFAULT_HS256_SECRET,
     };
-    use crate::api::http::TEST_ENV_LOCK;
+    use crate::{
+        api::http::TEST_ENV_LOCK,
+        isolation::{IsolationScopeField, IsolationScopeProvenance},
+    };
 
     #[tokio::test]
     async fn strict_mode_rejects_forged_x_identity_before_claims_are_created() {
@@ -656,8 +641,15 @@ mod tests {
         .unwrap();
 
         let identity = verify_jwt(&token).await.unwrap();
-        assert_eq!(identity.incomplete_scope_field(), Some("project_id"));
-        assert!(identity.isolation_claims().is_none());
+        let claims = identity.isolation_claims().unwrap();
+        assert_eq!(
+            claims.provenance(),
+            IsolationScopeProvenance::VerifiedDefaulted
+        );
+        assert_eq!(
+            claims.missing_scope_field(),
+            Some(IsolationScopeField::ProjectId)
+        );
         restore_env("AGENTOS_AUTH_MODE", previous_mode);
     }
 
