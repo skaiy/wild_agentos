@@ -14,7 +14,7 @@
 ```bash
 ./scripts/run_tool_selection_eval.sh
 # 或
-cargo run --bin tool-selection-eval -- --offline
+cargo run --bin tool_selection_eval -- --offline
 ```
 
 JSON 报告和简短 Markdown 摘要会写入 `target/tool-selection-eval/`。CI 会运行离线命令。
@@ -26,7 +26,7 @@ export TOOL_SELECTION_EVAL_PROVIDER="provider-name"
 export TOOL_SELECTION_EVAL_MODEL="model-name"
 export TOOL_SELECTION_EVAL_BASE_URL="https://example.invalid/v1/chat/completions"
 export TOOL_SELECTION_EVAL_API_KEY="..."
-cargo run --bin tool-selection-eval -- --output target/tool-selection-live
+cargo run --bin tool_selection_eval -- --output target/tool-selection-live
 ```
 
 仓库不提交模型、端点或密钥。在线模式固定 temperature 为 `0.0`、seed 为 `2710`，

@@ -18,7 +18,7 @@ connection or credentials:
 ```bash
 ./scripts/run_tool_selection_eval.sh
 # or
-cargo run --bin tool-selection-eval -- --offline
+cargo run --bin tool_selection_eval -- --offline
 ```
 
 The JSON report and short Markdown summary are written to
@@ -31,7 +31,7 @@ export TOOL_SELECTION_EVAL_PROVIDER="provider-name"
 export TOOL_SELECTION_EVAL_MODEL="model-name"
 export TOOL_SELECTION_EVAL_BASE_URL="https://example.invalid/v1/chat/completions"
 export TOOL_SELECTION_EVAL_API_KEY="..."
-cargo run --bin tool-selection-eval -- --output target/tool-selection-live
+cargo run --bin tool_selection_eval -- --output target/tool-selection-live
 ```
 
 No model, endpoint, or key is committed. Live mode fixes temperature to `0.0`
