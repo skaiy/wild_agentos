@@ -2969,7 +2969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_inbound_tenant_id_is_rejected_as_incomplete_before_sidecar() {
+    async fn missing_inbound_tenant_id_is_rejected_by_iam_before_sidecar() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -3029,16 +3029,10 @@ mod tests {
                     .to_string(),
             ))
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        let body = std::str::from_utf8(&body).unwrap();
-        assert!(body.contains("mcp_claims_incomplete"));
-        assert!(body.contains("tenant_id"));
-        assert!(!body.contains(&token));
-        assert!(!body.contains("default"));
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
         match previous_auth_mode {
             Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
@@ -3047,7 +3041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_inbound_tenant_id_is_rejected_as_incomplete_before_sidecar() {
+    async fn empty_inbound_tenant_id_is_rejected_by_iam_before_sidecar() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -3097,16 +3091,10 @@ mod tests {
                     .to_string(),
             ))
             .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        let body = std::str::from_utf8(&body).unwrap();
-        assert!(body.contains("mcp_claims_incomplete"));
-        assert!(body.contains("tenant_id"));
-        assert!(!body.contains(&token));
-        assert!(!body.contains("default"));
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
         match previous_auth_mode {
             Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
