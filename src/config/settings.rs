@@ -1,3 +1,4 @@
+pub use crate::tools::tool_groups::{RoleToolConfig, ToolGroupSettings};
 use anyhow::Result;
 use config::{Config, ConfigError, Environment};
 use serde::Deserialize;
@@ -864,78 +865,6 @@ pub struct TokenOptimizationSettings {
     pub tool_result_aging: ToolResultAgingSettings,
     #[serde(default)]
     pub prompt_optimization: PromptOptimizationSettings,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ToolGroupSettings {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub roles: std::collections::HashMap<String, RoleToolConfig>,
-}
-
-impl Default for ToolGroupSettings {
-    fn default() -> Self {
-        let mut roles = std::collections::HashMap::new();
-        roles.insert(
-            "Plan".to_string(),
-            RoleToolConfig {
-                default: vec![
-                    "Core".to_string(),
-                    "Search".to_string(),
-                    "Knowledge".to_string(),
-                    "System".to_string(),
-                ],
-                on_demand: vec!["Web".to_string(), "Code".to_string(), "Skill".to_string()],
-            },
-        );
-        roles.insert(
-            "Do".to_string(),
-            RoleToolConfig {
-                default: vec![
-                    "Core".to_string(),
-                    "Write".to_string(),
-                    "Search".to_string(),
-                    "Web".to_string(),
-                    "Code".to_string(),
-                    "Skill".to_string(),
-                    "System".to_string(),
-                ],
-                on_demand: vec!["Knowledge".to_string()],
-            },
-        );
-        roles.insert(
-            "Check".to_string(),
-            RoleToolConfig {
-                default: vec![
-                    "Core".to_string(),
-                    "Search".to_string(),
-                    "Knowledge".to_string(),
-                    "System".to_string(),
-                ],
-                on_demand: vec!["Web".to_string(), "Code".to_string()],
-            },
-        );
-        roles.insert(
-            "Act".to_string(),
-            RoleToolConfig {
-                default: vec!["Core".to_string(), "System".to_string()],
-                on_demand: vec!["Search".to_string(), "Knowledge".to_string()],
-            },
-        );
-        Self {
-            enabled: true,
-            roles,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct RoleToolConfig {
-    #[serde(default)]
-    pub default: Vec<String>,
-    #[serde(default)]
-    pub on_demand: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

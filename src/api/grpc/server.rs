@@ -696,6 +696,7 @@ fn build_supervisor_agent(
         templates.clone(),
         settings.agents.clone(),
     )
+    .with_tool_group_settings(settings.token_optimization.tool_groups.clone())
     .with_scheduler(scheduler.clone())
     .with_prefetch_engine(prefetch.clone())
     .with_unified_graph_store(unified_graph.store());

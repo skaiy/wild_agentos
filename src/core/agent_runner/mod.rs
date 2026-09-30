@@ -371,6 +371,7 @@ pub struct AgentRunner {
     pub tenant_spend_gate: Arc<TenantSpendGate>,
     pub total_prompt_tokens: Arc<AtomicU64>,
     pub total_completion_tokens: Arc<AtomicU64>,
+    pub total_cached_prompt_tokens: Arc<AtomicU64>,
     /// Prompt/completion token count from the last API call (non-cumulative, stores only the latest round)
     pub last_prompt_tokens: Arc<AtomicU64>,
     pub last_completion_tokens: Arc<AtomicU64>,
@@ -441,6 +442,7 @@ impl AgentRunner {
                 exe.set_projection_engine(projection.clone());
                 // Without this the policy stays None and every tool runs ungated.
                 exe.set_default_permission_policy();
+                exe.set_tool_group_manager(crate::tools::ToolGroupManager::new(None));
                 Arc::new(parking_lot::RwLock::new(exe))
             },
             agent_settings,
@@ -456,6 +458,7 @@ impl AgentRunner {
             tenant_spend_gate: Arc::new(TenantSpendGate::from_env()),
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
+            total_cached_prompt_tokens: Arc::new(AtomicU64::new(0)),
             last_prompt_tokens: Arc::new(AtomicU64::new(0)),
             last_completion_tokens: Arc::new(AtomicU64::new(0)),
             tool_result_compressor: None,
@@ -540,6 +543,16 @@ impl AgentRunner {
         tc: crate::core::tool_controller::ToolController,
     ) -> Self {
         self.tool_controller = Some(tc);
+        self
+    }
+
+    /// Configure tool exposure for this runner before it is shared by agents.
+    /// The manager itself is immutable; per-run activation remains local to each
+    /// execution loop.
+    pub fn with_tool_group_settings(self, settings: crate::tools::ToolGroupSettings) -> Self {
+        self.tool_executor
+            .write()
+            .set_tool_group_manager(crate::tools::ToolGroupManager::new(Some(settings)));
         self
     }
 

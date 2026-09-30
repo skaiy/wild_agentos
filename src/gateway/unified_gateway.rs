@@ -171,11 +171,58 @@ pub struct ResponseToolCallFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_prompt_tokens: Option<u32>,
+}
+
+fn cached_prompt_tokens(usage: &Value) -> Option<u32> {
+    usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+        .map(|tokens| tokens as u32)
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawUsage {
+            #[serde(default)]
+            prompt_tokens: u32,
+            #[serde(default)]
+            completion_tokens: u32,
+            #[serde(default)]
+            total_tokens: u32,
+            #[serde(default)]
+            cache_read_input_tokens: Option<u32>,
+            #[serde(default)]
+            prompt_tokens_details: Option<PromptTokenDetails>,
+        }
+        #[derive(Deserialize)]
+        struct PromptTokenDetails {
+            #[serde(default)]
+            cached_tokens: Option<u32>,
+        }
+        let raw = RawUsage::deserialize(deserializer)?;
+        Ok(Self {
+            prompt_tokens: raw.prompt_tokens,
+            completion_tokens: raw.completion_tokens,
+            total_tokens: raw.total_tokens,
+            cached_prompt_tokens: raw
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+                .or(raw.cache_read_input_tokens),
+        })
+    }
 }
 
 /// 单个 provider 的运行时端点信息(由 models 注册表灌入,支持热更新)。
@@ -776,6 +823,7 @@ impl UnifiedGateway {
             prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            cached_prompt_tokens: cached_prompt_tokens(u),
         });
 
         Ok(ChatCompletionResponse {
@@ -931,6 +979,26 @@ impl UnifiedGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_parses_optional_cached_prompt_tokens() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15,
+            "prompt_tokens_details": {"cached_tokens": 8}
+        }))
+        .unwrap();
+        assert_eq!(usage.cached_prompt_tokens, Some(8));
+
+        let no_cache: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "total_tokens": 15
+        }))
+        .unwrap();
+        assert_eq!(no_cache.cached_prompt_tokens, None);
+    }
 
     #[test]
     fn test_model_mapping() {
