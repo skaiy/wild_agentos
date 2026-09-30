@@ -3025,8 +3025,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // #257 gap: watcher-style verified claims cannot yet record that their scope did not originate in a token.
-    #[ignore = "expected-fail until #257 tracks claim presence for watcher-style claims"]
+    // #257 gap: watcher-built deploy-config claims cannot yet carry their non-token provenance.
+    #[ignore = "expected-fail until #257 refuses deploy-config claims for MCP minting"]
     async fn watcher_style_default_claims_are_refused_before_mcp_outbound() {
         let _guard = crate::api::http::TEST_ENV_LOCK
             .lock()
@@ -3090,7 +3090,7 @@ mod tests {
             .await
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
-        assert!(body.contains("mcp_claims_incomplete"));
+        assert!(body.contains("mcp_claims_unverified"));
         assert!(!body.contains("watcher-tenant"));
         assert!(!body.contains("default"));
         assert!(!body.contains("outbound-mcp-test-secret"));
