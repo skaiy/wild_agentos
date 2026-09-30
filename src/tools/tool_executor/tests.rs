@@ -109,6 +109,7 @@ mod tests {
     fn test_hook_runner_does_not_block_allowed_tool() {
         rt().block_on(async {
             let mut executor = ToolExecutor::new();
+            executor.set_tool_group_manager(ToolGroupManager::new(None));
             let hook_config = RuntimeHookConfig::new(
                 vec!["printf 'blocked by security policy'; exit 2".to_string()],
                 vec![],
@@ -117,7 +118,14 @@ mod tests {
             executor.set_hook_runner(HookRunner::new(hook_config));
 
             let input = json!({"query": "search test"});
-            let result = executor.execute("tool_search", input).await;
+            let result = executor
+                .execute_with_security_context(
+                    "tool_search",
+                    input,
+                    security_context(),
+                    &["tool_search".to_string()],
+                )
+                .await;
             assert!(result.is_ok());
         });
     }
