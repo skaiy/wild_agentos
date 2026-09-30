@@ -536,34 +536,9 @@ impl super::AgentRunner {
     }
 
     pub(super) fn build_readable_tool_menu(&self, role: &AgentRole) -> String {
-        let role_str = role.to_string();
-        let tool_defs = self
-            .tool_executor
+        self.tool_executor
             .read()
-            .tool_definitions_for_role(&role_str);
-
-        if tool_defs.is_empty() {
-            return String::new();
-        }
-
-        let os_hint = if cfg!(target_os = "windows") {
-            "[Platform: Windows | bash tool actually uses PowerShell]"
-        } else if cfg!(target_os = "macos") {
-            "[Platform: macOS]"
-        } else {
-            "[Platform: Linux]"
-        };
-        let mut lines = vec![os_hint.to_string(), "Available tools list:".to_string()];
-        for tool_def in &tool_defs {
-            let name = tool_def["function"]["name"].as_str().unwrap_or("");
-            let desc = tool_def["function"]["description"].as_str().unwrap_or("");
-            if desc.is_empty() {
-                lines.push(format!("- ID: {}", name));
-            } else {
-                lines.push(format!("- ID: {} | Purpose: {}", name, desc));
-            }
-        }
-        lines.join("\n")
+            .readable_tool_menu_for_role(&role.to_string())
     }
 }
 
