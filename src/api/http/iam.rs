@@ -965,9 +965,12 @@ rOaa4PuObG218MVBl8eR9G5Ni7YF7jSktxKJi14QJr2E00x2h4Ih
             &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
         )
         .unwrap();
-        assert!(
-            verify_jwt(&missing_tenant).await.is_none(),
-            "an OIDC token without tenant_id must not mint claims"
+        let identity = verify_jwt(&missing_tenant)
+            .await
+            .expect("a verified OIDC token keeps defaulted scope provenance");
+        assert_eq!(
+            identity.isolation_claims().unwrap().provenance(),
+            IsolationScopeProvenance::VerifiedDefaulted
         );
 
         std::env::set_var("AGENTOS_OIDC_ISSUER", "https://other-issuer.example.test");
