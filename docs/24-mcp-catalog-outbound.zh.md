@@ -48,6 +48,10 @@ MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
 endpoint 会在发送任何出站请求前被拒绝。超时和响应大小设置均为可选的正整数；
 上面的值即安全默认值。
 
+当 `AGENTOS_AUTH_STRICT=true` 时，必须设置 `MCP_OUTBOUND_ALLOWED_ORIGINS`。
+未设置或空值会阻止启动；Catalog 的登记和调用也会再次拒绝该配置，作为纵深防御。
+HTTP redirect 永远不会被跟随。
+
 条目还可以设置 `timeout_seconds`，取值为 1 至 300 的正整数。它是该条目的总出站
 请求超时，但会被 `MCP_OUTBOUND_TIMEOUT_MS` 限制；未设置时使用全局设置或其默认值。
 
@@ -74,8 +78,8 @@ Content-Type: application/json
 
 Catalog 管理和调用接口都要求经过验证的入站 `IsolationClaims`；Core 会将查找范围
 限定为调用者所在的租户和项目。
-登记 Catalog 条目还要求 `DA` 管理员角色。没有该角色的调用方会收到 `403`，且不会
-写入 Catalog 文件。
+登记 Catalog 条目要求专用的 `mcp_admin` 角色。只有普通 `DA` 角色的调用方会收到
+`403`，且不会写入 Catalog 文件。
 删除 Catalog 条目同样要求该角色和对应的租户/项目范围。
 
 通过 Catalog MCP 的 `name` 调用一个已注册的工具；当名称有歧义时，请使用

@@ -54,6 +54,10 @@ allowed. Invalid or changed endpoints are rejected before any outbound request.
 The timeout and response-size settings are optional positive integers; the
 values shown are the secure defaults.
 
+When `AGENTOS_AUTH_STRICT=true`, `MCP_OUTBOUND_ALLOWED_ORIGINS` is required.
+An unset or empty value prevents startup and catalog register/invoke requests
+also reject it as defense in depth. HTTP redirects are never followed.
+
 An entry may also set `timeout_seconds` to a positive value from 1 through 300.
 It applies as that entry's total outbound request timeout, capped by
 `MCP_OUTBOUND_TIMEOUT_MS`; when omitted, the global setting or its default is
@@ -82,8 +86,8 @@ Content-Type: application/json
 
 The catalog management and invoke endpoints require verified inbound
 `IsolationClaims`; Core scopes lookup to the caller's tenant and project.
-Registering a catalog entry also requires the `DA` administrator role. A caller
-without that role receives `403`, and no catalog file is written.
+Registering a catalog entry requires the dedicated `mcp_admin` role. A caller
+with only the ordinary `DA` role receives `403`, and no catalog file is written.
 Deleting a catalog entry requires the same role and tenant/project scope.
 
 Invoke a registered tool by its catalog `name` (or `id` when names are

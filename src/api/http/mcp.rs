@@ -20,6 +20,7 @@ const MAX_TOOL_NAME_LENGTH: usize = 128;
 const DEFAULT_OUTBOUND_MCP_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_OUTBOUND_MCP_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_OUTBOUND_MCP_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MCP_CATALOG_ADMIN_ROLE: &str = "mcp_admin";
 const WRITE_CLASS_TOOL_PREFIXES: &[&str] = &[
     "create_",
     "update_",
@@ -215,6 +216,16 @@ fn configured_outbound_mcp_origins() -> Result<Option<HashSet<String>>, &'static
     Ok(Some(origins))
 }
 
+pub(crate) fn validate_strict_mcp_outbound_configuration() -> Result<(), &'static str> {
+    let strict_mode = std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true");
+    if strict_mode && configured_outbound_mcp_origins()?.is_none() {
+        return Err(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS must be configured when AGENTOS_AUTH_STRICT=true",
+        );
+    }
+    Ok(())
+}
+
 fn validate_outbound_mcp_endpoint(server: &Value) -> Result<(), &'static str> {
     let endpoint = server
         .get("endpoint")
@@ -252,8 +263,15 @@ pub(crate) async fn register_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_role(MCP_CATALOG_ADMIN_ROLE) {
         return error.into_response();
+    }
+    if let Err(error) = validate_strict_mcp_outbound_configuration() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "mcp_outbound_allowlist_required", "message": error})),
+        )
+            .into_response();
     }
     if req.name.trim().is_empty() {
         return (
@@ -351,8 +369,15 @@ pub(crate) async fn delete_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_role(MCP_CATALOG_ADMIN_ROLE) {
         return error.into_response();
+    }
+    if let Err(error) = validate_strict_mcp_outbound_configuration() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "mcp_outbound_allowlist_required", "message": error})),
+        )
+            .into_response();
     }
 
     let mut servers = state.mcp_servers.write().await;
@@ -535,6 +560,7 @@ fn outbound_mcp_client(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(connect_timeout))
         .timeout(Duration::from_millis(timeout))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| {
             InvokeHttpMcpError::Transport(format!("MCP HTTP client setup failed: {error}"))
@@ -693,6 +719,11 @@ async fn invoke_http_mcp(
             }
         })?;
     let status = response.status();
+    if status.is_redirection() {
+        return Err(InvokeHttpMcpError::Transport(format!(
+            "MCP HTTP request returned redirect status {status}"
+        )));
+    }
     let is_sse = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -751,6 +782,13 @@ pub(crate) async fn invoke_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
+    if let Err(error) = validate_strict_mcp_outbound_configuration() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "mcp_outbound_allowlist_required", "message": error})),
+        )
+            .into_response();
+    }
     if request.tool_name.trim().is_empty() || !request.arguments.is_object() {
         return (
             StatusCode::BAD_REQUEST,
@@ -971,6 +1009,114 @@ mod tests {
         assert!(outbound_mcp_effective_timeout_ms(Some(0), 15_000).is_err());
     }
 
+    #[test]
+    fn strict_mode_requires_an_outbound_origin_allowlist() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        let previous_origins = std::env::var_os("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        assert!(validate_strict_mcp_outbound_configuration().is_ok());
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        assert!(validate_strict_mcp_outbound_configuration().is_err());
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", "");
+        assert!(validate_strict_mcp_outbound_configuration().is_err());
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", "https://mcp.example.test");
+        assert!(validate_strict_mcp_outbound_configuration().is_ok());
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+        match previous_origins {
+            Some(value) => std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", value),
+            None => std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_mode_rejects_catalog_register_and_invoke_without_allowlist() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_strict = std::env::var_os("AGENTOS_AUTH_STRICT");
+        let previous_origins = std::env::var_os("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        let state = test_app_state(vec![json!({
+            "id": "server-id",
+            "name": "catalog-server",
+            "endpoint": "http://127.0.0.1:8080/mcp",
+            "endpoint_origin": "http://127.0.0.1:8080",
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "tenantId": "test-tenant",
+            "projectId": "test-project",
+        })]);
+        let register = Router::new()
+            .route("/servers", post(register_mcp_server_handler))
+            .with_state(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/servers")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({
+                    "name": "new-server",
+                    "endpoint": "http://127.0.0.1:8081/mcp",
+                    "protocol": "http",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            register.oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let invoke = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({"server": "server-id", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            invoke.oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        match previous_strict {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_STRICT", value),
+            None => std::env::remove_var("AGENTOS_AUTH_STRICT"),
+        }
+        match previous_origins {
+            Some(value) => std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", value),
+            None => std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
     fn test_app_state(servers: Vec<Value>) -> Arc<AppState> {
         use crate::{
             core::core_types::{CoreConfig, SemanticCore},
@@ -1045,7 +1191,7 @@ mod tests {
     }
 
     fn inbound_identity_token() -> String {
-        inbound_identity_token_with_roles(vec!["DA"])
+        inbound_identity_token_with_roles(vec![MCP_CATALOG_ADMIN_ROLE])
     }
 
     fn test_isolation_claims() -> IsolationClaims {
@@ -1401,6 +1547,54 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn outbound_invoke_does_not_follow_redirects() {
+        let redirected_requests = Arc::new(AtomicUsize::new(0));
+        async fn redirected_handler(
+            State(requests): State<Arc<AtomicUsize>>,
+        ) -> axum::response::Response {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"unexpected": true}})).into_response()
+        }
+
+        let redirected = Router::new()
+            .route("/mcp", post(redirected_handler))
+            .with_state(redirected_requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirected_address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, redirected).await.unwrap() });
+
+        async fn redirect_handler(State(location): State<String>) -> axum::response::Response {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(reqwest::header::LOCATION, location)],
+            )
+                .into_response()
+        }
+
+        let redirect = Router::new()
+            .route("/mcp", post(redirect_handler))
+            .with_state(format!("http://{redirected_address}/mcp"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, redirect).await.unwrap() });
+
+        let error = invoke_http_mcp(
+            &format!("http://{redirect_address}/mcp"),
+            "test-token",
+            "read_status",
+            json!({}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let InvokeHttpMcpError::Transport(error) = error else {
+            panic!("redirect must be a transport failure");
+        };
+        assert!(error.contains("redirect status 307"));
+        assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn outbound_jwt_audience_is_bound_to_each_catalog_server() {
         let _guard = crate::api::http::TEST_ENV_LOCK
@@ -1583,7 +1777,7 @@ mod tests {
             .header("content-type", "application/json")
             .header(
                 "authorization",
-                format!("Bearer {}", inbound_identity_token_with_roles(vec![])),
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
             )
             .body(Body::from(
                 json!({
@@ -1598,6 +1792,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(state.mcp_servers.read().await.is_empty());
         assert!(!data_dir.path().join("mcp_servers.json").exists());
+        let app = Router::new()
+            .route(
+                "/servers/:id",
+                axum::routing::delete(delete_mcp_server_handler),
+            )
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/servers/server-id")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token_with_roles(vec!["DA"])),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         match previous_data_dir {
             Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
