@@ -16,6 +16,7 @@ The default groups are:
 | Search | File and indexed-document search |
 | Web | Public web search and retrieval |
 | KnowledgeRead | Read-only knowledge and graph queries |
+| KnowledgePlan | Plan-safe read-only knowledge search |
 | KnowledgeWrite | Knowledge graph updates and extraction |
 | Ingest | Document indexing and import |
 | Skill | Skill definition creation and conversion |

@@ -9,6 +9,7 @@ pub enum ToolGroup {
     Search,
     Web,
     KnowledgeRead,
+    KnowledgePlan,
     KnowledgeWrite,
     Ingest,
     Skill,
@@ -25,6 +26,7 @@ impl std::fmt::Display for ToolGroup {
             ToolGroup::Search => write!(f, "Search"),
             ToolGroup::Web => write!(f, "Web"),
             ToolGroup::KnowledgeRead => write!(f, "KnowledgeRead"),
+            ToolGroup::KnowledgePlan => write!(f, "KnowledgePlan"),
             ToolGroup::KnowledgeWrite => write!(f, "KnowledgeWrite"),
             ToolGroup::Ingest => write!(f, "Ingest"),
             ToolGroup::Skill => write!(f, "Skill"),
@@ -45,6 +47,7 @@ impl std::str::FromStr for ToolGroup {
             "search" => Ok(ToolGroup::Search),
             "web" => Ok(ToolGroup::Web),
             "knowledgeread" | "knowledge_read" => Ok(ToolGroup::KnowledgeRead),
+            "knowledgeplan" | "knowledge_plan" => Ok(ToolGroup::KnowledgePlan),
             "knowledgewrite" | "knowledge_write" => Ok(ToolGroup::KnowledgeWrite),
             "ingest" => Ok(ToolGroup::Ingest),
             "skill" => Ok(ToolGroup::Skill),
@@ -97,7 +100,7 @@ impl Default for ToolGroupSettings {
                 default: vec![
                     "Core".to_string(),
                     "Search".to_string(),
-                    "KnowledgeRead".to_string(),
+                    "KnowledgePlan".to_string(),
                     "System".to_string(),
                 ],
                 on_demand: vec!["Web".to_string()],
@@ -279,6 +282,10 @@ impl ToolGroupManager {
                 "knowledge_neighbors".to_string(),
                 "kb_vector_search".to_string(),
             ]),
+        );
+        map.insert(
+            ToolGroup::KnowledgePlan,
+            HashSet::from(["knowledge_list".to_string(), "knowledge_search".to_string()]),
         );
 
         map.insert(
@@ -469,7 +476,7 @@ mod tests {
 
         assert!(default.contains(&ToolGroup::Core));
         assert!(default.contains(&ToolGroup::Search));
-        assert!(default.contains(&ToolGroup::KnowledgeRead));
+        assert!(default.contains(&ToolGroup::KnowledgePlan));
         assert!(default.contains(&ToolGroup::System));
         assert!(!default.contains(&ToolGroup::Web));
 

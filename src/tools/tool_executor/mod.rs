@@ -1574,7 +1574,11 @@ impl ToolExecutor {
         result.extend(
             self.tool_descriptions
                 .iter()
-                .filter(|td| Self::is_micro_tool_name(&td.name) && role_is_allowed(td))
+                .filter(|td| {
+                    Self::is_micro_tool_name(&td.name)
+                        && role_is_allowed(td)
+                        && (role_name != "Plan" || Self::is_pa_readonly_tool(&td.name))
+                })
                 .map(definition),
         );
 

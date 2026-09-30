@@ -15,6 +15,7 @@
 | Search | 文件与索引文档搜索 |
 | Web | 公共网页搜索和读取 |
 | KnowledgeRead | 只读知识库与图查询 |
+| KnowledgePlan | Plan 安全的只读知识搜索 |
 | KnowledgeWrite | 知识图更新和抽取 |
 | Ingest | 文档索引和导入 |
 | Skill | Skill 定义创建和转换 |

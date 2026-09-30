@@ -177,7 +177,7 @@ token_optimization:
     max_activated_tools: 20
     roles:
       Plan:
-        default: ["Core", "Search", "KnowledgeRead", "System"]
+        default: ["Core", "Search", "KnowledgePlan", "System"]
         on_demand: ["Web"]
       Do:
         default: ["Core", "Workspace", "Write", "Search", "System"]
