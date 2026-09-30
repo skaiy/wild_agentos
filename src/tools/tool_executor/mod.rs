@@ -1787,11 +1787,11 @@ impl ToolExecutor {
     }
 
     pub fn pa_readonly_tools() -> &'static [&'static str] {
-        ToolPolicy::readonly_tools()
+        ToolPolicy::plan_readonly_tools()
     }
 
     pub fn is_pa_readonly_tool(name: &str) -> bool {
-        ToolPolicy::is_readonly_tool(name)
+        ToolPolicy::plan_readonly_tools().contains(&name)
     }
 
     /// Searches the live registry for tools visible to a verified runtime role.

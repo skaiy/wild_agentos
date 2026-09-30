@@ -45,6 +45,29 @@ impl ToolPolicy {
         &[
             "file_read",
             "file_list",
+            "workspace_status",
+            "read_agent_output",
+            "glob_search",
+            "grep_search",
+            "web_search",
+            "web_fetch",
+            "tool_search",
+            "rag_search",
+            "knowledge_list",
+            "knowledge_search",
+            "kg_search",
+            "knowledge_extract_code",
+            "knowledge_query",
+            "knowledge_neighbors",
+            "kb_vector_search",
+        ]
+    }
+
+    /// The immutable Plan cap retained from the main-branch execution policy.
+    pub fn plan_readonly_tools() -> &'static [&'static str] {
+        &[
+            "file_read",
+            "file_list",
             "glob_search",
             "grep_search",
             "web_search",
