@@ -3025,6 +3025,85 @@ mod tests {
     }
 
     #[tokio::test]
+    // #257 gap: watcher-style verified claims cannot yet record that their scope did not originate in a token.
+    #[ignore = "expected-fail until #257 tracks claim presence for watcher-style claims"]
+    async fn watcher_style_default_claims_are_refused_before_mcp_outbound() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved: Vec<_> = ["MCP_JWT_SECRET", "AGENTOS_AUTH_STRICT"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        let requests = Arc::new(AtomicUsize::new(0));
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests_for_server = requests.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/mcp", post(mock_handler))
+                    .with_state(requests_for_server),
+            )
+            .await
+            .unwrap()
+        });
+        let state = test_app_state(vec![json!({
+            "id": "watcher-server",
+            "name": "watcher-server",
+            "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
+            "protocol": "http",
+            "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "write_tools_enabled": false,
+            "tenantId": "watcher-tenant",
+            "projectId": "default",
+        })]);
+        let watcher_claims =
+            IsolationClaims::from_verified("watcher-tenant", "default", "watcher-service").unwrap();
+        let identity = crate::api::http::iam::test_identity_from_verified_claims(
+            watcher_claims,
+            vec!["DA".into()],
+        );
+        let response = invoke_mcp_server_handler(
+            State(state),
+            identity,
+            Json(McpCatalogInvokeRequest {
+                server: "watcher-server".into(),
+                tool_name: "read_status".into(),
+                arguments: json!({}),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("mcp_claims_incomplete"));
+        assert!(!body.contains("watcher-tenant"));
+        assert!(!body.contains("default"));
+        assert!(!body.contains("outbound-mcp-test-secret"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_default_project_id_mints_and_reaches_sidecar() {
         struct Seen {
             requests: AtomicUsize,

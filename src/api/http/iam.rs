@@ -106,6 +106,20 @@ impl UserIdentity {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_identity_from_verified_claims(
+    claims: IsolationClaims,
+    roles: Vec<String>,
+) -> UserIdentity {
+    UserIdentity {
+        user_id: claims.actor_id().to_string(),
+        tenant_id: claims.tenant_id().to_string(),
+        roles,
+        auth_method: AuthMethod::Jwt,
+        isolation_claims: Some(claims),
+    }
+}
+
 // ─── Axum Extractor ───────────────────────────────────────────────────────────
 
 #[async_trait]
