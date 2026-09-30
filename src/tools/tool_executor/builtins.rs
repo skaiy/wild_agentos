@@ -22,7 +22,7 @@ use crate::tools::builtin::sandbox::{
 use crate::tools::workspace_path::canonicalize_workspace_path;
 use crate::utils::text::safe_truncate;
 
-use super::{GlobSearchInput, GrepSearchInput, ToolSearchInput, WebFetchInput, WebSearchInput};
+use super::{GlobSearchInput, GrepSearchInput, WebFetchInput, WebSearchInput};
 
 // ========== Tool implementations ==========
 
@@ -637,25 +637,6 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
             "suggestion": "Web search unavailable, please answer based on your own knowledge"
         })),
     }
-}
-
-pub(super) async fn execute_tool_search(input: Value) -> Result<Value, String> {
-    let params: ToolSearchInput =
-        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    let q = params.query.to_lowercase();
-    let max = params.max_results.unwrap_or(10);
-    let all = [("glob_search", "Find files by glob pattern. Supports **, *, ? wildcards. Part of system:skills namespace."),
-        ("grep_search", "Search file contents with a regex pattern. Part of system:skills namespace."),
-        ("web_fetch", "Fetch a URL and convert it into readable text. Network tool."),
-        ("web_search", "Search the web for current information. Network tool."),
-        ("tool_search", "Search available tools by name or keyword. System tool.")];
-    let matches: Vec<Value> = all
-        .iter()
-        .filter(|(n, d)| n.to_lowercase().contains(&q) || d.to_lowercase().contains(&q))
-        .take(max)
-        .map(|(n, d)| json!({"name": n, "description": d, "source": "system:skills"}))
-        .collect();
-    Ok(json!({"matches": matches, "count": matches.len(), "query": params.query}))
 }
 
 // ===== File and Bash tool inputs =====
