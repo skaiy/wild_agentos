@@ -1200,6 +1200,21 @@ mod tests {
         inbound_identity_token_with_roles(vec![MCP_CATALOG_ADMIN_ROLE])
     }
 
+    fn inbound_identity_token_with_project(project_id: Option<&str>) -> String {
+        encode(
+            &Header::default(),
+            &crate::api::http::iam::JwtClaims {
+                sub: "test-user".into(),
+                tenant_id: "test-tenant".into(),
+                project_id: project_id.map(str::to_owned),
+                roles: vec!["DA".into()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
     fn test_isolation_claims() -> IsolationClaims {
         IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap()
     }
@@ -2755,6 +2770,172 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_inbound_tenant_id_does_not_mint_or_call_sidecar() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        let requests = Arc::new(AtomicUsize::new(0));
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests_for_server = requests.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/mcp", post(mock_handler))
+                    .with_state(requests_for_server),
+            )
+            .await
+            .unwrap()
+        });
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![json!({
+                "id": "tenant-server",
+                "name": "tenant-server",
+                "endpoint": format!("http://{address}/mcp"),
+                "endpoint_origin": format!("http://{address}"),
+                "protocol": "http",
+                "auth": {"kind": "bearer_jwt"},
+                "allowed_tools": ["read_status"],
+                "write_tools_enabled": false,
+                "tenantId": "test-tenant",
+                "projectId": "test-project",
+            })]));
+        let token = encode(
+            &Header::default(),
+            &json!({
+                "sub": "test-user",
+                "project_id": "test-project",
+                "roles": ["DA"],
+                "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+            }),
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({"server": "tenant-server", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_default_project_id_mints_and_reaches_sidecar() {
+        struct Seen {
+            requests: AtomicUsize,
+            project_id: std::sync::Mutex<Option<String>>,
+        }
+
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved: Vec<_> = ["MCP_JWT_SECRET", "AGENTOS_AUTH_MODE", "AGENTOS_AUTH_STRICT"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        async fn mock_handler(State(seen): State<Arc<Seen>>, headers: HeaderMap) -> Json<Value> {
+            seen.requests.fetch_add(1, Ordering::SeqCst);
+            let token = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .unwrap();
+            let mut validation = Validation::new(Algorithm::HS256);
+            validation.validate_aud = false;
+            let claims = decode::<OutboundMcpJwtClaims>(
+                token,
+                &DecodingKey::from_secret(b"outbound-mcp-test-secret"),
+                &validation,
+            )
+            .unwrap()
+            .claims;
+            *seen.project_id.lock().unwrap() = Some(claims.project_id);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let seen = Arc::new(Seen {
+            requests: AtomicUsize::new(0),
+            project_id: std::sync::Mutex::new(None),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen_for_server = seen.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/mcp", post(mock_handler))
+                    .with_state(seen_for_server),
+            )
+            .await
+            .unwrap()
+        });
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![json!({
+                "id": "explicit-default-server",
+                "name": "explicit-default-server",
+                "endpoint": format!("http://{address}/mcp"),
+                "endpoint_origin": format!("http://{address}"),
+                "protocol": "http",
+                "auth": {"kind": "bearer_jwt"},
+                "allowed_tools": ["read_status"],
+                "write_tools_enabled": false,
+                "tenantId": "test-tenant",
+                "projectId": "default",
+            })]));
+        let token = inbound_identity_token_with_project(Some("default"));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({
+                    "server": "explicit-default-server",
+                    "tool_name": "read_status",
+                    "arguments": {},
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(seen.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.project_id.lock().unwrap().as_deref(), Some("default"));
         for (name, value) in saved {
             match value {
                 Some(value) => std::env::set_var(name, value),
