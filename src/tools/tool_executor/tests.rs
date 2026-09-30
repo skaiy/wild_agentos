@@ -143,12 +143,63 @@ mod tests {
     }
 
     #[test]
-    fn test_pa_readonly_tools_includes_bash() {
-        assert!(ToolExecutor::is_pa_readonly_tool("bash"));
+    fn test_pa_readonly_tools_excludes_bash() {
+        assert!(!ToolExecutor::is_pa_readonly_tool("bash"));
         assert!(ToolExecutor::is_pa_readonly_tool("file_read"));
         assert!(ToolExecutor::is_pa_readonly_tool("grep_search"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_write"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_edit"));
+    }
+
+    #[test]
+    fn plan_and_pa_tool_definitions_exclude_bash_with_or_without_group_manager() {
+        let definitions_exclude_bash = |executor: &ToolExecutor, role: &str| {
+            assert!(
+                !executor
+                    .tool_definitions_for_role(role)
+                    .iter()
+                    .filter_map(|tool| tool["function"]["name"].as_str())
+                    .any(|name| name == "bash"),
+                "{role} must not be offered bash"
+            );
+        };
+
+        let executor = ToolExecutor::new();
+        definitions_exclude_bash(&executor, "Plan");
+        definitions_exclude_bash(&executor, "PA");
+
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        definitions_exclude_bash(&executor, "Plan");
+        definitions_exclude_bash(&executor, "PA");
+    }
+
+    #[test]
+    fn plan_execution_rejects_direct_calls_outside_the_role_allowlist() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let advertised_tools: Vec<String> = executor
+                .tool_definitions_for_role("Plan")
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect();
+
+            for name in ["bash", "file_write"] {
+                let result = executor
+                    .execute_with_security_context(
+                        name,
+                        json!({}),
+                        security_context(),
+                        &advertised_tools,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result["error"],
+                    format!("Tool not advertised for this turn: {name}")
+                );
+            }
+        });
     }
 
     fn security_context() -> SecurityContext {
