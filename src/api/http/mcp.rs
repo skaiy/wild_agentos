@@ -2771,7 +2771,16 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("mcp_claims_incomplete"));
+        assert!(body.contains("project_id"));
+        assert!(!body.contains(&token));
+        assert!(!body.contains("test-tenant"));
+        assert!(!body.contains("default"));
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         for (name, value) in saved {
@@ -2978,10 +2987,17 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        assert_eq!(
-            app.oneshot(request).await.unwrap().status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("mcp_claims_incomplete"));
+        assert!(body.contains("project_id"));
+        assert!(!body.contains(&token));
+        assert!(!body.contains("test-tenant"));
+        assert!(!body.contains("default"));
         assert_eq!(requests.load(Ordering::SeqCst), 0);
         for (name, value) in saved {
             match value {
