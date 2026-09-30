@@ -109,6 +109,7 @@ mod tests {
     fn test_hook_runner_does_not_block_allowed_tool() {
         rt().block_on(async {
             let mut executor = ToolExecutor::new();
+            executor.set_tool_group_manager(ToolGroupManager::new(None));
             let hook_config = RuntimeHookConfig::new(
                 vec!["printf 'blocked by security policy'; exit 2".to_string()],
                 vec![],
@@ -117,7 +118,14 @@ mod tests {
             executor.set_hook_runner(HookRunner::new(hook_config));
 
             let input = json!({"query": "search test"});
-            let result = executor.execute("tool_search", input).await;
+            let result = executor
+                .execute_with_security_context(
+                    "tool_search",
+                    input,
+                    security_context(),
+                    &["tool_search".to_string()],
+                )
+                .await;
             assert!(result.is_ok());
         });
     }
@@ -149,6 +157,126 @@ mod tests {
         assert!(ToolExecutor::is_pa_readonly_tool("grep_search"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_write"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_edit"));
+    }
+
+    #[test]
+    fn tool_search_ranking_is_deterministic_and_searches_parameter_metadata() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+
+        let first = executor
+            .search_tools_for_role("Do", json!({"query": "old_string", "max_results": 10}))
+            .unwrap();
+        let second = executor
+            .search_tools_for_role("Do", json!({"query": "old_string", "max_results": 10}))
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first["matches"][0]["name"], "file_edit");
+        assert_eq!(first["matches"][0]["retrieval"], "lexical");
+        assert_eq!(first["matches"][0]["group"], "Write");
+    }
+
+    #[test]
+    fn tool_search_filters_by_runtime_role_and_bounds_results() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+
+        let plan = executor
+            .search_tools_for_role("Plan", json!({"query": "write file shell command"}))
+            .unwrap();
+        assert!(plan["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .all(ToolExecutor::is_pa_readonly_tool));
+
+        let do_results = executor
+            .search_tools_for_role("Do", json!({"query": "write file shell command"}))
+            .unwrap();
+        let names: Vec<&str> = do_results["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"bash"));
+
+        let empty = executor
+            .search_tools_for_role("Do", json!({"query": "write", "max_results": 0}))
+            .unwrap();
+        assert_eq!(empty["count"], 0);
+        let capped = executor
+            .search_tools_for_role("Do", json!({"query": "search", "max_results": 99}))
+            .unwrap();
+        assert!(capped["count"].as_u64().unwrap() <= 10);
+    }
+
+    #[test]
+    fn tool_search_missing_or_argument_selected_role_fails_closed() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.set_tool_group_manager(ToolGroupManager::new(None));
+            let missing = executor
+                .execute("tool_search", json!({"query": "file_write"}))
+                .await
+                .unwrap_err();
+            assert!(missing.to_string().contains("verified runtime role"));
+
+            let advertised = vec!["tool_search".to_string()];
+            let result = executor
+                .execute_with_security_context(
+                    "tool_search",
+                    json!({"query": "write file", "role": "Do"}),
+                    SecurityContext::new("agent:plan", "PA"),
+                    &advertised,
+                )
+                .await
+                .unwrap();
+            assert!(result["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .all(ToolExecutor::is_pa_readonly_tool));
+        });
+    }
+
+    #[test]
+    fn lexical_results_activate_without_widening_plan_execution() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        let mut activated = executor.activated_tools();
+        let result = executor
+            .search_tools_for_role("Plan", json!({"query": "web search"}))
+            .unwrap();
+        let activation = executor.activate_on_demand_from_search("Plan", &mut activated, &result);
+        assert!(activation
+            .activated
+            .iter()
+            .all(|name| { ToolExecutor::is_pa_readonly_tool(name) }));
+        let definitions = executor.tool_definitions_for_turn("Plan", &activated);
+        let names: Vec<&str> = definitions
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"bash"));
+        assert!(!names.contains(&"file_write"));
+    }
+
+    #[test]
+    fn tool_search_vector_path_is_off_by_default() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        let result = executor
+            .search_tools_for_role("Do", json!({"query": "edit file"}))
+            .unwrap();
+        assert!(result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["retrieval"] == "lexical"));
     }
 
     #[test]

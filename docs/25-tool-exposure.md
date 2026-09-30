@@ -42,6 +42,30 @@ Appending tools preserves the resident prefix but changes the content after
 the append point. That later prompt content must be cached again, so callers
 should use a small number of focused searches.
 
+## Tool retrieval
+
+`tool_search` queries the live tool registry rather than a fixed catalog. Its
+deterministic lexical stage scores tool names, descriptions, parameter names,
+parameter descriptions, and group names. Exact names and prefixes receive an
+additional boost; score ties are ordered by tool name. It returns at most five
+results by default and ten at most.
+
+The returned metadata includes the tool name, group, one-line description,
+visibility status (`resident`, `activated`, or `on_demand`), and retrieval
+mode. The current mode is `lexical`. A future optional semantic-recall stage
+must use a dedicated server-owned index and fuse its candidates with lexical
+scores; it must never write to or query tenant knowledge namespaces. If an
+embedding operation fails or returns an invalid vector, retrieval must retain
+the lexical result and record the fallback rather than searching with a zero
+vector.
+
+The runtime supplies the caller role; `tool_search` accepts no role-selection
+parameter. Missing or unknown runtime roles fail closed. Candidates are
+filtered by both the role's exposure groups and its unchanged execution
+allowlist before ranking, so a search result cannot reveal or activate a tool
+that role cannot execute. Activation remains append-only and subject to the
+existing per-run limits.
+
 ## Configuration and rollback
 
 `token_optimization.tool_groups` configures role groups and activation limits.
