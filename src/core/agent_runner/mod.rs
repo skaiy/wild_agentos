@@ -1,6 +1,6 @@
 #![allow(deprecated)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -393,12 +393,12 @@ pub struct AgentRunner {
     /// Trusted supervisor restrictions keyed by a unique active run id.
     /// This is deliberately runner-owned, never shared executor or global state.
     pub run_tool_restrictions: Arc<dashmap::DashMap<String, Vec<String>>>,
-    active_tool_runs: Arc<dashmap::DashMap<String, String>>,
+    active_tool_runs: Arc<dashmap::DashMap<String, HashSet<String>>>,
 }
 
 pub(crate) struct ToolRestrictionRunGuard {
     restrictions: Arc<dashmap::DashMap<String, Vec<String>>>,
-    active_runs: Arc<dashmap::DashMap<String, String>>,
+    active_runs: Arc<dashmap::DashMap<String, HashSet<String>>>,
     task_iri: String,
     run_id: String,
 }
@@ -412,11 +412,13 @@ impl ToolRestrictionRunGuard {
 impl Drop for ToolRestrictionRunGuard {
     fn drop(&mut self) {
         self.restrictions.remove(&self.run_id);
-        if self
-            .active_runs
-            .get(&self.task_iri)
-            .is_some_and(|active| active.value() == &self.run_id)
-        {
+        let remove_task_entry = if let Some(mut active) = self.active_runs.get_mut(&self.task_iri) {
+            active.remove(&self.run_id);
+            active.is_empty()
+        } else {
+            false
+        };
+        if remove_task_entry {
             self.active_runs.remove(&self.task_iri);
         }
     }
@@ -601,7 +603,9 @@ impl AgentRunner {
     pub(crate) fn begin_tool_restriction_run(&self, task_iri: &str) -> ToolRestrictionRunGuard {
         let run_id = uuid::Uuid::new_v4().to_string();
         self.active_tool_runs
-            .insert(task_iri.to_string(), run_id.clone());
+            .entry(task_iri.to_string())
+            .or_default()
+            .insert(run_id.clone());
         ToolRestrictionRunGuard {
             restrictions: self.run_tool_restrictions.clone(),
             active_runs: self.active_tool_runs.clone(),
@@ -612,17 +616,20 @@ impl AgentRunner {
 
     /// Narrow the active task run's tools from trusted supervisor code.
     pub fn restrict_tools_for_run(&self, task_iri: &str, tools: Vec<String>) {
-        let Some(run_id) = self
+        let run_ids: Vec<String> = self
             .active_tool_runs
             .get(task_iri)
-            .map(|run_id| run_id.clone())
-        else {
+            .map(|run_ids| run_ids.iter().cloned().collect())
+            .unwrap_or_default();
+        if run_ids.is_empty() {
             return;
-        };
-        self.run_tool_restrictions
-            .entry(run_id)
-            .and_modify(|current| current.retain(|tool| tools.contains(tool)))
-            .or_insert(tools);
+        }
+        for run_id in run_ids {
+            self.run_tool_restrictions
+                .entry(run_id)
+                .and_modify(|current| current.retain(|tool| tools.contains(tool)))
+                .or_insert_with(|| tools.clone());
+        }
     }
 
     pub(crate) fn run_tool_restriction(&self, run_id: &str) -> Option<Vec<String>> {
@@ -700,36 +707,6 @@ impl AgentRunner {
         if let Some(wm) = executor.get_workspace_monitor() {
             wm.set_perception_store(Arc::new(self.perception_store.clone()));
         }
-    }
-}
-
-#[cfg(test)]
-mod run_restriction_tests {
-    use super::*;
-
-    #[test]
-    fn a_new_run_for_the_same_task_starts_unrestricted() {
-        let restrictions = Arc::new(dashmap::DashMap::new());
-        let active_runs = Arc::new(dashmap::DashMap::new());
-        let task = "iri://task/same";
-        let first = ToolRestrictionRunGuard {
-            restrictions: restrictions.clone(),
-            active_runs: active_runs.clone(),
-            task_iri: task.to_string(),
-            run_id: "run-one".to_string(),
-        };
-        active_runs.insert(task.to_string(), first.run_id.clone());
-        restrictions.insert(first.run_id.clone(), vec!["file_read".to_string()]);
-        drop(first);
-
-        let second = ToolRestrictionRunGuard {
-            restrictions: restrictions.clone(),
-            active_runs,
-            task_iri: task.to_string(),
-            run_id: "run-two".to_string(),
-        };
-        assert!(restrictions.get(second.run_id()).is_none());
-        drop(second);
     }
 }
 

@@ -199,6 +199,16 @@ mod tests {
             .search_tools_for_role("Check", json!({"query": "bash"}))
             .unwrap();
         assert_eq!(check["count"], 0);
+        let check_write_terms = executor
+            .search_tools_for_role("Check", json!({"query": "write file shell command"}))
+            .unwrap();
+        let check_policy = ToolPolicy::new();
+        assert!(check_write_terms["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .all(|name| check_policy.is_executable(&AgentRole::Check, "", name)));
 
         let do_results = executor
             .search_tools_for_role("Do", json!({"query": "write file shell command"}))
@@ -616,7 +626,24 @@ mod tests {
     #[test]
     fn check_returns_structured_role_denial_without_invoking_handler() {
         rt().block_on(async {
-            let executor = ToolExecutor::new();
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = calls.clone();
+            let mut executor = ToolExecutor::new();
+            executor.register(
+                "bash",
+                "Counted bash handler.",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(move |_| {
+                    let handler_calls = handler_calls.clone();
+                    Box::pin(async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"ok": true}))
+                    })
+                }),
+                &[],
+            );
             let result = executor
                 .execute_with_security_context(
                     "bash",
@@ -629,6 +656,7 @@ mod tests {
             assert_eq!(result["error"], "Tool not allowed for role");
             assert_eq!(result["tool"], "bash");
             assert_eq!(result["role"], "CA");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
         });
     }
 
