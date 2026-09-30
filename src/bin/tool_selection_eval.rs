@@ -11,7 +11,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use wild_agent_os_core::tools::ToolExecutor;
+use wild_agent_os_core::tools::{ToolExecutor, ToolGroupManager};
 
 const TEMPERATURE: f32 = 0.0;
 const SEED: u64 = 2710;
@@ -43,6 +43,8 @@ struct GoldenCase {
     recorded_tool_calls: Vec<String>,
     #[serde(default)]
     turns: Vec<GoldenTurn>,
+    #[serde(default)]
+    baseline_expected_failure: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +73,7 @@ struct CaseResult {
     id: String,
     role: String,
     category: String,
+    baseline_expected_failure: bool,
     called_tools: Vec<String>,
     expected_tools: Vec<String>,
     forbidden_tools: Vec<String>,
@@ -131,6 +134,26 @@ struct Report {
     case_results: Vec<CaseResult>,
     per_role: BTreeMap<String, Aggregate>,
     overall: Aggregate,
+    registry_coverage: RegistryCoverage,
+    prompt_cache_scenarios: BTreeMap<String, BTreeMap<String, CacheScenario>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegistryCoverage {
+    registered_tool_count: usize,
+    resident_or_on_demand_count: usize,
+    tool_search_catalog_count: usize,
+    unreachable_tools: Vec<String>,
+    expected_baseline_gap: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheScenario {
+    resident_tool_count: usize,
+    activated_tool_count: usize,
+    resident_prefix_stable: bool,
+    prompt_cache_hit_rate_proxy: f64,
+    activation_invalidates_cache_once: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +285,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         per_role: aggregate_by_role(&results),
         overall: aggregate(&results),
         case_results: results,
+        registry_coverage: registry_coverage(&executor),
+        prompt_cache_scenarios: prompt_cache_scenarios(&executor),
     };
     fs::create_dir_all(&args.output)?;
     fs::write(
@@ -275,6 +300,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.mode
     );
     Ok(())
+}
+
+fn prompt_cache_scenarios(
+    executor: &ToolExecutor,
+) -> BTreeMap<String, BTreeMap<String, CacheScenario>> {
+    let manager = ToolGroupManager::new(None);
+    let all = executor.list_tools("all");
+    ["Plan", "Do", "Check"]
+        .into_iter()
+        .map(|role| {
+            let (resident_groups, on_demand_groups) = manager.get_groups_for_role(role);
+            let resident_names = manager.get_tools_for_groups(&resident_groups);
+            let resident = all
+                .iter()
+                .filter(|name| resident_names.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut scenarios = BTreeMap::new();
+            scenarios.insert(
+                "no_on_demand_group_activated".to_string(),
+                CacheScenario {
+                    resident_tool_count: resident.len(),
+                    activated_tool_count: resident.len(),
+                    resident_prefix_stable: true,
+                    prompt_cache_hit_rate_proxy: 1.0,
+                    activation_invalidates_cache_once: false,
+                },
+            );
+            let activated_names = on_demand_groups
+                .first()
+                .map(|group| manager.get_tools_for_groups(&[*group]))
+                .unwrap_or_default();
+            let mut activated = resident.clone();
+            activated.extend(
+                all.iter()
+                    .filter(|name| {
+                        activated_names.contains(*name) && !resident_names.contains(*name)
+                    })
+                    .cloned(),
+            );
+            let prefix_stable = activated.starts_with(&resident);
+            scenarios.insert(
+                "one_on_demand_group_activated_once".to_string(),
+                CacheScenario {
+                    resident_tool_count: resident.len(),
+                    activated_tool_count: activated.len(),
+                    resident_prefix_stable: prefix_stable,
+                    // Adding tools changes the request once; a repeated
+                    // activated surface can reuse that new prefix.
+                    prompt_cache_hit_rate_proxy: 0.5,
+                    activation_invalidates_cache_once: !activated_names.is_empty(),
+                },
+            );
+            (role.to_string(), scenarios)
+        })
+        .collect()
+}
+
+fn registry_coverage(executor: &ToolExecutor) -> RegistryCoverage {
+    let mut registered = executor.list_tools("all");
+    registered.sort();
+    let groups = ToolGroupManager::new(None);
+    let mut grouped = std::collections::HashSet::new();
+    for role in ["Plan", "Do", "Check"] {
+        let (resident, on_demand) = groups.get_tool_names_for_role(role);
+        grouped.extend(resident);
+        grouped.extend(on_demand);
+    }
+    // Current `tool_search` is intentionally hard-coded. Keep this list here
+    // so the deterministic report makes missing registry coverage visible.
+    let search_catalog = [
+        "glob_search",
+        "grep_search",
+        "web_fetch",
+        "web_search",
+        "tool_search",
+    ];
+    let unreachable_tools = registered
+        .iter()
+        .filter(|tool| !grouped.contains(*tool) && !search_catalog.contains(&tool.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    RegistryCoverage {
+        registered_tool_count: registered.len(),
+        resident_or_on_demand_count: grouped.len(),
+        tool_search_catalog_count: search_catalog.len(),
+        expected_baseline_gap: !unreachable_tools.is_empty(),
+        unreachable_tools,
+    }
 }
 
 fn require_live_env() -> Result<(), Box<dyn std::error::Error>> {
@@ -422,6 +536,7 @@ fn score_case(
         id: case.id.clone(),
         role: case.role.clone(),
         category: case.category.clone(),
+        baseline_expected_failure: case.baseline_expected_failure,
         called_tools: calls.clone(),
         expected_tools,
         forbidden_tools,
@@ -576,6 +691,17 @@ fn markdown_summary(report: &Report) -> String {
     output.push_str(
         "\nToken values are deterministic character-based estimates for serialized function definitions plus the readable system-prompt tool menu. The cache metric is a proxy: it is true only when the previous same-role turn had the identical tools array and menu.\n",
     );
+    output.push_str(&format!(
+        "\n## Registry coverage\n\nRegistered: {}; resident/on-demand: {}; hard-coded tool_search catalog: {}; unreachable: {}.\n",
+        report.registry_coverage.registered_tool_count,
+        report.registry_coverage.resident_or_on_demand_count,
+        report.registry_coverage.tool_search_catalog_count,
+        if report.registry_coverage.unreachable_tools.is_empty() {
+            "none".to_string()
+        } else {
+            report.registry_coverage.unreachable_tools.join(", ")
+        }
+    ));
     output
 }
 

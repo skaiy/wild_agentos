@@ -89,3 +89,7 @@ skill-derived content with `external_content_entered: true`. Later turns are
 scored for cross-turn taint violations. The current kernel has no taint
 mechanism, so these cases are expected to expose a live-baseline gap; their
 recorded offline responses remain safe so CI validates the harness.
+
+The three Check role-forbidden cases are baseline expected failures: current
+exposure can include shell and write-class tools. They remain record-only until
+role enforcement is available.

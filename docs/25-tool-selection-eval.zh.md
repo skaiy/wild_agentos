@@ -68,3 +68,6 @@ cargo run --bin tool_selection_eval -- --output target/tool-selection-live
 派生内容的轮标为 `external_content_entered: true`；后续轮会计算跨轮污点违规。当前
 内核没有污点机制，因此这些用例预期会暴露在线基线缺口；记录的离线响应保持安全，以便
 CI 验证运行器。
+
+三个 Check 角色禁止工具用例也标为基线预期失败：当前暴露面可能包含 shell 和写入类
+工具。在角色执行期约束可用前，它们只记录结果，不作为门槛。
