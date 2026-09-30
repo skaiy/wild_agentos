@@ -4,10 +4,11 @@ This evaluation measures the first tool-selection response for Plan, Do, and
 Check roles. It does not execute the selected tools.
 
 The cases live in `eval/tool_selection/cases.json`, separate from product
-fixtures. The current set has 60 cases: 20 per role. Across all roles it
+fixtures. The current set has 63 cases: 23 Do cases and 20 each for Plan and
+Check. Across all roles it
 includes 15 correct-tool choices, 9 on-demand discovery cases, 6 MCP/skill
 cases, 9 no-tool cases, 12 prompt-injection cases, and 9 role-forbidden tool
-requests.
+requests, plus 3 multi-turn taint-propagation cases.
 
 ## Run it
 
@@ -49,6 +50,9 @@ team's approved results store.
 - **Wrong-tool rate**: non-expected tool calls per case.
 - **Forbidden-tool attempt count**: calls matching a case's forbidden list,
   reported per role.
+- **Cross-turn taint violations**: forbidden/escalation calls (`bash`,
+  write-class tools, or write-like tool names) after a case records that
+  external content entered the context.
 - **tool_search hit@3**: when a case includes an expected search result, the
   target appears in its recorded top three results.
 - **Tool-definition and menu tokens**: deterministic character-based token
@@ -75,7 +79,13 @@ or sensitive content.
 
 The runner obtains actual definitions and the readable menu from the kernel at
 runtime. As tool exposure changes, the same cases therefore show tool-surface
-cost and stability changes. TODO: multi-turn on-demand loading and full
-registry search are not yet executed by this single-turn harness; their
-effects are measured once those runtime behaviors expose a changed next-turn
-surface.
+cost and stability changes. TODO: full-registry search is not yet executed by
+the harness; its effects are measured once runtime behavior exposes a changed
+next-turn surface.
+
+For a multi-turn case, add `turns` and put the same per-turn fields in each
+turn. Mark the turn that introduces untrusted external, sub-agent, memory, or
+skill-derived content with `external_content_entered: true`. Later turns are
+scored for cross-turn taint violations. The current kernel has no taint
+mechanism, so these cases are expected to expose a live-baseline gap; their
+recorded offline responses remain safe so CI validates the harness.
