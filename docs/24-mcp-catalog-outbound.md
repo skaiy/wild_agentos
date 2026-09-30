@@ -12,19 +12,41 @@ The process that runs Core must set the following environment variables:
 ```sh
 MCP_JWT_SECRET=...           # required HS256 signing secret
 MCP_JWT_ISSUER=wild-agentos-core  # optional; default shown
-MCP_JWT_AUDIENCE=example-mcp      # optional; default shown
 MCP_JWT_SUB=mcp-client            # optional; default shown
 ```
 
 `MCP_JWT_SECRET` is required. The service mints a short-lived (five minute) HS256 JWT
-for each outbound request. The issuer, audience, and subject defaults are
-neutral examples and can be overridden with their respective environment
-variables.
+for each outbound request. The issuer and subject defaults are neutral examples
+and can be overridden with their respective environment variables. The JWT
+`aud` is always the registered catalog server ID, so credentials for different
+servers cannot share an audience.
 
 Secrets are never accepted in catalog JSON. To opt a catalog entry into this
 flow, register it with `auth_kind: "bearer_jwt"`. The persisted catalog record
 contains only the fixed environment-variable references (`MCP_JWT_SECRET`,
-`MCP_JWT_ISSUER`, `MCP_JWT_AUDIENCE`, and `MCP_JWT_SUB`).
+`MCP_JWT_ISSUER`, and `MCP_JWT_SUB`).
+
+## Configure outbound boundaries
+
+Catalog HTTP endpoints must be absolute `http` or `https` URLs without user
+credentials. Their scheme, host, and port are recorded at registration and
+checked again before every invoke. The invoke request cannot supply or replace
+an endpoint.
+
+Set `MCP_OUTBOUND_ALLOWED_ORIGINS` to a comma-separated list of permitted
+origins when the deployment needs an explicit network allowlist:
+
+```sh
+MCP_OUTBOUND_ALLOWED_ORIGINS=https://mcp.example.test,http://127.0.0.1:8080
+MCP_OUTBOUND_CONNECT_TIMEOUT_MS=5000
+MCP_OUTBOUND_TIMEOUT_MS=15000
+MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
+```
+
+When the allowlist is unset, only each catalog entry's registered origin is
+allowed. Invalid or changed endpoints are rejected before any outbound request.
+The timeout and response-size settings are optional positive integers; the
+values shown are the secure defaults.
 
 ## Register and invoke
 
@@ -47,6 +69,8 @@ Content-Type: application/json
 
 The catalog management and invoke endpoints require verified inbound
 `IsolationClaims`; Core scopes lookup to the caller's tenant and project.
+Registering a catalog entry also requires the `DA` administrator role. A caller
+without that role receives `403`, and no catalog file is written.
 
 Invoke a registered tool by its catalog `name` (or `id` when names are
 ambiguous):

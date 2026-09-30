@@ -1,6 +1,6 @@
 //! MCP server catalog and authenticated outbound invocation surface.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use futures::StreamExt;
@@ -12,6 +12,9 @@ use super::{data_dir, iam::UserIdentity, AppState};
 
 const MAX_ALLOWED_TOOLS: usize = 64;
 const MAX_TOOL_NAME_LENGTH: usize = 128;
+const DEFAULT_OUTBOUND_MCP_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_OUTBOUND_MCP_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_OUTBOUND_MCP_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const WRITE_CLASS_TOOL_PREFIXES: &[&str] = &[
     "create_",
     "update_",
@@ -160,12 +163,61 @@ fn catalog_auth(kind: Option<&str>) -> Result<Value, &'static str> {
             "kind": "bearer_jwt",
             "secret_env": "MCP_JWT_SECRET",
             "issuer_env": "MCP_JWT_ISSUER",
-            "audience_env": "MCP_JWT_AUDIENCE",
             "subject_env": "MCP_JWT_SUB",
         })),
         Some(_) => Err("auth_kind must be 'bearer_jwt' when supplied"),
         None => Ok(Value::Null),
     }
+}
+
+fn endpoint_origin(endpoint: &str) -> Result<String, &'static str> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|_| "HTTP MCP endpoint must be an absolute http(s) URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("HTTP MCP endpoint must be an absolute http(s) URL without user credentials");
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn configured_outbound_mcp_origins() -> Result<Option<HashSet<String>>, &'static str> {
+    let Ok(configured) = std::env::var("MCP_OUTBOUND_ALLOWED_ORIGINS") else {
+        return Ok(None);
+    };
+    let origins: HashSet<_> = configured
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(endpoint_origin)
+        .collect::<Result<_, _>>()?;
+    if origins.is_empty() {
+        return Err("MCP_OUTBOUND_ALLOWED_ORIGINS must contain at least one http(s) origin");
+    }
+    Ok(Some(origins))
+}
+
+fn validate_outbound_mcp_endpoint(server: &Value) -> Result<(), &'static str> {
+    let endpoint = server
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .ok_or("catalog MCP endpoint is missing")?;
+    let origin = endpoint_origin(endpoint)?;
+    let registered_origin = server
+        .get("endpoint_origin")
+        .and_then(Value::as_str)
+        .ok_or("catalog MCP endpoint is missing its registered origin")?;
+    if origin != registered_origin {
+        return Err("catalog MCP endpoint does not match its registered origin");
+    }
+    if let Some(allowed_origins) = configured_outbound_mcp_origins()? {
+        if !allowed_origins.contains(&origin) {
+            return Err("catalog MCP endpoint origin is not allowed");
+        }
+    }
+    Ok(())
 }
 
 /// POST /api/v1/mcp/servers — register a catalog MCP server.
@@ -177,6 +229,9 @@ pub(crate) async fn register_mcp_server_handler(
     let Some(claims) = identity.isolation_claims() else {
         return missing_isolation_claims().into_response();
     };
+    if let Err(error) = identity.require_role("DA") {
+        return error.into_response();
+    }
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -185,16 +240,33 @@ pub(crate) async fn register_mcp_server_handler(
             .into_response();
     }
     let protocol = req.protocol.unwrap_or_else(|| "sse".to_string());
-    let valid_http_endpoint = reqwest::Url::parse(&req.endpoint)
-        .map(|url| matches!(url.scheme(), "http" | "https"))
-        .unwrap_or(false);
-    if protocol == "http" && !valid_http_endpoint {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "HTTP MCP endpoint must be an absolute http(s) URL"})),
-        )
-            .into_response();
-    }
+    let registered_origin = if protocol == "http" {
+        match endpoint_origin(&req.endpoint) {
+            Ok(origin) => {
+                if let Some(allowed_origins) = match configured_outbound_mcp_origins() {
+                    Ok(origins) => origins,
+                    Err(error) => {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error": error})))
+                            .into_response()
+                    }
+                } {
+                    if !allowed_origins.contains(&origin) {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({"error": "catalog MCP endpoint origin is not allowed"})),
+                        )
+                            .into_response();
+                    }
+                }
+                Some(origin)
+            }
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+            }
+        }
+    } else {
+        None
+    };
     let auth = match catalog_auth(req.auth_kind.as_deref()) {
         Ok(auth) => auth,
         Err(message) => {
@@ -211,6 +283,7 @@ pub(crate) async fn register_mcp_server_handler(
         "name": req.name,
         "description": req.description.unwrap_or_default(),
         "endpoint": req.endpoint,
+        "endpoint_origin": registered_origin,
         "protocol": protocol,
         "auth": auth,
         "allowed_tools": req.allowed_tools,
@@ -265,12 +338,12 @@ fn mcp_env(name: &str, default: Option<&str>) -> Result<String, String> {
 /// Mints the credential for an *outbound* MCP request. It deliberately takes
 /// no `IsolationClaims`: inbound isolation determines catalog visibility, not
 /// the bearer credential trusted by the remote MCP server.
-fn mint_outbound_mcp_jwt() -> Result<String, String> {
+fn mint_outbound_mcp_jwt(audience: &str) -> Result<String, String> {
     let secret = mcp_env("MCP_JWT_SECRET", None)?;
     let now = chrono::Utc::now().timestamp() as usize;
     let claims = OutboundMcpJwtClaims {
         iss: mcp_env("MCP_JWT_ISSUER", Some("wild-agentos-core"))?,
-        aud: mcp_env("MCP_JWT_AUDIENCE", Some("example-mcp"))?,
+        aud: audience.to_string(),
         sub: mcp_env("MCP_JWT_SUB", Some("mcp-client"))?,
         iat: now,
         exp: now + 300,
@@ -292,7 +365,6 @@ fn server_uses_bearer_jwt(server: &Value) -> bool {
 }
 
 const OUTBOUND_MCP_REQUEST_ID: u64 = 1;
-const MAX_OUTBOUND_MCP_SSE_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 enum InvokeHttpMcpError {
@@ -300,25 +372,76 @@ enum InvokeHttpMcpError {
     JsonRpc(Value),
 }
 
-async fn read_sse_json_rpc_response(
+fn outbound_mcp_configured_positive_u64(name: &str, default: u64) -> Result<u64, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .ok()
+            .filter(|value: &u64| *value > 0)
+            .ok_or_else(|| format!("{name} must be a positive integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn outbound_mcp_configured_positive_usize(name: &str, default: usize) -> Result<usize, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .ok()
+            .filter(|value: &usize| *value > 0)
+            .ok_or_else(|| format!("{name} must be a positive integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn outbound_mcp_client() -> Result<(reqwest::Client, usize), InvokeHttpMcpError> {
+    let connect_timeout = outbound_mcp_configured_positive_u64(
+        "MCP_OUTBOUND_CONNECT_TIMEOUT_MS",
+        DEFAULT_OUTBOUND_MCP_CONNECT_TIMEOUT_MS,
+    )
+    .map_err(InvokeHttpMcpError::Transport)?;
+    let timeout = outbound_mcp_configured_positive_u64(
+        "MCP_OUTBOUND_TIMEOUT_MS",
+        DEFAULT_OUTBOUND_MCP_TIMEOUT_MS,
+    )
+    .map_err(InvokeHttpMcpError::Transport)?;
+    let max_response_bytes = outbound_mcp_configured_positive_usize(
+        "MCP_OUTBOUND_MAX_RESPONSE_BYTES",
+        DEFAULT_OUTBOUND_MCP_MAX_RESPONSE_BYTES,
+    )
+    .map_err(InvokeHttpMcpError::Transport)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(connect_timeout))
+        .timeout(Duration::from_millis(timeout))
+        .build()
+        .map_err(|error| {
+            InvokeHttpMcpError::Transport(format!("MCP HTTP client setup failed: {error}"))
+        })?;
+    Ok((client, max_response_bytes))
+}
+
+async fn read_bounded_response(
     response: reqwest::Response,
-    request_id: u64,
-) -> Result<Value, InvokeHttpMcpError> {
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, InvokeHttpMcpError> {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             InvokeHttpMcpError::Transport(format!("MCP SSE response read failed: {error}"))
         })?;
-        if body.len() + chunk.len() > MAX_OUTBOUND_MCP_SSE_RESPONSE_BYTES {
+        if body.len() + chunk.len() > max_response_bytes {
             return Err(InvokeHttpMcpError::Transport(format!(
-                "MCP SSE response exceeded {MAX_OUTBOUND_MCP_SSE_RESPONSE_BYTES} byte limit"
+                "MCP response exceeded {max_response_bytes} byte limit"
             )));
         }
         body.extend_from_slice(&chunk);
     }
+    Ok(body)
+}
 
-    let body = std::str::from_utf8(&body).map_err(|error| {
+fn read_sse_json_rpc_response(body: &[u8], request_id: u64) -> Result<Value, InvokeHttpMcpError> {
+    let body = std::str::from_utf8(body).map_err(|error| {
         InvokeHttpMcpError::Transport(format!("MCP SSE response was not valid UTF-8: {error}"))
     })?;
     let mut event_type = None;
@@ -422,7 +545,8 @@ async fn invoke_http_mcp(
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value, InvokeHttpMcpError> {
-    let response = reqwest::Client::new()
+    let (client, max_response_bytes) = outbound_mcp_client()?;
+    let response = client
         .post(endpoint)
         .bearer_auth(bearer)
         .header(
@@ -448,10 +572,11 @@ async fn invoke_http_mcp(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let response = read_bounded_response(response, max_response_bytes).await?;
     let body = if is_sse {
-        read_sse_json_rpc_response(response, OUTBOUND_MCP_REQUEST_ID).await?
+        read_sse_json_rpc_response(&response, OUTBOUND_MCP_REQUEST_ID)?
     } else {
-        response.json().await.map_err(|error| {
+        serde_json::from_slice(&response).map_err(|error| {
             InvokeHttpMcpError::Transport(format!("MCP response parse failed: {error}"))
         })?
     };
@@ -502,30 +627,33 @@ pub(crate) async fn invoke_mcp_server_handler(
         )
             .into_response();
     }
-    let servers = state.mcp_servers.read().await;
-    let matches: Vec<&Value> = servers
-        .iter()
-        .filter(|server| {
-            server_is_in_scope(server, Some(claims))
-                && (server.get("id").and_then(Value::as_str) == Some(request.server.as_str())
-                    || server.get("name").and_then(Value::as_str) == Some(request.server.as_str()))
-        })
-        .collect();
-    if matches.is_empty() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "catalog MCP server not found"})),
-        )
-            .into_response();
-    }
-    if matches.len() > 1 {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "catalog MCP name is ambiguous; invoke by id"})),
-        )
-            .into_response();
-    }
-    let server = matches[0];
+    let server = {
+        let servers = state.mcp_servers.read().await;
+        let matches: Vec<&Value> = servers
+            .iter()
+            .filter(|server| {
+                server_is_in_scope(server, Some(claims))
+                    && (server.get("id").and_then(Value::as_str) == Some(request.server.as_str())
+                        || server.get("name").and_then(Value::as_str)
+                            == Some(request.server.as_str()))
+            })
+            .collect();
+        if matches.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "catalog MCP server not found"})),
+            )
+                .into_response();
+        }
+        if matches.len() > 1 {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "catalog MCP name is ambiguous; invoke by id"})),
+            )
+                .into_response();
+        }
+        matches[0].clone()
+    };
     if server.get("protocol").and_then(Value::as_str) != Some("http") {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -533,17 +661,32 @@ pub(crate) async fn invoke_mcp_server_handler(
         )
             .into_response();
     }
-    if !server_uses_bearer_jwt(server) {
+    if !server_uses_bearer_jwt(&server) {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(json!({"error": "catalog MCP is not configured with auth_kind=bearer_jwt"})),
         )
             .into_response();
     }
-    if let Err(denied) = check_tool_policy(server, &request.tool_name) {
+    if let Err(denied) = check_tool_policy(&server, &request.tool_name) {
         return tool_policy_denied_response(denied, &request.tool_name).into_response();
     }
-    let bearer = match mint_outbound_mcp_jwt() {
+    if let Err(error) = validate_outbound_mcp_endpoint(&server) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "mcp_endpoint_not_allowed", "message": error})),
+        )
+            .into_response();
+    }
+    let audience = server["id"].as_str().unwrap_or_default();
+    if audience.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "mcp_endpoint_not_allowed", "message": "catalog MCP server is missing its id"})),
+        )
+            .into_response();
+    }
+    let bearer = match mint_outbound_mcp_jwt(audience) {
         Ok(token) => token,
         Err(error) => {
             return (
@@ -609,7 +752,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let previous = std::env::var_os("MCP_JWT_SECRET");
         std::env::remove_var("MCP_JWT_SECRET");
-        assert!(mint_outbound_mcp_jwt().is_err());
+        assert!(mint_outbound_mcp_jwt("server-id").is_err());
         match previous {
             Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
             None => std::env::remove_var("MCP_JWT_SECRET"),
@@ -728,19 +871,23 @@ mod tests {
         })
     }
 
-    fn inbound_identity_token() -> String {
+    fn inbound_identity_token_with_roles(roles: Vec<&str>) -> String {
         encode(
             &Header::default(),
             &crate::api::http::iam::JwtClaims {
                 sub: "test-user".into(),
                 tenant_id: "test-tenant".into(),
                 project_id: Some("test-project".into()),
-                roles: vec!["DA".into()],
+                roles: roles.into_iter().map(str::to_owned).collect(),
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
             &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap()
+    }
+
+    fn inbound_identity_token() -> String {
+        inbound_identity_token_with_roles(vec!["DA"])
     }
 
     #[tokio::test]
@@ -773,6 +920,7 @@ mod tests {
             "id": "server-id",
             "name": "catalog-server",
             "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
             "protocol": "http",
             "auth": {"kind": "bearer_jwt"},
             "allowed_tools": ["read_status"],
@@ -854,6 +1002,7 @@ mod tests {
             "id": "server-id",
             "name": "catalog-server",
             "endpoint": format!("http://{address}/mcp"),
+            "endpoint_origin": format!("http://{address}"),
             "protocol": "http",
             "auth": {"kind": "bearer_jwt"},
             "allowed_tools": ["read_status"],
@@ -959,7 +1108,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let bearer = mint_outbound_mcp_jwt().unwrap();
+        let bearer = mint_outbound_mcp_jwt("server-id").unwrap();
         let isolation =
             IsolationClaims::from_verified("tenant-not-mcp", "project", "actor").unwrap();
         let result = invoke_http_mcp(
@@ -1085,5 +1234,188 @@ mod tests {
 
         let response = outbound_mcp_failure_response(InvokeHttpMcpError::JsonRpc(error));
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn outbound_jwt_audience_is_bound_to_each_catalog_server() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_secret = std::env::var_os("MCP_JWT_SECRET");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_aud = false;
+        let first = decode::<OutboundMcpJwtClaims>(
+            &mint_outbound_mcp_jwt("catalog-server-a").unwrap(),
+            &DecodingKey::from_secret(b"outbound-mcp-test-secret"),
+            &validation,
+        )
+        .unwrap();
+        let second = decode::<OutboundMcpJwtClaims>(
+            &mint_outbound_mcp_jwt("catalog-server-b").unwrap(),
+            &DecodingKey::from_secret(b"outbound-mcp-test-secret"),
+            &validation,
+        )
+        .unwrap();
+        assert_eq!(first.claims.aud, "catalog-server-a");
+        assert_eq!(second.claims.aud, "catalog-server-b");
+        assert_ne!(first.claims.aud, second.claims.aud);
+
+        match previous_secret {
+            Some(value) => std::env::set_var("MCP_JWT_SECRET", value),
+            None => std::env::remove_var("MCP_JWT_SECRET"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_catalog_endpoint_is_rejected_before_outbound_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        async fn mock_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}))
+        }
+
+        let mock = Router::new()
+            .route("/mcp", post(mock_handler))
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let app = Router::new()
+            .route("/invoke", post(invoke_mcp_server_handler))
+            .with_state(test_app_state(vec![json!({
+                "id": "server-id",
+                "name": "catalog-server",
+                "endpoint": format!("http://{address}/mcp"),
+                "endpoint_origin": "http://127.0.0.1:1",
+                "protocol": "http",
+                "auth": {"kind": "bearer_jwt"},
+                "allowed_tools": ["read_status"],
+                "write_tools_enabled": false,
+                "tenantId": "test-tenant",
+                "projectId": "test-project",
+            })]));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/invoke")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token()),
+            )
+            .body(Body::from(
+                json!({"server": "server-id", "tool_name": "read_status", "arguments": {}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_response_limit_and_timeout_fail_explicitly() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_timeout = std::env::var_os("MCP_OUTBOUND_TIMEOUT_MS");
+        let previous_limit = std::env::var_os("MCP_OUTBOUND_MAX_RESPONSE_BYTES");
+        std::env::set_var("MCP_OUTBOUND_TIMEOUT_MS", "25");
+        std::env::set_var("MCP_OUTBOUND_MAX_RESPONSE_BYTES", "32");
+
+        async fn mock_handler(Json(body): Json<Value>) -> axum::response::Response {
+            match body["params"]["name"].as_str() {
+                Some("slow") => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}})).into_response()
+                }
+                _ => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"payload": "this response is intentionally too large"},
+                }))
+                .into_response(),
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/mcp", post(mock_handler)))
+                .await
+                .unwrap()
+        });
+        let endpoint = format!("http://{address}/mcp");
+        let oversized = invoke_http_mcp(&endpoint, "test-token", "large", json!({}))
+            .await
+            .unwrap_err();
+        let timed_out = invoke_http_mcp(&endpoint, "test-token", "slow", json!({}))
+            .await
+            .unwrap_err();
+        let InvokeHttpMcpError::Transport(oversized) = oversized else {
+            panic!("oversized response must be a transport error");
+        };
+        let InvokeHttpMcpError::Transport(timed_out) = timed_out else {
+            panic!("timeout must be a transport error");
+        };
+        assert!(oversized.contains("exceeded 32 byte limit"));
+        assert!(timed_out.contains("MCP HTTP request failed"));
+
+        match previous_timeout {
+            Some(value) => std::env::set_var("MCP_OUTBOUND_TIMEOUT_MS", value),
+            None => std::env::remove_var("MCP_OUTBOUND_TIMEOUT_MS"),
+        }
+        match previous_limit {
+            Some(value) => std::env::set_var("MCP_OUTBOUND_MAX_RESPONSE_BYTES", value),
+            None => std::env::remove_var("MCP_OUTBOUND_MAX_RESPONSE_BYTES"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_administrator_cannot_register_or_persist_catalog_entry() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", data_dir.path());
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+
+        let state = test_app_state(vec![]);
+        let app = Router::new()
+            .route("/servers", post(register_mcp_server_handler))
+            .with_state(state.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/servers")
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", inbound_identity_token_with_roles(vec![])),
+            )
+            .body(Body::from(
+                json!({
+                    "name": "catalog-server",
+                    "endpoint": "http://127.0.0.1:8080/mcp",
+                    "protocol": "http",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(state.mcp_servers.read().await.is_empty());
+        assert!(!data_dir.path().join("mcp_servers.json").exists());
+
+        match previous_data_dir {
+            Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+            None => std::env::remove_var("AGENTOS_DATA_DIR"),
+        }
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
     }
 }

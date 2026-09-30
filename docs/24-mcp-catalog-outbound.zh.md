@@ -11,18 +11,37 @@ allowlist，写类工具只有在明确启用后才能调用。
 ```sh
 MCP_JWT_SECRET=...           # 必填的 HS256 签名密钥
 MCP_JWT_ISSUER=wild-agentos-core  # 可选；此处为默认值
-MCP_JWT_AUDIENCE=example-mcp      # 可选；此处为默认值
 MCP_JWT_SUB=mcp-client            # 可选；此处为默认值
 ```
 
 `MCP_JWT_SECRET` 为必填项。服务会为每一个出站请求签发一个短期（五分钟）
-HS256 JWT。签发者、受众和主体的默认值是中性示例，并且可通过各自的环境变量
-覆盖。
+HS256 JWT。签发者和主体的默认值是中性示例，并且可通过各自的环境变量覆盖。
+JWT 的 `aud` 始终为已登记的 Catalog server ID，因此不同 server 的凭据不会
+共享同一个受众。
 
 Catalog JSON 永不接收密钥。若要让一个 Catalog 条目使用此流程，请在注册时设置
 `auth_kind: "bearer_jwt"`。持久化的 Catalog 记录只包含固定的环境变量引用
-（`MCP_JWT_SECRET`、`MCP_JWT_ISSUER`、`MCP_JWT_AUDIENCE` 和
-`MCP_JWT_SUB`）。
+（`MCP_JWT_SECRET`、`MCP_JWT_ISSUER` 和 `MCP_JWT_SUB`）。
+
+## 配置出站边界
+
+Catalog HTTP endpoint 必须是没有用户凭据的绝对 `http` 或 `https` URL。登记时会
+记录其 scheme、host 和 port，并在每次调用前再次检查。调用请求不能提供或替换
+endpoint。
+
+当部署需要显式网络 allowlist 时，可将
+`MCP_OUTBOUND_ALLOWED_ORIGINS` 设置为以逗号分隔的允许 origin 列表：
+
+```sh
+MCP_OUTBOUND_ALLOWED_ORIGINS=https://mcp.example.test,http://127.0.0.1:8080
+MCP_OUTBOUND_CONNECT_TIMEOUT_MS=5000
+MCP_OUTBOUND_TIMEOUT_MS=15000
+MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
+```
+
+未设置 allowlist 时，只允许每个 Catalog 条目已登记的 origin。无效或已改变的
+endpoint 会在发送任何出站请求前被拒绝。超时和响应大小设置均为可选的正整数；
+上面的值即安全默认值。
 
 ## 注册和调用
 
@@ -45,6 +64,8 @@ Content-Type: application/json
 
 Catalog 管理和调用接口都要求经过验证的入站 `IsolationClaims`；Core 会将查找范围
 限定为调用者所在的租户和项目。
+登记 Catalog 条目还要求 `DA` 管理员角色。没有该角色的调用方会收到 `403`，且不会
+写入 Catalog 文件。
 
 通过 Catalog MCP 的 `name` 调用一个已注册的工具；当名称有歧义时，请使用
 `id`：
