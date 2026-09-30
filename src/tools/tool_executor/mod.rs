@@ -18,7 +18,7 @@ use crate::tools::builtin::ontology_tools;
 use crate::tools::builtin::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use crate::tools::builtin::rag;
 use crate::tools::skill_registry::SkillRegistry;
-use crate::tools::tool_groups::ToolGroupManager;
+use crate::tools::tool_groups::{ActivatedTools, ToolGroupManager};
 use crate::tools::workspace_monitor::{FileState, WorkspaceMonitor};
 
 mod builtins;
@@ -260,6 +260,32 @@ impl ToolExecutor {
 
     pub fn set_tool_group_manager(&mut self, manager: ToolGroupManager) {
         self.tool_group_manager = Some(manager);
+    }
+
+    pub fn has_tool_group_manager(&self) -> bool {
+        self.tool_group_manager.is_some()
+    }
+
+    pub fn activated_tools(&self) -> ActivatedTools {
+        self.tool_group_manager
+            .as_ref()
+            .filter(|manager| manager.is_enabled())
+            .map(ToolGroupManager::activated_tools)
+            .unwrap_or_default()
+    }
+
+    pub fn registered_tool_names(&self) -> Vec<String> {
+        self.tool_descriptions
+            .iter()
+            .map(|description| description.name.clone())
+            .collect()
+    }
+
+    pub fn build_tool_group_summary(&self, role: &str) -> String {
+        self.tool_group_manager
+            .as_ref()
+            .map(|manager| manager.build_tool_summary(role, &self.registered_tool_names()))
+            .unwrap_or_default()
     }
 
     /// Replace internal KnowledgeGraphStore with a unified Oxigraph Store
@@ -1440,8 +1466,15 @@ impl ToolExecutor {
         self.tools.keys().cloned().collect()
     }
 
-    /// Return all tool definitions (LLM autonomously selects based on role description in agent.md)
+    /// Return resident definitions without run-local activations.
     pub fn tool_definitions_for_role(&self, role: &str) -> Vec<Value> {
+        self.tool_definitions_for_turn(role, &ActivatedTools::default())
+    }
+
+    /// Build the exact schema for one model turn. Resident definitions retain
+    /// registration order; activated on-demand definitions are appended in the
+    /// order they were activated; dynamic micro-tools always remain at the tail.
+    pub fn tool_definitions_for_turn(&self, role: &str, activated: &ActivatedTools) -> Vec<Value> {
         let role_name = match role {
             "PA" | "Plan" => "Plan",
             "DA" | "Do" => "Do",
@@ -1450,7 +1483,10 @@ impl ToolExecutor {
             _ => role,
         };
 
-        let (default_tools, on_demand_tools) = if let Some(ref manager) = self.tool_group_manager {
+        let (resident_tools, on_demand_tools) = if let Some(ref manager) = self
+            .tool_group_manager
+            .filter(|manager| manager.is_enabled())
+        {
             manager.get_tool_names_for_role(role_name)
         } else {
             let is_pa = role == "Plan" || role == "PA";
@@ -1460,7 +1496,7 @@ impl ToolExecutor {
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
-                (default.clone(), default)
+                (default, HashSet::new())
             } else if is_aa {
                 // Design: AA = Core(file_read,file_list) + System(tool_search) by default, Search+Knowledge on demand
                 let aa_tools: HashSet<String> = [
@@ -1479,42 +1515,67 @@ impl ToolExecutor {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-                let all = aa_tools.clone();
-                (all, aa_tools)
+                (aa_tools, HashSet::new())
             } else {
                 let all: HashSet<String> = self
                     .tool_descriptions
                     .iter()
                     .map(|td| td.name.clone())
                     .collect();
-                (all.clone(), all)
+                (all, HashSet::new())
             }
         };
 
-        let result: Vec<Value> = self
+        let role_is_allowed = |td: &ToolDescription| {
+            td.allowed_roles.is_empty()
+                || td.allowed_roles.iter().any(|allowed| {
+                    allowed == role
+                        || matches!(
+                            (allowed.as_str(), role_name),
+                            ("PA", "Plan") | ("DA", "Do") | ("CA", "Check") | ("AA", "Act")
+                        )
+                })
+        };
+        let definition = |td: &ToolDescription| {
+            let mut params = td.parameters.clone();
+            if params.get("type").is_none() {
+                params["type"] = json!("object");
+            }
+            json!({
+                "type": "function",
+                "function": {
+                    "name": td.name,
+                    "description": td.description,
+                    "parameters": params,
+                }
+            })
+        };
+
+        let mut result: Vec<Value> = self
             .tool_descriptions
             .iter()
-            .filter(|td| {
-                if !td.allowed_roles.is_empty() {
-                    return td.allowed_roles.iter().any(|r| r == role);
-                }
-                default_tools.contains(&td.name) || on_demand_tools.contains(&td.name)
-            })
-            .map(|td| {
-                let mut params = td.parameters.clone();
-                if params.get("type").is_none() {
-                    params["type"] = json!("object");
-                }
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": td.name,
-                        "description": td.description,
-                        "parameters": params,
-                    }
-                })
-            })
+            .filter(|td| !Self::is_micro_tool_name(&td.name))
+            .filter(|td| resident_tools.contains(&td.name) && role_is_allowed(td))
+            .map(definition)
             .collect();
+
+        for name in activated.names() {
+            if !on_demand_tools.contains(name) {
+                continue;
+            }
+            if let Some(description) = self.tool_descriptions.iter().find(|td| {
+                td.name == *name && !Self::is_micro_tool_name(&td.name) && role_is_allowed(td)
+            }) {
+                result.push(definition(description));
+            }
+        }
+
+        result.extend(
+            self.tool_descriptions
+                .iter()
+                .filter(|td| Self::is_micro_tool_name(&td.name) && role_is_allowed(td))
+                .map(definition),
+        );
 
         let tool_names: Vec<&str> = result
             .iter()
@@ -1531,6 +1592,37 @@ impl ToolExecutor {
         result
     }
 
+    /// Activate names returned by tool_search for the current role and run.
+    /// Search implementation is intentionally separate; this accepts the
+    /// stable `matches[].name` contract consumed by the runner.
+    pub fn activate_on_demand_from_search(
+        &self,
+        role: &str,
+        activated: &mut ActivatedTools,
+        result: &Value,
+    ) -> crate::tools::tool_groups::ActivationResult {
+        let role_name = match role {
+            "PA" | "Plan" => "Plan",
+            "DA" | "Do" => "Do",
+            "CA" | "Check" => "Check",
+            "AA" | "Act" => "Act",
+            _ => role,
+        };
+        let candidates: Vec<String> = result["matches"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["name"].as_str().map(str::to_owned))
+            .collect();
+        let on_demand = self
+            .tool_group_manager
+            .as_ref()
+            .filter(|manager| manager.is_enabled())
+            .map(|manager| manager.get_tool_names_for_role(role_name).1)
+            .unwrap_or_default();
+        activated.activate(&candidates, &on_demand)
+    }
+
     pub fn pa_readonly_tools() -> &'static [&'static str] {
         &[
             "file_read",
@@ -1543,8 +1635,13 @@ impl ToolExecutor {
             "rag_search",
             "knowledge_list",
             "knowledge_search",
+            "knowledge_query",
+            "knowledge_neighbors",
             "kg_search",
+            "kb_vector_search",
             "knowledge_extract_code",
+            "workspace_status",
+            "read_agent_output",
         ]
     }
 

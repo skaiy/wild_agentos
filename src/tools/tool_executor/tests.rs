@@ -175,6 +175,48 @@ mod tests {
     }
 
     #[test]
+    fn on_demand_definitions_are_append_only_and_keep_resident_prefix_stable() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        let mut activated = executor.activated_tools();
+        let first = executor.tool_definitions_for_turn("Do", &activated);
+        let first_bytes = serde_json::to_vec(&first).unwrap();
+
+        let search_result = json!({
+            "matches": [
+                {"name": "web_fetch"},
+                {"name": "knowledge_search"},
+                {"name": "web_fetch"}
+            ]
+        });
+        let activation =
+            executor.activate_on_demand_from_search("Do", &mut activated, &search_result);
+        assert_eq!(activation.activated, vec!["web_fetch", "knowledge_search"]);
+
+        let second = executor.tool_definitions_for_turn("Do", &activated);
+        let second_bytes = serde_json::to_vec(&second[..first.len()]).unwrap();
+        assert_eq!(first_bytes, second_bytes);
+
+        let repeat = executor.activate_on_demand_from_search("Do", &mut activated, &search_result);
+        assert!(repeat.activated.is_empty());
+        assert_eq!(second, executor.tool_definitions_for_turn("Do", &activated));
+    }
+
+    #[test]
+    fn on_demand_tools_are_not_advertised_until_activated() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        let activated = executor.activated_tools();
+        let names: Vec<&str> = executor
+            .tool_definitions_for_turn("Do", &activated)
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"web_fetch"));
+        assert!(!names.contains(&"knowledge_search"));
+    }
+
+    #[test]
     fn plan_execution_rejects_direct_calls_outside_the_role_allowlist() {
         rt().block_on(async {
             let executor = ToolExecutor::new();

@@ -173,19 +173,21 @@ token_optimization:
   enabled: true
   tool_groups:
     enabled: true
+    max_tools_per_activation: 5
+    max_activated_tools: 20
     roles:
       Plan:
-        default: ["Core", "Search", "Knowledge", "System"]
-        on_demand: ["Web", "Code", "Skill"]
+        default: ["Core", "Search", "KnowledgeRead", "System"]
+        on_demand: ["Web"]
       Do:
-        default: ["Core", "Write", "Search", "Web", "Code", "Skill", "System"]
-        on_demand: ["Knowledge"]
+        default: ["Core", "Write", "Search", "System"]
+        on_demand: ["Web", "KnowledgeRead", "KnowledgeWrite", "Ingest", "Skill", "Ontology"]
       Check:
-        default: ["Core", "Search", "Knowledge", "System"]
-        on_demand: ["Web", "Code"]
+        default: ["Core", "Search", "System"]
+        on_demand: ["Web", "KnowledgeRead"]
       Act:
         default: ["Core", "System"]
-        on_demand: ["Search", "Knowledge"]
+        on_demand: ["Search", "KnowledgeRead"]
   tool_result_compressor:
     enabled: true
     max_full_results: 2
