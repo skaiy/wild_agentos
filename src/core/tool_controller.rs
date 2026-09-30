@@ -95,17 +95,98 @@ mod tests {
                 .filter(|tool| tc.is_tool_allowed_for_role(tool, &role))
                 .collect::<std::collections::BTreeSet<_>>()
         };
-        let all_registered = registered.iter().map(String::as_str).collect();
-
         assert_eq!(
             allowed_for(AgentRole::Plan),
             plan_main.into_iter().collect()
         );
-        assert_eq!(allowed_for(AgentRole::Do), all_registered);
-        assert!(allowed_for(AgentRole::Check).is_subset(&all_registered));
-        assert!(allowed_for(AgentRole::Act).is_subset(&all_registered));
-        assert!(!allowed_for(AgentRole::Check).contains("bash"));
-        assert!(!allowed_for(AgentRole::Act).contains("file_write"));
+        assert_eq!(
+            allowed_for(AgentRole::Do),
+            [
+                "file_read",
+                "file_list",
+                "workspace_status",
+                "read_agent_output",
+                "file_write",
+                "bash",
+                "powershell",
+                "file_edit",
+                "grep_search",
+                "glob_search",
+                "rag_search",
+                "kg_search",
+                "web_search",
+                "web_fetch",
+                "knowledge_query",
+                "knowledge_neighbors",
+                "kb_vector_search",
+                "knowledge_list",
+                "knowledge_search",
+                "knowledge_extract_code",
+                "knowledge_update",
+                "knowledge_extract",
+                "knowledge_bridge",
+                "rag_index",
+                "rag_chunk",
+                "knowledge_import_file",
+                "knowledge_import_url",
+                "knowledge_import_directory",
+                "knowledge_import_json",
+                "create_skill",
+                "convert_skill",
+                "ontology_validate_turtle",
+                "ontology_lint_turtle",
+                "ontology_diff_turtle",
+                "ontology_validate_shacl",
+                "ontology_reason",
+                "tool_search",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            allowed_for(AgentRole::Check),
+            [
+                "file_read",
+                "file_list",
+                "workspace_status",
+                "read_agent_output",
+                "grep_search",
+                "glob_search",
+                "rag_search",
+                "kg_search",
+                "web_search",
+                "web_fetch",
+                "tool_search",
+                "knowledge_list",
+                "knowledge_search",
+                "knowledge_extract_code",
+                "knowledge_query",
+                "knowledge_neighbors",
+                "kb_vector_search",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            allowed_for(AgentRole::Act),
+            [
+                "file_read",
+                "file_list",
+                "grep_search",
+                "glob_search",
+                "rag_search",
+                "kg_search",
+                "tool_search",
+                "knowledge_list",
+                "knowledge_search",
+                "knowledge_extract_code",
+                "knowledge_query",
+                "knowledge_neighbors",
+                "kb_vector_search",
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
