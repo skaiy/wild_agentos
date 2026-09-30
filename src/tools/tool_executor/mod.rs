@@ -1621,6 +1621,35 @@ impl ToolExecutor {
             .map(|manager| manager.get_tool_names_for_role(role_name).1)
             .unwrap_or_default();
         activated.activate(&candidates, &on_demand)
+
+    /// Human-readable mirror of the function definitions sent to the model.
+    ///
+    /// Keeping this beside `tool_definitions_for_role` lets diagnostics compare
+    /// both tool-exposure channels without constructing an AgentRunner.
+    pub fn readable_tool_menu_for_role(&self, role: &str) -> String {
+        let tool_defs = self.tool_definitions_for_role(role);
+        if tool_defs.is_empty() {
+            return String::new();
+        }
+
+        let os_hint = if cfg!(target_os = "windows") {
+            "[Platform: Windows | bash tool actually uses PowerShell]"
+        } else if cfg!(target_os = "macos") {
+            "[Platform: macOS]"
+        } else {
+            "[Platform: Linux]"
+        };
+        let mut lines = vec![os_hint.to_string(), "Available tools list:".to_string()];
+        for tool_def in &tool_defs {
+            let name = tool_def["function"]["name"].as_str().unwrap_or("");
+            let description = tool_def["function"]["description"].as_str().unwrap_or("");
+            if description.is_empty() {
+                lines.push(format!("- ID: {}", name));
+            } else {
+                lines.push(format!("- ID: {} | Purpose: {}", name, description));
+            }
+        }
+        lines.join("\n")
     }
 
     pub fn pa_readonly_tools() -> &'static [&'static str] {
