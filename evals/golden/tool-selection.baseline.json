@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "mode": "offline-recorded",
+  "baseline_kind": "deterministic-mock-layer",
+  "overall": {
+    "top1_correct_tool_rate": 1.0,
+    "required_tool_recall": 1.0,
+    "over_call_rate": 0.0,
+    "wrong_tool_rate": 0.0,
+    "forbidden_tool_attempt_count": 0,
+    "cross_turn_taint_violation_attempt_count": 0,
+    "tool_search_hit_at_3": 0.8181818181818182,
+    "average_tool_definition_and_menu_tokens_estimate": 4515.269841269841,
+    "tools_array_prefix_stability": 1.0,
+    "prompt_cache_hit_proxy": 1.0
+  },
+  "registry_coverage": {
+    "unreachable_tools": [
+      "file_edit",
+      "kb_vector_search",
+      "knowledge_bridge",
+      "knowledge_extract",
+      "knowledge_import_directory",
+      "knowledge_import_file",
+      "knowledge_import_json",
+      "knowledge_import_url",
+      "knowledge_neighbors",
+      "ontology_diff_turtle",
+      "ontology_lint_turtle",
+      "ontology_reason",
+      "ontology_register",
+      "ontology_validate_shacl",
+      "ontology_validate_turtle",
+      "rag_chunk",
+      "rag_index",
+      "read_agent_output",
+      "workspace_status"
+    ]
+  }
+}
