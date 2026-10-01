@@ -403,6 +403,12 @@ pub(crate) struct ToolRestrictionRunGuard {
     run_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunRestrictionOutcome {
+    Applied { runs_narrowed: usize },
+    NoActiveRun,
+}
+
 impl ToolRestrictionRunGuard {
     pub(crate) fn run_id(&self) -> &str {
         &self.run_id
@@ -616,21 +622,27 @@ impl AgentRunner {
     }
 
     /// Narrow the active task run's tools from trusted supervisor code.
-    pub fn restrict_tools_for_run(&self, task_iri: &str, tools: Vec<String>) {
+    pub fn restrict_tools_for_run(
+        &self,
+        task_iri: &str,
+        tools: Vec<String>,
+    ) -> RunRestrictionOutcome {
         let run_ids: Vec<String> = self
             .active_tool_runs
             .get(task_iri)
             .map(|run_ids| run_ids.iter().cloned().collect())
             .unwrap_or_default();
         if run_ids.is_empty() {
-            return;
+            return RunRestrictionOutcome::NoActiveRun;
         }
+        let runs_narrowed = run_ids.len();
         for run_id in run_ids {
             self.run_tool_restrictions
                 .entry(run_id)
                 .and_modify(|current| current.retain(|tool| tools.contains(tool)))
                 .or_insert_with(|| tools.clone());
         }
+        RunRestrictionOutcome::Applied { runs_narrowed }
     }
 
     pub(crate) fn run_tool_restriction(&self, run_id: &str) -> Option<Vec<String>> {

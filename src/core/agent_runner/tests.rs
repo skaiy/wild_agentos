@@ -66,7 +66,10 @@ fn a_new_run_for_the_same_task_starts_unrestricted() {
     let runner = create_test_runner();
     let task = "iri://task/same";
     let g1 = runner.begin_tool_restriction_run(task);
-    runner.restrict_tools_for_run(task, vec!["file_read".into()]);
+    assert_eq!(
+        runner.restrict_tools_for_run(task, vec!["file_read".into()]),
+        RunRestrictionOutcome::Applied { runs_narrowed: 1 }
+    );
     assert_eq!(
         runner.run_tool_restriction(g1.run_id()),
         Some(vec!["file_read".to_string()])
@@ -77,7 +80,10 @@ fn a_new_run_for_the_same_task_starts_unrestricted() {
 
     let g2 = runner.begin_tool_restriction_run(task);
     assert!(runner.run_tool_restriction(g2.run_id()).is_none());
-    runner.restrict_tools_for_run(task, vec!["file_list".into()]);
+    assert_eq!(
+        runner.restrict_tools_for_run(task, vec!["file_list".into()]),
+        RunRestrictionOutcome::Applied { runs_narrowed: 1 }
+    );
     assert_eq!(
         runner.run_tool_restriction(g2.run_id()),
         Some(vec!["file_list".to_string()])
@@ -90,7 +96,10 @@ fn overlapping_runs_are_restricted_independently() {
     let task = "iri://task/overlap";
     let g1 = runner.begin_tool_restriction_run(task);
     let g2 = runner.begin_tool_restriction_run(task);
-    runner.restrict_tools_for_run(task, vec!["file_read".into()]);
+    assert_eq!(
+        runner.restrict_tools_for_run(task, vec!["file_read".into()]),
+        RunRestrictionOutcome::Applied { runs_narrowed: 2 }
+    );
     assert_eq!(
         runner.run_tool_restriction(g1.run_id()),
         Some(vec!["file_read".to_string()])
@@ -107,6 +116,16 @@ fn overlapping_runs_are_restricted_independently() {
         Some(vec!["file_read".to_string()])
     );
     assert!(runner.active_tool_runs.get(task).is_some());
+}
+
+#[test]
+fn restricting_a_task_without_an_active_run_is_reported() {
+    let runner = create_test_runner();
+    assert_eq!(
+        runner.restrict_tools_for_run("iri://task/inactive", vec!["file_read".into()]),
+        RunRestrictionOutcome::NoActiveRun
+    );
+    assert!(runner.run_tool_restrictions.is_empty());
 }
 
 #[derive(Clone)]
