@@ -408,10 +408,7 @@ pub(crate) async fn list_batch_agents_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("batch agent operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("batch agent operations") {
         return error.into_response();
     }
     let mgr_arc = match &state.batch_manager {
@@ -465,10 +462,7 @@ pub(crate) async fn control_batch_agent_handler(
     axum::extract::Path(name): axum::extract::Path<String>,
     Json(req): Json<BatchControlRequest>,
 ) -> impl IntoResponse {
-    if let Err(response) = identity.require_verified_isolation_claims("batch agent operations") {
-        return response.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("batch agent operations") {
         return error.into_response();
     }
     let mgr_arc = match &state.batch_manager {
