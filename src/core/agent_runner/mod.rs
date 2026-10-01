@@ -419,7 +419,8 @@ impl Drop for ToolRestrictionRunGuard {
             false
         };
         if remove_task_entry {
-            self.active_runs.remove(&self.task_iri);
+            self.active_runs
+                .remove_if(&self.task_iri, |_, active| active.is_empty());
         }
     }
 }

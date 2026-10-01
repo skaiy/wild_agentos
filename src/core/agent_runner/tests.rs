@@ -77,6 +77,11 @@ fn a_new_run_for_the_same_task_starts_unrestricted() {
 
     let g2 = runner.begin_tool_restriction_run(task);
     assert!(runner.run_tool_restriction(g2.run_id()).is_none());
+    runner.restrict_tools_for_run(task, vec!["file_list".into()]);
+    assert_eq!(
+        runner.run_tool_restriction(g2.run_id()),
+        Some(vec!["file_list".to_string()])
+    );
 }
 
 #[test]
