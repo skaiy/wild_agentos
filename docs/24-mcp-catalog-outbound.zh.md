@@ -88,6 +88,9 @@ Catalog 管理和调用接口都要求经过验证的入站 `IsolationClaims`；
 登记 Catalog 条目要求专用的 `mcp_admin` 角色。只有普通 `DA` 角色的调用方会收到
 `403`，且不会写入 Catalog 文件。
 删除 Catalog 条目同样要求该角色和对应的租户/项目范围。
+调用 Catalog 工具则要求 `DA` 或专用 `mcp_invoke` 角色。缺少角色或只有无关角色时，
+会在 JWT 签发、HTTP client 创建以及任何出站请求之前返回
+`403 {"error":"mcp_role_required"}`。
 
 通过 Catalog MCP 的 `name` 调用一个已注册的工具；当名称有歧义时，请使用
 `id`：

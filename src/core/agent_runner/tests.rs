@@ -61,6 +61,49 @@ fn create_test_runner() -> AgentRunner {
     )
 }
 
+#[test]
+fn a_new_run_for_the_same_task_starts_unrestricted() {
+    let runner = create_test_runner();
+    let task = "iri://task/same";
+    let g1 = runner.begin_tool_restriction_run(task);
+    runner.restrict_tools_for_run(task, vec!["file_read".into()]);
+    assert_eq!(
+        runner.run_tool_restriction(g1.run_id()),
+        Some(vec!["file_read".to_string()])
+    );
+    drop(g1);
+    assert!(runner.run_tool_restrictions.is_empty());
+    assert!(runner.active_tool_runs.get(task).is_none());
+
+    let g2 = runner.begin_tool_restriction_run(task);
+    assert!(runner.run_tool_restriction(g2.run_id()).is_none());
+}
+
+#[test]
+fn overlapping_runs_are_restricted_independently() {
+    let runner = create_test_runner();
+    let task = "iri://task/overlap";
+    let g1 = runner.begin_tool_restriction_run(task);
+    let g2 = runner.begin_tool_restriction_run(task);
+    runner.restrict_tools_for_run(task, vec!["file_read".into()]);
+    assert_eq!(
+        runner.run_tool_restriction(g1.run_id()),
+        Some(vec!["file_read".to_string()])
+    );
+    assert_eq!(
+        runner.run_tool_restriction(g2.run_id()),
+        Some(vec!["file_read".to_string()])
+    );
+
+    let g2_id = g2.run_id().to_string();
+    drop(g1);
+    assert_eq!(
+        runner.run_tool_restriction(&g2_id),
+        Some(vec!["file_read".to_string()])
+    );
+    assert!(runner.active_tool_runs.get(task).is_some());
+}
+
 #[derive(Clone)]
 struct ScriptedGateway {
     responses: Arc<AtomicUsize>,

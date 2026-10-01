@@ -76,6 +76,10 @@ pub struct ToolGroupSettings {
     pub max_tools_per_activation: usize,
     #[serde(default = "default_max_activated_tools")]
     pub max_activated_tools: usize,
+    /// Opt-in for Check to execute shell commands. Off by default because
+    /// verification should not mutate a workspace or execute untrusted input.
+    #[serde(default)]
+    pub check_bash_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -139,14 +143,9 @@ impl Default for ToolGroupSettings {
                 ],
                 on_demand: vec![
                     "Workspace".to_string(),
-                    "Write".to_string(),
                     "Web".to_string(),
                     "KnowledgePlan".to_string(),
                     "KnowledgeRead".to_string(),
-                    "KnowledgeWrite".to_string(),
-                    "Ingest".to_string(),
-                    "Skill".to_string(),
-                    "Ontology".to_string(),
                 ],
             },
         );
@@ -168,6 +167,7 @@ impl Default for ToolGroupSettings {
             roles,
             max_tools_per_activation: default_max_tools_per_activation(),
             max_activated_tools: default_max_activated_tools(),
+            check_bash_enabled: false,
         }
     }
 }
@@ -186,6 +186,7 @@ pub struct ActivatedTools {
     max_per_activation: usize,
     max_total: usize,
     activation_events: usize,
+    policy: crate::core::tool_policy::ToolPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +202,13 @@ impl ActivatedTools {
             max_per_activation,
             max_total,
             activation_events: 0,
+            policy: crate::core::tool_policy::ToolPolicy::new(),
         }
+    }
+
+    pub fn with_policy(mut self, policy: crate::core::tool_policy::ToolPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     pub fn activate(
@@ -234,6 +241,18 @@ impl ActivatedTools {
 
     pub fn activation_events(&self) -> usize {
         self.activation_events
+    }
+
+    pub fn policy(&self) -> &crate::core::tool_policy::ToolPolicy {
+        &self.policy
+    }
+
+    pub fn restrict_tools(
+        &mut self,
+        agent_id: impl Into<String>,
+        tools: impl IntoIterator<Item = String>,
+    ) {
+        self.policy.restrict_tools(agent_id, tools);
     }
 }
 
@@ -410,10 +429,17 @@ impl ToolGroupManager {
         self.settings.enabled
     }
 
+    pub fn check_bash_enabled(&self) -> bool {
+        self.settings.check_bash_enabled
+    }
+
     pub fn activated_tools(&self) -> ActivatedTools {
         ActivatedTools::new(
             self.settings.max_tools_per_activation,
             self.settings.max_activated_tools,
+        )
+        .with_policy(
+            crate::core::tool_policy::ToolPolicy::new().with_tool_group_manager(self.clone()),
         )
     }
 
@@ -580,37 +606,18 @@ mod tests {
     #[test]
     fn role_groups_preserve_main_fallback_reachability() {
         let manager = ToolGroupManager::new(None);
-        let executor = crate::tools::tool_executor::ToolExecutor::new();
-        let registered = executor.registered_tool_names();
+        let policy = crate::core::tool_policy::ToolPolicy::new();
         for role in ["Plan", "Do", "Check", "Act"] {
             let (resident, on_demand) = manager.get_tool_names_for_role(role);
             let reachable = resident.union(&on_demand).cloned().collect::<HashSet<_>>();
-            let expected: HashSet<String> = match role {
-                "Plan" => crate::tools::tool_executor::ToolExecutor::pa_readonly_tools()
-                    .iter()
-                    .map(|name| name.to_string())
-                    .collect(),
-                "Act" => [
-                    "file_read",
-                    "file_list",
-                    "tool_search",
-                    "grep_search",
-                    "glob_search",
-                    "rag_search",
-                    "kg_search",
-                    "knowledge_list",
-                    "knowledge_search",
-                    "knowledge_extract_code",
-                ]
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
-                "Do" | "Check" => registered.iter().cloned().collect(),
-                _ => unreachable!(),
-            };
+            let agent_role = role.parse().unwrap();
+            let expected = policy
+                .visible_tools(&agent_role, "")
+                .into_iter()
+                .collect::<HashSet<_>>();
             assert!(
                 expected.is_subset(&reachable),
-                "{role} lost fallback reachability"
+                "{role} lost policy-approved reachability"
             );
         }
     }

@@ -1,6 +1,6 @@
 #![allow(deprecated)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -366,7 +366,6 @@ pub struct AgentRunner {
     pub scheduler: Option<Arc<MemoryScheduler>>,
     pub prefetch_engine: Option<Arc<PrefetchEngine>>,
     pub unified_graph_store: Option<Arc<oxigraph::store::Store>>,
-    pub tool_controller: Option<crate::core::tool_controller::ToolController>,
     /// Process-local tenant spend gate for LLM-initiated tool invocations.
     pub tenant_spend_gate: Arc<TenantSpendGate>,
     pub total_prompt_tokens: Arc<AtomicU64>,
@@ -391,6 +390,38 @@ pub struct AgentRunner {
     pub relevance_tracker: Option<Arc<std::sync::Mutex<RelevanceTracker>>>,
     /// Workspace root directory path (all Agent file operations are restricted to this scope)
     pub workspace_root: Option<PathBuf>,
+    /// Trusted supervisor restrictions keyed by a unique active run id.
+    /// This is deliberately runner-owned, never shared executor or global state.
+    pub run_tool_restrictions: Arc<dashmap::DashMap<String, Vec<String>>>,
+    active_tool_runs: Arc<dashmap::DashMap<String, HashSet<String>>>,
+}
+
+pub(crate) struct ToolRestrictionRunGuard {
+    restrictions: Arc<dashmap::DashMap<String, Vec<String>>>,
+    active_runs: Arc<dashmap::DashMap<String, HashSet<String>>>,
+    task_iri: String,
+    run_id: String,
+}
+
+impl ToolRestrictionRunGuard {
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+}
+
+impl Drop for ToolRestrictionRunGuard {
+    fn drop(&mut self) {
+        self.restrictions.remove(&self.run_id);
+        let remove_task_entry = if let Some(mut active) = self.active_runs.get_mut(&self.task_iri) {
+            active.remove(&self.run_id);
+            active.is_empty()
+        } else {
+            false
+        };
+        if remove_task_entry {
+            self.active_runs.remove(&self.task_iri);
+        }
+    }
 }
 
 impl AgentRunner {
@@ -454,7 +485,6 @@ impl AgentRunner {
             scheduler: None,
             prefetch_engine: None,
             unified_graph_store: None,
-            tool_controller: None,
             tenant_spend_gate: Arc::new(TenantSpendGate::from_env()),
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
@@ -472,6 +502,8 @@ impl AgentRunner {
             embedder: None,
             relevance_tracker: None,
             workspace_root: None,
+            run_tool_restrictions: Arc::new(dashmap::DashMap::new()),
+            active_tool_runs: Arc::new(dashmap::DashMap::new()),
         };
         runner.init_context_compressors();
         runner
@@ -538,14 +570,6 @@ impl AgentRunner {
         self
     }
 
-    pub fn with_tool_controller(
-        mut self,
-        tc: crate::core::tool_controller::ToolController,
-    ) -> Self {
-        self.tool_controller = Some(tc);
-        self
-    }
-
     /// Configure tool exposure for this runner before it is shared by agents.
     /// The manager itself is immutable; per-run activation remains local to each
     /// execution loop.
@@ -572,6 +596,46 @@ impl AgentRunner {
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
         self
+    }
+
+    /// Start a unique run-scoped restriction context. The guard removes its
+    /// state when either AgentRunner loop returns.
+    pub(crate) fn begin_tool_restriction_run(&self, task_iri: &str) -> ToolRestrictionRunGuard {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        self.active_tool_runs
+            .entry(task_iri.to_string())
+            .or_default()
+            .insert(run_id.clone());
+        ToolRestrictionRunGuard {
+            restrictions: self.run_tool_restrictions.clone(),
+            active_runs: self.active_tool_runs.clone(),
+            task_iri: task_iri.to_string(),
+            run_id,
+        }
+    }
+
+    /// Narrow the active task run's tools from trusted supervisor code.
+    pub fn restrict_tools_for_run(&self, task_iri: &str, tools: Vec<String>) {
+        let run_ids: Vec<String> = self
+            .active_tool_runs
+            .get(task_iri)
+            .map(|run_ids| run_ids.iter().cloned().collect())
+            .unwrap_or_default();
+        if run_ids.is_empty() {
+            return;
+        }
+        for run_id in run_ids {
+            self.run_tool_restrictions
+                .entry(run_id)
+                .and_modify(|current| current.retain(|tool| tools.contains(tool)))
+                .or_insert_with(|| tools.clone());
+        }
+    }
+
+    pub(crate) fn run_tool_restriction(&self, run_id: &str) -> Option<Vec<String>> {
+        self.run_tool_restrictions
+            .get(run_id)
+            .map(|tools| tools.clone())
     }
 
     pub fn with_hook_manager(mut self, hook_manager: HookManager) -> Self {
