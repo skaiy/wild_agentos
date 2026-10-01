@@ -732,16 +732,9 @@ async fn observe_control_plane_requests(
     observation
 }
 
-// The established `VerifiedDefaulted` convention rejects incomplete JWT scope
-// with 403 (see `invoke_mcp_server_handler`). #241 only checks that claims are
-// present, so a missing project currently proceeds to normal results:
-// /api/v1/batch/agents=200; /api/v1/batch/agents/:name/control=503;
-// /api/v1/models/test=400; /api/v1/providers/models=200 (and hits its mock);
-// /api/v1/embedding/activate=200 (and hot-swaps); /api/v1/api-clients and
-// /api/v1/api-audit=200; POST /api/v1/api-clients=201; PUT/DELETE
-// /api/v1/api-clients/:id and POST/DELETE /api/v1/api-clients/:id/keys(/:kid)=404.
+// A verified JWT that defaulted project_id must fail closed before every
+// control-plane side effect, matching the established VerifiedDefaulted convention.
 #[tokio::test]
-#[ignore = "missing-project VerifiedDefaulted claims reach control-plane handlers; see observed statuses above"]
 async fn control_plane_routes_reject_defaulted_verified_claims() {
     let _lock = TEST_ENV_LOCK
         .lock()
