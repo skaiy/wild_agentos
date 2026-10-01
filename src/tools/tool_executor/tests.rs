@@ -32,11 +32,22 @@ mod tests {
             )
         });
         for (role, bytes) in role_schema_bytes(schemas) {
+            eprintln!("{role} resident schema: {bytes} bytes");
             assert!(
                 bytes <= MAX_ROLE_SCHEMA_BYTES,
                 "{role} schema is {bytes} bytes, over {MAX_ROLE_SCHEMA_BYTES}"
             );
         }
+        let lengths: Vec<usize> = executor
+            .tool_descriptions
+            .iter()
+            .map(|tool| tool.description.len())
+            .collect();
+        eprintln!(
+            "built-in descriptions: average {} bytes, max {} bytes",
+            lengths.iter().sum::<usize>() / lengths.len(),
+            lengths.iter().max().unwrap()
+        );
     }
 
     #[test]
