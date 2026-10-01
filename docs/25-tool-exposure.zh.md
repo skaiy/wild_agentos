@@ -86,3 +86,28 @@ Plan、Check 与 Act 默认只读。只有在明确开启服务端
 `enabled: false` 会恢复旧的 fallback 工具暴露行为。网关会解析 OpenAI
 兼容的 `prompt_tokens_details.cached_tokens` 或 `cache_read_input_tokens`，
 并记录累计缓存命中率。
+
+## 工具描述规范
+
+每轮函数 schema 是每个工具定义的唯一真源。系统提示词不再重复文本菜单；
+环境区域保留平台提示，并且在适用时保留稳定的按需分组目录。
+
+`tool_description_lint` 测试会检查每个已注册内置工具：
+
+- 名称使用小写 snake case、全局唯一，不使用版本后缀或泛化名称；
+- 描述长度为 80–600 字节，并使用固定的 `Use when:` 与 `Not for:` 标记；
+- 容易混淆的工具必须在 `Not for:` 中点名同族工具；
+- object schema 为每个参数提供说明，`required` 名称存在于 `properties`，
+  布尔参数说明默认值，路径、URL、模式和枚举输入说明格式或提供 schema 约束；
+- 每个角色的常驻 schema 必须符合配置的字节预算。
+
+初始容易混淆的族群包括文件与知识搜索、文件写入与编辑、shell 命令、网页搜索
+与读取、知识导入和本体校验。代码生成的 micro-tool 只豁免 `Not for:` 标记，
+参数说明仍会检查。以后如确需豁免，必须在 `LINT_EXEMPTIONS` 写明简短原因；
+测试会阻止已批准的豁免数量增加。
+
+例如，将模糊的 `Write content to a file.` 改写为：
+
+> Write a complete text file. Use when: creating or replacing the file is
+> required. Not for: `file_edit`; use that tool for a targeted replacement in
+> an existing file.

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::core::agent_instance::AgentRole;
 use crate::core::tool_policy::ToolPolicy;
@@ -24,6 +24,7 @@ use crate::tools::tool_groups::{ActivatedTools, ToolGroupManager};
 use crate::tools::workspace_monitor::{FileState, WorkspaceMonitor};
 
 mod builtins;
+pub(crate) mod tool_description_lint;
 
 #[cfg(test)]
 mod tests;
@@ -299,6 +300,20 @@ impl ToolExecutor {
             .iter()
             .map(|description| description.name.clone())
             .collect()
+    }
+
+    /// Return the live registry's resident names after the same role policy
+    /// used for a first-turn schema. The result is sorted for prompt-only
+    /// planning preferences; it never authorizes a call.
+    pub fn visible_tool_names_for_role(&self, role: &str, agent_id: &str) -> Vec<String> {
+        let activated = self.activated_tools();
+        let mut names: Vec<String> = self
+            .tool_definitions_for_turn_with_policy(role, agent_id, &activated)
+            .iter()
+            .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names
     }
 
     pub fn build_tool_group_summary(&self, role: &str) -> String {
@@ -1053,16 +1068,18 @@ impl ToolExecutor {
         allowed_roles: &[&str],
     ) {
         let roles: Vec<String> = allowed_roles.iter().map(|s| s.to_string()).collect();
+        let description = tool_description_lint::normalize_builtin_description(name, description);
+        let parameters = tool_description_lint::normalize_parameter_descriptions(parameters);
         self.tools.insert(name.to_string(), handler);
 
         if let Some(existing) = self.tool_descriptions.iter_mut().find(|td| td.name == name) {
-            existing.description = description.to_string();
+            existing.description = description;
             existing.parameters = parameters.clone();
             existing.allowed_roles = roles;
         } else {
             self.tool_descriptions.push(ToolDescription {
                 name: name.to_string(),
-                description: description.to_string(),
+                description,
                 parameters,
                 allowed_roles: roles,
             });
@@ -1087,6 +1104,13 @@ impl ToolExecutor {
                     }
                 }
             }
+        }
+        if let Err(violations) = tool_description_lint::lint_registry(&self.tool_descriptions) {
+            warn!(
+                tool = name,
+                violations = %violations.join("; "),
+                "registered tool does not meet description lint"
+            );
         }
     }
 
@@ -1569,9 +1593,11 @@ impl ToolExecutor {
         }))
     }
 
-    /// List all tools
+    /// List all registered tools in deterministic name order.
     pub fn list_tools(&self, _role: &str) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Return resident definitions without run-local activations.
@@ -1757,36 +1783,6 @@ impl ToolExecutor {
             .map(|manager| manager.get_tool_names_for_role(role_name).1)
             .unwrap_or_default();
         activated.activate(&candidates, &on_demand)
-    }
-
-    /// Human-readable mirror of the function definitions sent to the model.
-    ///
-    /// Keeping this beside `tool_definitions_for_role` lets diagnostics compare
-    /// both tool-exposure channels without constructing an AgentRunner.
-    pub fn readable_tool_menu_for_role(&self, role: &str) -> String {
-        let tool_defs = self.tool_definitions_for_role(role);
-        if tool_defs.is_empty() {
-            return String::new();
-        }
-
-        let os_hint = if cfg!(target_os = "windows") {
-            "[Platform: Windows | bash tool actually uses PowerShell]"
-        } else if cfg!(target_os = "macos") {
-            "[Platform: macOS]"
-        } else {
-            "[Platform: Linux]"
-        };
-        let mut lines = vec![os_hint.to_string(), "Available tools list:".to_string()];
-        for tool_def in &tool_defs {
-            let name = tool_def["function"]["name"].as_str().unwrap_or("");
-            let description = tool_def["function"]["description"].as_str().unwrap_or("");
-            if description.is_empty() {
-                lines.push(format!("- ID: {}", name));
-            } else {
-                lines.push(format!("- ID: {} | Purpose: {}", name, description));
-            }
-        }
-        lines.join("\n")
     }
 
     pub fn pa_readonly_tools() -> &'static [&'static str] {

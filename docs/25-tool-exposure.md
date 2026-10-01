@@ -102,3 +102,35 @@ Setting `enabled: false` restores the legacy fallback exposure behavior. The
 gateway records cached prompt tokens from OpenAI-compatible
 `prompt_tokens_details.cached_tokens` or `cache_read_input_tokens` and logs
 the cumulative cache hit rate.
+
+## Tool description standard
+
+The per-turn function schema is the single source of per-tool definitions.
+System prompts do not repeat a text menu. They retain the platform note in
+the environment section and, when applicable, a stable directory of
+on-demand groups.
+
+The `tool_description_lint` test checks every registered built-in tool:
+
+- names use lowercase snake case, are unique, avoid version suffixes and
+  generic names;
+- descriptions are 80–600 bytes and use the fixed `Use when:` and `Not for:`
+  markers;
+- tools in a confusable family name a sibling in their `Not for:` sentence;
+- object schemas describe every parameter, required names exist in
+  `properties`, booleans state a default, and path, URL, pattern, and enum
+  inputs state their format or carry a schema constraint;
+- each role's resident schema fits the configured byte budget.
+
+The initial confusable families are file and knowledge search, file write and
+edit, shell commands, web search and fetch, knowledge import, and ontology
+validation. Generated micro-tools are exempt only from the `Not for:` marker;
+their parameter descriptions are still checked. Any future exemption needs a
+short reason in `LINT_EXEMPTIONS`; the test prevents the approved exemption
+count from growing.
+
+For example, a vague description such as `Write content to a file.` becomes:
+
+> Write a complete text file. Use when: creating or replacing the file is
+> required. Not for: `file_edit`; use that tool for a targeted replacement in
+> an existing file.

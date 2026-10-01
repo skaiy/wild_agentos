@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tracing::debug;
 
 use crate::core::agent_instance::{AgentInstance, AgentRole};
@@ -62,10 +62,26 @@ impl super::AgentRunner {
             AgentRole::Act => "Act",
         };
 
-        let tools_list = if step.tools_allowed.is_empty() {
-            self.tool_executor.read().list_tools(&role.to_string())
+        let planned_tools = if step.tools_allowed.is_empty() {
+            String::new()
         } else {
-            step.tools_allowed.clone()
+            let visible_tools: BTreeSet<String> = self
+                .tool_executor
+                .read()
+                .visible_tool_names_for_role(&role.to_string(), "")
+                .into_iter()
+                .collect();
+            let planned: Vec<String> = step
+                .tools_allowed
+                .iter()
+                .filter(|name| visible_tools.contains(*name))
+                .cloned()
+                .collect();
+            if planned.is_empty() {
+                String::new()
+            } else {
+                format!("\n## Planned Tool Preference\n{}\n", planned.join(", "))
+            }
         };
 
         let model = self.gateway.get_model(&role.to_string().to_lowercase());
@@ -151,6 +167,8 @@ impl super::AgentRunner {
 {}
 
 ## Available Tools
+Tool definitions are provided separately for this turn. Use `tool_search` to
+discover relevant on-demand tools.
 {}
 
 ## Output Format Requirements
@@ -160,7 +178,7 @@ impl super::AgentRunner {
             step.objective,
             step.expected_output,
             step.success_criteria,
-            tools_list.join(", "),
+            planned_tools,
             format_constraint
         );
 
@@ -366,8 +384,6 @@ impl super::AgentRunner {
     ) -> String {
         let role_name = role.to_string();
         let role_lower = role_name.to_lowercase();
-        let tools_list = self.tool_executor.read().list_tools(&role_name);
-
         let supports_reasoning = self.gateway.supports_native_reasoning(model);
         let _format_constraint = if supports_reasoning {
             LLM_RESPONSE_FORMAT_NO_THOUGHT
@@ -379,10 +395,6 @@ impl super::AgentRunner {
         vars.insert(
             "task_description".to_string(),
             serde_json::Value::String(objective.to_string()),
-        );
-        vars.insert(
-            "available_skills".to_string(),
-            serde_json::Value::String(tools_list.join(", ")),
         );
         vars.insert(
             "context_summary".to_string(),
@@ -534,12 +546,6 @@ impl super::AgentRunner {
         );
         debug!(role = %role_name, "=== agent.md (fallback) ===\n{}", md);
         md
-    }
-
-    pub(super) fn build_readable_tool_menu(&self, role: &AgentRole) -> String {
-        self.tool_executor
-            .read()
-            .readable_tool_menu_for_role(&role.to_string())
     }
 }
 

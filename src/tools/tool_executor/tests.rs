@@ -7,9 +7,36 @@ use crate::tools::builtin::permissions::{PermissionMode, PermissionPolicy};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::tool_executor::tool_description_lint::{
+        lint_registry, role_schema_bytes, MAX_ROLE_SCHEMA_BYTES,
+    };
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Runtime::new().expect("Failed to create runtime")
+    }
+
+    #[test]
+    fn tool_description_lint_passes_for_all_registered_builtins_and_role_budgets() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+        assert!(
+            lint_registry(&executor.tool_descriptions).is_ok(),
+            "{:?}",
+            lint_registry(&executor.tool_descriptions)
+        );
+
+        let schemas = ["Plan", "Do", "Check", "Act"].map(|role| {
+            (
+                role.to_string(),
+                executor.tool_definitions_for_turn(role, &executor.activated_tools()),
+            )
+        });
+        for (role, bytes) in role_schema_bytes(schemas) {
+            assert!(
+                bytes <= MAX_ROLE_SCHEMA_BYTES,
+                "{role} schema is {bytes} bytes, over {MAX_ROLE_SCHEMA_BYTES}"
+            );
+        }
     }
 
     #[test]
