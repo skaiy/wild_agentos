@@ -891,11 +891,20 @@ Output the summary report directly, not in JSON format."#,
             reasoning_content: None,
         });
 
+        let restriction_guard = self.begin_tool_restriction_run(&ctx.task_iri);
+        let run_id = restriction_guard.run_id().to_string();
         let mut activated_tools = self.tool_executor.read().activated_tools();
+        if let Some(allowed) = self.run_tool_restriction(&run_id) {
+            activated_tools.restrict_tools(&agent.agent_id, allowed);
+        }
         let tools = self
             .tool_executor
             .read()
-            .tool_definitions_for_turn(&agent.role.to_string(), &activated_tools);
+            .tool_definitions_for_turn_with_policy(
+                &agent.role.to_string(),
+                &agent.agent_id,
+                &activated_tools,
+            );
 
         info!(
             "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}",
@@ -1387,10 +1396,17 @@ Output the summary report directly, not in JSON format."#,
 
             // The schema payload is the authoritative executable set for this
             // turn. Keep its names for tool-call validation after the response.
+            if let Some(allowed) = self.run_tool_restriction(&run_id) {
+                activated_tools.restrict_tools(&agent.agent_id, allowed);
+            }
             let current_tools = self
                 .tool_executor
                 .read()
-                .tool_definitions_for_turn(&agent.role.to_string(), &activated_tools);
+                .tool_definitions_for_turn_with_policy(
+                    &agent.role.to_string(),
+                    &agent.agent_id,
+                    &activated_tools,
+                );
             let advertised_tools: Vec<String> = current_tools
                 .iter()
                 .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
@@ -1899,21 +1915,7 @@ Output the summary report directly, not in JSON format."#,
                                 .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
                                 .collect();
 
-                            let force_finish = if let Some(ref tc) = self.tool_controller {
-                                let tool_calls: Vec<(String, Value)> = calls
-                                    .iter()
-                                    .map(|c| {
-                                        (
-                                            c.function.name.clone(),
-                                            serde_json::from_str(&c.function.arguments)
-                                                .unwrap_or_default(),
-                                        )
-                                    })
-                                    .collect();
-                                tc.should_force_finish(&tool_calls, &agent.role)
-                            } else {
-                                !disallowed_tools.is_empty()
-                            };
+                            let force_finish = !disallowed_tools.is_empty();
 
                             if force_finish {
                                 warn!(
@@ -2095,7 +2097,7 @@ Output the summary report directly, not in JSON format."#,
                             // syscall policies.
                             let executor = self.tool_executor.read().clone();
                             let mut result = executor
-                                .execute_with_security_context_and_claims(
+                                .execute_with_security_context_and_claims_and_policy(
                                     name,
                                     args,
                                     crate::skill_graph::security::SecurityContext::new(
@@ -2105,6 +2107,7 @@ Output the summary report directly, not in JSON format."#,
                                     .with_task(&ctx.task_iri),
                                     &advertised_tools,
                                     ctx.isolation_claims.clone(),
+                                    activated_tools.policy(),
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));

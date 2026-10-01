@@ -24,8 +24,37 @@ The default groups are:
 | System | Tool discovery |
 
 Plan receives only read-only groups, including its Web on-demand group. Do has
-the write-capable resident group; Check receives shell tools on demand rather
-than as resident tools. Role visibility is separate from execution policy.
+the write-capable resident group; Check is read-only by default. Role visibility
+is separate from execution policy.
+
+## Role policy and enforcement
+
+Every call passes two independent gates. First, its name must be in the exact
+schema advertised for the current turn. Second, the runtime security context
+must satisfy the role policy. The executor obtains the role and agent identity
+only from that context, never from tool arguments or model output. A denied
+call returns a structured tool result and does not invoke its handler.
+
+The effective set can only narrow: role cap ∩ trusted per-agent restriction ∩
+active supervisor restriction. Plan metadata such as `tools_allowed` is a
+planning hint, not an execution control. Restrictions and on-demand activation
+belong to one run; they are not shared executor state.
+
+| Role | Default visible and executable tools |
+| --- | --- |
+| Plan | `file_read`, `file_list`, `glob_search`, `grep_search`, `web_search`, `web_fetch`, `tool_search`, `rag_search`, `knowledge_list`, `knowledge_search`, `kg_search`, `knowledge_extract_code` |
+| Do | Registered built-ins in the configured role groups except `knowledge_delete` and `ontology_register` |
+| Check | `file_read`, `file_list`, `workspace_status`, `read_agent_output`, `glob_search`, `grep_search`, `rag_search`, `kg_search`, `web_search`, `web_fetch`, `tool_search`, `knowledge_list`, `knowledge_search`, `knowledge_extract_code`, `knowledge_query`, `knowledge_neighbors`, `kb_vector_search` |
+| Act | `file_read`, `file_list`, `glob_search`, `grep_search`, `rag_search`, `kg_search`, `tool_search`, `knowledge_list`, `knowledge_search`, `knowledge_extract_code`, `knowledge_query`, `knowledge_neighbors`, `kb_vector_search` |
+
+Plan, Check, and Act are read-only by default. Check may execute `bash` only
+when the server-owned `token_optimization.tool_groups.check_bash_enabled`
+switch is explicitly enabled. This is risky: shell commands can execute
+untrusted workspace content and may change the environment, so keep the
+default `false` unless an operator accepts that risk. When enabled, this adds
+only `bash` to Check's advertised and executable set; it does not enable the
+Write group or other shell/editing tools. Audit warnings include only the
+agent, role, and tool name—never tool arguments.
 
 ## Activation and cache behavior
 

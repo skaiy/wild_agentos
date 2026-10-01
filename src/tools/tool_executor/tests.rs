@@ -190,6 +190,25 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .all(ToolExecutor::is_pa_readonly_tool));
+        let plan_denied = executor
+            .search_tools_for_role("Plan", json!({"query": "bash"}))
+            .unwrap();
+        assert_eq!(plan_denied["count"], 0);
+
+        let check = executor
+            .search_tools_for_role("Check", json!({"query": "bash"}))
+            .unwrap();
+        assert_eq!(check["count"], 0);
+        let check_write_terms = executor
+            .search_tools_for_role("Check", json!({"query": "write file shell command"}))
+            .unwrap();
+        let check_policy = ToolPolicy::new();
+        assert!(check_write_terms["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .all(|name| check_policy.is_executable(&AgentRole::Check, "", name)));
 
         let do_results = executor
             .search_tools_for_role("Do", json!({"query": "write file shell command"}))
@@ -300,6 +319,38 @@ mod tests {
         executor.set_tool_group_manager(ToolGroupManager::new(None));
         definitions_exclude_bash(&executor, "Plan");
         definitions_exclude_bash(&executor, "PA");
+    }
+
+    #[test]
+    fn check_bash_switch_exposes_only_bash_when_enabled() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(ToolGroupManager::new(None));
+
+        let disabled = executor.activated_tools();
+        let disabled_definitions = executor.tool_definitions_for_turn("Check", &disabled);
+        let disabled_names: Vec<&str> = disabled_definitions
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(!disabled_names.contains(&"bash"));
+        assert!(!disabled
+            .policy()
+            .is_executable(&AgentRole::Check, "", "bash"));
+
+        let enabled = executor
+            .activated_tools()
+            .with_policy(ToolPolicy::new().with_check_bash_enabled(true));
+        let enabled_definitions = executor.tool_definitions_for_turn("Check", &enabled);
+        let enabled_names: Vec<&str> = enabled_definitions
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(enabled_names.contains(&"bash"));
+        assert!(!enabled_names.contains(&"file_write"));
+        assert!(!enabled_names.contains(&"powershell"));
+        assert!(enabled
+            .policy()
+            .is_executable(&AgentRole::Check, "", "bash"));
     }
 
     #[test]
@@ -518,6 +569,94 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(result["error"], "Tool not advertised for this turn: bash");
+        });
+    }
+
+    #[test]
+    fn advertised_and_role_policy_gates_are_independent() {
+        rt().block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = calls.clone();
+            let mut executor = ToolExecutor::new();
+            executor.register(
+                "counted_tool",
+                "Counts handler calls.",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(move |_| {
+                    let handler_calls = handler_calls.clone();
+                    Box::pin(async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"ok": true}))
+                    })
+                }),
+                &[],
+            );
+
+            let denied = executor
+                .execute_with_security_context(
+                    "counted_tool",
+                    json!({"role": "DA"}),
+                    SecurityContext::new("agent:plan", "PA"),
+                    &["counted_tool".to_string()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied["error"], "Tool not allowed for role");
+            assert_eq!(denied["role"], "PA");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let unadvertised = executor
+                .execute_with_security_context(
+                    "file_read",
+                    json!({}),
+                    SecurityContext::new("agent:plan", "PA"),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                unadvertised["error"],
+                "Tool not advertised for this turn: file_read"
+            );
+        });
+    }
+
+    #[test]
+    fn check_returns_structured_role_denial_without_invoking_handler() {
+        rt().block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = calls.clone();
+            let mut executor = ToolExecutor::new();
+            executor.register(
+                "bash",
+                "Counted bash handler.",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(move |_| {
+                    let handler_calls = handler_calls.clone();
+                    Box::pin(async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"ok": true}))
+                    })
+                }),
+                &[],
+            );
+            let result = executor
+                .execute_with_security_context(
+                    "bash",
+                    json!({"command": "must not execute"}),
+                    SecurityContext::new("agent:check", "CA"),
+                    &["bash".to_string()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["error"], "Tool not allowed for role");
+            assert_eq!(result["tool"], "bash");
+            assert_eq!(result["role"], "CA");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
         });
     }
 

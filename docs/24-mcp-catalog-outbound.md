@@ -99,6 +99,9 @@ The catalog management and invoke endpoints require verified inbound
 Registering a catalog entry requires the dedicated `mcp_admin` role. A caller
 with only the ordinary `DA` role receives `403`, and no catalog file is written.
 Deleting a catalog entry requires the same role and tenant/project scope.
+Invoking a catalog tool requires either `DA` or the dedicated `mcp_invoke`
+role. Missing or unrelated roles receive `403 {"error":"mcp_role_required"}`
+before JWT signing, HTTP-client creation, or any outbound request.
 
 Invoke a registered tool by its catalog `name` (or `id` when names are
 ambiguous):
