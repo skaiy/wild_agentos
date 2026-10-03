@@ -248,7 +248,16 @@ impl super::AgentRunner {
         // Build independent agent.md
         let context_data = self.gather_context_data_async(agent.role, &ctx).await;
         let agent_md = if let Some(ref step) = plan_step {
-            self.build_agent_md_from_step(agent.role, step, &context_data)
+            // BizAgent starts its own run; no run-local supervisor restriction
+            // exists until that loop begins. Use the server-owned role policy.
+            let run_tools = self.tool_executor.read().activated_tools();
+            self.build_agent_md_from_step(
+                agent.role,
+                step,
+                &context_data,
+                &agent.agent_id,
+                &run_tools,
+            )
         } else {
             let model = self
                 .gateway
@@ -671,17 +680,18 @@ Output the summary report directly, not in JSON format."#,
             prompt_builder.set_region(SystemPromptRegion::TimeAwareness, time_text);
         }
 
-        // Region 3: Workspace environment info area (let Agent know its workspace boundaries)
+        // Region 3: Workspace environment information, including the platform note.
+        let mut env_info = crate::core::system_prompt::platform_environment_hint().to_string();
         if let Some(ref ws_root) = self.workspace_root {
-            let env_info = format!(
-                "## Workspace\n\n- Workspace path: {}\n\
+            env_info.push_str(&format!(
+                "\n\n## Workspace\n\n- Workspace path: {}\n\
                  - All file operations (read, write, search, command execution) must stay within the workspace\n\
                  - Files outside the workspace are unrelated to the current task and must not be accessed\n\
                  - The workspace root may contain other directories and files unrelated to the current task — distinguish carefully",
                 ws_root.display()
-            );
-            prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
+            ));
         }
+        prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
 
         // Region 2: Behavioral policy area (constitution layer + methodology layer)
         {
@@ -756,20 +766,14 @@ Output the summary report directly, not in JSON format."#,
             crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
         );
 
-        // Region 5: Tools area (built-in tools + dynamic tools)
-        let mut tool_menu = self.build_readable_tool_menu(&agent.role);
+        // Region 5: Tools area contains only the stable on-demand directory.
+        // Per-tool definitions are supplied by the exact per-turn schema.
         let group_directory = self
             .tool_executor
             .read()
             .build_tool_group_summary(&agent.role.to_string());
         if !group_directory.is_empty() {
-            if !tool_menu.is_empty() {
-                tool_menu.push_str("\n\n");
-            }
-            tool_menu.push_str(&group_directory);
-        }
-        if !tool_menu.is_empty() {
-            prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
+            prompt_builder.set_region(SystemPromptRegion::Tools, group_directory);
         }
 
         // Region 5: Extraction prompt area (loaded from config)
