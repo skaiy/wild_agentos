@@ -2,12 +2,12 @@
 //!
 //! 路由仍由 `mod.rs` 的 `build_router` 组装；持久化模型在 `api_gov`。
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -29,6 +29,40 @@ fn key_public_view(k: &ApiKey) -> Value {
         "expires_at": k.expires_at,
         "created_at": k.created_at,
     })
+}
+
+fn client_not_found(id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "client not found", "id": id })),
+    )
+        .into_response()
+}
+
+fn key_not_found(kid: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "key not found", "id": kid })),
+    )
+        .into_response()
+}
+
+async fn valid_grants(state: &AppState, tenant: &str, ids: &[String]) -> bool {
+    let agents = state.user_agents.read().await;
+    ids.iter().all(|id| {
+        agents.iter().any(|agent| {
+            agent.get("id").and_then(Value::as_str) == Some(id)
+                && agent.get("tenant_id").and_then(Value::as_str) == Some(tenant)
+        })
+    })
+}
+
+fn invalid_grants() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid_granted_agent_ids" })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -70,10 +104,15 @@ pub(crate) async fn list_api_clients_handler(
     if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
+    let tenant = identity
+        .isolation_claims()
+        .expect("DA claims required")
+        .tenant_id();
     let clients = state.api_clients.read().await;
     let keys = state.api_keys.read().await;
     let items: Vec<Value> = clients
         .iter()
+        .filter(|c| c.tenant_id == tenant)
         .map(|c| {
             let ckeys: Vec<Value> = keys
                 .iter()
@@ -113,6 +152,13 @@ pub(crate) async fn create_api_client_handler(
     if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
+    let tenant = identity
+        .isolation_claims()
+        .expect("DA claims required")
+        .tenant_id();
+    if !valid_grants(&state, tenant, &req.granted_agent_ids).await {
+        return invalid_grants();
+    }
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -125,7 +171,7 @@ pub(crate) async fn create_api_client_handler(
         id: uuid::Uuid::new_v4().hyphenated().to_string(),
         name: req.name.trim().to_string(),
         description: req.description,
-        tenant_id: identity.tenant_id.clone(),
+        tenant_id: tenant.to_string(),
         owner: if req.owner.is_empty() {
             identity.user_id.clone()
         } else {
@@ -158,16 +204,33 @@ pub(crate) async fn update_api_client_handler(
     if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
-    let mut guard = state.api_clients.write().await;
-    let client = match guard.iter_mut().find(|c| c.id == id) {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "client not found", "id": id })),
-            )
-                .into_response()
+    let tenant = identity
+        .isolation_claims()
+        .expect("DA claims required")
+        .tenant_id();
+    // Resolve ownership first so an invalid grant cannot distinguish a foreign
+    // client from a missing client. Recheck under the write lock below.
+    if !state
+        .api_clients
+        .read()
+        .await
+        .iter()
+        .any(|c| c.id == id && c.tenant_id == tenant)
+    {
+        return client_not_found(&id);
+    }
+    if let Some(ids) = &req.granted_agent_ids {
+        if !valid_grants(&state, tenant, ids).await {
+            return invalid_grants();
         }
+    }
+    let mut guard = state.api_clients.write().await;
+    let client = match guard
+        .iter_mut()
+        .find(|c| c.id == id && c.tenant_id == tenant)
+    {
+        Some(c) => c,
+        None => return client_not_found(&id),
     };
     if let Some(v) = req.name {
         client.name = v;
@@ -209,15 +272,15 @@ pub(crate) async fn delete_api_client_handler(
     if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
+    let tenant = identity
+        .isolation_claims()
+        .expect("DA claims required")
+        .tenant_id();
     let mut clients = state.api_clients.write().await;
     let before = clients.len();
-    clients.retain(|c| c.id != id);
+    clients.retain(|c| c.id != id || c.tenant_id != tenant);
     if clients.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "client not found", "id": id })),
-        )
-            .into_response();
+        return client_not_found(&id);
     }
     let _ = api_gov::save_api_clients(&clients);
     let mut keys = state.api_keys.write().await;
@@ -240,20 +303,17 @@ pub(crate) async fn issue_api_key_handler(
     if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
-    let tenant = {
+    let tenant = identity
+        .isolation_claims()
+        .expect("DA claims required")
+        .tenant_id();
+    {
         let clients = state.api_clients.read().await;
-        match clients.iter().find(|c| c.id == id) {
-            Some(c) => c.tenant_id.clone(),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "client not found", "id": id })),
-                )
-                    .into_response()
-            }
+        if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
+            return client_not_found(&id);
         }
-    };
-    let (plaintext, prefix, hash) = api_gov::generate_key(&tenant);
+    }
+    let (plaintext, prefix, hash) = api_gov::generate_key(tenant);
     let key = ApiKey {
         id: uuid::Uuid::new_v4().hyphenated().to_string(),
         name: req.name,
@@ -289,6 +349,22 @@ pub(crate) async fn revoke_api_key_handler(
     if let Err(error) = identity.require_control_plane_da("API client operations") {
         return error.into_response();
     }
+    let tenant = identity
+        .isolation_claims()
+        .expect("DA claims required")
+        .tenant_id();
+    // Release the client lock before taking the key lock: `authenticate_public`
+    // acquires keys then clients, so holding both here in the opposite order
+    // could deadlock behind a queued writer.
+    let owns_client = state
+        .api_clients
+        .read()
+        .await
+        .iter()
+        .any(|c| c.id == id && c.tenant_id == tenant);
+    if !owns_client {
+        return key_not_found(&kid);
+    }
     let mut guard = state.api_keys.write().await;
     let key = guard.iter_mut().find(|k| k.id == kid && k.client_id == id);
     match key {
@@ -301,11 +377,7 @@ pub(crate) async fn revoke_api_key_handler(
             )
                 .into_response()
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "key not found", "id": kid })),
-        )
-            .into_response(),
+        None => key_not_found(&kid),
     }
 }
 
@@ -318,14 +390,33 @@ pub struct AuditQuery {
 
 /// GET /api/v1/api-audit — 对外调用审计查询（按 client/agent 过滤，倒序）。
 pub(crate) async fn list_api_audit_handler(
+    State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Query(q): Query<AuditQuery>,
 ) -> impl IntoResponse {
     if let Err(error) = identity.require_control_plane_da("API audit access") {
         return error.into_response();
     }
+    let tenant = identity
+        .isolation_claims()
+        .expect("DA claims required")
+        .tenant_id();
+    let tenant_client_ids: HashSet<String> = state
+        .api_clients
+        .read()
+        .await
+        .iter()
+        .filter(|c| c.tenant_id == tenant)
+        .map(|c| c.id.clone())
+        .collect();
     let limit = q.limit.unwrap_or(200).min(1000);
-    let items = api_gov::read_audit(q.client_id.as_deref(), q.agent_id.as_deref(), limit);
+    let items = api_gov::read_audit_for_tenant(
+        tenant,
+        &tenant_client_ids,
+        q.client_id.as_deref(),
+        q.agent_id.as_deref(),
+        limit,
+    );
     (
         StatusCode::OK,
         Json(json!({ "count": items.len(), "records": items })),

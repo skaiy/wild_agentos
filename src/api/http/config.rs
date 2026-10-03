@@ -239,7 +239,7 @@ pub(crate) async fn update_config_handler(
         )
             .into_response();
     }
-    if let Err(error) = identity.require_role("DA") {
+    if let Err(error) = identity.require_control_plane_da("configuration updates") {
         return error.into_response();
     }
     let patch = request.into_patch();
@@ -660,13 +660,13 @@ mod tests {
             .unwrap();
         assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
-        let token_for = |roles: Vec<&str>| {
+        let token_for = |roles: Vec<&str>, project: Option<&str>| {
             encode(
                 &Header::default(),
                 &JwtClaims {
                     sub: "config-test".to_string(),
                     tenant_id: "test-tenant".to_string(),
-                    project_id: None,
+                    project_id: project.map(str::to_string),
                     roles: roles.into_iter().map(str::to_string).collect(),
                     exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
                 },
@@ -677,7 +677,7 @@ mod tests {
         let unknown_field = router
             .clone()
             .oneshot(put_config(
-                Some(token_for(vec!["DA"])),
+                Some(token_for(vec!["DA"], Some("test-project"))),
                 json!({"gateway": {"base_url": "https://blocked.example"}, "unexpected": true}),
             ))
             .await
@@ -686,17 +686,28 @@ mod tests {
         let non_da = router
             .clone()
             .oneshot(put_config(
-                Some(token_for(vec!["PA"])),
+                Some(token_for(vec!["PA"], Some("test-project"))),
                 json!({"gateway": {"base_url": "https://blocked.example"}}),
             ))
             .await
             .unwrap();
         assert_eq!(non_da.status(), StatusCode::FORBIDDEN);
+        let da = router
+            .clone()
+            .oneshot(put_config(
+                Some(token_for(vec!["DA"], None)),
+                json!({"gateway": {"base_url": "https://blocked.example"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(da.status(), StatusCode::FORBIDDEN);
+        // A defaulted project must fail before touching either the runtime or disk.
+        assert!(!tmp.join("config_override.json").exists());
 
         let secret_value = "test-only-gateway-key";
         let updated = router
             .oneshot(put_config(
-                Some(token_for(vec!["DA"])),
+                Some(token_for(vec!["DA"], Some("test-project"))),
                 json!({
                     "gateway": {
                         "base_url": "https://configured.example",

@@ -631,13 +631,15 @@ async fn authenticate_public(
 }
 
 /// Agent 是否已发布（published=true）。
-async fn agent_is_published(state: &Arc<AppState>, id: &str) -> bool {
+async fn agent_is_published(state: &Arc<AppState>, id: &str, tenant: &str) -> Option<bool> {
     let guard = state.user_agents.read().await;
     guard
         .iter()
-        .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
-        .and_then(|a| a.get("published").and_then(|v| v.as_bool()))
-        .unwrap_or(false)
+        .find(|a| {
+            a.get("id").and_then(Value::as_str) == Some(id)
+                && a.get("tenant_id").and_then(Value::as_str) == Some(tenant)
+        })
+        .map(|a| a.get("published").and_then(Value::as_bool).unwrap_or(false))
 }
 
 /// 更新命中密钥的 last_used_at 并落盘。
@@ -706,7 +708,8 @@ async fn public_gate(
         Ok(c) => c,
         Err(resp) => return Err(resp.into_response()),
     };
-    if !ctx.granted_agent_ids.iter().any(|a| a == id) {
+    let published = agent_is_published(state, id, &ctx.tenant_id).await;
+    if !ctx.granted_agent_ids.iter().any(|a| a == id) || published.is_none() {
         write_public_audit(&ctx, id, endpoint, 403, started, "not_in_scope");
         return Err((
             StatusCode::FORBIDDEN,
@@ -714,7 +717,7 @@ async fn public_gate(
         )
             .into_response());
     }
-    if !agent_is_published(state, id).await {
+    if published == Some(false) {
         write_public_audit(&ctx, id, endpoint, 403, started, "not_published");
         return Err((
             StatusCode::FORBIDDEN,
@@ -1037,7 +1040,11 @@ pub(crate) async fn openai_list_models_handler(
         .filter(|aid| {
             agents
                 .iter()
-                .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(aid.as_str()))
+                .find(|a| {
+                    a.get("id").and_then(|v| v.as_str()) == Some(aid.as_str())
+                        && a.get("tenant_id").and_then(Value::as_str)
+                            == Some(ctx.tenant_id.as_str())
+                })
                 .and_then(|a| a.get("published").and_then(|v| v.as_bool()))
                 .unwrap_or(false)
         })

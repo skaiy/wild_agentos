@@ -37,12 +37,12 @@ use crate::{
 
 const TEST_JWT_SECRET: &[u8] = b"test-hs256-secret-at-least-32-bytes-long";
 
-struct EnvGuard {
+pub(super) struct EnvGuard {
     previous: Vec<(&'static str, Option<OsString>)>,
 }
 
 impl EnvGuard {
-    fn set(vars: &[(&'static str, String)]) -> Self {
+    pub(super) fn set(vars: &[(&'static str, String)]) -> Self {
         let previous = vars
             .iter()
             .map(|(name, _)| (*name, std::env::var_os(name)))
@@ -79,7 +79,7 @@ fn test_gateway() -> UnifiedGateway {
     .unwrap()
 }
 
-fn test_state(data_dir: &std::path::Path) -> Arc<AppState> {
+pub(super) fn test_state(data_dir: &std::path::Path) -> Arc<AppState> {
     let core = Arc::new(
         SemanticCore::new(CoreConfig {
             l0_storage_path: data_dir.join("l0").to_string_lossy().into_owned(),
@@ -143,8 +143,14 @@ fn seed_key() -> ApiKey {
     }
 }
 
-fn app(state: Arc<AppState>) -> Router {
+pub(super) fn app(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/api/v1/config", put(super::config::update_config_handler))
+        .route(
+            "/api/v1/public/agents/:id/chat",
+            post(super::chat::public_agent_chat_handler),
+        )
+        .route("/v1/models", get(super::chat::openai_list_models_handler))
         .route("/api/v1/batch/agents", get(list_batch_agents_handler))
         .route(
             "/api/v1/batch/agents/:name/control",

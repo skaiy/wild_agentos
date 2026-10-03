@@ -708,6 +708,9 @@ pub fn build_router(
 mod control_plane_route_auth_tests;
 
 #[cfg(test)]
+mod isolation_contract_api_clients_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
