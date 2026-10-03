@@ -1,8 +1,16 @@
 //! 管理面：调用方 & 密钥中心（需 DA 角色）。
 //!
 //! 路由仍由 `mod.rs` 的 `build_router` 组装；持久化模型在 `api_gov`。
+//! Lock order: when both are held, take `api_keys` first, then `api_clients`;
+//! never acquire `api_keys` while holding `api_clients`.
 
 use std::{collections::HashSet, sync::Arc};
+
+#[cfg(test)]
+use std::{collections::HashMap, sync::LazyLock};
+
+#[cfg(test)]
+use tokio::sync::Notify;
 
 use axum::{
     extract::{Query, State},
@@ -16,6 +24,35 @@ use serde_json::{json, Value};
 use super::api_gov::{self, ApiClient, ApiKey};
 use super::iam::UserIdentity;
 use super::AppState;
+
+#[cfg(test)]
+type IssuePause = (Arc<Notify>, Arc<Notify>);
+
+#[cfg(test)]
+static ISSUE_KEY_PAUSE: LazyLock<std::sync::Mutex<HashMap<String, IssuePause>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(super) fn arm_issue_key_pause(id: &str) -> IssuePause {
+    let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    ISSUE_KEY_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string(), pause.clone());
+    pause
+}
+
+#[cfg(test)]
+async fn issue_key_test_pause(id: &str) {
+    let pause = ISSUE_KEY_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
+    if let Some((reached, resume)) = pause {
+        reached.notify_one();
+        resume.notified().await;
+    }
+}
 
 /// 密钥对外视图（绝不含 key_hash）。
 fn key_public_view(k: &ApiKey) -> Value {
@@ -108,8 +145,8 @@ pub(crate) async fn list_api_clients_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    let clients = state.api_clients.read().await;
     let keys = state.api_keys.read().await;
+    let clients = state.api_clients.read().await;
     let items: Vec<Value> = clients
         .iter()
         .filter(|c| c.tenant_id == tenant)
@@ -276,15 +313,18 @@ pub(crate) async fn delete_api_client_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
+    let mut keys = state.api_keys.write().await;
     let mut clients = state.api_clients.write().await;
     let before = clients.len();
     clients.retain(|c| c.id != id || c.tenant_id != tenant);
     if clients.len() == before {
         return client_not_found(&id);
     }
+    let other_client_has_id = clients.iter().any(|c| c.id == id);
     let _ = api_gov::save_api_clients(&clients);
-    let mut keys = state.api_keys.write().await;
-    keys.retain(|k| k.client_id != id);
+    keys.retain(|k| {
+        k.client_id != id || (other_client_has_id && !api_gov::key_belongs_to_tenant(k, tenant))
+    });
     let _ = api_gov::save_api_keys(&keys);
     (
         StatusCode::OK,
@@ -313,6 +353,13 @@ pub(crate) async fn issue_api_key_handler(
             return client_not_found(&id);
         }
     }
+    #[cfg(test)]
+    issue_key_test_pause(&id).await;
+    let mut guard = state.api_keys.write().await;
+    let clients = state.api_clients.read().await;
+    if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
+        return client_not_found(&id);
+    }
     let (plaintext, prefix, hash) = api_gov::generate_key(tenant);
     let key = ApiKey {
         id: uuid::Uuid::new_v4().hyphenated().to_string(),
@@ -325,7 +372,6 @@ pub(crate) async fn issue_api_key_handler(
         expires_at: req.expires_at,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let mut guard = state.api_keys.write().await;
     guard.push(key.clone());
     let _ = api_gov::save_api_keys(&guard);
     (
@@ -353,9 +399,7 @@ pub(crate) async fn revoke_api_key_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    // Release the client lock before taking the key lock: `authenticate_public`
-    // acquires keys then clients, so holding both here in the opposite order
-    // could deadlock behind a queued writer.
+    // The locks never overlap here: release clients before acquiring keys.
     let owns_client = state
         .api_clients
         .read()

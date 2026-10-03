@@ -616,6 +616,7 @@ async fn authenticate_public(
             ))
         }
     };
+    // See api_clients module lock order: keys first, then clients.
     let keys = state.api_keys.read().await;
     let clients = state.api_clients.read().await;
     match api_gov::resolve_bearer_token(&token, &keys, &clients) {
