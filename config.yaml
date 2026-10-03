@@ -58,11 +58,7 @@ memory:
     max_tokens: 4096
   l2:
     max_node_size: 2048
-  max_projection_size: 500
-  sa_execution_timeout_secs: 30
-  tool_timeout_secs: 60
-  mcp_timeout_secs: 30
-  embedding_timeout_secs: 30
+    max_projection_size: 500
   l3:
     default_frame: "summary_only"
     max_size: 500
@@ -95,6 +91,10 @@ agents:
   snapshot_frequency: 1000
   max_full_snapshots: 10
   max_projection_size: 500
+  sa_execution_timeout_secs: 30
+  tool_timeout_secs: 60
+  mcp_timeout_secs: 30
+  embedding_timeout_secs: 30
 
 api:
   grpc_addr: "0.0.0.0:50051"
