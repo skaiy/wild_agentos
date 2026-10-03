@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Demo tenant helper (docs/26-demo-tenant.md): mint a tenant-scoped demo token,
+# seed fictional sample data through the public HTTP API, and verify isolation.
+# It never prints the signing secret or a token: tokens live only in mode-600
+# files and reach curl through a header file, never through argv.
+
 DEMO_TENANT="${DEMO_TENANT-demo}"
 DEMO_PROJECT="${DEMO_PROJECT-showcase}"
 DEMO_ACTOR="${DEMO_ACTOR:-demo-user}"
@@ -25,6 +30,9 @@ done
 [[ "$PLATFORM_TENANT" != default ]] || die "AGENTOS_PLATFORM_ADMIN_TENANT cannot be default."
 [[ -z "$PLATFORM_TENANT" || "$DEMO_TENANT" != "$PLATFORM_TENANT" ]] ||
     die "DEMO_TENANT cannot equal AGENTOS_PLATFORM_ADMIN_TENANT."
+if [[ -z "$PLATFORM_TENANT" ]]; then
+    printf 'Note: AGENTOS_PLATFORM_ADMIN_TENANT is not set in this shell; cannot confirm the demo tenant differs from the platform tenant.\n' >&2
+fi
 IFS=, read -r -a roles <<< "$DEMO_ROLES"
 for role in "${roles[@]}"; do
     role="${role//[[:space:]]/}"
