@@ -418,16 +418,14 @@ impl ToolRestrictionRunGuard {
 impl Drop for ToolRestrictionRunGuard {
     fn drop(&mut self) {
         self.restrictions.remove(&self.run_id);
-        let remove_task_entry = if let Some(mut active) = self.active_runs.get_mut(&self.task_iri) {
+        // Single atomic operation under the shard write lock: drop this run id
+        // and remove the task entry only if no other run for the task remains.
+        // A concurrent `begin_tool_restriction_run` for the same task cannot
+        // interleave between the removal and the emptiness check.
+        self.active_runs.remove_if_mut(&self.task_iri, |_, active| {
             active.remove(&self.run_id);
             active.is_empty()
-        } else {
-            false
-        };
-        if remove_task_entry {
-            self.active_runs
-                .remove_if(&self.task_iri, |_, active| active.is_empty());
-        }
+        });
     }
 }
 
