@@ -81,6 +81,62 @@ impl UserIdentity {
     pub fn isolation_claims(&self) -> Option<&IsolationClaims> {
         self.isolation_claims.as_ref()
     }
+    /// Require isolation claims that were verified at the authentication boundary.
+    ///
+    /// Control-plane routes must never infer tenant or project scope from
+    /// caller-provided request data.
+    pub(crate) fn require_verified_isolation_claims(
+        &self,
+        resource: &str,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        if self.isolation_claims().is_some() {
+            return Ok(());
+        }
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "verified_isolation_claims_required",
+                "message": format!("verified isolation claims required for {resource}"),
+            })),
+        ))
+    }
+    /// Require the tenant-scoped DA role and an explicitly verified JWT scope.
+    ///
+    /// A defaulted tenant or project is not a platform-wide scope. Control-plane
+    /// operations must therefore reject it even when the caller has the DA role.
+    pub(crate) fn require_control_plane_da(
+        &self,
+        resource: &str,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        self.require_verified_isolation_claims(resource)?;
+        self.require_role("DA")?;
+
+        match self
+            .isolation_claims()
+            .expect("verified claims were required above")
+            .provenance()
+        {
+            IsolationScopeProvenance::VerifiedExplicit => Ok(()),
+            IsolationScopeProvenance::VerifiedDefaulted => {
+                let missing_field = self
+                    .isolation_claims()
+                    .and_then(IsolationClaims::missing_scope_field)
+                    .map(IsolationScopeField::as_str)
+                    .unwrap_or("project_id");
+                Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "control_plane_claims_incomplete",
+                        "missing_field": missing_field,
+                    })),
+                ))
+            }
+            IsolationScopeProvenance::DeploymentConfig => Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "control_plane_claims_unverified"})),
+            )),
+        }
+    }
     /// 检查调用方是否具有指定角色（任一匹配）。
     pub fn has_role(&self, role: &str) -> bool {
         self.roles.iter().any(|r| r.as_str() == role)
@@ -467,8 +523,8 @@ pub(crate) mod tests {
     use serde::Serialize;
 
     use super::{
-        validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims, UserIdentity,
-        DEFAULT_HS256_SECRET,
+        claims_identity, validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims,
+        UserIdentity, DEFAULT_HS256_SECRET,
     };
     use crate::api::http::TEST_ENV_LOCK;
 
@@ -555,6 +611,76 @@ pub(crate) mod tests {
             "X-Identity is a development simulation, not a trusted claims source"
         );
         restore_strict_mode(previous);
+    }
+
+    #[test]
+    fn verified_isolation_claims_gate_rejects_missing_claims_and_accepts_verified_claims() {
+        let missing_claims = UserIdentity::anonymous();
+        let rejection = missing_claims
+            .require_verified_isolation_claims("control-plane operations")
+            .unwrap_err();
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+
+        let verified_claims = UserIdentity {
+            user_id: "service".to_string(),
+            tenant_id: "acme".to_string(),
+            roles: vec!["DA".to_string()],
+            auth_method: AuthMethod::Jwt,
+            isolation_claims: Some(
+                crate::isolation::IsolationClaims::from_verified("acme", "default", "service")
+                    .unwrap(),
+            ),
+        };
+        assert!(verified_claims
+            .require_verified_isolation_claims("control-plane operations")
+            .is_ok());
+    }
+
+    #[test]
+    fn control_plane_da_gate_requires_explicit_jwt_scope() {
+        let explicit = claims_identity(JwtClaims {
+            sub: "service".to_string(),
+            tenant_id: "acme".to_string(),
+            project_id: Some("project-a".to_string()),
+            roles: vec!["DA".to_string()],
+            exp: 0,
+        })
+        .unwrap();
+        assert!(explicit
+            .require_control_plane_da("control-plane operations")
+            .is_ok());
+
+        let defaulted = claims_identity(JwtClaims {
+            sub: "service".to_string(),
+            tenant_id: "acme".to_string(),
+            project_id: None,
+            roles: vec!["DA".to_string()],
+            exp: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            defaulted
+                .require_control_plane_da("control-plane operations")
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+
+        let no_da = claims_identity(JwtClaims {
+            sub: "service".to_string(),
+            tenant_id: "acme".to_string(),
+            project_id: Some("project-a".to_string()),
+            roles: vec![],
+            exp: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            no_da
+                .require_control_plane_da("control-plane operations")
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

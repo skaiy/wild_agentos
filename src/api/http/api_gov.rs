@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 // ─── 领域模型 ──────────────────────────────────────────────────────────────────
 
@@ -157,7 +157,13 @@ pub fn append_audit(entry: &Value) {
 }
 
 /// 读取审计（返回最近 limit 条，倒序），可按 client_id / agent_id 过滤。
-pub fn read_audit(client_id: Option<&str>, agent_id: Option<&str>, limit: usize) -> Vec<Value> {
+pub fn read_audit_for_tenant(
+    tenant: &str,
+    tenant_client_ids: &HashSet<String>,
+    client_id: Option<&str>,
+    agent_id: Option<&str>,
+    limit: usize,
+) -> Vec<Value> {
     let content = match std::fs::read_to_string(api_audit_path()) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -165,6 +171,13 @@ pub fn read_audit(client_id: Option<&str>, agent_id: Option<&str>, limit: usize)
     let mut out: Vec<Value> = content
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| match e.get("tenant_id") {
+            Some(value) => value.as_str() == Some(tenant),
+            None => e
+                .get("client_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| tenant_client_ids.contains(id)),
+        })
         .filter(|e| {
             client_id.is_none_or(|c| e.get("client_id").and_then(|v| v.as_str()) == Some(c))
         })

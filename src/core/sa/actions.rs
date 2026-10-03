@@ -56,8 +56,14 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
         InterventionAction::RestrictTools { .. } => Some(Box::new(|sa, params, task_iri| {
             Box::pin(async move {
                 let tools = params.allowed_tools.clone().unwrap_or_default();
-                sa.runner.restrict_tools_for_run(task_iri, tools.clone());
-                info!("Intervention: restrict tools to {:?}", tools);
+                match sa.runner.restrict_tools_for_run(task_iri, tools.clone()) {
+                    crate::core::agent_runner::RunRestrictionOutcome::Applied { runs_narrowed } => {
+                        info!(runs_narrowed, "Intervention: restrict tools to {:?}", tools)
+                    }
+                    crate::core::agent_runner::RunRestrictionOutcome::NoActiveRun => {
+                        warn!("Intervention: no active run, restriction not applied")
+                    }
+                }
                 Ok(())
             })
         })),
