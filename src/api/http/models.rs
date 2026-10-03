@@ -14,7 +14,9 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::config::{hot_reload_embedding, json_deep_merge, save_config_override};
+use super::config::{
+    hot_reload_embedding, json_deep_merge, same_provider_endpoint, save_config_override,
+};
 use super::iam::UserIdentity;
 use super::AppState;
 
@@ -359,11 +361,11 @@ pub(crate) async fn test_model_handler(
             }
             (StatusCode::OK, Json(out)).into_response()
         }
-        // 错误信息仅取网络层原因(不含 Authorization/请求头)。
+        // 错误信息仅取网络层原因(不含 Authorization/请求头;#299: 也不含 URL)。
         Err(e) => (
             StatusCode::OK,
             Json(
-                json!({ "ok": false, "http_status": 0, "latency_ms": latency_ms, "error": e.to_string() }),
+                json!({ "ok": false, "http_status": 0, "latency_ms": latency_ms, "error": e.without_url().to_string() }),
             ),
         )
             .into_response(),
@@ -382,6 +384,20 @@ pub(crate) struct ProviderModelsRequest {
     api_key: String,
 }
 
+/// Generic 400 for a request that would reuse a saved provider key on a
+/// different endpoint (#299). The body never echoes the key, the URL, the
+/// provider id or the caller's identity.
+fn explicit_api_key_required() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "explicit_api_key_required",
+            "message": "base_url differs from the saved provider endpoint; provide api_key explicitly",
+        })),
+    )
+        .into_response()
+}
+
 /// POST /api/v1/providers/models — 拉取 provider 的 /v1/models 型号列表（自动加载）。
 /// 返回 { ok, http_status, models:[{id, owned_by}] }。绝不回显 api_key；错误仅取网络层原因。
 pub(crate) async fn provider_models_handler(
@@ -392,6 +408,8 @@ pub(crate) async fn provider_models_handler(
         return error.into_response();
     }
     // 端点/密钥解析：内联优先，缺省按 provider_id 回填持久化值。
+    // #299: 已保存的 api_key 只回填给它保存时的同一端点（归一化后精确比较）；
+    // 内联 base_url 与已保存端点不同时拒绝（400），绝不把已保存密钥发往调用方指定的地址。
     let (mut base_url, mut api_key, mut timeout) =
         (req.base_url.trim().to_string(), req.api_key.clone(), 60u64);
     if base_url.is_empty() || api_key.is_empty() {
@@ -400,7 +418,10 @@ pub(crate) async fn provider_models_handler(
             if base_url.is_empty() {
                 base_url = p.base_url.clone();
             }
-            if api_key.is_empty() {
+            if api_key.is_empty() && !p.api_key.is_empty() {
+                if !same_provider_endpoint(&base_url, &p.base_url) {
+                    return explicit_api_key_required();
+                }
                 api_key = p.api_key.clone();
             }
             timeout = p.timeout_seconds;
@@ -459,7 +480,7 @@ pub(crate) async fn provider_models_handler(
         }
         Err(e) => (
             StatusCode::OK,
-            Json(json!({ "ok": false, "http_status": 0, "models": [], "error": e.to_string() })),
+            Json(json!({ "ok": false, "http_status": 0, "models": [], "error": e.without_url().to_string() })),
         )
             .into_response(),
     }
@@ -479,7 +500,7 @@ pub(crate) async fn activate_embedding_handler(
     identity: UserIdentity,
     Json(req): Json<EmbeddingActivateRequest>,
 ) -> Response {
-    if let Err(error) = identity.require_control_plane_da("model operations") {
+    if let Err(error) = identity.require_platform_admin("model operations") {
         return error.into_response();
     }
     let m = crate::config::settings::Settings::load_models();

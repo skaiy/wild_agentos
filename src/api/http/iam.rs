@@ -31,6 +31,9 @@ use std::{
 
 use crate::isolation::{IsolationClaims, IsolationScopeField, IsolationScopeProvenance};
 
+pub(crate) const PLATFORM_ADMIN_ROLE: &str = "PLATFORM_ADMIN";
+pub(crate) const PLATFORM_ADMIN_TENANT_ENV: &str = "AGENTOS_PLATFORM_ADMIN_TENANT";
+
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +139,44 @@ impl UserIdentity {
                 Json(json!({"error": "control_plane_claims_unverified"})),
             )),
         }
+    }
+    /// Gate process-global configuration writes on a verified JWT with explicit
+    /// non-empty tenant_id and project_id claims, the exact PLATFORM_ADMIN role,
+    /// and tenant_id matching the deployment-configured platform tenant. DA is
+    /// neither required nor sufficient. An unset, blank, or `default` platform
+    /// tenant fails closed, regardless of the non-strict development role bypass.
+    pub(crate) fn require_platform_admin(
+        &self,
+        resource: &str,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        self.require_verified_isolation_claims(resource)?;
+        let denied = || {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "platform_admin_required",
+                    "message": format!("platform administrator required for {resource}"),
+                })),
+            )
+        };
+        if self.auth_method != AuthMethod::Jwt {
+            return Err(denied());
+        }
+        let claims = self
+            .isolation_claims()
+            .expect("verified claims required above");
+        if claims.provenance() != IsolationScopeProvenance::VerifiedExplicit {
+            return Err(denied());
+        }
+        if !self.has_role(PLATFORM_ADMIN_ROLE) {
+            return Err(denied());
+        }
+        let tenant = std::env::var(PLATFORM_ADMIN_TENANT_ENV).unwrap_or_default();
+        let tenant = tenant.trim();
+        if tenant.is_empty() || tenant == "default" || claims.tenant_id() != tenant {
+            return Err(denied());
+        }
+        Ok(())
     }
     /// 检查调用方是否具有指定角色（任一匹配）。
     pub fn has_role(&self, role: &str) -> bool {
@@ -524,9 +565,127 @@ pub(crate) mod tests {
 
     use super::{
         claims_identity, validate_startup_auth_configuration, verify_jwt, AuthMethod, JwtClaims,
-        UserIdentity, DEFAULT_HS256_SECRET,
+        UserIdentity, DEFAULT_HS256_SECRET, PLATFORM_ADMIN_ROLE, PLATFORM_ADMIN_TENANT_ENV,
     };
-    use crate::api::http::TEST_ENV_LOCK;
+    use crate::api::http::{control_plane_route_auth_tests::EnvGuard, TEST_ENV_LOCK};
+
+    fn platform_identity(tenant: &str, project: Option<&str>, roles: &[&str]) -> UserIdentity {
+        claims_identity(JwtClaims {
+            sub: "test-actor".into(),
+            tenant_id: tenant.into(),
+            project_id: project.map(str::to_owned),
+            roles: roles.iter().map(|role| (*role).into()).collect(),
+            exp: 0,
+        })
+        .unwrap()
+    }
+
+    fn assert_platform_denied(identity: &UserIdentity) {
+        let (status, body) = identity
+            .require_platform_admin("configuration updates")
+            .unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.0,
+            serde_json::json!({
+                "error": "platform_admin_required",
+                "message": "platform administrator required for configuration updates"
+            })
+        );
+    }
+
+    #[test]
+    fn platform_admin_requires_verified_claims_even_in_non_strict_mode() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("AGENTOS_AUTH_STRICT", "false".into()),
+            (PLATFORM_ADMIN_TENANT_ENV, "platform".into()),
+        ]);
+        for mut identity in [
+            UserIdentity::anonymous(),
+            platform_identity("platform", Some("project-a"), &[PLATFORM_ADMIN_ROLE]),
+        ] {
+            if identity.auth_method == AuthMethod::Jwt {
+                identity.auth_method = AuthMethod::Base64Header;
+                identity.isolation_claims = None;
+            }
+            let (status, body) = identity
+                .require_platform_admin("configuration updates")
+                .unwrap_err();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body.0["error"], "verified_isolation_claims_required");
+        }
+    }
+
+    #[test]
+    fn platform_admin_requires_jwt_even_with_verified_claims() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[(PLATFORM_ADMIN_TENANT_ENV, "platform".into())]);
+        let mut identity = platform_identity("platform", Some("project-a"), &[PLATFORM_ADMIN_ROLE]);
+        identity.auth_method = AuthMethod::ApiKey;
+        assert_platform_denied(&identity);
+    }
+
+    #[test]
+    fn platform_admin_requires_explicit_scope() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[(PLATFORM_ADMIN_TENANT_ENV, "platform".into())]);
+        assert_platform_denied(&platform_identity("platform", None, &[PLATFORM_ADMIN_ROLE]));
+        assert_platform_denied(&platform_identity(
+            "platform",
+            Some("  "),
+            &[PLATFORM_ADMIN_ROLE],
+        ));
+        let mut identity = platform_identity("platform", Some("project-a"), &[PLATFORM_ADMIN_ROLE]);
+        identity.isolation_claims = Some(
+            crate::isolation::IsolationClaims::from_verified("platform", "project-a", "test-actor")
+                .unwrap(),
+        );
+        assert_platform_denied(&identity);
+    }
+
+    #[test]
+    fn platform_admin_requires_exact_role_not_da() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[(PLATFORM_ADMIN_TENANT_ENV, "platform".into())]);
+        for roles in [&["DA"][..], &["platform_admin"][..], &[][..]] {
+            assert_platform_denied(&platform_identity("platform", Some("project-a"), roles));
+        }
+    }
+
+    #[test]
+    fn platform_admin_tenant_fails_closed_and_matches_exactly() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[(PLATFORM_ADMIN_TENANT_ENV, "platform".into())]);
+        let identity = platform_identity("platform", Some("project-a"), &[PLATFORM_ADMIN_ROLE]);
+        assert_platform_denied(&platform_identity(
+            "other",
+            Some("project-a"),
+            &[PLATFORM_ADMIN_ROLE],
+        ));
+        assert_platform_denied(&platform_identity(
+            "Platform",
+            Some("project-a"),
+            &[PLATFORM_ADMIN_ROLE],
+        ));
+        for setting in ["", "  ", "default"] {
+            std::env::set_var(PLATFORM_ADMIN_TENANT_ENV, setting);
+            assert_platform_denied(&identity);
+        }
+        std::env::remove_var(PLATFORM_ADMIN_TENANT_ENV);
+        assert_platform_denied(&identity);
+    }
+
+    #[test]
+    fn platform_admin_role_stands_alone() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[(PLATFORM_ADMIN_TENANT_ENV, " platform ".into())]);
+        assert!(
+            platform_identity("platform", Some("project-a"), &[PLATFORM_ADMIN_ROLE])
+                .require_platform_admin("configuration updates")
+                .is_ok()
+        );
+    }
 
     #[tokio::test]
     async fn strict_mode_rejects_forged_x_identity_before_claims_are_created() {
