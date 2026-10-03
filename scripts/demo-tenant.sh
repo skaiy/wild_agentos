@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Demo tenant helper (docs/26-demo-tenant.md): mint a tenant-scoped demo token,
+# Demo tenant helper (docs/28-demo-tenant.md): mint a tenant-scoped demo token,
 # seed fictional sample data through the public HTTP API, and verify isolation.
 # It never prints the signing secret or a token: tokens live only in mode-600
 # files and reach curl through a header file, never through argv.
