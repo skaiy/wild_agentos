@@ -48,6 +48,22 @@ blob names are minted. In that case `verify_jwt` produces no identity.
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
 
+## Platform-level configuration belongs to no tenant
+
+`PUT /api/v1/config` (gateway, embedding, models, and admin policies) and
+`POST /api/v1/embedding/activate` write shared process-wide state. Only a
+`PLATFORM_ADMIN` may write it; a tenant `DA` cannot. The bearer JWT must be
+verified by the configured auth mode, carry explicit non-empty `tenant_id` and
+`project_id` claims, and include the exact case-sensitive `PLATFORM_ADMIN`
+role. `tenant_id` must match the deployment's
+`AGENTOS_PLATFORM_ADMIN_TENANT` exactly. An unset or blank value, or the
+legacy `default` tenant, grants nobody this permission. The `DA` role is not
+required in addition. This gate applies even in non-strict development mode:
+requests without a verified JWT return `401`;
+all other failures return `403` with only
+`{"error":"platform_admin_required","message":"platform administrator required for <resource>"}`.
+`GET /api/v1/config` keeps its existing read behavior.
+
 ### Local HS256 empirical check
 
 For a running **local** kernel configured for HS256 with an explicitly set,

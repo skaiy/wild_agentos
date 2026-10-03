@@ -239,7 +239,7 @@ pub(crate) async fn update_config_handler(
         )
             .into_response();
     }
-    if let Err(error) = identity.require_control_plane_da("configuration updates") {
+    if let Err(error) = identity.require_platform_admin("configuration updates") {
         return error.into_response();
     }
     let patch = request.into_patch();
@@ -531,6 +531,10 @@ mod tests {
     #[tokio::test]
     async fn test_config_handler_returns_sanitized_config() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _platform_tenant = super::super::control_plane_route_auth_tests::EnvGuard::set(&[(
+            super::super::iam::PLATFORM_ADMIN_TENANT_ENV,
+            "test-tenant".into(),
+        )]);
         let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
         let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
         // 构造一个包含 api_key 的测试配置
@@ -705,9 +709,20 @@ mod tests {
         assert!(!tmp.join("config_override.json").exists());
 
         let secret_value = "test-only-gateway-key";
-        let updated = router
+        let rejected = router
+            .clone()
             .oneshot(put_config(
                 Some(token_for(vec!["DA"], Some("test-project"))),
+                json!({"gateway": {"base_url": "https://blocked.example"}}),
+            ))
+            .await
+            .unwrap();
+        // #274: tightened
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert!(!tmp.join("config_override.json").exists());
+        let updated = router
+            .oneshot(put_config(
+                Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
                 json!({
                     "gateway": {
                         "base_url": "https://configured.example",
@@ -717,6 +732,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        // #274: tightened (success now requires a platform-admin token)
         assert_eq!(updated.status(), StatusCode::OK);
         let override_contents = std::fs::read_to_string(tmp.join("config_override.json")).unwrap();
         assert!(!override_contents.contains(secret_value));

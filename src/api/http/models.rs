@@ -479,7 +479,7 @@ pub(crate) async fn activate_embedding_handler(
     identity: UserIdentity,
     Json(req): Json<EmbeddingActivateRequest>,
 ) -> Response {
-    if let Err(error) = identity.require_control_plane_da("model operations") {
+    if let Err(error) = identity.require_platform_admin("model operations") {
         return error.into_response();
     }
     let m = crate::config::settings::Settings::load_models();
