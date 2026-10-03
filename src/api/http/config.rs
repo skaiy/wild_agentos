@@ -5,7 +5,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -234,7 +239,102 @@ pub(crate) fn json_deep_merge(dst: &mut Value, src: &Value) {
     }
 }
 
-pub(crate) async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+/// Shared first step of both config routes: a verified JWT with isolation
+/// claims. Each route then applies its own role gate (#290 / #274).
+fn require_verified_jwt(identity: &UserIdentity, action: &str) -> Option<Response> {
+    if identity.auth_method != AuthMethod::Jwt || identity.isolation_claims().is_none() {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "unauthorized",
+                    "message": format!("a verified JWT is required to {action} configuration"),
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+/// GET /api/v1/config gate: verified JWT, then either a control-plane DA
+/// (explicit tenant/project + DA) or a platform administrator (#274). On
+/// rejection the DA gate's error is returned unchanged.
+fn require_config_reader(identity: &UserIdentity) -> Option<Response> {
+    if let Some(error) = require_verified_jwt(identity, "read") {
+        return Some(error);
+    }
+    let da = identity.require_control_plane_da("configuration reads");
+    if da.is_ok()
+        || identity
+            .require_platform_admin("configuration reads")
+            .is_ok()
+    {
+        return None;
+    }
+    da.err().map(IntoResponse::into_response)
+}
+
+/// Secret-looking field names, compared after `normalize_field_name`.
+const SECRET_FIELD_NAMES: &[&str] = &[
+    "apikey",
+    "secret",
+    "token",
+    "password",
+    "secretkey",
+    "privatekey",
+    "accesskey",
+    "authorization",
+    "credential",
+    "credentials",
+];
+
+/// Lowercase and drop `_` / `-`, so `accessToken`, `access_token` and
+/// `ACCESS-TOKEN` all normalize to `accesstoken`.
+fn normalize_field_name(key: &str) -> String {
+    key.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Blacklist check used by `scrub_secret_fields`: a field is secret when its
+/// normalized name equals or ends with one of `SECRET_FIELD_NAMES`. Display
+/// flags ending in `configured` (e.g. `api_key_configured`) are kept.
+fn is_secret_field_name(key: &str) -> bool {
+    let name = normalize_field_name(key);
+    if name.ends_with("configured") {
+        return false;
+    }
+    SECRET_FIELD_NAMES
+        .iter()
+        .any(|secret| name.ends_with(secret))
+}
+
+pub(crate) fn scrub_secret_fields(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            fields.retain(|key, _| !is_secret_field_name(key));
+            for value in fields.values_mut() {
+                scrub_secret_fields(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                scrub_secret_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) async fn config_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+) -> impl IntoResponse {
+    if let Some(error) = require_config_reader(&identity) {
+        return error;
+    }
     let mut info = state.config_info.read().await.clone();
     if let Some(obj) = info.as_object_mut() {
         let live = live_runtime_hardening_fields();
@@ -261,7 +361,8 @@ pub(crate) async fn config_handler(State(state): State<Arc<AppState>>) -> impl I
             );
         }
     }
-    Json(info)
+    scrub_secret_fields(&mut info);
+    Json(info).into_response()
 }
 
 /// PUT /api/v1/config — 更新运行期配置并持久化到 data/config_override.json（重启后由 Settings 生效）
@@ -271,17 +372,11 @@ pub(crate) async fn update_config_handler(
     identity: UserIdentity,
     Json(request): Json<ConfigUpdateRequest>,
 ) -> impl IntoResponse {
-    if identity.auth_method != AuthMethod::Jwt || identity.isolation_claims().is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "unauthorized",
-                "message": "a verified JWT is required to update configuration",
-            })),
-        )
-            .into_response();
+    if let Some(error) = require_verified_jwt(&identity, "update") {
+        return error;
     }
-    if let Err(error) = identity.require_control_plane_da("configuration updates") {
+    // #274: process-global writes stay on the platform-admin gate; DA is not enough.
+    if let Err(error) = identity.require_platform_admin("configuration updates") {
         return error.into_response();
     }
     let patch = request.into_patch();
@@ -573,6 +668,10 @@ mod tests {
     #[tokio::test]
     async fn test_config_handler_returns_sanitized_config() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _platform_tenant = super::super::control_plane_route_auth_tests::EnvGuard::set(&[(
+            super::super::iam::PLATFORM_ADMIN_TENANT_ENV,
+            "test-tenant".into(),
+        )]);
         let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
         let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
         // 构造一个包含 api_key 的测试配置
@@ -648,6 +747,25 @@ mod tests {
 
         let req = axum::http::Request::builder()
             .uri("/api/v1/config")
+            .header(
+                "authorization",
+                format!(
+                    "Bearer {}",
+                    encode(
+                        &Header::default(),
+                        &JwtClaims {
+                            sub: "config-test".to_string(),
+                            tenant_id: "test-tenant".to_string(),
+                            project_id: Some("test-project".to_string()),
+                            roles: vec!["DA".to_string()],
+                            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()
+                                as usize,
+                        },
+                        &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+                    )
+                    .unwrap()
+                ),
+            )
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -747,9 +865,20 @@ mod tests {
         assert!(!tmp.join("config_override.json").exists());
 
         let secret_value = "test-only-gateway-key";
-        let updated = router
+        let rejected = router
+            .clone()
             .oneshot(put_config(
                 Some(token_for(vec!["DA"], Some("test-project"))),
+                json!({"gateway": {"base_url": "https://blocked.example"}}),
+            ))
+            .await
+            .unwrap();
+        // #274: tightened
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert!(!tmp.join("config_override.json").exists());
+        let updated = router
+            .oneshot(put_config(
+                Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
                 json!({
                     "gateway": {
                         "base_url": "https://configured.example",
@@ -759,6 +888,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        // #274: tightened (success now requires a platform-admin token)
         assert_eq!(updated.status(), StatusCode::OK);
         let override_contents = std::fs::read_to_string(tmp.join("config_override.json")).unwrap();
         assert!(!override_contents.contains(secret_value));
@@ -779,5 +909,87 @@ mod tests {
             std::env::remove_var("AGENTOS_AUTH_MODE");
         }
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn scrub_secret_fields_recurses_and_preserves_non_secrets() {
+        let mut value = json!({
+            "API_KEY": "hidden",
+            "nested": {
+                "Secret": "hidden",
+                "access_token": "hidden",
+                "refresh_token": "hidden",
+                "ApiKey": "hidden",
+                "api_key_configured": true,
+                "max_tokens": 100,
+                "token_budget": 200,
+                "base_url": "https://example.invalid"
+            },
+            "items": [
+                {"password": "hidden", "client_secret": "hidden", "token_configured": false},
+                {"custom_api_key": "hidden", "service_token": "hidden", "name": "kept"}
+            ]
+        });
+        scrub_secret_fields(&mut value);
+        assert_eq!(
+            value,
+            json!({
+                "nested": {
+                    "api_key_configured": true,
+                    "max_tokens": 100,
+                    "token_budget": 200,
+                    "base_url": "https://example.invalid"
+                },
+                "items": [
+                    {"token_configured": false},
+                    {"name": "kept"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn scrub_secret_fields_normalizes_case_and_separators() {
+        let mut value = json!({
+            "accessToken": "hidden",
+            "ACCESS-TOKEN": "hidden",
+            "apiKey": "hidden",
+            "api-key": "hidden",
+            "clientSecret": "hidden",
+            "secret_key": "hidden",
+            "secretKey": "hidden",
+            "private_key": "hidden",
+            "PrivateKey": "hidden",
+            "aws_access_key": "hidden",
+            "accessKey": "hidden",
+            "Authorization": "hidden",
+            "proxy-authorization": "hidden",
+            "credential": "hidden",
+            "Credentials": {"user": "hidden", "pass": "hidden"},
+            "service_credentials": ["hidden"],
+            "bearerToken": "hidden",
+            "apiKeyConfigured": true,
+            "access-token-configured": false,
+            "maxTokens": 100,
+            "token_budget": 200,
+            "tokenizer": "kept",
+            "keyspace": "kept",
+            "authorized": true,
+            "baseUrl": "https://example.invalid"
+        });
+        scrub_secret_fields(&mut value);
+        assert_eq!(
+            value,
+            json!({
+                "apiKeyConfigured": true,
+                "access-token-configured": false,
+                "maxTokens": 100,
+                "token_budget": 200,
+                "tokenizer": "kept",
+                "keyspace": "kept",
+                "authorized": true,
+                "baseUrl": "https://example.invalid"
+            })
+        );
     }
 }

@@ -714,6 +714,12 @@ mod control_plane_route_auth_tests;
 mod isolation_contract_api_clients_tests;
 
 #[cfg(test)]
+mod isolation_contract_platform_config_tests;
+
+#[cfg(test)]
+mod isolation_contract_config_read_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
