@@ -149,14 +149,12 @@ impl UserIdentity {
         if !auth_strict() && self.auth_method == AuthMethod::Anonymous {
             return Ok(());
         }
+        tracing::debug!(user_id = %self.user_id, required_role = %role, "role required");
         Err((
             StatusCode::FORBIDDEN,
             Json(json!({
                 "error": "forbidden",
                 "required_role": role,
-                "user_id": self.user_id,
-                "user_roles": self.roles,
-                "hint": "Set AGENTOS_AUTH_STRICT=false to bypass role checks in dev mode",
             })),
         ))
     }
@@ -208,7 +206,7 @@ impl<S: Send + Sync> FromRequestParts<S> for UserIdentity {
             if auth_strict() {
                 return Err((
                     StatusCode::UNAUTHORIZED,
-                    "X-Identity is disabled when AGENTOS_AUTH_STRICT=true".to_string(),
+                    "X-Identity is not authorized".to_string(),
                 ));
             }
             if let Ok(val) = hdr.to_str() {
@@ -528,6 +526,68 @@ pub(crate) mod tests {
     };
     use crate::api::http::TEST_ENV_LOCK;
 
+    #[test]
+    fn require_role_does_not_echo_identity_or_bypass_hint() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("AGENTOS_AUTH_STRICT");
+
+        for strict in [false, true] {
+            std::env::set_var("AGENTOS_AUTH_STRICT", if strict { "true" } else { "false" });
+
+            for (user_id, roles, allowed) in [
+                ("caller-without-roles", vec![], false),
+                ("caller-with-other-role", vec!["PA".to_string()], false),
+                ("caller-with-da", vec!["DA".to_string()], true),
+            ] {
+                let identity = UserIdentity {
+                    user_id: user_id.to_string(),
+                    tenant_id: "tenant-a".to_string(),
+                    roles,
+                    auth_method: AuthMethod::Jwt,
+                    isolation_claims: None,
+                };
+                if allowed {
+                    assert!(identity.require_role("DA").is_ok());
+                } else {
+                    let (status, axum::Json(body)) = identity.require_role("DA").unwrap_err();
+                    assert_eq!(status, StatusCode::FORBIDDEN);
+                    let serialized = serde_json::to_string(&body).unwrap();
+                    assert_eq!(serialized, r#"{"error":"forbidden","required_role":"DA"}"#);
+                    for forbidden in [
+                        "user_id",
+                        "user_roles",
+                        "hint",
+                        "AGENTOS_AUTH_STRICT",
+                        user_id,
+                    ] {
+                        assert!(!serialized.contains(forbidden));
+                    }
+                }
+            }
+
+            let anonymous = UserIdentity::anonymous();
+            if strict {
+                let (status, axum::Json(body)) = anonymous.require_role("DA").unwrap_err();
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                let serialized = serde_json::to_string(&body).unwrap();
+                assert_eq!(serialized, r#"{"error":"forbidden","required_role":"DA"}"#);
+                for forbidden in [
+                    "user_id",
+                    "user_roles",
+                    "hint",
+                    "AGENTOS_AUTH_STRICT",
+                    anonymous.user_id.as_str(),
+                ] {
+                    assert!(!serialized.contains(forbidden));
+                }
+            } else {
+                assert!(anonymous.require_role("DA").is_ok());
+            }
+        }
+
+        restore_strict_mode(previous);
+    }
+
     #[tokio::test]
     async fn strict_mode_rejects_forged_x_identity_before_claims_are_created() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -544,6 +604,7 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(rejection.1, "X-Identity is not authorized");
 
         restore_strict_mode(previous);
     }

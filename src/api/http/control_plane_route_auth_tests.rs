@@ -500,6 +500,51 @@ async fn control_plane_routes_require_verified_claims_and_da() {
 }
 
 #[tokio::test]
+async fn control_plane_route_forbidden_body_does_not_echo_caller() {
+    let _lock = TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let data_dir = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set(&[
+        ("AGENTOS_AUTH_MODE", "hs256".into()),
+        ("AGENTOS_AUTH_STRICT", "true".into()),
+        (
+            "AGENTOS_JWT_SECRET",
+            String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        ),
+        (
+            "AGENTOS_DATA_DIR",
+            data_dir.path().to_string_lossy().into_owned(),
+        ),
+    ]);
+    let response = app(test_state(data_dir.path()))
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/api-clients")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", jwt(&["PA"], Some("project-a"))),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        br#"{"error":"forbidden","required_role":"DA"}"#
+    );
+    for forbidden in [b"test-user".as_slice(), b"PA", b"user_id", b"user_roles"] {
+        assert!(!body
+            .windows(forbidden.len())
+            .any(|window| window == forbidden));
+    }
+}
+
+#[tokio::test]
 async fn provider_models_authorization_precedes_outbound_request() {
     let _lock = TEST_ENV_LOCK
         .lock()
