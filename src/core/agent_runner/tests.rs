@@ -193,6 +193,145 @@ async fn scripted_chat_completion(
     Json(response)
 }
 
+async fn immediate_finish(Json(_request): Json<Value>) -> Json<Value> {
+    Json(json!({
+        "id": "complete",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "{\"action\":\"finish\",\"summary\":\"complete\"}"},
+            "finish_reason": "stop"
+        }]
+    }))
+}
+
+#[test]
+fn agent_runner_first_turn_prompts_use_only_turn_schemas() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    immediate_finish(Json(json!({}))).await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for role in [
+            AgentRole::Plan,
+            AgentRole::Do,
+            AgentRole::Check,
+            AgentRole::Act,
+        ] {
+            for _ in 0..2 {
+                let runner = create_test_runner();
+                runner.gateway.set_base_url(format!("http://{address}"));
+                runner
+                    .execute(
+                        &mut AgentInstance::new("agent:prompt".into(), role),
+                        TaskContext::new("iri://task/prompt", "Inspect the task", 1),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let captured = requests.lock().unwrap();
+            let first = &captured[captured.len() - 2];
+            let second = &captured[captured.len() - 1];
+            let prompt = first["messages"][0]["content"].as_str().unwrap();
+            let other = second["messages"][0]["content"].as_str().unwrap();
+            let tools = first["tools"].as_array().unwrap();
+            let names: std::collections::HashSet<_> = tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .collect();
+            let executor = ToolExecutor::new();
+            for description in executor.builtin_tool_descriptions() {
+                assert!(
+                    !prompt.contains(&description.description),
+                    "{role}: {}",
+                    description.name
+                );
+            }
+            // Policy prose may mention disallowed tools as prohibitions. Only
+            // the Tools/Capabilities regions describe available capabilities.
+            let capabilities = prompt
+                .split("# Tools\n")
+                .nth(1)
+                .unwrap_or("")
+                .split("\n# ")
+                .next()
+                .unwrap_or("");
+            for token in capabilities
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|token| token.contains('_'))
+            {
+                if executor.builtin_tool_names().contains(token) {
+                    assert!(names.contains(token), "{role}: unadvertised {token}");
+                }
+            }
+            assert!(prompt.contains(crate::core::system_prompt::platform_environment_hint()));
+            // The Time Awareness region contains the wall clock and session
+            // start time; strip it before comparing the stable prompt bytes.
+            let without_clock = |text: &str| {
+                let (before, rest) = text.split_once("# Time Awareness").unwrap();
+                let (_, after) = rest.split_once("# Workspace Environment").unwrap();
+                format!("{before}# Workspace Environment{after}")
+            };
+            assert_eq!(without_clock(prompt), without_clock(other));
+            eprintln!(
+                "METRIC: {role} first-turn system prompt {} bytes, tools-schema {} bytes, {} tools",
+                prompt.len(),
+                serde_json::to_vec(tools).unwrap().len(),
+                tools.len()
+            );
+        }
+        server.abort();
+    });
+}
+
+#[test]
+fn agent_runner_prompt_templates_and_planned_preference_exclude_hidden_tools() {
+    let runner = create_test_runner();
+    let context = HashMap::new();
+    for role in [
+        AgentRole::Plan,
+        AgentRole::Do,
+        AgentRole::Check,
+        AgentRole::Act,
+    ] {
+        let template = runner.build_agent_md(role, "Inspect", &context, "deepseek-v4-pro");
+        assert!(!template.contains("{available_skills}"));
+        assert!(!template.contains("Write content to a file."));
+        assert!(!template.contains("## Planned Tool Preference"));
+    }
+    let step = crate::core::sa::PlanStep {
+        step_id: "one".into(),
+        role: AgentRole::Plan,
+        objective: "Inspect".into(),
+        expected_output: "Summary".into(),
+        dependencies: vec![],
+        tools_allowed: vec![
+            "grep_search".into(),
+            "file_write".into(),
+            "file_read".into(),
+            "grep_search".into(),
+        ],
+        success_criteria: "Done".into(),
+    };
+    let mut run_tools = runner.tool_executor.read().activated_tools();
+    run_tools.restrict_tools("agent:plan", ["grep_search".into(), "file_read".into()]);
+    let prompt =
+        runner.build_agent_md_from_step(AgentRole::Plan, &step, &context, "agent:plan", &run_tools);
+    assert!(prompt.contains("## Planned Tool Preference\nfile_read, grep_search"));
+    assert!(!prompt.contains("file_write"));
+}
+
 #[test]
 fn agent_runner_passes_context_claims_to_graph_tools_per_tenant() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {

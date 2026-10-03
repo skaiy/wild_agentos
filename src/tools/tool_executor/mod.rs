@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -154,6 +154,10 @@ pub struct MicroToolContext {
 pub struct ToolExecutor {
     tools: HashMap<String, ToolFn>,
     tool_descriptions: Vec<ToolDescription>,
+    description_indices: HashMap<String, usize>,
+    micro_description_order: VecDeque<String>,
+    builtin_tool_names: BTreeSet<String>,
+    registering_builtins: bool,
     kg_store: Arc<std::sync::RwLock<KnowledgeGraphStore>>,
     projection_engine:
         Arc<parking_lot::RwLock<Option<Arc<crate::memory::l3_projection::ProjectionEngine>>>>,
@@ -255,6 +259,10 @@ impl ToolExecutor {
         let mut exe = Self {
             tools: HashMap::new(),
             tool_descriptions: Vec::new(),
+            description_indices: HashMap::new(),
+            micro_description_order: VecDeque::new(),
+            builtin_tool_names: BTreeSet::new(),
+            registering_builtins: false,
             kg_store,
             projection_engine: Arc::new(parking_lot::RwLock::new(None)),
             micro_tool_contexts: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -302,13 +310,29 @@ impl ToolExecutor {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn builtin_tool_names(&self) -> &BTreeSet<String> {
+        &self.builtin_tool_names
+    }
+
+    #[cfg(test)]
+    pub(crate) fn builtin_tool_descriptions(&self) -> impl Iterator<Item = &ToolDescription> {
+        self.tool_descriptions
+            .iter()
+            .filter(|tool| self.builtin_tool_names.contains(&tool.name))
+    }
+
     /// Return the live registry's resident names after the same role policy
     /// used for a first-turn schema. The result is sorted for prompt-only
     /// planning preferences; it never authorizes a call.
-    pub fn visible_tool_names_for_role(&self, role: &str, agent_id: &str) -> Vec<String> {
-        let activated = self.activated_tools();
+    pub fn visible_tool_names_for_role(
+        &self,
+        role: &str,
+        agent_id: &str,
+        activated: &ActivatedTools,
+    ) -> Vec<String> {
         let mut names: Vec<String> = self
-            .tool_definitions_for_turn_with_policy(role, agent_id, &activated)
+            .tool_definitions_for_turn_with_policy(role, agent_id, activated)
             .iter()
             .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_owned))
             .collect();
@@ -400,13 +424,15 @@ impl ToolExecutor {
     }
 
     fn register_builtins(&mut self) {
+        self.registering_builtins = true;
         // All tools open to all roles; LLM selects based on role description in agent.md
         let all: &[&str] = &[];
         self.register(
             "glob_search",
-            "Find files by glob pattern.",
+            "Find file paths matching a glob in a directory. Use when: locating files by name or extension. Not for: searching file contents; use grep_search.",
             json!({
-                "properties": {"pattern": {"type":"string"},"path": {"type":"string"}},
+                "type": "object",
+                "properties": {"pattern": {"type":"string","description":"File-name glob pattern, such as **/*.rs."},"path": {"type":"string","description":"Directory path to search; defaults to the current directory."}},
                 "required": ["pattern"]
             }),
             Arc::new(|input: Value| {
@@ -414,11 +440,12 @@ impl ToolExecutor {
             }),
             all,
         );
-        self.register("grep_search", "Search file contents with regex.", json!({
+        self.register("grep_search", "Search file contents with a regular expression and optional filters. Use when: finding matching lines in files. Not for: locating paths by glob alone; use glob_search.", json!({
+            "type": "object",
             "properties": {
-                "pattern": {"type":"string","description":"Regex pattern to search for"},
-                "path": {"type":"string","description":"Directory to search in"},
-                "glob": {"type":"string","description":"File glob pattern (e.g. *.rs)"},
+                "pattern": {"type":"string","description":"Regular expression to match against file contents."},
+                "path": {"type":"string","description":"Directory path to search; defaults to the current directory."},
+                "glob": {"type":"string","description":"File-name glob filter, such as *.rs."},
                 "output_mode": {"type":"string","description":"Output mode: files_with_matches | content | count"},
                 "before": {"type":"integer","description":"Lines before match (-B)"},
                 "after": {"type":"integer","description":"Lines after match (-A)"},
@@ -426,17 +453,18 @@ impl ToolExecutor {
                 "line_numbers": {"type":"boolean","description":"Show line numbers (default true)"},
                 "head_limit": {"type":"integer","description":"Limit number of results (default 250)"},
                 "offset": {"type":"integer","description":"Skip first N results"},
-                "-i": {"type":"boolean","description":"Case insensitive search"},
-                "multiline": {"type":"boolean","description":"Enable multiline mode"},
+                "-i": {"type":"boolean","description":"Case-insensitive search; default false."},
+                "multiline": {"type":"boolean","description":"Match across lines; default false."},
                 "file_type": {"type":"string","description":"File type filter (rust, python, etc.)"}
             },
             "required": ["pattern"]
         }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_grep_search(input).await })), all);
         self.register(
             "web_fetch",
-            "Fetch a URL into readable text.",
+            "Fetch and extract readable text from one web page. Use when: the URL is already known and its content is needed. Not for: finding URLs; use web_search.",
             json!({
-                "properties": {"url": {"type":"string"},"prompt": {"type":"string"}},
+                "type": "object",
+                "properties": {"url": {"type":"string","description":"Absolute HTTP or HTTPS URL to fetch."},"prompt": {"type":"string","description":"Optional question to focus the extracted page text."}},
                 "required": ["url"]
             }),
             Arc::new(|input: Value| {
@@ -446,9 +474,10 @@ impl ToolExecutor {
         );
         self.register(
             "web_search",
-            "Search the web for information.",
+            "Search public web pages by query and return matching results. Use when: finding sources without a known URL. Not for: reading a known page; use web_fetch.",
             json!({
-                "properties": {"query": {"type":"string","minLength":2}},
+                "type": "object",
+                "properties": {"query": {"type":"string","minLength":2,"description":"Search phrase of at least two characters."}},
                 "required": ["query"]
             }),
             Arc::new(|input: Value| {
@@ -458,8 +487,9 @@ impl ToolExecutor {
         );
         self.register(
             "tool_search",
-            "Find tools relevant to a task before choosing a tool. Searches tool names, descriptions, parameters, and groups; returns only tools visible to the runtime role. Do not use to execute a tool or change permissions.",
+            "Find role-visible tools by name, description, parameter, or group; returns ranked matches for later turns. Use when: discovering an on-demand capability. Not for: executing tools or changing permissions.",
             json!({
+                "type": "object",
                 "properties": {
                     "query": {"type":"string", "description":"Task or capability to find; include operation and relevant parameter terms."},
                     "max_results": {"type":"integer", "description":"Optional result count from 0 to 10; defaults to 5."}
@@ -475,9 +505,10 @@ impl ToolExecutor {
             all,
         );
         let ws_read = self.workspace_monitor.clone();
-        self.register("file_read", "Read a text file. Reads the entire file by default. On re-read of a changed file, returns a unified diff showing what changed. On re-read of an unchanged file, returns from_cache=true — content already in your context, skip re-reading. Use mode:full to force full content, mode:changed_only to get only the new/changed lines.", json!({
+        self.register("file_read", "Read text file lines, with optional offsets and workspace diff/cache modes on repeat reads. Use when: inspecting file content. Not for: listing directory entries; use file_list.", json!({
+            "type": "object",
             "properties": {
-                "path": {"type":"string", "description": "File path to read"},
+                "path": {"type":"string", "description": "Path of the text file to read."},
                 "offset": {"type":"integer", "description": "Line offset to start from (0-indexed). Omit to read from beginning."},
                 "limit": {"type":"integer", "description": "Number of lines to return. Omit to read all remaining lines from offset."},
                 "mode": {"type":"string", "description": "Read mode: auto (default=use diff if previously read) | full | force_refresh | diff | changed_only"}
@@ -550,9 +581,10 @@ impl ToolExecutor {
         let ws_write = self.workspace_monitor.clone();
         self.register(
             "file_write",
-            "Write content to a file.",
+            "Write the complete supplied content to a file, creating or replacing it. Use when: a whole file must be written. Not for: a targeted change in an existing file; use file_edit.",
             json!({
-                "properties": {"path": {"type":"string"},"content": {"type":"string"}},
+                "type": "object",
+                "properties": {"path": {"type":"string","description":"Path of the file to create or replace."},"content": {"type":"string","description":"Complete text content to write."}},
                 "required": ["path","content"]
             }),
             Arc::new(move |input: Value| {
@@ -573,7 +605,8 @@ impl ToolExecutor {
             all,
         );
         let ws_status = self.workspace_monitor.clone();
-        self.register("workspace_status", "View workspace file status summary: stale files, written-unread files, counts by state and language.", json!({
+        self.register("workspace_status", "Summarize tracked workspace files by state and language, including stale and unread writes. Use when: checking tracked file status. Not for: listing directory contents; use file_list.", json!({
+            "type": "object",
             "properties": {},
             "required": []
         }), Arc::new(move |_: Value| {
@@ -620,9 +653,10 @@ impl ToolExecutor {
         let ws_list = self.workspace_monitor.clone();
         self.register(
             "file_list",
-            "List files in a directory.",
+            "List entries in a directory and include tracked file state when available. Use when: browsing directory contents. Not for: reading file text; use file_read.",
             json!({
-                "properties": {"path": {"type":"string"}},
+                "type": "object",
+                "properties": {"path": {"type":"string","description":"Directory path to list; defaults to the current directory."}},
                 "required": []
             }),
             Arc::new(move |input: Value| {
@@ -658,17 +692,18 @@ impl ToolExecutor {
             all,
         );
         let bash_desc = if cfg!(target_os = "windows") {
-            "Execute a shell command via PowerShell. Use for running python, pytest, etc. Supports most common shell commands.\n\nOUTPUT MANAGEMENT (mandatory):\n- If the command may produce >100 lines of output, pipe through | head -N or | grep <keyword> to limit results\n- Use | tail -N for recent entries, | wc -l to count first, | grep -c to match-count\n- For file searches, constrain the path (e.g. grep ... path/) instead of searching the entire workspace\n- The output will be truncated at 16KB if too large; always filter proactively to avoid losing data"
+            "Run a shell command through PowerShell with bounded output and optional background execution. Use when: running general commands. Not for: a specifically PowerShell command; use powershell."
         } else {
-            "Execute a shell command. Use for running python, pytest, etc.\n\nOUTPUT MANAGEMENT (mandatory):\n- If the command may produce >100 lines of output, pipe through | head -N or | grep <keyword> to limit results\n- Use | tail -N for recent entries, | wc -l to count first, | grep -c to match-count\n- For file searches, constrain the path (e.g. grep ... path/) instead of searching the entire workspace\n- The output will be truncated at 16KB if too large; always filter proactively to avoid losing data"
+            "Run a shell command with bounded output and optional background execution. Use when: running scripts, builds, or tests. Not for: PowerShell syntax; use powershell."
         };
         self.register("bash", bash_desc, json!({
+            "type": "object",
             "properties": {
                 "command": {"type":"string","description":"Shell command to run"},
                 "description": {"type":"string","description":"What this command does"},
                 "timeout": {"type":"integer","description":"Timeout in milliseconds"},
                 "run_in_background": {"type":"boolean","description":"Spawn detached and return a task id immediately (default false)"},
-                "dangerouslyDisableSandbox": {"type":"boolean","description":"Unsupported for the default shell tool. Commands without an active sandbox are rejected."},
+                "dangerouslyDisableSandbox": {"type":"boolean","description":"Disable sandbox; default false. Unsupported without an active sandbox."},
                 "namespaceRestrictions": {"type":"boolean","description":"Enable user/mount/pid namespace isolation via unshare (default true when sandbox enabled)"},
                 "isolateNetwork": {"type":"boolean","description":"Isolate network via a new network namespace (default false)"},
                 "filesystemMode": {"type":"string","enum":["off","workspace-only","allow-list"],"description":"Filesystem isolation level (default workspace-only)"},
@@ -677,9 +712,10 @@ impl ToolExecutor {
             "required": ["command"]
         }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_bash(input).await })), all);
         let ws_edit = self.workspace_monitor.clone();
-        self.register("file_edit", "Edit a file by replacing old_string with new_string.", json!({
+        self.register("file_edit", "Replace matching text in an existing file, optionally replacing all occurrences. Use when: making a targeted change. Not for: creating or replacing a whole file; use file_write.", json!({
+            "type": "object",
             "properties": {
-                "path": {"type":"string","description":"File path to edit"},
+                "path": {"type":"string","description":"Path of the existing file to edit."},
                 "old_string": {"type":"string","description":"Text to find and replace"},
                 "new_string": {"type":"string","description":"Replacement text"},
                 "replace_all": {"type":"boolean","description":"Replace all occurrences (default: false)"}
@@ -702,8 +738,9 @@ impl ToolExecutor {
         }), all);
         self.register(
             "powershell",
-            "Execute a PowerShell command.",
+            "Run a PowerShell command and return its bounded output. Use when: the command requires PowerShell syntax. Not for: general shell commands; use bash.",
             json!({
+                "type": "object",
                 "properties": {
                     "command": {"type":"string","description":"PowerShell command to run"},
                     "description": {"type":"string","description":"What this command does"},
@@ -716,23 +753,27 @@ impl ToolExecutor {
             }),
             all,
         );
-        self.register("rag_search", "Semantic search for relevant documents using RAG (Retrieval-Augmented Generation).", json!({
-            "properties": {"query": {"type":"string","description":"Search query"},"limit": {"type":"integer","description":"Max results"}},
+        self.register("rag_search", "Retrieve semantically relevant chunks from the RAG index. Use when: searching indexed documents by meaning. Not for: matching file text by regex; use grep_search.", json!({
+            "type": "object",
+            "properties": {"query": {"type":"string","description":"Natural-language search query."},"limit": {"type":"integer","description":"Maximum number of matching chunks."}},
             "required": ["query"]
         }), sync_tool_ref(rag::execute_rag_search), all);
-        self.register("rag_index", "Index a document for RAG retrieval.", json!({
+        self.register("rag_index", "Index supplied document text for later semantic retrieval. Use when: adding a document to RAG storage. Not for: splitting text without indexing; use rag_chunk.", json!({
+            "type": "object",
             "properties": {"content": {"type":"string","description":"Document content to index"},"iri": {"type":"string","description":"Optional IRI identifier"},"tags": {"type":"array","items":{"type":"string"},"description":"Optional tags"}},
             "required": ["content"]
         }), sync_tool_ref(rag::execute_rag_index), all);
-        self.register("rag_chunk", "Split a document into chunks for indexing.", json!({
+        self.register("rag_chunk", "Split supplied document text into overlapping chunks without indexing it. Use when: previewing segmentation. Not for: persisting searchable text; use rag_index.", json!({
+            "type": "object",
             "properties": {"content": {"type":"string","description":"Document content to chunk"},"chunk_size": {"type":"integer","description":"Chunk size in characters (default 500)"},"overlap": {"type":"integer","description":"Overlap between chunks (default 50)"}},
             "required": ["content"]
         }), sync_tool_ref(rag::execute_rag_chunk), all);
 
         // ========== Knowledge Import Tools ==========
-        self.register("knowledge_import_file", "Import knowledge from a file (Markdown, TXT, HTML, JSON, etc.). Auto-chunks and indexes the content.", json!({
+        self.register("knowledge_import_file", "Read a local file, chunk its content, and index it as knowledge. Use when: importing one file. Not for: importing a whole folder; use knowledge_import_directory.", json!({
+            "type": "object",
             "properties": {
-                "path": {"type":"string","description":"File path to import"},
+                "path": {"type":"string","description":"Path of the local file to import."},
                 "tags": {"type":"array","items":{"type":"string"},"description":"Tags for categorization"},
                 "chunk_size": {"type":"integer","description":"Chunk size in characters (default 1000)"},
                 "overlap": {"type":"integer","description":"Overlap between chunks (default 100)"},
@@ -741,21 +782,23 @@ impl ToolExecutor {
             "required": ["path"]
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_import_file(input).await })), all);
 
-        self.register("knowledge_import_url", "Import knowledge from a URL. Fetches and extracts text content from web pages.", json!({
+        self.register("knowledge_import_url", "Fetch a web page, extract its text, and index it as knowledge. Use when: importing one URL. Not for: importing a local file; use knowledge_import_file.", json!({
+            "type": "object",
             "properties": {
-                "url": {"type":"string","description":"URL to fetch and import"},
+                "url": {"type":"string","description":"Absolute HTTP or HTTPS URL to fetch and import."},
                 "tags": {"type":"array","items":{"type":"string"},"description":"Tags for categorization"},
                 "chunk_size": {"type":"integer","description":"Chunk size in characters (default 1000)"},
                 "overlap": {"type":"integer","description":"Overlap between chunks (default 100)"},
-                "selector": {"type":"string","description":"CSS selector or regex to extract specific content"}
+                "selector": {"type":"string","description":"CSS selector for page content to extract."}
             },
             "required": ["url"]
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_import_url(input).await })), all);
 
-        self.register("knowledge_import_directory", "Batch import knowledge from a directory. Recursively processes matching files.", json!({
+        self.register("knowledge_import_directory", "Index matching files from a directory, optionally including subdirectories. Use when: importing many files. Not for: one file; use knowledge_import_file.", json!({
+            "type": "object",
             "properties": {
-                "path": {"type":"string","description":"Directory path to import"},
-                "pattern": {"type":"string","description":"File pattern (default: *.md,*.txt,*.html,*.json)"},
+                "path": {"type":"string","description":"Directory path containing files to import."},
+                "pattern": {"type":"string","description":"File-name glob pattern; default includes md, txt, html, and json."},
                 "tags": {"type":"array","items":{"type":"string"},"description":"Tags for categorization"},
                 "recursive": {"type":"boolean","description":"Recursively process subdirectories (default true)"},
                 "chunk_size": {"type":"integer","description":"Chunk size in characters (default 1000)"},
@@ -764,7 +807,8 @@ impl ToolExecutor {
             "required": ["path"]
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_import_directory(input).await })), all);
 
-        self.register("knowledge_list", "List imported knowledge entries with optional filtering.", json!({
+        self.register("knowledge_list", "List indexed knowledge entries with optional source, tag, and pagination filters. Use when: browsing entries. Not for: relevance-ranked matches; use knowledge_search.", json!({
+            "type": "object",
             "properties": {
                 "tags": {"type":"array","items":{"type":"string"},"description":"Filter by tags"},
                 "source_type": {"type":"string","description":"Filter by source type (file, url)"},
@@ -773,15 +817,17 @@ impl ToolExecutor {
             }
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_list(input).await })), all);
 
-        self.register("knowledge_delete", "Delete imported knowledge entries by IRI or tags.", json!({
+        self.register("knowledge_delete", "Delete indexed knowledge entries by IRI, tags, or all entries when explicitly requested. Use when: removing stored entries. Not for: changing content; use knowledge_update.", json!({
+            "type": "object",
             "properties": {
                 "iri": {"type":"string","description":"IRI of knowledge entry to delete"},
                 "tags": {"type":"array","items":{"type":"string"},"description":"Delete all entries with these tags"},
-                "all": {"type":"boolean","description":"Delete all knowledge entries"}
+                "all": {"type":"boolean","description":"Delete all knowledge entries; default false."}
             }
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_delete(input).await })), all);
 
-        self.register("knowledge_search", "Search imported knowledge with keyword matching and optional tag filtering.", json!({
+        self.register("knowledge_search", "Rank imported knowledge entries by keyword relevance, optionally filtered by tags. Use when: finding matching entries. Not for: browsing all entries; use knowledge_list.", json!({
+            "type": "object",
             "properties": {
                 "query": {"type":"string","description":"Search query"},
                 "tags": {"type":"array","items":{"type":"string"},"description":"Filter by tags"},
@@ -791,7 +837,8 @@ impl ToolExecutor {
             "required": ["query"]
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_search(input).await })), all);
 
-        self.register("knowledge_update", "Update content or tags of an imported knowledge entry.", json!({
+        self.register("knowledge_update", "Change the content or tags of an existing indexed knowledge entry. Use when: revising an entry by IRI. Not for: deleting entries; use knowledge_delete.", json!({
+            "type": "object",
             "properties": {
                 "iri": {"type":"string","description":"IRI of knowledge entry to update"},
                 "content": {"type":"string","description":"New content"},
@@ -802,7 +849,8 @@ impl ToolExecutor {
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_update(input).await })), all);
 
         // ========== Skill Creation Tools ==========
-        self.register("create_skill", "Create a new Skill definition from natural language description using LLM. The skill will be auto-registered and available for use.", json!({
+        self.register("create_skill", "Generate and register a skill definition from a natural-language request. Use when: creating a new skill from instructions. Not for: converting existing Markdown; use convert_skill.", json!({
+            "type": "object",
             "properties": {
                 "description": {"type":"string","description":"Natural language description of the skill to create"},
                 "skill_name_hint": {"type":"string","description":"Suggested skill name (optional, lowercase with underscores)"},
@@ -812,20 +860,22 @@ impl ToolExecutor {
             "required": ["description"]
         }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_create_skill(input).await })), &["DA"]);
 
-        self.register("convert_skill", "Convert a Markdown-formatted skill description into a JSON-LD Skill definition. Parses the markdown structure and generates proper skill schema.", json!({
+        self.register("convert_skill", "Convert a Markdown skill description into a JSON-LD skill definition. Use when: structured Markdown is already available. Not for: generating from a request; use create_skill.", json!({
+            "type": "object",
             "properties": {
                 "markdown_content": {"type":"string","description":"Markdown content describing the skill"},
-                "source_path": {"type":"string","description":"Source file path (optional)"}
+                "source_path": {"type":"string","description":"Optional path of the source Markdown file."}
             },
             "required": ["markdown_content"]
         }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_convert_skill(input).await })), &["DA","CA"]);
 
         // ========== Knowledge Graph Tools ==========
         let kg_store_for_extract = self.kg_store.clone();
-        self.register("knowledge_extract", "Extract entities and relations from unstructured text into the knowledge graph. Uses LLM for intelligent extraction.", json!({
+        self.register("knowledge_extract", "Extract entities and relations from supplied text into the knowledge graph. Use when: converting prose into graph facts. Not for: querying stored facts; use knowledge_query.", json!({
+            "type": "object",
             "properties": {
                 "text": {"type":"string","description":"Text content to extract from."},
-                "domain": {"type":"string","description":"Domain filter (optional, e.g. business/core)."}
+                "domain": {"type":"string","description":"Optional extraction domain hint."}
             },
             "required": ["text"]
         }), Arc::new(move |input: Value| {
@@ -836,8 +886,9 @@ impl ToolExecutor {
         let kg_store_for_query = self.kg_store.clone();
         self.register(
             "knowledge_query",
-            "Execute a SPARQL SELECT query against the knowledge graph.",
+            "Run a SPARQL SELECT query over the knowledge graph and return bindings. Use when: querying graph triples precisely. Not for: fuzzy entity lookup; use kg_search.",
             json!({
+                "type": "object",
                 "properties": {
                     "sparql": {"type":"string","description":"SPARQL SELECT query statement."},
                     "named_graph": {"type":"string","description":"Named graph IRI (optional)."}
@@ -852,7 +903,8 @@ impl ToolExecutor {
         );
 
         let kg_store_for_search = self.kg_store.clone();
-        self.register("kg_search", "Fuzzy search entities in the knowledge graph.", json!({
+        self.register("kg_search", "Find knowledge-graph entities by fuzzy keyword and optional type. Use when: locating graph nodes. Not for: SPARQL triple patterns; use knowledge_query.", json!({
+            "type": "object",
             "properties": {
                 "keyword": {"type":"string","description":"Search keyword."},
                 "entity_type": {"type":"string","description":"Entity type IRI filter (optional)."}
@@ -864,7 +916,8 @@ impl ToolExecutor {
         }), all);
 
         let vector_store_for_search = self.vector_store.clone();
-        self.register("kb_vector_search", "Semantic (vector) retrieval over ingested knowledge bases. Use for natural-language questions where keyword matching fails (e.g. maintenance manuals, domain documents). Returns text chunks ranked by semantic similarity.", json!({
+        self.register("kb_vector_search", "Return vector-ranked text chunks from an ingested knowledge namespace. Use when: semantic document retrieval is needed. Not for: fuzzy graph entities; use kg_search.", json!({
+            "type": "object",
             "properties": {
                 "query": {"type":"string","description":"Natural-language query for semantic retrieval."},
                 "namespace": {"type":"string","description":"Vector namespace to restrict search to a specific knowledge base (optional)."},
@@ -879,8 +932,9 @@ impl ToolExecutor {
         let kg_store_for_neighbors = self.kg_store.clone();
         self.register(
             "knowledge_neighbors",
-            "Get neighbor nodes and relations of a specified entity in the knowledge graph.",
+            "Traverse neighboring graph entities and their relations up to the requested depth. Use when: exploring connections from an entity. Not for: finding an entity by keyword; use kg_search.",
             json!({
+                "type": "object",
                 "properties": {
                     "entity_id": {"type":"string","description":"Entity ID or IRI."},
                     "depth": {"type":"integer","description":"Traversal depth (1-3, default 1)."}
@@ -897,10 +951,11 @@ impl ToolExecutor {
         );
 
         let kg_store_for_import = self.kg_store.clone();
-        self.register("knowledge_import_json", "Map structured JSON data into knowledge graph nodes.", json!({
+        self.register("knowledge_import_json", "Map structured JSON objects into knowledge-graph nodes using a supplied mapping. Use when: importing structured data. Not for: indexing document text; use knowledge_import_file.", json!({
+            "type": "object",
             "properties": {
-                "json_data": {"type":"string","description":"JSON data (object or array)."},
-                "mapping_config": {"type":"string","description":"Mapping config JSON: {id_field, type_field, label_field, relations:[{field, relation, target_prefix}]}."}
+                "json_data": {"type":"string","description":"JSON string containing an object or array of objects."},
+                "mapping_config": {"type":"string","description":"JSON mapping string with id_field, type_field, label_field and optional relations."}
             },
             "required": ["json_data","mapping_config"]
         }), Arc::new(move |input: Value| {
@@ -909,7 +964,8 @@ impl ToolExecutor {
         }), all);
 
         let kg_store_for_ontology = self.kg_store.clone();
-        self.register("ontology_register", "Register custom ontology classes or properties to the knowledge graph.", json!({
+        self.register("ontology_register", "Register ontology classes or properties in the knowledge graph. Use when: adding schema terms. Not for: checking RDF syntax; use ontology_validate_turtle.", json!({
+            "type": "object",
             "properties": {
                 "terms": {
                     "type": "array",
@@ -933,7 +989,8 @@ impl ToolExecutor {
         }), all);
 
         let kg_store_for_bridge = self.kg_store.clone();
-        self.register("knowledge_bridge", "Create bridge relations between knowledge graph entities and skills.", json!({
+        self.register("knowledge_bridge", "Link a knowledge-graph entity to a skill with a relation. Use when: associating stored entities and skills. Not for: creating graph entities from prose; use knowledge_extract.", json!({
+            "type": "object",
             "properties": {
                 "entity_id": {"type":"string","description":"Entity ID."},
                 "skill_iri": {"type":"string","description":"Skill IRI."},
@@ -946,9 +1003,10 @@ impl ToolExecutor {
         }), all);
 
         let kg_store_for_code = self.kg_store.clone();
-        self.register("knowledge_extract_code", "Extract AST structure (functions, classes, imports, call relations etc.) from code files using tree-sitter and write to knowledge graph. Supports incremental updates: skips unchanged files automatically. Supports Rust/Python/JS/TS/Go/Java/C/C++.", json!({
+        self.register("knowledge_extract_code", "Parse a code file into graph entities and relations, skipping unchanged files unless forced. Use when: indexing source structure. Not for: searching file text; use grep_search.", json!({
+            "type": "object",
             "properties": {
-                "file_path": {"type":"string","description":"Code file path."},
+                "file_path": {"type":"string","description":"Path of the source code file to parse."},
                 "named_graph": {"type":"string","description":"Named graph IRI (optional, default graph:code)."},
                 "force": {"type":"boolean","description":"Force full extraction, ignore cache (optional, default false)."}
             },
@@ -960,7 +1018,8 @@ impl ToolExecutor {
 
         // ========== L3 Projection Query Tool ==========
         let proj_for_tool = self.projection_engine.clone();
-        self.register("read_agent_output", "Read the complete output of a specified agent via L3 projection. Use to view detailed reports from previous agents (PA/DA/CA/AA). node_iri is obtained from task context (format: iri://task/xxx/turn_3).", json!({
+        self.register("read_agent_output", "Read a previous agent's complete output from its projected task node. Use when: inspecting prior agent results by node IRI. Not for: reading a workspace file; use file_read.", json!({
+            "type": "object",
             "properties": {
                 "node_iri": {"type":"string","description":"L2 node IRI to read (e.g. iri://task/xxx/turn_3)."}
             },
@@ -989,8 +1048,9 @@ impl ToolExecutor {
         {
             self.register(
                 "ontology_validate_turtle",
-                "Validate Turtle RDF syntax. Returns number of valid triples.",
+                "Parse Turtle RDF and report syntax validity and triple count. Use when: checking whether Turtle parses. Not for: style warnings; use ontology_lint_turtle.",
                 json!({
+                    "type": "object",
                     "properties": {
                         "ttl": {"type":"string","description":"Turtle content to validate"}
                     },
@@ -1006,8 +1066,9 @@ impl ToolExecutor {
 
             self.register(
                 "ontology_lint_turtle",
-                "Lint Turtle content for best practices (labels, comments, domain/range).",
+                "Check Turtle RDF for missing labels, comments, and domain or range guidance. Use when: reviewing ontology quality. Not for: syntax validation alone; use ontology_validate_turtle.",
                 json!({
+                    "type": "object",
                     "properties": {
                         "ttl": {"type":"string","description":"Turtle content to lint"}
                     },
@@ -1023,8 +1084,9 @@ impl ToolExecutor {
 
             self.register(
                 "ontology_diff_turtle",
-                "Diff two Turtle documents and report added/removed triples.",
+                "Compare two Turtle documents and report added and removed triples. Use when: reviewing RDF changes. Not for: syntax checking one document; use ontology_validate_turtle.",
                 json!({
+                    "type": "object",
                     "properties": {
                         "old_ttl": {"type":"string","description":"Original Turtle content"},
                         "new_ttl": {"type":"string","description":"New Turtle content"}
@@ -1039,7 +1101,8 @@ impl ToolExecutor {
                 all,
             );
 
-            self.register("ontology_validate_shacl", "Validate RDF data against SHACL shapes.", json!({
+            self.register("ontology_validate_shacl", "Validate RDF data against supplied SHACL shapes and report violations. Use when: checking shape constraints. Not for: Turtle syntax alone; use ontology_validate_turtle.", json!({
+                "type": "object",
                 "properties": {
                     "shapes_ttl": {"type":"string","description":"SHACL shapes in Turtle format"},
                     "data_ttl": {"type":"string","description":"Optional data Turtle to validate. If omitted, validates loaded store."}
@@ -1047,7 +1110,8 @@ impl ToolExecutor {
                 "required": ["shapes_ttl"]
             }), Arc::new(|input: Value| Box::pin(async move { ontology_tools::execute_ontology_validate_shacl(input).await })), all);
 
-            self.register("ontology_reason", "Run RDFS/OWL-RL reasoning on Turtle data. Returns inferred triples.", json!({
+            self.register("ontology_reason", "Infer triples from Turtle data with a selected RDFS or OWL reasoning profile. Use when: materializing logical consequences. Not for: validating shapes; use ontology_validate_shacl.", json!({
+                "type": "object",
                 "properties": {
                     "ttl": {"type":"string","description":"Turtle data to reason over"},
                     "profile": {"type":"string","description":"Reasoning profile: rdfs, owl-rl (default), owl-rl-ext, owl-dl"},
@@ -1056,6 +1120,7 @@ impl ToolExecutor {
                 "required": ["ttl"]
             }), Arc::new(|input: Value| Box::pin(async move { ontology_tools::execute_ontology_reason(input).await })), all);
         }
+        self.registering_builtins = false;
     }
 
     /// Register a tool with role whitelist. Empty = all roles allowed.
@@ -1068,49 +1133,57 @@ impl ToolExecutor {
         allowed_roles: &[&str],
     ) {
         let roles: Vec<String> = allowed_roles.iter().map(|s| s.to_string()).collect();
-        let description = tool_description_lint::normalize_builtin_description(name, description);
-        let parameters = tool_description_lint::normalize_parameter_descriptions(parameters);
+        if self.registering_builtins {
+            self.builtin_tool_names.insert(name.to_string());
+        } else {
+            let candidate = ToolDescription {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: parameters.clone(),
+                allowed_roles: roles.clone(),
+            };
+            let violations = tool_description_lint::lint_tool(&candidate);
+            if !violations.is_empty() {
+                warn!(
+                    tool = name,
+                    violations = %violations.join("; "),
+                    "registered tool does not meet description lint"
+                );
+            }
+        }
         self.tools.insert(name.to_string(), handler);
 
-        if let Some(existing) = self.tool_descriptions.iter_mut().find(|td| td.name == name) {
-            existing.description = description;
-            existing.parameters = parameters.clone();
+        if let Some(&index) = self.description_indices.get(name) {
+            let existing = &mut self.tool_descriptions[index];
+            existing.description = description.to_string();
+            existing.parameters = parameters;
             existing.allowed_roles = roles;
         } else {
+            self.description_indices
+                .insert(name.to_string(), self.tool_descriptions.len());
             self.tool_descriptions.push(ToolDescription {
                 name: name.to_string(),
-                description,
+                description: description.to_string(),
                 parameters,
                 allowed_roles: roles,
             });
-            // Micro-tool description cap: removes oldest when exceeded
             if Self::is_micro_tool_name(name) {
-                while self
-                    .tool_descriptions
-                    .iter()
-                    .filter(|td| Self::is_micro_tool_name(&td.name))
-                    .count()
-                    > MAX_MICRO_TOOL_DESCRIPTIONS
-                {
-                    // position() returns the first match (oldest registered)
+                self.micro_description_order.push_back(name.to_string());
+                if self.micro_description_order.len() > MAX_MICRO_TOOL_DESCRIPTIONS {
                     if let Some(pos) = self
-                        .tool_descriptions
-                        .iter()
-                        .position(|td| Self::is_micro_tool_name(&td.name))
+                        .micro_description_order
+                        .pop_front()
+                        .and_then(|oldest| self.description_indices.remove(&oldest))
                     {
                         self.tool_descriptions.remove(pos);
-                    } else {
-                        break;
+                        // Capped micro-tools are appended after resident tools.
+                        // Repair only the shifted tail when retiring the oldest.
+                        for (index, tool) in self.tool_descriptions.iter().enumerate().skip(pos) {
+                            self.description_indices.insert(tool.name.clone(), index);
+                        }
                     }
                 }
             }
-        }
-        if let Err(violations) = tool_description_lint::lint_registry(&self.tool_descriptions) {
-            warn!(
-                tool = name,
-                violations = %violations.join("; "),
-                "registered tool does not meet description lint"
-            );
         }
     }
 
@@ -1407,29 +1480,15 @@ impl ToolExecutor {
         input: Value,
         context: SecurityContext,
         advertised_tools: &[String],
-    ) -> Result<Value, ToolExecutionError> {
-        self.execute_with_security_context_and_claims(name, input, context, advertised_tools, None)
-            .await
-    }
-
-    /// Executes a tool with identity already verified by the runtime boundary.
-    ///
-    /// Tool arguments never carry claims or select graph/vector targets.
-    pub async fn execute_with_security_context_and_claims(
-        &self,
-        name: &str,
-        input: Value,
-        context: SecurityContext,
-        advertised_tools: &[String],
-        claims: Option<IsolationClaims>,
+        policy: &ToolPolicy,
     ) -> Result<Value, ToolExecutionError> {
         self.execute_with_security_context_and_claims_and_policy(
             name,
             input,
             context,
             advertised_tools,
-            claims,
-            &ToolPolicy::new(),
+            None,
+            policy,
         )
         .await
     }

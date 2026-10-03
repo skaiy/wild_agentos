@@ -92,22 +92,43 @@ Plan、Check 与 Act 默认只读。只有在明确开启服务端
 每轮函数 schema 是每个工具定义的唯一真源。系统提示词不再重复文本菜单；
 环境区域保留平台提示，并且在适用时保留稳定的按需分组目录。
 
-`tool_description_lint` 测试会检查每个已注册内置工具：
+### 来源与执行时机
 
-- 名称使用小写 snake case、全局唯一，不使用版本后缀或泛化名称；
-- 描述长度为 80–600 字节，并使用固定的 `Use when:` 与 `Not for:` 标记；
-- 容易混淆的工具必须在 `Not for:` 中点名同族工具；
-- object schema 为每个参数提供说明，`required` 名称存在于 `properties`，
-  布尔参数说明默认值，路径、URL、模式和枚举输入说明格式或提供 schema 约束；
-- 每个角色的常驻 schema 必须符合配置的字节预算。
+内置工具及参数描述是在注册处手写的字面量，运行时不做自动规范化。
+内置工具集合由注册过程记录，而非手工维护名称列表。运行
+`cargo test --lib tool_description_lint` 检查原始定义。外部及生成的
+工具在运行时仅针对该工具记录 warning，不修改也不阻止注册。
 
-初始容易混淆的族群包括文件与知识搜索、文件写入与编辑、shell 命令、网页搜索
-与读取、知识导入和本体校验。代码生成的 micro-tool 只豁免 `Not for:` 标记，
-参数说明仍会检查。以后如确需豁免，必须在 `LINT_EXEMPTIONS` 写明简短原因；
-测试会阻止已批准的豁免数量增加。
+### 规则
 
-例如，将模糊的 `Write content to a file.` 改写为：
+- 名称使用小写 snake case、全局唯一，不使用数字版本后缀或泛化名称。
+- 描述长度为 80–600 字节，包含字面标记 `Use when:` 与 `Not for:`。
+- 容易混淆的工具在 `Not for:` 中点名真正的同族工具，并说明何时改用它。
+- 参数必须是 object schema，每个属性都要有说明；`required` 名称必须
+  存在于 `properties`。布尔参数说明真实默认值。路径、URL、正则、
+  glob 和类似枚举的输入说明格式，或使用处理器已实施的 schema 约束。
+- 每个角色的常驻序列化 schema 不超过 48,000 字节；测试也检查外部
+  描述的 Jaccard 相似度。
 
-> Write a complete text file. Use when: creating or replacing the file is
-> required. Not for: `file_edit`; use that tool for a targeted replacement in
-> an existing file.
+### 易混淆工具族
+
+| 族 | 工具 |
+| --- | --- |
+| 搜索 | `grep_search`, `glob_search`, `rag_search`, `kg_search`, `kb_vector_search`, `knowledge_search`, `knowledge_query`, `knowledge_list` |
+| 写入 | `file_write`, `file_edit` |
+| Shell | `bash`, `powershell` |
+| Web | `web_search`, `web_fetch` |
+| 导入 | `knowledge_import_file`, `knowledge_import_url`, `knowledge_import_directory`, `knowledge_import_json` |
+| 本体校验 | `ontology_validate_turtle`, `ontology_lint_turtle`, `ontology_validate_shacl` |
+
+### 豁免与示例
+
+生成的 micro-tool 只豁免上述标记，仍须检查参数描述。其他豁免
+必须在 `LINT_EXEMPTIONS` 写明原因，并获准增加 `MAX_LINT_EXEMPTIONS`
+（当前为零）；测试会校验两者。
+
+修改前：`file_write` 的描述为 `Write content to a file.`
+
+修改后：`Write the complete supplied content to a file, creating or replacing
+it. Use when: a whole file must be written. Not for: a targeted change in an
+existing file; use file_edit.`

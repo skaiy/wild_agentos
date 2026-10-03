@@ -8,7 +8,7 @@ use crate::tools::builtin::permissions::{PermissionMode, PermissionPolicy};
 mod tests {
     use super::*;
     use crate::tools::tool_executor::tool_description_lint::{
-        lint_registry, role_schema_bytes, MAX_ROLE_SCHEMA_BYTES,
+        check_role_schema_budget, lint_registry, role_schema_bytes,
     };
 
     fn rt() -> tokio::runtime::Runtime {
@@ -19,11 +19,18 @@ mod tests {
     fn tool_description_lint_passes_for_all_registered_builtins_and_role_budgets() {
         let mut executor = ToolExecutor::new();
         executor.set_tool_group_manager(ToolGroupManager::new(None));
-        assert!(
-            lint_registry(&executor.tool_descriptions).is_ok(),
-            "{:?}",
-            lint_registry(&executor.tool_descriptions)
-        );
+        let registered: std::collections::BTreeSet<_> =
+            executor.registered_tool_names().into_iter().collect();
+        let covered: std::collections::BTreeSet<_> = executor
+            .tool_descriptions
+            .iter()
+            .filter(|tool| executor.builtin_tool_names().contains(&tool.name))
+            .map(|tool| tool.name.clone())
+            .collect();
+        assert_eq!(executor.builtin_tool_names(), &registered);
+        assert_eq!(executor.builtin_tool_names(), &covered);
+        let violations = lint_registry(&executor.tool_descriptions, executor.builtin_tool_names());
+        assert!(violations.is_empty(), "{violations:?}");
 
         let schemas = ["Plan", "Do", "Check", "Act"].map(|role| {
             (
@@ -31,23 +38,80 @@ mod tests {
                 executor.tool_definitions_for_turn(role, &executor.activated_tools()),
             )
         });
-        for (role, bytes) in role_schema_bytes(schemas) {
-            eprintln!("{role} resident schema: {bytes} bytes");
-            assert!(
-                bytes <= MAX_ROLE_SCHEMA_BYTES,
-                "{role} schema is {bytes} bytes, over {MAX_ROLE_SCHEMA_BYTES}"
-            );
+        let bytes = role_schema_bytes(schemas);
+        for (role, size) in &bytes {
+            eprintln!("METRIC: {role} resident schema: {size} bytes");
         }
+        assert!(check_role_schema_budget(&bytes).is_empty(), "{bytes:?}");
         let lengths: Vec<usize> = executor
             .tool_descriptions
             .iter()
             .map(|tool| tool.description.len())
             .collect();
         eprintln!(
-            "built-in descriptions: average {} bytes, max {} bytes",
+            "METRIC: built-in descriptions: average {} bytes, max {} bytes",
             lengths.iter().sum::<usize>() / lengths.len(),
             lengths.iter().max().unwrap()
         );
+        executor.register(
+            "external_after_construction",
+            "A separately registered tool. Use when: testing external registration provenance. Not for: built-in tool registration.",
+            json!({"type":"object","properties":{}}),
+            Arc::new(|_| Box::pin(async { Ok(json!({})) })),
+            &[],
+        );
+        assert!(!executor
+            .builtin_tool_names()
+            .contains("external_after_construction"));
+    }
+
+    #[test]
+    fn configured_run_policy_denies_advertised_hidden_tool_without_invoking_handler() {
+        rt().block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let mut executor = ToolExecutor::new();
+            let mut settings = crate::tools::tool_groups::ToolGroupSettings::default();
+            settings.roles.insert(
+                "Do".to_string(),
+                crate::tools::tool_groups::RoleToolConfig {
+                    default: vec!["Core".to_string()],
+                    on_demand: vec![],
+                },
+            );
+            executor.set_tool_group_manager(ToolGroupManager::new(Some(settings)));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            executor.register(
+                "file_write",
+                "Count attempted writes for a restricted role. Use when: testing run policy isolation. Not for: editing an existing file; use file_edit.",
+                json!({"type":"object","properties":{}}),
+                Arc::new(move |_| {
+                    let counted = counted.clone();
+                    Box::pin(async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"success":true}))
+                    })
+                }),
+                &[],
+            );
+            let run_tools = executor.activated_tools();
+            assert!(!executor
+                .visible_tool_names_for_role("Do", "agent:do", &run_tools)
+                .contains(&"file_write".to_string()));
+            let denied = executor
+                .execute_with_security_context(
+                    "file_write",
+                    json!({"path":"ignored","content":"ignored"}),
+                    SecurityContext::new("agent:do", "DA"),
+                    &["file_write".to_string()],
+                    run_tools.policy(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied["error"], "Tool not allowed for role");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]
@@ -162,6 +226,7 @@ mod tests {
                     input,
                     security_context(),
                     &["tool_search".to_string()],
+                    executor.activated_tools().policy(),
                 )
                 .await;
             assert!(result.is_ok());
@@ -288,6 +353,7 @@ mod tests {
                     json!({"query": "write file", "role": "Do"}),
                     SecurityContext::new("agent:plan", "PA"),
                     &advertised,
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -479,6 +545,7 @@ mod tests {
                         json!({}),
                         security_context(),
                         &advertised_tools,
+                        executor.activated_tools().policy(),
                     )
                     .await
                     .unwrap();
@@ -603,6 +670,7 @@ mod tests {
                     json!({"command": "ls"}),
                     security_context(),
                     &["file_read".to_string()],
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -638,6 +706,7 @@ mod tests {
                     json!({"role": "DA"}),
                     SecurityContext::new("agent:plan", "PA"),
                     &["counted_tool".to_string()],
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -651,6 +720,7 @@ mod tests {
                     json!({}),
                     SecurityContext::new("agent:plan", "PA"),
                     &[],
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -688,6 +758,7 @@ mod tests {
                     json!({"command": "must not execute"}),
                     SecurityContext::new("agent:check", "CA"),
                     &["bash".to_string()],
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -718,6 +789,7 @@ mod tests {
                     json!({"path": path.clone(), "content": "advertised"}),
                     security_context(),
                     &advertised,
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -729,6 +801,7 @@ mod tests {
                     json!({"path": path.clone()}),
                     security_context(),
                     &advertised,
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -740,6 +813,7 @@ mod tests {
                     json!({"command": "printf advertised"}),
                     security_context(),
                     &advertised,
+                    executor.activated_tools().policy(),
                 )
                 .await;
             if crate::tools::builtin::sandbox::unshare_available() {
@@ -810,6 +884,7 @@ mod tests {
                     json!({}),
                     security_context(),
                     &first_turn,
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -822,6 +897,7 @@ mod tests {
                     json!({}),
                     security_context(),
                     &next_turn,
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -856,6 +932,7 @@ mod tests {
                     json!({"path": target, "content": "blocked"}),
                     security_context(),
                     &["file_write".to_string()],
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
@@ -897,6 +974,7 @@ mod tests {
                         json!({"path": "."}),
                         security_context(),
                         &[tool.to_string()],
+                        executor.activated_tools().policy(),
                     )
                     .await;
                 let err = match outcome {
@@ -931,6 +1009,7 @@ mod tests {
                     json!({}),
                     security_context(),
                     &["unregistered_tool".to_string()],
+                    executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();

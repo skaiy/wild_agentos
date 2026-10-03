@@ -4,6 +4,7 @@ use tracing::debug;
 use crate::core::agent_instance::{AgentInstance, AgentRole};
 use crate::core::sa::PlanStep;
 use crate::memory::l1_session::L1Session;
+use crate::tools::tool_groups::ActivatedTools;
 
 use super::{TaskContext, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
 
@@ -54,6 +55,8 @@ impl super::AgentRunner {
         role: AgentRole,
         step: &PlanStep,
         context_data: &HashMap<String, String>,
+        agent_id: &str,
+        run_tools: &ActivatedTools,
     ) -> String {
         let role_name = match role {
             AgentRole::Plan => "Plan",
@@ -68,10 +71,10 @@ impl super::AgentRunner {
             let visible_tools: BTreeSet<String> = self
                 .tool_executor
                 .read()
-                .visible_tool_names_for_role(&role.to_string(), "")
+                .visible_tool_names_for_role(&role.to_string(), agent_id, run_tools)
                 .into_iter()
                 .collect();
-            let planned: Vec<String> = step
+            let planned: BTreeSet<String> = step
                 .tools_allowed
                 .iter()
                 .filter(|name| visible_tools.contains(*name))
@@ -80,7 +83,10 @@ impl super::AgentRunner {
             if planned.is_empty() {
                 String::new()
             } else {
-                format!("\n## Planned Tool Preference\n{}\n", planned.join(", "))
+                format!(
+                    "\n## Planned Tool Preference\n{}\n",
+                    planned.into_iter().collect::<Vec<_>>().join(", ")
+                )
             }
         };
 

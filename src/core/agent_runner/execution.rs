@@ -248,7 +248,16 @@ impl super::AgentRunner {
         // Build independent agent.md
         let context_data = self.gather_context_data_async(agent.role, &ctx).await;
         let agent_md = if let Some(ref step) = plan_step {
-            self.build_agent_md_from_step(agent.role, step, &context_data)
+            // BizAgent starts its own run; no run-local supervisor restriction
+            // exists until that loop begins. Use the server-owned role policy.
+            let run_tools = self.tool_executor.read().activated_tools();
+            self.build_agent_md_from_step(
+                agent.role,
+                step,
+                &context_data,
+                &agent.agent_id,
+                &run_tools,
+            )
         } else {
             let model = self
                 .gateway
