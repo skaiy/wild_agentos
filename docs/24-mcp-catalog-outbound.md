@@ -54,6 +54,7 @@ origins when the deployment needs an explicit network allowlist:
 
 ```sh
 MCP_OUTBOUND_ALLOWED_ORIGINS=https://mcp.example.test,http://127.0.0.1:8080
+MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS=10.20.0.0/16,fd00:1::/64
 MCP_OUTBOUND_CONNECT_TIMEOUT_MS=5000
 MCP_OUTBOUND_TIMEOUT_MS=15000
 MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
@@ -67,6 +68,36 @@ values shown are the secure defaults.
 When `AGENTOS_AUTH_STRICT=true`, `MCP_OUTBOUND_ALLOWED_ORIGINS` is required.
 An unset or empty value prevents startup and catalog register/invoke requests
 also reject it as defense in depth. HTTP redirects are never followed.
+
+Before minting a JWT, each catalog invoke resolves a hostname exactly once,
+rejects the entire answer if any address is not permitted, and pins all vetted
+addresses to the request client. The URL retains its original hostname for
+HTTPS certificate validation and SNI. Catalog outbound requests do not use
+configured HTTP proxies, which could otherwise resolve the hostname again.
+IP-literal endpoints do not require DNS resolution.
+
+By default, loopback, link-local (including metadata), private IPv4 and IPv6,
+unspecified, shared/CGNAT, `192.0.0.0/24`, benchmark, multicast, and reserved
+addresses are blocked, including IPv4-mapped IPv6 forms. Three explicit
+permission rules apply:
+
+1. An IP-literal endpoint with its exact origin in
+   `MCP_OUTBOUND_ALLOWED_ORIGINS` may use a blocked address, such as a local
+   sidecar.
+2. In non-strict local development with the origin allowlist **unset**, an
+   IP-literal endpoint may use loopback or private addresses. Link-local,
+   unspecified, multicast, and broadcast literals remain blocked.
+3. A **hostname** may resolve into `MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS` (a
+   comma-separated CIDR list, as shown above). Every resolved address must be
+   permitted. Unspecified, multicast, and broadcast addresses are never
+   permitted, even by an explicit rule.
+
+The CIDR opt-in limits hostname access to chosen network segments instead of
+letting a boolean "allow private" switch expose every private network.
+Malformed CIDRs fail closed with `503 mcp_outbound_allowlist_required` on invoke
+and prevent startup in strict mode. Rejected addresses return
+`403 mcp_endpoint_not_allowed`; failed or empty DNS answers return
+`502 outbound_mcp_call_failed`. Neither response includes resolved addresses.
 
 An entry may also set `timeout_seconds` to a positive value from 1 through 300.
 It applies as that entry's total outbound request timeout, capped by
