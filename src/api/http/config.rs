@@ -74,6 +74,17 @@ fn config_override_path() -> std::path::PathBuf {
     data_dir().join("config_override.json")
 }
 
+/// Whether two OpenAI-compatible base URLs name the same endpoint (#299).
+///
+/// A saved provider credential may only be reused for the endpoint it was saved
+/// with. Both sides are normalized with `normalize_api_base` (trim, trailing
+/// `/`, trailing `/v1`) and then compared exactly; an empty side never matches.
+pub(crate) fn same_provider_endpoint(a: &str, b: &str) -> bool {
+    let a = crate::config::settings::normalize_api_base(a);
+    let b = crate::config::settings::normalize_api_base(b);
+    !a.is_empty() && a == b
+}
+
 /// 将网关配置持久化到运行期覆盖文件，重启后由 Settings::load() 生效。
 /// Gateway API keys are runtime-only and never written to this file.
 pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
@@ -124,12 +135,35 @@ pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
         }
         if let Some(obj) = root.as_object_mut() {
             let existing = obj.entry("embedding").or_insert(json!({}));
+            // #299: a saved oneapi key is only kept for the endpoint it was saved
+            // with. A patch that moves `oneapi.base_url` without supplying a new
+            // key drops the saved key instead of carrying it to the new endpoint.
+            let new_base = clean
+                .get("oneapi")
+                .filter(|o| o.get("api_key").is_none())
+                .and_then(|o| o.get("base_url"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let (Some(new_base), Some(old_oneapi)) = (
+                new_base,
+                existing.get_mut("oneapi").and_then(|v| v.as_object_mut()),
+            ) {
+                let old_base = old_oneapi
+                    .get("base_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !same_provider_endpoint(&new_base, old_base) {
+                    old_oneapi.remove("api_key");
+                }
+            }
             json_deep_merge(existing, &clean);
         }
     }
 
     // Models 段:整体替换 providers/resources(集合语义,避免深合并残留已删项);
     // 空/缺失 provider.api_key 时回填 root 中同 id 的旧 key,避免误清空。
+    // #299: 仅当该 provider 的 base_url(归一化后)未变时才回填;端点变了则丢弃旧 key,
+    // 绝不把已保存密钥带到新端点。
     if let Some(models_patch) = patch.get("models") {
         let mut clean = models_patch.clone();
         if let Some(provs) = clean.get_mut("providers").and_then(|v| v.as_array_mut()) {
@@ -158,8 +192,16 @@ pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
                         .iter()
                         .find(|x| x.get("id").and_then(|v| v.as_str()) == Some(&pid))
                     {
+                        let new_base = p
+                            .get("base_url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let old_base = old_p.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+                        let same_endpoint = same_provider_endpoint(&new_base, old_base);
                         if let (Some(o), Some(ok)) = (p.as_object_mut(), old_p.get("api_key")) {
-                            if ok.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+                            if same_endpoint && ok.as_str().map(|s| !s.is_empty()).unwrap_or(false)
+                            {
                                 o.insert("api_key".into(), ok.clone());
                             } else {
                                 o.remove("api_key");
