@@ -88,8 +88,12 @@ pub(crate) async fn write_node_handler(
 
 pub(crate) async fn get_projection_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<ProjectionRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = authorize_core_write(&state, &identity, &req.task_iri).await {
+        return response;
+    }
     let frame = req
         .frame_name
         .unwrap_or_else(|| "reference_only".to_string());
@@ -104,22 +108,30 @@ pub(crate) async fn get_projection_handler(
             "projection": serde_json::from_str::<Value>(&projection).ok(),
             "frame": frame,
             "task_iri": req.task_iri,
-        })),
-        Err(e) => Json(json!({"error": e.to_string(), "task_iri": req.task_iri})),
+        }))
+        .into_response(),
+        Err(e) => Json(json!({"error": e.to_string(), "task_iri": req.task_iri})).into_response(),
     }
 }
 
 pub(crate) async fn read_node_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(node_iri): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    // Same scope gate as core writes: verified claims matching the node's
+    // persisted tenant/project, or a verified DA JWT.
+    if let Err(response) = authorize_core_write(&state, &identity, &node_iri).await {
+        return response;
+    }
     match state.core.read_node(&node_iri).await {
         Ok(Some(node)) => Json(json!({
             "found": true,
             "json_ld": node.json_ld,
-        })),
-        Ok(None) => Json(json!({"found": false})),
-        Err(e) => Json(json!({"found": false, "error": e.to_string()})),
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({"found": false})).into_response(),
+        Err(e) => Json(json!({"found": false, "error": e.to_string()})).into_response(),
     }
 }
 
@@ -222,7 +234,12 @@ async fn authorize_core_write(
 
 pub(crate) async fn stream_batch_events_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
 ) -> impl IntoResponse {
+    // Reject before subscribing so no SSE stream is opened for anonymous callers.
+    if let Err(error) = identity.require_verified_isolation_claims("batch event stream") {
+        return error.into_response();
+    }
     let event_bus = state.core.events.clone();
     let mut rx = event_bus.subscribe();
 

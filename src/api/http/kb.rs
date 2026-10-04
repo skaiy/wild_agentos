@@ -248,9 +248,13 @@ pub struct KbCategoryCreateRequest {
 /// 每个知识包关联 N 个知识库分类 / N 个图知识库 / N 个向量知识库，可被 Agent 挂载。
 pub(crate) async fn list_knowledge_packs_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_verified_isolation_claims("knowledge packs") {
+        return error.into_response();
+    }
     let packs = state.knowledge_packs.read().await.clone();
-    Json(json!({ "count": packs.len(), "knowledge_packs": packs }))
+    Json(json!({ "count": packs.len(), "knowledge_packs": packs })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -311,8 +315,12 @@ async fn validate_pack_refs(
 /// POST /api/v1/knowledge-packs — 创建知识包并持久化。
 pub(crate) async fn create_knowledge_pack_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<KnowledgePackCreateRequest>,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_platform_admin("knowledge pack writes") {
+        return error;
+    }
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -359,9 +367,13 @@ pub(crate) async fn create_knowledge_pack_handler(
 /// PUT /api/v1/knowledge-packs/:id — 更新知识包（合并 patch，校验关联引用）。
 pub(crate) async fn update_knowledge_pack_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(patch): Json<Value>,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_platform_admin("knowledge pack writes") {
+        return error;
+    }
     let extract_ids = |k: &str| -> Vec<String> {
         patch
             .get(k)
@@ -411,8 +423,12 @@ pub(crate) async fn update_knowledge_pack_handler(
 /// DELETE /api/v1/knowledge-packs/:id — 删除知识包并持久化。
 pub(crate) async fn delete_knowledge_pack_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_platform_admin("knowledge pack writes") {
+        return error;
+    }
     let mut guard = state.knowledge_packs.write().await;
     let before = guard.len();
     guard.retain(|p| p.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
@@ -432,16 +448,24 @@ pub(crate) async fn delete_knowledge_pack_handler(
 /// GET /api/v1/kb/categories — 返回全部知识库分类
 pub(crate) async fn list_kb_categories_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_verified_isolation_claims("knowledge base categories") {
+        return error.into_response();
+    }
     let categories = state.kb_categories.read().await.clone();
-    Json(json!({ "count": categories.len(), "categories": categories }))
+    Json(json!({ "count": categories.len(), "categories": categories })).into_response()
 }
 
 /// POST /api/v1/kb/categories — 创建知识库分类并持久化
 pub(crate) async fn create_kb_category_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     Json(req): Json<KbCategoryCreateRequest>,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_platform_admin("knowledge base category writes") {
+        return error;
+    }
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -467,9 +491,13 @@ pub(crate) async fn create_kb_category_handler(
 /// PUT /api/v1/kb/categories/:id — 更新知识库分类并持久化
 pub(crate) async fn update_kb_category_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(patch): Json<Value>,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_platform_admin("knowledge base category writes") {
+        return error;
+    }
     let mut guard = state.kb_categories.write().await;
     let found = guard
         .iter_mut()
@@ -502,8 +530,12 @@ pub(crate) async fn update_kb_category_handler(
 /// DELETE /api/v1/kb/categories/:id — 删除知识库分类并持久化
 pub(crate) async fn delete_kb_category_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_platform_admin("knowledge base category writes") {
+        return error;
+    }
     let mut guard = state.kb_categories.write().await;
     let before = guard.len();
     guard.retain(|c| c.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
@@ -1450,15 +1482,31 @@ pub(crate) async fn upload_knowledge_base_handler(
 }
 
 /// GET /api/v1/kb/bases/:id/documents — 返回该向量库的原文档台账（documents）。
+/// Requires verified isolation claims (401 otherwise). A KB owned by another
+/// tenant/project returns the same 404 as a missing KB, so the id is not an
+/// existence oracle.
 pub(crate) async fn list_kb_documents_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for KB catalog" })),
+            )
+        }
+    };
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
             .cloned()
     };
     match kb {
@@ -1502,11 +1550,26 @@ pub(crate) async fn kb_document_raw_handler(
     identity: UserIdentity,
     axum::extract::Path((id, doc_id)): axum::extract::Path<(String, String)>,
 ) -> Response {
+    // Claims first: anonymous callers get 401 before any KB/document lookup,
+    // and another tenant's KB answers the same 404 as a missing one.
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "verified isolation claims required for blob storage" })),
+            )
+                .into_response()
+        }
+    };
     let doc = {
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
             .and_then(|k| k.get("documents").and_then(|v| v.as_array()).cloned())
             .and_then(|docs| {
                 docs.into_iter()
@@ -1535,16 +1598,6 @@ pub(crate) async fn kb_document_raw_handler(
         )
             .into_response();
     }
-    let claims = match identity.isolation_claims() {
-        Some(claims) => claims,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "verified isolation claims required for blob storage" })),
-            )
-                .into_response()
-        }
-    };
     let blob = match &state.blob_store {
         Some(b) => b.clone(),
         None => {
@@ -2886,6 +2939,113 @@ mod isolation_contract {
         } else {
             std::env::remove_var("AGENTOS_DATA_DIR");
         }
+    }
+
+    const KB_DOCS_OWNED_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const KB_DOCS_MISSING_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// Router with one tenant-b vector KB carrying a private document ledger.
+    async fn kb_documents_app(tmp: &std::path::Path) -> Router {
+        let state = test_state(tmp);
+        state.knowledge_bases.write().await.push(json!({
+            "id": KB_DOCS_OWNED_ID,
+            "name": "tenant B base",
+            "kb_type": "vector",
+            "tenant_id": "tenant-b",
+            "project_id": "default",
+            "documents": [{"doc_id": "doc-1", "filename": "private-plan.md"}],
+        }));
+        Router::new()
+            .route("/kb/bases/:id/documents", get(list_kb_documents_handler))
+            .with_state(state)
+    }
+
+    fn kb_documents_request(id: &str, token: Option<String>) -> Request<Body> {
+        let mut builder = Request::builder().uri(format!("/kb/bases/{id}/documents"));
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn raw_response(app: &Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_kb_documents_anonymous_is_unauthorized() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let app = kb_documents_app(tmp.path()).await;
+        let (status, body) = raw_response(&app, kb_documents_request(KB_DOCS_OWNED_ID, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!String::from_utf8_lossy(&body).contains("private-plan.md"));
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_kb_documents_cross_tenant_matches_missing_kb_404() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let app = kb_documents_app(tmp.path()).await;
+        let (status, cross_tenant) = raw_response(
+            &app,
+            kb_documents_request(KB_DOCS_OWNED_ID, Some(jwt("tenant-a"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (missing_status, missing) = raw_response(
+            &app,
+            kb_documents_request(KB_DOCS_MISSING_ID, Some(jwt("tenant-a"))),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        // Byte-identical to the nonexistent-KB 404 apart from the echoed id.
+        assert_eq!(
+            cross_tenant,
+            format!(r#"{{"error":"knowledge base not found","id":"{KB_DOCS_OWNED_ID}"}}"#)
+                .into_bytes()
+        );
+        assert_eq!(
+            missing,
+            format!(r#"{{"error":"knowledge base not found","id":"{KB_DOCS_MISSING_ID}"}}"#)
+                .into_bytes()
+        );
+        assert_eq!(
+            String::from_utf8(cross_tenant)
+                .unwrap()
+                .replace(KB_DOCS_OWNED_ID, "<id>"),
+            String::from_utf8(missing)
+                .unwrap()
+                .replace(KB_DOCS_MISSING_ID, "<id>")
+        );
+        // Same tenant, other project: not visible either.
+        let (status, _) = raw_response(
+            &app,
+            kb_documents_request(
+                KB_DOCS_OWNED_ID,
+                Some(jwt_for_scope("tenant-b", Some("other-project"))),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_kb_documents_own_tenant_lists_ledger() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let app = kb_documents_app(tmp.path()).await;
+        let (status, own) = response_json(
+            &app,
+            kb_documents_request(KB_DOCS_OWNED_ID, Some(jwt("tenant-b"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(own["count"], json!(1));
+        assert_eq!(own["documents"][0]["filename"], json!("private-plan.md"));
     }
 
     #[tokio::test]
