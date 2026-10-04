@@ -1,6 +1,12 @@
 use crate::core::agent_instance::AgentRole;
 use crate::core::tool_policy::ToolPolicy;
 
+/// Role/tool queries over the default `ToolPolicy` (built-in groups, no
+/// per-run narrowing, no view of the executor's internal micro-tools).
+/// It is not on the runtime execution path: tool calls are authorised by
+/// `ToolExecutor::execute_with_security_context_and_claims_and_policy` with
+/// the caller's run-local policy, so this type can only answer "what does the
+/// default cap allow", never widen a run.
 #[derive(Clone)]
 pub struct ToolController {
     policy: ToolPolicy,
@@ -106,9 +112,16 @@ mod tests {
             allowed_for(AgentRole::Plan),
             plan_main.into_iter().collect()
         );
-        assert!(!tc.is_tool_allowed_for_role("read_full_result_test", &AgentRole::Plan));
-        for role in [AgentRole::Do, AgentRole::Check, AgentRole::Act] {
-            assert!(tc.is_tool_allowed_for_role("read_full_result_test", &role));
+        // #270-2: the controller cannot see the executor's internal
+        // micro-tool registry, so a micro-tool-like name is denied for every
+        // role here; registered internal readers are allowed by the executor.
+        for role in [
+            AgentRole::Plan,
+            AgentRole::Do,
+            AgentRole::Check,
+            AgentRole::Act,
+        ] {
+            assert!(!tc.is_tool_allowed_for_role("read_full_result_test", &role));
         }
         assert_eq!(
             allowed_for(AgentRole::Do),

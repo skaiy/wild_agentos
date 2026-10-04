@@ -1124,7 +1124,23 @@ impl ToolExecutor {
     }
 
     /// Register a tool with role whitelist. Empty = all roles allowed.
+    ///
+    /// A tool registered here is never an internal micro-tool, even when its
+    /// name uses a micro-tool prefix: registering it replaces any internal
+    /// reader of the same name (#270-2).
     pub fn register(
+        &mut self,
+        name: &str,
+        description: &str,
+        parameters: Value,
+        handler: ToolFn,
+        allowed_roles: &[&str],
+    ) {
+        self.micro_tool_contexts.write().remove(name);
+        self.register_handler(name, description, parameters, handler, allowed_roles);
+    }
+
+    fn register_handler(
         &mut self,
         name: &str,
         description: &str,
@@ -1191,6 +1207,27 @@ impl ToolExecutor {
         MICRO_TOOL_PREFIXES.iter().any(|p| name.starts_with(p))
     }
 
+    /// True only for result readers created by `register_micro_tool`, never
+    /// for an external tool that merely shares a micro-tool name prefix.
+    fn is_internal_micro_tool(&self, name: &str) -> bool {
+        ToolPolicy::has_internal_micro_tool_prefix(name)
+            && self.micro_tool_contexts.read().contains_key(name)
+    }
+
+    /// Run-local policy decision, with the prefix read-only rule applied only
+    /// to internal micro-tools.
+    fn policy_allows(
+        &self,
+        policy: &ToolPolicy,
+        role: &AgentRole,
+        agent_id: &str,
+        name: &str,
+    ) -> bool {
+        policy.is_executable(role, agent_id, name)
+            || (self.is_internal_micro_tool(name)
+                && policy.is_internal_micro_tool_executable(role, agent_id, name))
+    }
+
     /// Register micro-tool (dynamically generated tool for querying large tool results)
     pub fn register_micro_tool(&mut self, tool_name: &str, context: MicroToolContext) {
         let contexts = Arc::clone(&self.micro_tool_contexts);
@@ -1222,7 +1259,7 @@ impl ToolExecutor {
             }
         });
 
-        self.register(
+        self.register_handler(
             tool_name,
             &description,
             params,
@@ -1389,11 +1426,25 @@ impl ToolExecutor {
                 .try_with(|context| context.clone())
                 .ok()
                 .flatten();
-            let role = context
+            let run_policy = TOOL_RUN_POLICY
+                .try_with(|policy| policy.clone())
+                .ok()
+                .flatten();
+            let (role, agent_id) = context
                 .as_ref()
-                .map(|context| context.agent_role.as_str())
-                .unwrap_or("");
-            if let Err(e) = gate.validate_tool_with_5w2h(name, role, None) {
+                .map(|context| (context.agent_role.as_str(), context.agent_id.as_str()))
+                .unwrap_or(("", ""));
+            // #270-1: the gate decides with the caller's run-local policy and
+            // fails closed without a trusted role or run policy.
+            let decision = gate.validate_tool_for_run(
+                name,
+                role,
+                agent_id,
+                run_policy.as_ref(),
+                self.is_internal_micro_tool(name),
+                None,
+            );
+            if let Err(e) = decision {
                 return Ok(json!({"error": format!("SyscallGate rejected: {}", e)}));
             }
         }
@@ -1528,9 +1579,7 @@ impl ToolExecutor {
             // inherit the least-privilege built-in read capability instead of
             // becoming an unregistered security bypass.
             .or_else(|| {
-                MICRO_TOOL_PREFIXES
-                    .iter()
-                    .any(|prefix| name.starts_with(prefix))
+                self.is_internal_micro_tool(name)
                     .then(|| "iri://skills/file_read".to_string())
             });
             let Some(skill_iri) = skill_iri else {
@@ -1558,7 +1607,7 @@ impl ToolExecutor {
             }
         }
 
-        if !policy.is_executable(&role, &context.agent_id, name) {
+        if !self.policy_allows(policy, &role, &context.agent_id, name) {
             tracing::warn!(
                 agent = %context.agent_id,
                 role = %context.agent_role,
@@ -1732,7 +1781,7 @@ impl ToolExecutor {
 
         let agent_role = role.parse::<AgentRole>().unwrap_or(AgentRole::Act);
         let policy_is_allowed =
-            |name: &str| activated.policy().is_visible(&agent_role, agent_id, name);
+            |name: &str| self.policy_allows(activated.policy(), &agent_role, agent_id, name);
         if agent_role == AgentRole::Check && activated.policy().check_bash_enabled() {
             resident_tools.insert("bash".to_string());
         }
@@ -1891,7 +1940,7 @@ impl ToolExecutor {
             .tool_descriptions
             .iter()
             .any(|tool| tool.name == exact_query)
-            && !policy.is_executable(&role, agent_id, exact_query)
+            && !self.policy_allows(policy, &role, agent_id, exact_query)
         {
             return Ok(json!({
                 "matches": [],

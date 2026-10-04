@@ -36,6 +36,15 @@ handler。
 `tools_allowed` 等 Plan 元数据只是规划提示，不是执行控制。限制和按需激活状态只属于
 一次运行，不会保存到共享执行器中。
 
+结果读取类 micro-tool（`read_full_result_*`、`query_*`、`get_entity_details_*`、
+`expand_relation_*`）继承 `file_read` 的权限，Plan 始终不可用。这条规则只适用于
+执行器自己注册的读取工具。仅凭名称前缀不会把工具视为只读：同前缀的外部或插件工具
+按普通角色上限处理，并且注册它会取代同名的内部读取工具。
+
+安装 `SyscallGate` 后，它按调用方的本次运行策略检查每次调用。没有可信运行时角色或
+没有本次运行策略的调用会被拒绝；空角色或未知角色不会被当作"跳过角色检查"。
+supervisor 的工具限制会报告是否收窄了活跃运行；没有活跃运行时记录为未生效。
+
 | 角色 | 默认可见且可执行的工具 |
 | --- | --- |
 | Plan | `file_read`、`file_list`、`glob_search`、`grep_search`、`web_search`、`web_fetch`、`tool_search`、`rag_search`、`knowledge_list`、`knowledge_search`、`kg_search`、`knowledge_extract_code` |

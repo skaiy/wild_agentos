@@ -81,12 +81,45 @@ impl ToolPolicy {
         ]
     }
 
+    /// Static read-only built-ins. A name prefix alone never makes a tool
+    /// read-only: an external or plugin tool may be called `query_*` and write.
     pub fn is_readonly_tool(name: &str) -> bool {
         Self::readonly_tools().contains(&name)
-            || name.starts_with("read_full_result_")
-            || name.starts_with("query_")
-            || name.starts_with("get_entity_details_")
-            || name.starts_with("expand_relation_")
+    }
+
+    /// Name prefixes used by the executor's internal result-reader micro-tools.
+    pub fn internal_micro_tool_prefixes() -> &'static [&'static str] {
+        &[
+            "read_full_result_",
+            "query_",
+            "get_entity_details_",
+            "expand_relation_",
+        ]
+    }
+
+    pub fn has_internal_micro_tool_prefix(name: &str) -> bool {
+        Self::internal_micro_tool_prefixes()
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    }
+
+    /// Read-only rule for internal micro-tools. The caller must already have
+    /// confirmed that `name` is registered in the executor's internal
+    /// micro-tool registry; this policy cannot see that registry, so
+    /// `is_visible` / `is_executable` never grant a tool by prefix alone.
+    /// Such readers inherit `file_read` and are never available to Plan.
+    pub fn is_internal_micro_tool_executable(
+        &self,
+        role: &AgentRole,
+        agent_id: &str,
+        name: &str,
+    ) -> bool {
+        *role != AgentRole::Plan
+            && Self::has_internal_micro_tool_prefix(name)
+            && self
+                .visible_tools(role, agent_id)
+                .iter()
+                .any(|tool| tool == "file_read")
     }
 
     fn role_name(role: &AgentRole) -> &'static str {
@@ -136,20 +169,9 @@ impl ToolPolicy {
         tools
     }
 
+    /// Tools in the role cap after per-run narrowing. Internal micro-tools are
+    /// handled by `is_internal_micro_tool_executable`, never by name here.
     pub fn is_visible(&self, role: &AgentRole, agent_id: &str, name: &str) -> bool {
-        if name.starts_with("read_full_result_")
-            || name.starts_with("query_")
-            || name.starts_with("get_entity_details_")
-            || name.starts_with("expand_relation_")
-        {
-            if *role == AgentRole::Plan {
-                return false;
-            }
-            return self
-                .visible_tools(role, agent_id)
-                .iter()
-                .any(|tool| tool == "file_read");
-        }
         self.visible_tools(role, agent_id)
             .iter()
             .any(|tool| tool == name)
@@ -197,8 +219,10 @@ mod tests {
             assert!(!policy.is_executable(&role, "agent", "knowledge_delete"));
             assert!(!policy.is_executable(&role, "agent", "ontology_register"));
             assert!(!policy.is_executable(&role, "agent", "not_registered"));
+            // #270-2: a prefix alone never grants execution.
+            assert!(!policy.is_executable(&role, "agent", "read_full_result_test"));
             assert_eq!(
-                policy.is_executable(&role, "agent", "read_full_result_test"),
+                policy.is_internal_micro_tool_executable(&role, "agent", "read_full_result_test"),
                 role != AgentRole::Plan,
                 "{role:?}"
             );
@@ -231,5 +255,45 @@ mod tests {
             ToolPolicy::new().with_tool_group_manager(ToolGroupManager::new(Some(settings)));
         assert!(!policy.is_executable(&AgentRole::Plan, "agent", "workspace_status"));
         assert!(!policy.is_executable(&AgentRole::Plan, "agent", "read_full_result_test"));
+        assert!(!policy.is_internal_micro_tool_executable(
+            &AgentRole::Plan,
+            "agent",
+            "read_full_result_test"
+        ));
+    }
+
+    /// #270-2: an external tool named like a micro-tool is not read-only.
+    #[test]
+    fn prefix_named_external_tools_are_not_readonly_for_check_or_act() {
+        for name in [
+            "query_orders",
+            "read_full_result_x",
+            "get_entity_details_x",
+            "expand_relation_x",
+        ] {
+            assert!(!ToolPolicy::is_readonly_tool(name), "{name}");
+        }
+        // Before #270 these were visible to any role that could see file_read.
+        let policy = ToolPolicy::new();
+        for role in [AgentRole::Check, AgentRole::Act] {
+            for name in ["query_orders", "read_full_result_x"] {
+                assert!(!policy.is_visible(&role, "agent", name), "{role:?} {name}");
+                assert!(
+                    !policy.is_executable(&role, "agent", name),
+                    "{role:?} {name}"
+                );
+            }
+        }
+    }
+
+    /// The micro-tool rule still follows run-local narrowing: without
+    /// `file_read` in the run there is no result reader either.
+    #[test]
+    fn internal_micro_tool_rule_follows_run_restriction() {
+        let mut policy = ToolPolicy::new();
+        assert!(policy.is_internal_micro_tool_executable(&AgentRole::Do, "agent", "query_person"));
+        policy.restrict_tools("agent", ["file_list".to_string()]);
+        assert!(!policy.is_internal_micro_tool_executable(&AgentRole::Do, "agent", "query_person"));
+        assert!(!policy.is_internal_micro_tool_executable(&AgentRole::Do, "agent", "file_read"));
     }
 }
