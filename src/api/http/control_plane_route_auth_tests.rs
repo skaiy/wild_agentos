@@ -239,8 +239,8 @@ async fn request(
 
 async fn api_state(state: &AppState) -> Value {
     json!({
-        "clients": state.api_clients.read().await.clone(),
         "keys": state.api_keys.read().await.clone(),
+        "clients": state.api_clients.read().await.clone(),
     })
 }
 

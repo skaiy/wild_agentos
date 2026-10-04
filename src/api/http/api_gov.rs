@@ -198,8 +198,7 @@ pub fn hash_key(plaintext: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// 生成一把新 key，返回 (明文, key_prefix, key_hash)。明文仅此一次可得。
-pub fn generate_key(tenant: &str) -> (String, String, String) {
+fn tenant_key_slug(tenant: &str) -> String {
     let slug: String = tenant
         .chars()
         .map(|c| {
@@ -211,14 +210,37 @@ pub fn generate_key(tenant: &str) -> (String, String, String) {
         })
         .collect();
     let slug = slug.trim_matches('-');
-    let slug = if slug.is_empty() { "t" } else { slug };
+    if slug.is_empty() { "t" } else { slug }.to_string()
+}
+
+/// Identifies a tenant's key by its generated prefix. When deleting a client,
+/// remove matching keys for this tenant if another client shares the ID; if no
+/// client with that ID remains, remove all its keys regardless of prefix.
+/// Slugs are lossy (case folding and punctuation replacement), so distinct
+/// tenant IDs can collide; the prefix cannot disambiguate those legacy keys.
+pub fn key_belongs_to_tenant(key: &ApiKey, tenant: &str) -> bool {
+    // `generate_key` writes `sk-<slug>-<6 secret chars>`. Match the whole
+    // prefix, not just its start: slugs may contain `-`, so `sk-a-` alone
+    // would also claim a key issued for a tenant whose slug is `a-b`.
+    let head = format!("sk-{}-", tenant_key_slug(tenant));
+    key.key_prefix.len() == head.len() + KEY_PREFIX_SECRET_CHARS
+        && key.key_prefix.starts_with(&head)
+        && !key.key_prefix[head.len()..].contains('-')
+}
+
+/// Number of secret characters `generate_key` copies into `key_prefix`.
+const KEY_PREFIX_SECRET_CHARS: usize = 6;
+
+/// 生成一把新 key，返回 (明文, key_prefix, key_hash)。明文仅此一次可得。
+pub fn generate_key(tenant: &str) -> (String, String, String) {
+    let slug = tenant_key_slug(tenant);
     let secret = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
     let plaintext = format!("sk-{slug}-{secret}");
-    let prefix = format!("sk-{slug}-{}", &secret[..6]);
+    let prefix = format!("sk-{slug}-{}", &secret[..KEY_PREFIX_SECRET_CHARS]);
     let hash = hash_key(&plaintext);
     (plaintext, prefix, hash)
 }

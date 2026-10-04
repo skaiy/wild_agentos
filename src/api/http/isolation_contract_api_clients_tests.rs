@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use axum::{
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use super::{
+    api_clients::arm_issue_key_pause,
     api_gov::{self, ApiClient, ApiKey},
     control_plane_route_auth_tests::{app, test_state, EnvGuard},
     iam::JwtClaims,
@@ -124,10 +126,287 @@ async fn seeded(dir: &Path) -> Arc<AppState> {
 
 async fn snapshot(state: &AppState, dir: &Path) -> (Value, Vec<u8>, Vec<u8>) {
     (
-        json!({"clients": *state.api_clients.read().await, "keys": *state.api_keys.read().await}),
+        json!({"keys": *state.api_keys.read().await, "clients": *state.api_clients.read().await}),
         std::fs::read(dir.join("api_clients.json")).unwrap(),
         std::fs::read(dir.join("api_keys.json")).unwrap(),
     )
+}
+
+#[tokio::test]
+async fn isolation_contract_api_clients_delete_scopes_keys_with_shared_id() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let state = seeded(dir.path()).await;
+    state.api_clients.write().await[1].id = "client-a".into();
+    state.api_keys.write().await[1].client_id = "client-a".into();
+    api_gov::save_api_clients(&state.api_clients.read().await).unwrap();
+    api_gov::save_api_keys(&state.api_keys.read().await).unwrap();
+    let before = snapshot(&state, dir.path()).await;
+    let router = app(state.clone());
+    let token = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    let (status, _) = request_raw(
+        &router,
+        Method::DELETE,
+        "/api/v1/api-clients/client-a",
+        json!(null),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (memory, clients_file, keys_file) = snapshot(&state, dir.path()).await;
+    assert_ne!(clients_file, before.1);
+    assert_ne!(keys_file, before.2);
+    for clients in [
+        &memory["clients"],
+        &serde_json::from_slice::<Value>(&clients_file).unwrap(),
+    ] {
+        assert_eq!(clients.as_array().unwrap().len(), 1);
+        assert_eq!(clients[0]["tenant_id"], "tenant-b");
+        assert_eq!(clients[0]["id"], "client-a");
+    }
+    for keys in [
+        &memory["keys"],
+        &serde_json::from_slice::<Value>(&keys_file).unwrap(),
+    ] {
+        assert_eq!(keys.as_array().unwrap().len(), 1);
+        assert_eq!(keys[0]["id"], "key-b");
+        assert_eq!(keys[0]["client_id"], "client-a");
+    }
+
+    // Without a remaining client of any tenant sharing the ID, remove every
+    // key of that client, even one without the caller's tenant slug.
+    let solo_dir = tempfile::tempdir().unwrap();
+    let _solo_env = setup(solo_dir.path());
+    let solo = seeded(solo_dir.path()).await;
+    solo.api_keys.write().await.push(ApiKey {
+        id: "legacy-key".into(),
+        key_prefix: "sk-unattributed-prefix".into(),
+        ..key("a")
+    });
+    api_gov::save_api_keys(&solo.api_keys.read().await).unwrap();
+    let solo_before = snapshot(&solo, solo_dir.path()).await;
+    let (status, _) = request_raw(
+        &app(solo.clone()),
+        Method::DELETE,
+        "/api/v1/api-clients/client-a",
+        json!(null),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (memory, clients_file, keys_file) = snapshot(&solo, solo_dir.path()).await;
+    assert_ne!(clients_file, solo_before.1);
+    assert_ne!(keys_file, solo_before.2);
+    for clients in [
+        &memory["clients"],
+        &serde_json::from_slice::<Value>(&clients_file).unwrap(),
+    ] {
+        assert!(clients
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "client-a"));
+        assert_eq!(clients.as_array().unwrap().len(), 1);
+    }
+    for keys in [
+        &memory["keys"],
+        &serde_json::from_slice::<Value>(&keys_file).unwrap(),
+    ] {
+        assert!(keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["client_id"] != "client-a"));
+        assert_eq!(keys.as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn isolation_contract_api_clients_key_ownership_matches_whole_prefix() {
+    let key_for = |tenant: &str| ApiKey {
+        key_prefix: api_gov::generate_key(tenant).1,
+        ..key("a")
+    };
+    // Slugs may contain `-`: tenant `a`'s slug is a prefix of tenant `a-b`'s.
+    let a = key_for("a");
+    let a_b = key_for("a-b");
+    assert!(api_gov::key_belongs_to_tenant(&a, "a"));
+    assert!(!api_gov::key_belongs_to_tenant(&a, "a-b"));
+    assert!(api_gov::key_belongs_to_tenant(&a_b, "a-b"));
+    assert!(!api_gov::key_belongs_to_tenant(&a_b, "a"));
+    assert!(!api_gov::key_belongs_to_tenant(&a, "b"));
+}
+
+#[tokio::test]
+async fn isolation_contract_api_clients_issue_after_delete_returns_identical_not_found() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let state = seeded(dir.path()).await;
+    let router = app(state.clone());
+    let token = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    let before = snapshot(&state, dir.path()).await;
+    let missing_dir = tempfile::tempdir().unwrap();
+    let missing = request_raw(
+        &app(test_state(missing_dir.path())),
+        Method::POST,
+        "/api/v1/api-clients/client-a/keys",
+        json!({"name":"new"}),
+        Some(&token),
+    )
+    .await;
+    let (reached, resume) = arm_issue_key_pause("client-a");
+    let issue_router = router.clone();
+    let issue_token = token.clone();
+    let issue = tokio::spawn(async move {
+        request_raw(
+            &issue_router,
+            Method::POST,
+            "/api/v1/api-clients/client-a/keys",
+            json!({"name":"new"}),
+            Some(&issue_token),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    let (deleted, _) = request_raw(
+        &router,
+        Method::DELETE,
+        "/api/v1/api-clients/client-a",
+        json!(null),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(deleted, StatusCode::OK);
+    resume.notify_one();
+    let actual = issue.await.unwrap();
+    assert_eq!(actual.0, StatusCode::NOT_FOUND);
+    assert_eq!(actual, missing);
+    assert!(!actual.1.windows(b"api_key".len()).any(|w| w == b"api_key"));
+    assert!(!actual.1.windows(b"sk-".len()).any(|w| w == b"sk-"));
+    let (memory, clients_file, keys_file) = snapshot(&state, dir.path()).await;
+    assert_ne!(clients_file, before.1);
+    assert_ne!(keys_file, before.2);
+    for keys in [
+        &memory["keys"],
+        &serde_json::from_slice::<Value>(&keys_file).unwrap(),
+    ] {
+        assert!(keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["client_id"] != "client-a"));
+    }
+    for clients in [
+        &memory["clients"],
+        &serde_json::from_slice::<Value>(&clients_file).unwrap(),
+    ] {
+        assert!(clients
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["id"] != "client-a"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolation_contract_api_clients_lock_order_with_queued_writers() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let state = seeded(dir.path()).await;
+    let (public_token, prefix, hash) = api_gov::generate_key("tenant-b");
+    state.api_keys.write().await.push(ApiKey {
+        id: "public-key-b".into(),
+        key_prefix: prefix,
+        key_hash: hash,
+        ..key("b")
+    });
+    api_gov::save_api_keys(&state.api_keys.read().await).unwrap();
+    let before = snapshot(&state, dir.path()).await;
+    let router = app(state.clone());
+    let da_token = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    let issue_token = jwt_for("tenant-b", &["DA"], Some("project-b"));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let keys_reader = state.api_keys.read().await;
+        // Delete queues for keys.write behind this reader. A reversed-order
+        // list would take clients.read, then queue for keys.read behind delete;
+        // delete would in turn wait for clients.write behind that list.
+        let delete_router = router.clone();
+        let delete_token = da_token.clone();
+        let delete = tokio::spawn(async move {
+            request_raw(
+                &delete_router,
+                Method::DELETE,
+                "/api/v1/api-clients/client-a",
+                json!(null),
+                Some(&delete_token),
+            )
+            .await
+            .0
+        });
+        tokio::task::yield_now().await;
+        let mut calls = Vec::new();
+        for _ in 0..12 {
+            for (method, uri, body, token) in [
+                (
+                    Method::POST,
+                    "/api/v1/public/agents/missing/chat",
+                    json!({"message":"hi"}),
+                    public_token.clone(),
+                ),
+                (
+                    Method::GET,
+                    "/api/v1/api-clients",
+                    json!(null),
+                    da_token.clone(),
+                ),
+                (
+                    Method::POST,
+                    "/api/v1/api-clients/client-b/keys",
+                    json!({"name":"new"}),
+                    issue_token.clone(),
+                ),
+            ] {
+                let router = router.clone();
+                calls.push(tokio::spawn(async move {
+                    request_raw(&router, method, uri, body, Some(&token))
+                        .await
+                        .0
+                }));
+            }
+        }
+        // Let every spawned request reach its lock acquisition before the
+        // reader goes away; with a reversed-order list this is where list
+        // holds clients.read while queued for keys.read behind delete.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(keys_reader);
+        assert_eq!(delete.await.unwrap(), StatusCode::OK);
+        for (index, call) in calls.into_iter().enumerate() {
+            let status = call.await.unwrap();
+            match index % 3 {
+                0 => assert_eq!(status, StatusCode::FORBIDDEN),
+                1 => assert_eq!(status, StatusCode::OK),
+                _ => assert_eq!(status, StatusCode::CREATED),
+            }
+        }
+    })
+    .await
+    .expect("concurrent API operations must complete without deadlock");
+    let (memory, clients_file, keys_file) = snapshot(&state, dir.path()).await;
+    assert_ne!(before.1, clients_file);
+    assert_ne!(before.2, keys_file);
+    assert_eq!(
+        memory["clients"],
+        serde_json::from_slice::<Value>(&clients_file).unwrap()
+    );
+    assert_eq!(
+        memory["keys"],
+        serde_json::from_slice::<Value>(&keys_file).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -210,6 +489,109 @@ async fn cross_tenant_revoke_via_own_client_is_not_found() {
         std::fs::read(dir.path().join("api_keys.json")).unwrap(),
         before.2
     );
+}
+
+#[tokio::test]
+async fn isolation_contract_api_clients_revoke_scopes_keys_with_shared_id() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let state = test_state(dir.path());
+    let router = app(state.clone());
+    let token_a = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    let token_b = jwt_for("tenant-b", &["DA"], Some("project-b"));
+    let body_of = |raw: &[u8]| serde_json::from_slice::<Value>(raw).unwrap();
+
+    // Each tenant creates a client through the API.
+    let mut ids = vec![];
+    for token in [&token_a, &token_b] {
+        let (status, raw) = request_raw(
+            &router,
+            Method::POST,
+            "/api/v1/api-clients",
+            json!({"name": "shared"}),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        ids.push(body_of(&raw)["client"]["id"].as_str().unwrap().to_string());
+    }
+    // Legacy/imported data: tenant B's client ends up with tenant A's id.
+    let shared = ids[0].clone();
+    for c in state.api_clients.write().await.iter_mut() {
+        if c.id == ids[1] {
+            c.id = shared.clone();
+        }
+    }
+    api_gov::save_api_clients(&state.api_clients.read().await).unwrap();
+
+    // Both tenants issue a key under the shared id.
+    let mut issued = vec![];
+    for token in [&token_a, &token_b] {
+        let (status, raw) = request_raw(
+            &router,
+            Method::POST,
+            &format!("/api/v1/api-clients/{shared}/keys"),
+            json!({"name": "k"}),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let v = body_of(&raw);
+        issued.push((
+            v["key"]["id"].as_str().unwrap().to_string(),
+            v["api_key"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (kid_a, _) = issued[0].clone();
+    let (kid_b, plaintext_b) = issued[1].clone();
+    let before = snapshot(&state, dir.path()).await;
+
+    // Tenant A's DA cannot revoke tenant B's key through the shared id.
+    let attempt = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_b}"),
+        json!(null),
+        Some(&token_a),
+    )
+    .await;
+    assert_eq!(attempt.0, StatusCode::NOT_FOUND);
+    // Same body as a kid that does not exist at all.
+    let missing = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_b}"),
+        json!(null),
+        Some(&jwt_for("tenant-c", &["DA"], Some("project-c"))),
+    )
+    .await;
+    assert_eq!(attempt, missing);
+    assert_eq!(snapshot(&state, dir.path()).await, before);
+
+    // Tenant B's key still authenticates afterwards.
+    let caller = api_gov::resolve_bearer_token(
+        &plaintext_b,
+        &state.api_keys.read().await,
+        &state.api_clients.read().await,
+    )
+    .unwrap_or_else(|_| panic!("tenant B key must still authenticate"));
+    assert_eq!(caller.key_id, kid_b);
+
+    // Tenant A can still revoke its own key under the shared id.
+    let (status, _) = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_a}"),
+        json!(null),
+        Some(&token_a),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = state.api_keys.read().await;
+    let status_of = |kid: &str| keys.iter().find(|k| k.id == kid).unwrap().status.clone();
+    assert_eq!(status_of(&kid_a), "revoked");
+    assert_eq!(status_of(&kid_b), "active");
 }
 
 #[tokio::test]
