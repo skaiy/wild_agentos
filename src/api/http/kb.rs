@@ -1646,6 +1646,9 @@ pub(crate) async fn reindex_knowledge_base_handler(
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = identity.require_verified_isolation_claims("KB reindex") {
+        return e.into_response();
+    }
     if let Err(e) = identity.require_role("DA") {
         return e.into_response();
     }

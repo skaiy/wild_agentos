@@ -91,7 +91,7 @@ pub(crate) async fn get_projection_handler(
     identity: UserIdentity,
     Json(req): Json<ProjectionRequest>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_core_write(&state, &identity, &req.task_iri).await {
+    if let Err(response) = authorize_core_read(&state, &identity, &req.task_iri).await {
         return response;
     }
     let frame = req
@@ -119,9 +119,7 @@ pub(crate) async fn read_node_handler(
     identity: UserIdentity,
     axum::extract::Path(node_iri): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // Same scope gate as core writes: verified claims matching the node's
-    // persisted tenant/project, or a verified DA JWT.
-    if let Err(response) = authorize_core_write(&state, &identity, &node_iri).await {
+    if let Err(response) = authorize_core_read(&state, &identity, &node_iri).await {
         return response;
     }
     match state.core.read_node(&node_iri).await {
@@ -167,6 +165,55 @@ pub(crate) async fn emit_event_handler(
         .emit_event(task_iri, event_type, source, &payload.to_string())
         .await;
     Json(json!({"event_id": event_id, "status": "emitted"})).into_response()
+}
+
+/// Body returned for both a missing node and a node outside the caller's
+/// scope, so reads are not an existence oracle.
+fn core_read_not_found() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+}
+
+/// Authorize reads of a node or task projection.
+///
+/// Unlike `authorize_core_write`, a DA role grants nothing extra: every caller
+/// needs verified claims matching the node's persisted tenant and project.
+/// Only a platform admin (`require_platform_admin`) may read across tenants.
+/// A node outside the scope answers exactly like a missing node.
+async fn authorize_core_read(
+    state: &AppState,
+    identity: &UserIdentity,
+    iri: &str,
+) -> Result<(), axum::response::Response> {
+    let Some(claims) = identity.isolation_claims() else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims required for core reads"})),
+        )
+            .into_response());
+    };
+    if identity.require_platform_admin("core reads").is_ok() {
+        return Ok(());
+    }
+    let node = match state.core.read_node(iri).await {
+        Ok(Some(node)) => node,
+        Ok(None) => return Err(core_read_not_found()),
+        Err(error) => {
+            tracing::warn!(%iri, "failed to read node scope: {}", error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to verify node scope"})),
+            )
+                .into_response());
+        }
+    };
+    let scope: Value = serde_json::from_str(&node.json_ld).unwrap_or(Value::Null);
+    let in_scope = scope.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+        && scope.get("project_id").and_then(Value::as_str) == Some(claims.project_id());
+    if in_scope {
+        Ok(())
+    } else {
+        Err(core_read_not_found())
+    }
 }
 
 /// Authorize writes to a task-scoped blackboard/event stream.
@@ -694,8 +741,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        emit_event_handler, list_blackboard_nodes_handler, list_blackboard_tasks_handler,
-        write_node_handler,
+        emit_event_handler, get_projection_handler, list_blackboard_nodes_handler,
+        list_blackboard_tasks_handler, read_node_handler, write_node_handler,
     };
     use crate::{
         api::http::{iam::JwtClaims, ApiUsageState, AppState, TEST_ENV_LOCK},
@@ -946,6 +993,119 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"], "task_iri is required");
+
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+        match previous_jwt_secret {
+            Some(value) => std::env::set_var("AGENTOS_JWT_SECRET", value),
+            None => std::env::remove_var("AGENTOS_JWT_SECRET"),
+        }
+    }
+
+    async fn raw_response(router: &Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, body.to_vec())
+    }
+
+    fn node_read_request(iri: &str, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri(format!(
+            "/api/v1/nodes/{}",
+            iri.replace(':', "%3A").replace('/', "%2F")
+        ));
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn projection_request(iri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/projections")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(json!({"task_iri": iri}).to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_core_reads_cross_tenant_matches_missing_404() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let node_b = "iri://task/tenant-b-private";
+        state
+            .core
+            .blackboard
+            .write_node(
+                node_b,
+                &json!({
+                    "@id": node_b,
+                    "@type": "Task",
+                    "tenant_id": "tenant-b",
+                    "project_id": "project-b",
+                    "note": "tenant-b-plan",
+                })
+                .to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/nodes/:node_iri", get(read_node_handler))
+            .route("/api/v1/projections", post(get_projection_handler))
+            .with_state(state.clone());
+        let missing = "iri://task/does-not-exist";
+        let not_found = br#"{"error":"not found"}"#.to_vec();
+        // Tenant A's DA, a plain tenant A user, and tenant B's DA in another
+        // project all get the missing-node 404 for tenant B's node.
+        for token in [
+            jwt("tenant-a", "project-a", vec!["DA"]),
+            jwt("tenant-a", "project-a", vec![]),
+            jwt("tenant-b", "project-other", vec!["DA"]),
+        ] {
+            let (status, cross) =
+                raw_response(&router, node_read_request(node_b, Some(&token))).await;
+            let (missing_status, absent) =
+                raw_response(&router, node_read_request(missing, Some(&token))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(missing_status, StatusCode::NOT_FOUND);
+            assert_eq!(cross, absent);
+            assert_eq!(cross, not_found);
+
+            let (status, cross) = raw_response(&router, projection_request(node_b, &token)).await;
+            let (missing_status, absent) =
+                raw_response(&router, projection_request(missing, &token)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(missing_status, StatusCode::NOT_FOUND);
+            assert_eq!(cross, absent);
+            assert_eq!(cross, not_found);
+        }
+        let (status, own) = raw_response(
+            &router,
+            node_read_request(node_b, Some(&jwt("tenant-b", "project-b", vec![]))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&own).contains("tenant-b-plan"));
+        assert_eq!(
+            raw_response(&router, node_read_request(node_b, None))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
 
         match previous_auth_mode {
             Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),

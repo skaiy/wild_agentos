@@ -2,11 +2,10 @@
 //!
 //! Every `(method, path)` registered in `build_router` is parsed from the
 //! router source (not a hand-maintained list) and called twice: with no
-//! credentials and with a fake bearer key. Each call must answer 401 unless
-//! the route is in `ANONYMOUS_ALLOWLIST`. `KNOWN_GAPS` is a temporary,
-//! separate list of routes that still answer something else; it may only
-//! shrink, and an entry that starts answering 401 fails the sweep so the list
-//! is kept honest.
+//! credentials and with a fake bearer key. Only 401 counts as protected.
+//! `ANONYMOUS_ALLOWLIST` is intentionally public. `KNOWN_GAPS` (open routes)
+//! and `INCONCLUSIVE` (extractor rejects before auth) are temporary, disjoint
+//! lists that may only shrink; an entry whose status changes fails the sweep.
 
 use std::time::Duration;
 
@@ -57,13 +56,105 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
     // Prompt routes are tracked by #302 and deliberately untouched here.
     ("GET", "/api/v1/prompts", "issue: #302"),
     ("GET", "/api/v1/prompts/resolve", "issue: #302"),
+    (
+        "DELETE",
+        "/api/v1/prompts/:id",
+        "issue: #302 (403, not 401)",
+    ),
+    (
+        "POST",
+        "/api/v1/prompts/:id/activate",
+        "issue: #302 (403, not 401)",
+    ),
 ];
 
-/// A probe is "open" unless it was denied (401/403) or rejected by a request
-/// extractor before the handler ran (400/413/415/422). Extractor rejections
-/// are inconclusive for auth and are counted separately; see the PR notes.
-fn is_open(status: &str) -> bool {
-    !matches!(status, "401" | "403" | "400" | "413" | "415" | "422")
+/// TEMPORARY: routes whose anonymous probe is rejected by a request extractor
+/// (400/413/415/422) before the handler runs, so the probe cannot show whether
+/// the handler authenticates. Resolved later by a default-deny layer. May only
+/// shrink: an entry that starts answering 401 fails the sweep, and an unlisted
+/// route that answers 400/422 fails too.
+const INCONCLUSIVE: &[(&str, &str)] = &[
+    ("DELETE", "/api/v1/mcp/skill-exposures"),
+    ("DELETE", "/api/v1/skills"),
+    ("GET", "/api/v1/blackboard/nodes"),
+    ("GET", "/api/v1/ontology/constrained-extractions/:id"),
+    ("POST", "/api/v1/agents"),
+    ("POST", "/api/v1/agents/:id/chat"),
+    ("POST", "/api/v1/api-clients"),
+    ("POST", "/api/v1/artifacts"),
+    ("POST", "/api/v1/batch/agents/:name/control"),
+    ("POST", "/api/v1/embedding/activate"),
+    ("POST", "/api/v1/events"),
+    ("POST", "/api/v1/images/upload"),
+    ("POST", "/api/v1/kb/bases"),
+    ("POST", "/api/v1/kb/bases/:id/import-graph"),
+    ("POST", "/api/v1/kb/bases/:id/materialize-rml"),
+    ("POST", "/api/v1/kb/bases/:id/search"),
+    ("POST", "/api/v1/kb/bases/:id/upload"),
+    ("POST", "/api/v1/kb/categories"),
+    ("POST", "/api/v1/kg/import"),
+    ("POST", "/api/v1/kg/query"),
+    ("POST", "/api/v1/knowledge-packs"),
+    ("POST", "/api/v1/market/packages"),
+    ("POST", "/api/v1/market/packages/:name/install"),
+    ("POST", "/api/v1/market/packages/:name/upgrade"),
+    ("POST", "/api/v1/mcp/servers"),
+    ("POST", "/api/v1/mcp/servers/invoke"),
+    ("POST", "/api/v1/mcp/skill-exposures"),
+    ("POST", "/api/v1/nodes"),
+    ("POST", "/api/v1/online-corpus-jobs"),
+    ("POST", "/api/v1/online-corpus-jobs/:id/run"),
+    ("POST", "/api/v1/ontology/action-types"),
+    ("POST", "/api/v1/ontology/constrained-extractions"),
+    (
+        "POST",
+        "/api/v1/ontology/constrained-extractions/:id/materialize",
+    ),
+    ("POST", "/api/v1/ontology/entity-resolution/suggestions"),
+    ("POST", "/api/v1/ontology/function-defs"),
+    ("POST", "/api/v1/ontology/link-types"),
+    ("POST", "/api/v1/ontology/object-types"),
+    ("POST", "/api/v1/ontology/readiness-report"),
+    ("POST", "/api/v1/ontology/type-drafts/:draft_id/promote"),
+    ("POST", "/api/v1/ontology/type-drafts/from-csv"),
+    ("POST", "/api/v1/ontology/type-drafts/from-induction"),
+    ("POST", "/api/v1/ontology/type-drafts/from-json-schema"),
+    ("POST", "/api/v1/ontology/type-drafts/from-openapi"),
+    ("POST", "/api/v1/ontology/type-drafts/from-sql-ddl"),
+    ("POST", "/api/v1/projections"),
+    ("POST", "/api/v1/prompts"),
+    ("POST", "/api/v1/public/agents/:id/chat"),
+    ("POST", "/api/v1/public/agents/:id/chat/stream"),
+    ("POST", "/api/v1/skills"),
+    ("POST", "/api/v1/skills/import-git"),
+    ("POST", "/api/v1/skills/pipeline-rerun"),
+    ("POST", "/api/v1/tasks"),
+    ("POST", "/api/v1/tasks/stream"),
+    ("POST", "/mcp"),
+    ("POST", "/v1/chat/completions"),
+    ("PUT", "/api/v1/ontology/action-types/:id"),
+    ("PUT", "/api/v1/ontology/function-defs/:id"),
+    ("PUT", "/api/v1/ontology/link-types/:id"),
+    ("PUT", "/api/v1/ontology/object-types/:id"),
+    ("PUT", "/api/v1/prompts/:id/canary"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeClass {
+    /// Both probes answered 401.
+    Protected,
+    /// No probe was open, but at least one was an extractor rejection.
+    Inconclusive,
+    /// Any other answer, including 403 (only 401 counts as protected).
+    Open,
+}
+
+fn classify(status: &str) -> ProbeClass {
+    match status {
+        "401" => ProbeClass::Protected,
+        "400" | "413" | "415" | "422" => ProbeClass::Inconclusive,
+        _ => ProbeClass::Open,
+    }
 }
 
 /// Query strings that let a probe get past a required `Query` extractor, so the
@@ -73,40 +164,96 @@ const PROBE_QUERIES: &[(&str, &str)] = &[("/api/v1/skills/manifest", "iri=skill:
 const ROUTER_SOURCE: &str = include_str!("mod.rs");
 const FAKE_KEY: &str = "wao_fake_0000000000000000000000000000";
 
-/// Parse `(METHOD, path)` pairs from the `.route(...)` calls in `build_router`.
-fn registered_routes() -> Vec<(String, String)> {
-    let start = ROUTER_SOURCE
+/// The `Router::new() ... .with_state(state)` chain of `build_router`, plus
+/// whatever follows `.with_state(state)` up to the end of the function.
+fn router_chain(source: &str) -> (&str, &str) {
+    let start = source
         .find("pub fn build_router(")
         .expect("build_router present");
-    let body = &ROUTER_SOURCE[start..];
+    let body = &source[start..];
+    let chain_start = body
+        .find("Router::new()")
+        .expect("Router::new() in build_router");
+    let body = &body[chain_start..];
     let end = body
         .find(".with_state(state)")
-        .expect("build_router ends with state");
-    let body = &body[..end];
+        .expect("build_router calls .with_state(state)");
+    let after = &body[end + ".with_state(state)".len()..];
+    (&body[..end], after)
+}
+
+fn has_call(chain: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    let bytes = chain.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = chain[from..].find(&needle) {
+        let at = from + pos;
+        let prev = if at == 0 { b' ' } else { bytes[at - 1] };
+        if !(prev.is_ascii_alphanumeric() || prev == b'_') {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
+/// Constructs the route parser does not understand. Any of them would let a
+/// route escape the sweep, so the guard fails instead.
+fn router_source_violations(source: &str) -> Vec<String> {
+    let (chain, after) = router_chain(source);
+    let mut violations = Vec::new();
+    for token in [".merge(", ".nest(", "route_service(", ".fallback("] {
+        if chain.contains(token) {
+            violations.push(format!("build_router uses {token}"));
+        }
+    }
+    for name in ["any", "on"] {
+        if has_call(chain, name) {
+            violations.push(format!("build_router uses {name}(...)"));
+        }
+    }
+    if chain.contains("_service(") {
+        violations.push("build_router uses a *_service(...) call".to_string());
+    }
+    if after.trim_start().chars().next() != Some('}') {
+        violations.push(".with_state(state) is not the last call in build_router".to_string());
+    }
+    violations
+}
+
+/// Parse `(METHOD, path)` pairs from the `.route(...)` calls in `build_router`.
+/// Returns the routes and the paths whose `.route(` block had no method.
+fn parse_routes(source: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let (chain, _) = router_chain(source);
     let mut routes = Vec::new();
-    let chunks: Vec<&str> = body.split(".route(").skip(1).collect();
-    for chunk in chunks {
+    let mut unparsed = Vec::new();
+    for chunk in chain.split(".route(").skip(1) {
         let open = chunk.find('"').expect("route path literal");
         let close = open + 1 + chunk[open + 1..].find('"').expect("route path end");
         let path = chunk[open + 1..close].to_string();
         let rest = &chunk[close + 1..];
-        let bytes = rest.as_bytes();
+        let mut found = false;
         for method in ["get", "post", "put", "delete", "patch"] {
-            let needle = format!("{method}(");
-            let mut from = 0;
-            while let Some(pos) = rest[from..].find(&needle) {
-                let at = from + pos;
-                let prev = if at == 0 { b' ' } else { bytes[at - 1] };
-                if !(prev.is_ascii_alphanumeric() || prev == b'_') {
-                    routes.push((method.to_uppercase(), path.clone()));
-                    break;
-                }
-                from = at + needle.len();
+            if has_call(rest, method) {
+                routes.push((method.to_uppercase(), path.clone()));
+                found = true;
             }
+        }
+        if !found {
+            unparsed.push(path);
         }
     }
     routes.sort();
     routes.dedup();
+    (routes, unparsed)
+}
+
+fn registered_routes() -> Vec<(String, String)> {
+    let (routes, unparsed) = parse_routes(ROUTER_SOURCE);
+    assert!(
+        unparsed.is_empty(),
+        "route blocks with no parsed method: {unparsed:?}"
+    );
     routes
 }
 
@@ -192,10 +339,13 @@ async fn status_for(router: &Router, method: &str, path: &str, key: Option<&str>
     }
 }
 
-/// Returns `METHOD path -> anon=<status> fake_key=<status>` for every
-/// non-allowlisted route that does not answer 401 to both calls.
-async fn sweep(router: &Router, routes: &[(String, String)]) -> Vec<(String, String, String)> {
-    let mut unguarded = Vec::new();
+/// Probes every non-allowlisted route anonymously and with a fake key.
+/// Returns `(method, path, class, "anon=<status> fake_key=<status>")`.
+async fn sweep(
+    router: &Router,
+    routes: &[(String, String)],
+) -> Vec<(String, String, ProbeClass, String)> {
+    let mut results = Vec::new();
     for (method, path) in routes {
         if ANONYMOUS_ALLOWLIST
             .iter()
@@ -205,15 +355,81 @@ async fn sweep(router: &Router, routes: &[(String, String)]) -> Vec<(String, Str
         }
         let anonymous = status_for(router, method, path, None).await;
         let fake_key = status_for(router, method, path, Some(FAKE_KEY)).await;
-        if is_open(&anonymous) || is_open(&fake_key) {
-            unguarded.push((
-                method.clone(),
-                path.clone(),
-                format!("anon={anonymous} fake_key={fake_key}"),
-            ));
-        }
+        let classes = [classify(&anonymous), classify(&fake_key)];
+        let class = if classes.contains(&ProbeClass::Open) {
+            ProbeClass::Open
+        } else if classes.contains(&ProbeClass::Inconclusive) {
+            ProbeClass::Inconclusive
+        } else {
+            ProbeClass::Protected
+        };
+        results.push((
+            method.clone(),
+            path.clone(),
+            class,
+            format!("anon={anonymous} fake_key={fake_key}"),
+        ));
     }
-    unguarded
+    results
+}
+
+fn listed(list: &[(&str, &str)], method: &str, path: &str) -> bool {
+    list.iter().any(|(m, p)| *m == method && *p == path)
+}
+
+fn known_gap(method: &str, path: &str) -> bool {
+    KNOWN_GAPS
+        .iter()
+        .any(|(m, p, _)| *m == method && *p == path)
+}
+
+#[test]
+fn isolation_contract_anonymous_route_sweep_router_source_guard() {
+    let violations = router_source_violations(ROUTER_SOURCE);
+    assert!(violations.is_empty(), "{violations:?}");
+    let (_, unparsed) = parse_routes(ROUTER_SOURCE);
+    assert!(
+        unparsed.is_empty(),
+        "route blocks with no parsed method: {unparsed:?}"
+    );
+}
+
+#[test]
+fn isolation_contract_anonymous_route_sweep_guard_rejects_unparsed_constructs() {
+    let (chain, _) = router_chain(ROUTER_SOURCE);
+    let original = format!("{chain}.with_state(state)");
+    for canary in [
+        ".route(\"/api/v1/__canary_any\", any(health_handler))",
+        ".merge(Router::new())",
+        ".nest(\"/x\", Router::new())",
+        ".route_service(\"/x\", svc)",
+        ".fallback(health_handler)",
+        ".route(\"/x\", on(MethodFilter::GET, health_handler))",
+        ".route(\"/x\", get_service(svc))",
+    ] {
+        let mutated =
+            ROUTER_SOURCE.replacen(&original, &format!("{chain}{canary}.with_state(state)"), 1);
+        assert_ne!(mutated, ROUTER_SOURCE);
+        assert!(
+            !router_source_violations(&mutated).is_empty(),
+            "guard missed {canary}"
+        );
+    }
+    let trailing = ROUTER_SOURCE.replacen(
+        &original,
+        &format!("{original}.layer(tower::layer::util::Identity::new())"),
+        1,
+    );
+    assert!(!router_source_violations(&trailing).is_empty());
+    let unparsed = ROUTER_SOURCE.replacen(
+        &original,
+        &format!("{chain}.route(\"/api/v1/__canary_any\", any(health_handler)).with_state(state)"),
+        1,
+    );
+    assert_eq!(
+        parse_routes(&unparsed).1,
+        vec!["/api/v1/__canary_any".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -227,56 +443,66 @@ async fn isolation_contract_anonymous_route_sweep() {
         "route parser found only {} routes",
         routes.len()
     );
-    for (method, path, _) in KNOWN_GAPS {
-        assert!(
-            !ANONYMOUS_ALLOWLIST
-                .iter()
-                .any(|(m, p)| m == method && p == path),
-            "{method} {path} is in both ANONYMOUS_ALLOWLIST and KNOWN_GAPS"
-        );
-        assert!(
-            routes.iter().any(|(m, p)| m == method && p == path),
-            "KNOWN_GAPS route {method} {path} is not registered"
-        );
-    }
+    let registered = |m: &str, p: &str| routes.iter().any(|(rm, rp)| rm == m && rp == p);
     for (method, path) in ANONYMOUS_ALLOWLIST {
         assert!(
-            routes.iter().any(|(m, p)| m == method && p == path),
-            "allowlisted route {method} {path} is not registered"
+            registered(method, path),
+            "allowlisted {method} {path} not registered"
         );
     }
-    let router = real_router(dir.path());
-    let unguarded = sweep(&router, &routes).await;
-    let mut exact_401 = 0;
-    for (method, path) in &routes {
-        if status_for(&router, method, path, None).await == "401" {
-            exact_401 += 1;
-        }
+    for (method, path, _) in KNOWN_GAPS {
+        assert!(
+            registered(method, path),
+            "KNOWN_GAPS {method} {path} not registered"
+        );
+        assert!(
+            !listed(ANONYMOUS_ALLOWLIST, method, path),
+            "{method} {path} in ANONYMOUS_ALLOWLIST and KNOWN_GAPS"
+        );
     }
+    for (method, path) in INCONCLUSIVE {
+        assert!(
+            registered(method, path),
+            "INCONCLUSIVE {method} {path} not registered"
+        );
+        assert!(
+            !listed(ANONYMOUS_ALLOWLIST, method, path) && !known_gap(method, path),
+            "{method} {path} in INCONCLUSIVE and another list"
+        );
+    }
+
+    let router = real_router(dir.path());
+    let results = sweep(&router, &routes).await;
+    let count = |class: ProbeClass| results.iter().filter(|r| r.2 == class).count();
     eprintln!(
-        "anonymous sweep: routes={} exact_401={} open={}",
+        "anonymous sweep: routes={} protected_401={} inconclusive={} open={}",
         routes.len(),
-        exact_401,
-        unguarded.len()
+        count(ProbeClass::Protected),
+        count(ProbeClass::Inconclusive),
+        count(ProbeClass::Open)
     );
 
-    let unexpected: Vec<String> = unguarded
-        .iter()
-        .filter(|(m, p, _)| !KNOWN_GAPS.iter().any(|(gm, gp, _)| gm == m && gp == p))
-        .map(|(m, p, s)| format!("{m} {p} -> {s}"))
-        .collect();
-    let stale: Vec<String> = KNOWN_GAPS
-        .iter()
-        .filter(|(gm, gp, _)| !unguarded.iter().any(|(m, p, _)| gm == m && gp == p))
-        .map(|(m, p, _)| format!("{m} {p}"))
-        .collect();
-    assert!(
-        unexpected.is_empty() && stale.is_empty(),
-        "routes={} unguarded routes not in the allowlist:\n{}\nKNOWN_GAPS entries that now answer 401 (remove them):\n{}",
-        routes.len(),
-        unexpected.join("\n"),
-        stale.join("\n")
-    );
+    let mut failures = Vec::new();
+    for (method, path, class, statuses) in &results {
+        let gap = known_gap(method, path);
+        let inconclusive = listed(INCONCLUSIVE, method, path);
+        match class {
+            ProbeClass::Open if !gap => failures.push(format!(
+                "open route not in KNOWN_GAPS: {method} {path} -> {statuses}"
+            )),
+            ProbeClass::Inconclusive if !inconclusive => failures.push(format!(
+                "inconclusive route not in INCONCLUSIVE: {method} {path} -> {statuses}"
+            )),
+            ProbeClass::Protected if gap || inconclusive => failures.push(format!(
+                "now protected, remove from KNOWN_GAPS/INCONCLUSIVE: {method} {path}"
+            )),
+            ProbeClass::Inconclusive if gap => failures.push(format!(
+                "KNOWN_GAPS entry no longer open: {method} {path} -> {statuses}"
+            )),
+            _ => {}
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Negative control: an unauthenticated route added to the real router must
@@ -291,9 +517,10 @@ async fn isolation_contract_anonymous_route_sweep_catches_unguarded_route() {
         get(|| async { StatusCode::OK }),
     );
     let routes = vec![("GET".to_string(), "/api/v1/__sweep_canary/:id".to_string())];
-    let unguarded = sweep(&router, &routes).await;
-    assert_eq!(unguarded.len(), 1);
-    assert_eq!(unguarded[0].2, "anon=200 fake_key=200");
+    let results = sweep(&router, &routes).await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].2, ProbeClass::Open);
+    assert_eq!(results[0].3, "anon=200 fake_key=200");
 }
 
 #[test]
