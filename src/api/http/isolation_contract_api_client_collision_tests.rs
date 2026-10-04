@@ -317,8 +317,34 @@ async fn isolation_contract_id_conflict_client_status_update_is_409_and_auth_sta
     );
 }
 
+/// In-memory and on-disk client/key snapshot (ids, tenants, statuses, key
+/// hashes) used to prove a refused delete changed nothing.
+async fn snapshot(state: &super::AppState) -> (Value, Value, Value, Value) {
+    (
+        serde_json::to_value(&*state.api_clients.read().await).unwrap(),
+        serde_json::to_value(&*state.api_keys.read().await).unwrap(),
+        serde_json::to_value(api_gov::load_api_clients()).unwrap(),
+        serde_json::to_value(api_gov::load_api_keys()).unwrap(),
+    )
+}
+
+/// Seeds state (and disk) with quarantined `clients` plus `keys`.
+async fn seeded(
+    dir: &Path,
+    mut clients: Vec<ApiClient>,
+    keys: Vec<ApiKey>,
+) -> std::sync::Arc<super::AppState> {
+    api_gov::quarantine_cross_tenant_client_ids(&mut clients);
+    api_gov::save_api_clients(&clients).unwrap();
+    api_gov::save_api_keys(&keys).unwrap();
+    let state = test_state(dir);
+    *state.api_clients.write().await = clients;
+    *state.api_keys.write().await = keys;
+    state
+}
+
 #[tokio::test]
-async fn isolation_contract_delete_colliding_client_keeps_other_tenant_keys() {
+async fn isolation_contract_delete_colliding_client_is_409_and_changes_nothing() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let _env = setup(dir.path());
@@ -326,44 +352,65 @@ async fn isolation_contract_delete_colliding_client_keeps_other_tenant_keys() {
     let (key_a2, _) = issued("key-a2", SHARED, "tenant-a");
     let (key_b1, _) = issued("key-b1", SHARED, "tenant-b");
     let (key_b2, _) = issued("key-b2", SHARED, "tenant-b");
-    let mut clients = vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")];
-    api_gov::quarantine_cross_tenant_client_ids(&mut clients);
-    let state = test_state(dir.path());
-    *state.api_clients.write().await = clients;
-    *state.api_keys.write().await = vec![key_a1, key_b1, key_a2, key_b2];
-    let router = app(state.clone());
-    let b_hashes = |keys: &[ApiKey]| -> Vec<String> {
-        keys.iter()
-            .filter(|k| k.id.starts_with("key-b"))
-            .map(|k| k.key_hash.clone())
-            .collect()
-    };
-    let before = b_hashes(&state.api_keys.read().await);
-    assert_eq!(before.len(), 2);
+    let cases = [
+        // Distinct slugs and same slug (`Tenant-A` / `tenant-a`): both refused.
+        vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")],
+        vec![client(SHARED, "Tenant-A"), client(SHARED, "tenant-a")],
+    ];
+    for clients in cases {
+        let state = seeded(
+            dir.path(),
+            clients,
+            vec![
+                key_a1.clone(),
+                key_b1.clone(),
+                key_a2.clone(),
+                key_b2.clone(),
+            ],
+        )
+        .await;
+        let router = app(state.clone());
+        let before = snapshot(&state).await;
+        assert_eq!(before.0.as_array().unwrap().len(), 2);
+        assert_eq!(before.1.as_array().unwrap().len(), 4);
 
-    let (status, _) = send(
-        &router,
-        Method::DELETE,
-        &format!("/api/v1/api-clients/{SHARED}"),
-        Value::Null,
-        &da("tenant-a"),
+        let (status, body) = send(
+            &router,
+            Method::DELETE,
+            &format!("/api/v1/api-clients/{SHARED}"),
+            Value::Null,
+            &da("tenant-a"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!body.to_string().contains("tenant-b"));
+        assert_eq!(
+            snapshot(&state).await,
+            before,
+            "refused delete must not touch clients or keys (memory or disk)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn isolation_contract_legacy_unprefixed_key_under_colliding_id_is_not_handed_over() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    // A legacy key under A's (colliding) client that carries no tenant prefix.
+    let (mut legacy, _) = issued("key-legacy-a", SHARED, "tenant-a");
+    legacy.key_prefix = "sk-legacy0".into();
+    legacy.name = "legacy-a-key-name".into();
+    let (key_b, _) = issued("key-b", SHARED, "tenant-b");
+    let state = seeded(
+        dir.path(),
+        vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")],
+        vec![legacy.clone(), key_b],
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let keys = state.api_keys.read().await.clone();
-    assert_eq!(b_hashes(&keys), before, "tenant B's keys must be unchanged");
-    assert_eq!(keys.len(), 2, "only tenant A's keys are removed");
-    assert!(keys.iter().all(|k| k.id.starts_with("key-b")));
-    let persisted = api_gov::load_api_keys();
-    assert_eq!(b_hashes(&persisted), before);
-    let clients = state.api_clients.read().await.clone();
-    assert_eq!(clients.len(), 1);
-    assert_eq!(clients[0].tenant_id, "tenant-b");
+    let router = app(state.clone());
+    let before = snapshot(&state).await;
 
-    // Same-slug tenants cannot be told apart by prefix: 409, nothing removed.
-    let (key_s, _) = issued("key-s", SHARED, "tenant-a");
-    *state.api_clients.write().await = vec![client(SHARED, "Tenant-A"), client(SHARED, "tenant-a")];
-    *state.api_keys.write().await = vec![key_s];
     let (status, _) = send(
         &router,
         Method::DELETE,
@@ -373,8 +420,22 @@ async fn isolation_contract_delete_colliding_client_keeps_other_tenant_keys() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(state.api_clients.read().await.len(), 2);
-    assert_eq!(state.api_keys.read().await.len(), 1);
+    assert_eq!(snapshot(&state).await, before);
+
+    let (status, body) = send(
+        &router,
+        Method::GET,
+        "/api/v1/api-clients",
+        Value::Null,
+        &da("tenant-b"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.to_string();
+    for hidden in [&legacy.id, &legacy.key_prefix, &legacy.name] {
+        assert!(!text.contains(hidden.as_str()), "A's legacy key shown to B");
+    }
+    assert!(text.contains("key-b"));
 }
 
 #[tokio::test]

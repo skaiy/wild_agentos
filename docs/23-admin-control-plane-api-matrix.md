@@ -57,10 +57,12 @@ An API client id that appears under more than one tenant in `api_clients.json`
   shared by more than one client, whatever their status. A client in
   `id_conflict` also returns `401`.
 - `PUT /api/v1/api-clients/:id` returns `409` for a status change on an
-  `id_conflict` client. `DELETE` on a shared id removes only keys that carry
-  the caller tenant's prefix (`409` if two tenants share the same slug). The
-  client list shows only those keys. Legacy audit records without `tenant_id`
-  under a shared id are never returned.
+  `id_conflict` client. `DELETE /api/v1/api-clients/:id` on a shared id is
+  refused with `409` and changes nothing (no client, no keys): deleting one
+  side would end the collision and leave the other tenant with keys it never
+  owned. Under a shared id the client list shows only keys that carry the
+  caller tenant's prefix (none if two tenants share the same slug). Legacy
+  audit records without `tenant_id` under a shared id are never returned.
 
 Recovery is manual. With the service stopped (it rewrites these files from
 memory), an administrator edits `api_clients.json` (and

@@ -53,11 +53,12 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
 - 对外 API 鉴权时，只要 key 的 `client_id` 被多个 client 共用，无论状态如何都返回 `401`；
   状态为 `id_conflict` 的 client 同样返回 `401`。
 - 对 `id_conflict` client 的 `PUT /api/v1/api-clients/:id` 状态变更返回 `409`。对共用 id 的
-  `DELETE` 只删除带调用方 tenant 前缀的 key（两个 tenant slug 相同时返回 `409`）；client 列表
-  也只展示这些 key。共用 id 下不带 `tenant_id` 的旧审计记录永不返回。
+  `DELETE /api/v1/api-clients/:id` 一律以 `409` 拒绝，不做任何改动（不删 client，也不删 key）：
+  只删一方会让冲突消失，使另一方租户得到本不属于它的 key。共用 id 下，client 列表只展示带调用方
+  tenant 前缀的 key（两个 tenant slug 相同时不展示）。共用 id 下不带 `tenant_id` 的旧审计记录永不返回。
 
-恢复需人工处理：先停止服务（服务会用内存数据覆盖这些文件），管理员再修改 `api_clients.json`（以及相关 key 的 `api_keys.json`），使每个
-client id 只属于一个 tenant，然后在文件中把保留的 client `status` 从 `id_conflict` 改回
+恢复需人工处理：先停止服务（服务会用内存数据覆盖这些文件），管理员再修改
+`api_clients.json`（以及相关 key 的 `api_keys.json`），使每个 client id 只属于一个 tenant，然后在文件中把保留的 client `status` 从 `id_conflict` 改回
 `active`，然后启动服务。在此之前该状态会在保存和重新加载后一直保留。
 
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、

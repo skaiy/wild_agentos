@@ -298,23 +298,22 @@ pub(crate) async fn delete_api_client_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
+    // Lock order (see `authenticate_public`): api_keys before api_clients.
+    let mut keys = state.api_keys.write().await;
     let mut clients = state.api_clients.write().await;
     if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
         return client_not_found(&id);
     }
-    // When another tenant shares this id, keys are removed only if they carry
-    // this tenant's prefix; same-slug tenants cannot be told apart -> 409.
-    let collisions = api_gov::cross_tenant_client_id_collisions(&clients);
-    if collisions
-        .get(&id)
-        .is_some_and(|tenants| api_gov::colliding_tenant_slug_is_ambiguous(tenants, tenant))
-    {
+    // A client id shared with another tenant does not identify which keys are
+    // whose (legacy keys may carry no tenant prefix), and deleting one side
+    // would make the collision disappear and hand the leftovers to the other
+    // tenant. Refuse and change nothing; an administrator fixes the data.
+    if api_gov::cross_tenant_client_id_collisions(&clients).contains_key(&id) {
         return client_id_conflict(&id);
     }
     clients.retain(|c| c.id != id || c.tenant_id != tenant);
     let _ = api_gov::save_api_clients(&clients);
-    let mut keys = state.api_keys.write().await;
-    keys.retain(|k| k.client_id != id || !api_gov::tenant_may_manage_key(&collisions, k, tenant));
+    keys.retain(|k| k.client_id != id);
     let _ = api_gov::save_api_keys(&keys);
     (
         StatusCode::OK,
