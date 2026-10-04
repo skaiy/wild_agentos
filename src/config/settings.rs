@@ -72,6 +72,11 @@ const PROCESS_ENV_VARS: &[&str] = &[
     "AGENT_OS_WORKSPACE_ROOT",
 ];
 
+/// `Value` origin tag for settings injected from [`ENV_KEY_MAP`]; followed by
+/// the variable name. [`deserialize_with_field_path`] uses it to keep the raw
+/// value out of load errors (a mistyped key must not land in startup logs).
+const MAPPED_ENV_ORIGIN_PREFIX: &str = "environment variable ";
+
 static WARN_UNKNOWN_ENV: Once = Once::new();
 
 fn is_mapped_or_process_var(name: &str) -> bool {
@@ -125,7 +130,8 @@ fn config_builder_with_sources(
             // names must reach serde verbatim (e.g. `007` or `1e5` must not
             // be reparsed as numbers).
             let kind = ValueKind::String(value.clone());
-            builder = builder.set_override(key, Value::new(None, kind))?;
+            let origin = format!("{MAPPED_ENV_ORIGIN_PREFIX}{name}");
+            builder = builder.set_override(key, Value::new(Some(&origin), kind))?;
         }
     }
     Ok(builder)
@@ -1383,17 +1389,56 @@ fn development_config_fallback_enabled(
         })
 }
 
+/// Whether the value at `path` in `config` was injected from the mapped
+/// environment variable `name` (see [`MAPPED_ENV_ORIGIN_PREFIX`]).
+fn is_from_mapped_env(config: &Config, name: &str, path: &str) -> bool {
+    let mut value = &config.cache;
+    for segment in path.split('.') {
+        match &value.kind {
+            ValueKind::Table(table) => match table.get(segment) {
+                Some(child) => value = child,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    value
+        .origin()
+        .and_then(|origin| origin.strip_prefix(MAPPED_ENV_ORIGIN_PREFIX))
+        == Some(name)
+}
+
 /// Deserialize a built [`Config`], naming the field path of any error.
 ///
 /// `config` alone reports e.g. ``missing field `max_projection_size` ``
 /// without saying which section is wrong; this wraps the error so an operator
 /// sees ``missing field `max_projection_size` (at `memory.l2`)``.
+///
+/// An error at a field set from an [`ENV_KEY_MAP`] variable is replaced by one
+/// naming only the field path, the variable and the expected type: the raw
+/// value is never echoed, in case a secret was put in the wrong variable.
+/// Errors for values from config files keep `config`'s original wording.
 fn deserialize_with_field_path<T: serde::de::DeserializeOwned>(
     config: Config,
 ) -> Result<T, ConfigError> {
+    // Resolved up front: deserializing consumes `config`.
+    let env_sourced: Vec<(&str, &str)> = ENV_KEY_MAP
+        .iter()
+        .filter(|(name, path)| is_from_mapped_env(&config, name, path))
+        .map(|&(name, path)| (path, name))
+        .collect();
     serde_path_to_error::deserialize(config).map_err(|err| {
         let path = err.path().to_string();
         let inner = err.into_inner();
+        if let Some((_, name)) = env_sourced.iter().find(|(p, _)| *p == path) {
+            let expected = match &inner {
+                ConfigError::Type { expected, .. } => *expected,
+                _ => "a valid value",
+            };
+            return ConfigError::Message(format!(
+                "invalid value for `{path}` from environment variable `{name}`: expected {expected}"
+            ));
+        }
         if path.is_empty() || path == "." {
             inner
         } else {
@@ -1621,19 +1666,55 @@ mod tests {
 
     #[test]
     fn invalid_mapped_env_value_error_names_the_field_path() {
+        const CANARY: &str = "canary-7f3a-not-a-number";
+        // Out of u16 range: fails after parsing, in `config`'s range check.
+        const CANARY_OVERFLOW: &str = "73519046287";
         let dir = tempfile::tempdir().unwrap();
         write_full_test_layers(dir.path());
-        let config = test_config(
-            dir.path(),
-            &[("AGENT_OS_GATEWAY_MAX_RETRIES", "not-a-number")],
-        )
-        .unwrap();
-        let err = deserialize_with_field_path::<Settings>(config)
+        for (name, path, value, expected) in [
+            (
+                "AGENT_OS_GATEWAY_MAX_RETRIES",
+                "gateway.max_retries",
+                CANARY,
+                "expected an integer",
+            ),
+            (
+                "AGENT_OS_EMBEDDING_ENABLED",
+                "embedding.enabled",
+                CANARY,
+                "expected a boolean",
+            ),
+            (
+                "AGENT_OS_API_METRICS_PORT",
+                "api.metrics_port",
+                CANARY_OVERFLOW,
+                "expected an unsigned 16 bit integer",
+            ),
+        ] {
+            let config = test_config(dir.path(), &[(name, value)]).unwrap();
+            let err = deserialize_with_field_path::<Settings>(config)
+                .expect_err("mistyped mapped env value must fail to load")
+                .to_string();
+            assert!(err.contains(&format!("`{path}`")), "{err}");
+            assert!(err.contains(&format!("`{name}`")), "{err}");
+            assert!(err.contains(expected), "{err}");
+            // The value may be a secret put in the wrong variable.
+            assert!(!err.contains(value), "raw env value echoed: {err}");
+        }
+    }
+
+    #[test]
+    fn invalid_config_file_value_error_is_not_attributed_to_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let shipped = shipped_config_yaml_text();
+        let broken = shipped.replacen("  max_retries: 3\n", "  max_retries: oops\n", 1);
+        assert_ne!(broken, shipped, "fixture edit must apply");
+        std::fs::write(dir.path().join("config.yaml"), broken).unwrap();
+        let err = deserialize_with_field_path::<Settings>(test_config(dir.path(), &[]).unwrap())
             .expect_err("non-numeric max_retries must fail to load")
             .to_string();
-        // Only bool/integer fields can fail to coerce, so the value `config`
-        // echoes here is never a key or URL.
-        assert!(err.contains("gateway.max_retries"), "{err}");
+        assert!(err.contains("(at `gateway.max_retries`)"), "{err}");
+        assert!(!err.contains("AGENT_OS_"), "{err}");
     }
 
     #[test]
