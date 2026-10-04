@@ -720,6 +720,9 @@ mod isolation_contract_platform_config_tests;
 mod isolation_contract_config_read_tests;
 
 #[cfg(test)]
+mod isolation_contract_anonymous_route_sweep_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
