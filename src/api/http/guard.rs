@@ -167,6 +167,7 @@ mod tests {
             validation_passed: true,
             retry_count: 0,
             error: error.map(str::to_string),
+            policy_denied_by: None,
         }
     }
 
