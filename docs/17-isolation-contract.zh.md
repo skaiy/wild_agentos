@@ -35,6 +35,19 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 传入 `IsolationClaims::from_verified`；`.`、`..`、路径分隔符（如 `a/b`）等不安全
 值会 fail closed，`verify_jwt` 不产生 identity。
 
+## 平台级配置不属于任何租户
+
+`PUT /api/v1/config`（gateway、embedding、models、admin policies）和
+`POST /api/v1/embedding/activate` 修改进程共享状态，仅允许 `PLATFORM_ADMIN`
+写入，租户 `DA` 不可写。Bearer JWT 必须经配置的认证模式验证，明确携带非空
+`tenant_id` 和 `project_id`，且 roles 包含大小写完全匹配的 `PLATFORM_ADMIN`。
+`tenant_id` 必须与部署配置 `AGENTOS_PLATFORM_ADMIN_TENANT` 完全相同；该配置
+未设置、为空白或为历史回退租户 `default` 时，任何人都不能取得此权限。
+无需同时具备 `DA`。即使在非严格开发模式中仍强制此门禁：没有经验证的 JWT
+返回 `401`；其余拒绝均返回 `403`，响应
+仅为 `{"error":"platform_admin_required","message":"platform administrator required for <resource>"}`。
+`GET /api/v1/config` 的读取权限保持不变。
+
 ### 本地 HS256 实证检查
 
 对已使用显式、非默认且至少 32 字节 `AGENTOS_JWT_SECRET` 配置为 HS256 的**运行中**

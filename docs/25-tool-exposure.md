@@ -102,3 +102,57 @@ Setting `enabled: false` restores the legacy fallback exposure behavior. The
 gateway records cached prompt tokens from OpenAI-compatible
 `prompt_tokens_details.cached_tokens` or `cache_read_input_tokens` and logs
 the cumulative cache hit rate.
+
+## Tool description standard
+
+The per-turn function schema is the single source of per-tool definitions.
+System prompts do not repeat a text menu. They retain the platform note in
+the environment section and, when applicable, a stable directory of
+on-demand groups.
+
+### Source and enforcement
+
+Descriptions and parameter descriptions are hand-written literals at builtin
+registration. No runtime normalization occurs. The builtin set is recorded
+from registration, not a maintained name list. Run
+`cargo test --lib tool_description_lint` to check the raw definitions.
+External and generated registrations only log per-tool warnings at runtime;
+they are never changed or blocked.
+
+### Rules
+
+- Names use lowercase snake case, are unique, and avoid numeric version
+  suffixes and generic names.
+- Descriptions are 80–600 bytes, with literal `Use when:` and `Not for:`
+  markers.
+- Confusable tools name a real same-family neighbor in `Not for:` and explain
+  when to use that neighbor instead.
+- Parameters are an object schema with descriptions for every property;
+  `required` names exist in `properties`. Booleans state their actual default.
+  Path, URL, regex, glob, and enum-like inputs state their format or an
+  already-enforced schema constraint.
+- Each role's resident serialized schema stays within 48,000 bytes. External
+  descriptions are checked for excessive Jaccard similarity in tests.
+
+### Confusable families
+
+| Family | Tools |
+| --- | --- |
+| Search | `grep_search`, `glob_search`, `rag_search`, `kg_search`, `kb_vector_search`, `knowledge_search`, `knowledge_query`, `knowledge_list` |
+| Write | `file_write`, `file_edit` |
+| Shell | `bash`, `powershell` |
+| Web | `web_search`, `web_fetch` |
+| Import | `knowledge_import_file`, `knowledge_import_url`, `knowledge_import_directory`, `knowledge_import_json` |
+| Ontology validation | `ontology_validate_turtle`, `ontology_lint_turtle`, `ontology_validate_shacl` |
+
+### Exemptions and example
+
+Generated micro-tools are exempt from the markers but still require parameter
+descriptions. Any other exemption needs a reason in `LINT_EXEMPTIONS` and an
+approved increase to `MAX_LINT_EXEMPTIONS` (currently zero); tests enforce both.
+
+Before: `file_write` said `Write content to a file.`
+
+After: `Write the complete supplied content to a file, creating or replacing
+it. Use when: a whole file must be written. Not for: a targeted change in an
+existing file; use file_edit.`
