@@ -62,7 +62,7 @@ required in addition. This gate applies even in non-strict development mode:
 requests without a verified JWT return `401`;
 all other failures return `403` with only
 `{"error":"platform_admin_required","message":"platform administrator required for <resource>"}`.
-`GET /api/v1/config` keeps its existing read behavior.
+`GET /api/v1/config` requires control-plane DA or platform-tenant `PLATFORM_ADMIN` (#295).
 
 ### Local HS256 empirical check
 
