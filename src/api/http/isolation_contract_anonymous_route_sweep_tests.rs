@@ -128,8 +128,6 @@ const INCONCLUSIVE: &[(&str, &str)] = &[
     ("POST", "/api/v1/skills"),
     ("POST", "/api/v1/skills/import-git"),
     ("POST", "/api/v1/skills/pipeline-rerun"),
-    ("POST", "/api/v1/tasks"),
-    ("POST", "/api/v1/tasks/stream"),
     ("POST", "/mcp"),
     ("POST", "/v1/chat/completions"),
     ("PUT", "/api/v1/ontology/action-types/:id"),
@@ -160,6 +158,26 @@ fn classify(status: &str) -> ProbeClass {
 /// Query strings that let a probe get past a required `Query` extractor, so the
 /// sweep observes the handler instead of a 400.
 const PROBE_QUERIES: &[(&str, &str)] = &[("/api/v1/skills/manifest", "iri=skill://sweep/probe")];
+
+/// Minimal valid bodies so a probe gets past the JSON extractor and reaches
+/// the handler's auth check (otherwise the route would be inconclusive).
+const PROBE_BODIES: &[(&str, &str, &str)] = &[
+    ("POST", "/api/v1/tasks", r#"{"user_input":"sweep probe"}"#),
+    (
+        "POST",
+        "/api/v1/tasks/stream",
+        r#"{"prompt":"sweep probe"}"#,
+    ),
+];
+
+/// Routes that must stay protected (401 for both probes). Guards against a
+/// regression being absorbed by a status change into another list.
+const MUST_BE_PROTECTED: &[(&str, &str)] = &[
+    ("POST", "/api/v1/tasks"),
+    ("POST", "/api/v1/tasks/stream"),
+    ("GET", "/api/v1/kb/bases/:id/documents"),
+    ("GET", "/api/v1/batch/events"),
+];
 
 const ROUTER_SOURCE: &str = include_str!("mod.rs");
 const FAKE_KEY: &str = "wao_fake_0000000000000000000000000000";
@@ -324,6 +342,11 @@ async fn status_for(router: &Router, method: &str, path: &str, key: Option<&str>
     }
     let body = if method == "GET" {
         Body::empty()
+    } else if let Some((_, _, body)) = PROBE_BODIES
+        .iter()
+        .find(|(m, p, _)| *m == method && *p == path)
+    {
+        Body::from(*body)
     } else {
         Body::from("{}")
     };
@@ -471,8 +494,33 @@ async fn isolation_contract_anonymous_route_sweep() {
         );
     }
 
+    for (method, path) in MUST_BE_PROTECTED {
+        assert!(
+            registered(method, path),
+            "MUST_BE_PROTECTED {method} {path} not registered"
+        );
+        assert!(
+            !listed(ANONYMOUS_ALLOWLIST, method, path)
+                && !known_gap(method, path)
+                && !listed(INCONCLUSIVE, method, path),
+            "MUST_BE_PROTECTED {method} {path} is also in another list"
+        );
+    }
+
     let router = real_router(dir.path());
     let results = sweep(&router, &routes).await;
+    for (method, path) in MUST_BE_PROTECTED {
+        let result = results
+            .iter()
+            .find(|(m, p, _, _)| m == method && p == path)
+            .expect("protected route was probed");
+        assert_eq!(
+            result.2,
+            ProbeClass::Protected,
+            "{method} {path} must answer 401: {}",
+            result.3
+        );
+    }
     let count = |class: ProbeClass| results.iter().filter(|r| r.2 == class).count();
     eprintln!(
         "anonymous sweep: routes={} protected_401={} inconclusive={} open={}",

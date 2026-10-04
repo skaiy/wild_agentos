@@ -786,7 +786,7 @@ mod tests {
         let core = Arc::new(
             SemanticCore::new(CoreConfig {
                 max_node_size: 1024,
-                max_projection_size: 2048,
+                max_projection_size: 65536,
                 l0_storage_path: tmp.join("l0").display().to_string(),
                 event_buffer_size: 10,
                 enable_metrics: false,
@@ -1212,20 +1212,56 @@ mod tests {
                 "status": "active",
             }),
         );
+        // The SPARQL frames read `ex:` triples, which the JSON-LD node write
+        // above does not produce. Seed them directly so the canary is really
+        // reachable by a whole-graph CONSTRUCT.
+        state
+            .core
+            .blackboard
+            .sparql_update(&format!(
+                r#"PREFIX ex: <https://wildagentos.org/ontology/>
+                INSERT DATA {{
+                    <iri://task/tenant-a-secret> a ex:Task ;
+                        ex:summary "{canary}" ;
+                        ex:goal "{canary}" ;
+                        ex:constraints "{canary}" ;
+                        ex:status "active" .
+                }}"#
+            ))
+            .unwrap();
         let task_b = "iri://task/tenant-b-own";
         write_scoped_task(&state, task_b, "tenant-b", "project-b", json!({}));
         let router = Router::new()
             .route("/api/v1/projections", post(get_projection_handler))
             .with_state(state.clone());
+
+        // Positive control: the whole-graph frame really returns the canary
+        // (platform admin is allowed to run it), so the absence check below
+        // is meaningful.
+        let admin = jwt(
+            "platform",
+            "ops",
+            vec![crate::api::http::iam::PLATFORM_ADMIN_ROLE],
+        );
+        let (status, body) =
+            raw_response(&router, projection_frame_request(task_b, "pa_init", &admin)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&body).contains(canary),
+            "seeded canary must be visible to the whole-graph pa_init frame: {}",
+            String::from_utf8_lossy(&body)
+        );
+
         let user_b = jwt("tenant-b", "project-b", vec![]);
         for frame in ["pa_init", "workspace_overview", "summary_only", "da_input"] {
             let (status, body) =
                 raw_response(&router, projection_frame_request(task_b, frame, &user_b)).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "frame {frame}");
+            // Canary first, so a regression is reported as the leak it is.
             assert!(
                 !String::from_utf8_lossy(&body).contains(canary),
                 "frame {frame} leaked tenant A's task"
             );
+            assert_eq!(status, StatusCode::NOT_FOUND, "frame {frame}");
         }
     }
 
