@@ -1715,6 +1715,7 @@ mod tests {
             .to_string();
         assert!(err.contains("(at `gateway.max_retries`)"), "{err}");
         assert!(!err.contains("AGENT_OS_"), "{err}");
+        assert!(err.contains("oops"), "{err}");
     }
 
     #[test]
