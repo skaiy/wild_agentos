@@ -97,6 +97,21 @@ pub(crate) async fn get_projection_handler(
     let frame = req
         .frame_name
         .unwrap_or_else(|| "reference_only".to_string());
+    // Frames with a SPARQL template run a CONSTRUCT over the whole blackboard
+    // with no task or tenant binding. Until templates are scope-bound, only a
+    // platform admin may use them; everyone else gets the missing-node 404.
+    let whole_graph = state
+        .core
+        .projection
+        .get_frame(&frame)
+        .is_some_and(|f| f.sparql_template.is_some());
+    if whole_graph
+        && identity
+            .require_platform_admin("whole-graph projections")
+            .is_err()
+    {
+        return core_read_not_found();
+    }
     let params = req.params.unwrap_or_default();
     match state
         .core
@@ -1030,6 +1045,188 @@ mod tests {
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(json!({"task_iri": iri}).to_string()))
             .unwrap()
+    }
+
+    fn write_scoped_task(state: &AppState, iri: &str, tenant: &str, project: &str, extra: Value) {
+        let mut node = json!({
+            "@id": iri,
+            "@type": "Task",
+            "tenant_id": tenant,
+            "project_id": project,
+        });
+        if let (Some(node), Some(extra)) = (node.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                node.insert(key.clone(), value.clone());
+            }
+        }
+        state
+            .core
+            .blackboard
+            .write_node(iri, &node.to_string(), &state.core.config)
+            .unwrap();
+    }
+
+    fn projection_frame_request(iri: &str, frame: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/projections")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                json!({"task_iri": iri, "frame_name": frame}).to_string(),
+            ))
+            .unwrap()
+    }
+
+    struct ProjectionEnv {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ProjectionEnv {
+        fn set() -> Self {
+            let vars = [
+                ("AGENTOS_AUTH_MODE", "hs256"),
+                (
+                    "AGENTOS_JWT_SECRET",
+                    "test-hs256-secret-at-least-32-bytes-long",
+                ),
+                (crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, "platform"),
+            ];
+            let previous = vars
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ProjectionEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Every registered frame with a `sparql_template` runs a whole-blackboard
+    /// CONSTRUCT, so only a platform admin may use it; everyone else gets the
+    /// same 404 as a missing node, even on their own task.
+    #[tokio::test]
+    async fn isolation_contract_core_projection_sparql_frames_platform_admin_only() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _env = ProjectionEnv::set();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let task_b = "iri://task/tenant-b-own";
+        write_scoped_task(&state, task_b, "tenant-b", "project-b", json!({}));
+        let router = Router::new()
+            .route("/api/v1/projections", post(get_projection_handler))
+            .with_state(state.clone());
+
+        let mut sparql_frames: Vec<String> = state
+            .core
+            .projection
+            .list_frames()
+            .into_iter()
+            .filter(|frame| frame.sparql_template.is_some())
+            .map(|frame| frame.name.clone())
+            .collect();
+        sparql_frames.sort();
+        assert!(
+            sparql_frames.len() >= 7,
+            "expected the SPARQL frames, got {sparql_frames:?}"
+        );
+
+        let not_found = br#"{"error":"not found"}"#.to_vec();
+        let (missing_status, missing) = raw_response(
+            &router,
+            projection_frame_request(
+                "iri://task/missing",
+                "reference_only",
+                &jwt("tenant-b", "project-b", vec![]),
+            ),
+        )
+        .await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing, not_found);
+
+        let admin = jwt(
+            "platform",
+            "ops",
+            vec![crate::api::http::iam::PLATFORM_ADMIN_ROLE],
+        );
+        for frame in &sparql_frames {
+            for token in [
+                jwt("tenant-b", "project-b", vec![]),
+                jwt("tenant-b", "project-b", vec!["DA"]),
+            ] {
+                let (status, body) =
+                    raw_response(&router, projection_frame_request(task_b, frame, &token)).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "frame {frame}");
+                assert_eq!(body, missing, "frame {frame} must look like a missing node");
+            }
+            let (status, _) =
+                raw_response(&router, projection_frame_request(task_b, frame, &admin)).await;
+            assert_eq!(status, StatusCode::OK, "platform admin frame {frame}");
+        }
+
+        // Frames without a SPARQL template stay available on the caller's own task.
+        let (status, _) = raw_response(
+            &router,
+            projection_frame_request(
+                task_b,
+                "reference_only",
+                &jwt("tenant-b", "project-b", vec![]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_core_projection_never_leaks_other_tenant_task() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _env = ProjectionEnv::set();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let canary = "tenant-a-canary-goal-7f3c";
+        write_scoped_task(
+            &state,
+            "iri://task/tenant-a-secret",
+            "tenant-a",
+            "project-a",
+            json!({
+                "goal": canary,
+                "constraints": [canary],
+                "summary": canary,
+                "status": "active",
+            }),
+        );
+        let task_b = "iri://task/tenant-b-own";
+        write_scoped_task(&state, task_b, "tenant-b", "project-b", json!({}));
+        let router = Router::new()
+            .route("/api/v1/projections", post(get_projection_handler))
+            .with_state(state.clone());
+        let user_b = jwt("tenant-b", "project-b", vec![]);
+        for frame in ["pa_init", "workspace_overview", "summary_only", "da_input"] {
+            let (status, body) =
+                raw_response(&router, projection_frame_request(task_b, frame, &user_b)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "frame {frame}");
+            assert!(
+                !String::from_utf8_lossy(&body).contains(canary),
+                "frame {frame} leaked tenant A's task"
+            );
+        }
     }
 
     #[tokio::test]
