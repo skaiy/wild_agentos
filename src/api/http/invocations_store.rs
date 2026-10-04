@@ -26,9 +26,21 @@
 //!
 //! [`InvocationStore::open`] moves every non-terminal record (`queued`,
 //! `running`, `cancel_requested`) to `failed` with `error.code =
-//! "interrupted"` and bumps its revision. Nothing is re-run automatically.
-//! Recovery is the only write path that bypasses [`InvocationState::permits`];
-//! it can only ever target `failed` from a non-terminal state.
+//! "interrupted"`, bumps its revision, records an audit event with actor
+//! `system` and persists the result before the store is returned. Nothing is
+//! re-run automatically.
+//!
+//! Restart recovery is the single privileged write path: it is the only code
+//! that bypasses [`InvocationState::permits`] (for example `queued → failed`
+//! is not a lifecycle edge), and it can only move a non-terminal record to
+//! `failed/interrupted`. Terminal records are never touched. Every other write
+//! goes through [`InvocationStore::transition_for_claims`].
+//!
+//! # `If-Match`
+//!
+//! [`parse_if_match`] accepts one strong tag `"<revision>"` or `*`. Anything
+//! else (weak tags, lists, unquoted or non-numeric values) is
+//! [`InvalidIfMatch`], which the routes map to `400 invalid_if_match`.
 
 // The store is consumed by the routes and execution bridge that land in
 // follow-up sub-issues of #313; until then only the unit tests exercise it.
@@ -66,8 +78,13 @@ const STORE_FILE_NAME: &str = "invocations.json";
 /// queued ──► running ──► succeeded
 ///   │           ├──────► failed
 ///   │           └──► cancel_requested ──► cancelled
+///   │                        ├──────────► succeeded
+///   │                        └──────────► failed
 ///   └──────────────────────────────────► cancelled
 /// ```
+///
+/// `cancel_requested → succeeded | failed` records the real outcome when
+/// execution finishes before the cancel request takes effect.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InvocationState {
@@ -114,7 +131,10 @@ impl InvocationState {
                     Self::Running,
                     Self::Succeeded | Self::Failed | Self::CancelRequested
                 )
-                | (Self::CancelRequested, Self::Cancelled)
+                | (
+                    Self::CancelRequested,
+                    Self::Cancelled | Self::Succeeded | Self::Failed
+                )
         )
     }
 
@@ -347,8 +367,22 @@ pub(crate) fn etag_for_revision(revision: u64) -> HeaderValue {
     HeaderValue::from_str(&format!("\"{revision}\"")).expect("digits and quotes are valid")
 }
 
+/// Malformed `If-Match`; maps to `400 invalid_if_match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidIfMatch;
+
+impl IntoResponse for InvalidIfMatch {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_if_match",
+                "message": "If-Match must be a single strong tag \"<revision>\" or *",
+            })),
+        )
+            .into_response()
+    }
+}
 
 /// Parses an optional `If-Match: "<revision>"` header.
 ///

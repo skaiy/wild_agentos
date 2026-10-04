@@ -94,6 +94,8 @@ fn invocations_lifecycle_permits_matches_graph_exactly() {
         (Running, Failed),
         (Running, CancelRequested),
         (CancelRequested, Cancelled),
+        (CancelRequested, Succeeded),
+        (CancelRequested, Failed),
     ]
     .into_iter()
     .map(|(a, b)| (a.as_str(), b.as_str()))
@@ -715,4 +717,59 @@ fn invocations_lifecycle_if_match_parsing() {
     assert_eq!(parse(&["\"1\"", "\"2\""]), Err(InvalidIfMatch));
     assert_eq!(parse(&["\"99999999999999999999999\""]), Err(InvalidIfMatch));
     assert_eq!(etag_for_revision(42), HeaderValue::from_static("\"42\""));
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_invalid_if_match_is_400() {
+    let (status, body) = body_bytes(InvalidIfMatch.into_response()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "invalid_if_match");
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_outcome_after_cancel_requested_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    for (outcome, patch) in [
+        (
+            InvocationState::Succeeded,
+            TransitionPatch {
+                result: Some(InvocationResult {
+                    summary: "finished-before-cancel".into(),
+                    artifacts: vec![],
+                }),
+                error: None,
+            },
+        ),
+        (
+            InvocationState::Failed,
+            TransitionPatch {
+                result: None,
+                error: Some(InvocationErrorInfo::new("execution_failed", "boom")),
+            },
+        ),
+    ] {
+        let cancelling = invocation_in(&store, &claims, InvocationState::CancelRequested).await;
+        let done = store
+            .transition_for_claims(
+                &claims,
+                &cancelling.id,
+                Some(cancelling.revision),
+                outcome,
+                patch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.state, outcome);
+        assert_eq!(done.revision, cancelling.revision + 1);
+        assert!(done.completed_at.is_some());
+        match outcome {
+            InvocationState::Succeeded => {
+                assert_eq!(done.result.unwrap().summary, "finished-before-cancel")
+            }
+            _ => assert_eq!(done.error.unwrap().code, "execution_failed"),
+        }
+    }
 }
