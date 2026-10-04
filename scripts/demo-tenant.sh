@@ -17,8 +17,10 @@ AGENT_NAME="Example Co. demo agent"
 KB_NAME="Example Co. sample knowledge"
 
 die() { printf 'Error: %s\n' "$1" >&2; exit 2; }
+MAX_EXP_DAYS=30
 usage() {
-    printf 'Usage: %s mint [--out PATH] [--exp-days N] | seed | verify\n' "$0"
+    printf 'Usage: %s mint [--out PATH] [--exp-days N (1-%s)] | seed | verify\n' "$0" "$MAX_EXP_DAYS"
+    printf 'Note: until #302 merges, distributed demo tokens must carry only mcp_invoke (DEMO_ROLES=mcp_invoke, no DA); a DA token used for seeding stays local, mode 600, and is deleted after use.\n'
 }
 
 # Reject unsafe scope before parsing a subcommand or creating any files.
@@ -181,6 +183,59 @@ check() {
     fi
 }
 
+# Reads only the role claim from the local token file; prints nothing.
+token_has_role() {
+    python3 - "$1" "$2" <<'PY'
+import base64
+import json
+import sys
+with open(sys.argv[1], encoding="ascii") as token_file:
+    parts = token_file.read().strip().split(".")
+try:
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    roles = json.loads(base64.urlsafe_b64decode(payload)).get("roles", [])
+except (IndexError, ValueError):
+    sys.exit(1)
+sys.exit(0 if isinstance(roles, list) and sys.argv[2] in roles else 1)
+PY
+}
+
+# Mirrors the kernel's scrub_secret_fields rule: a field is secret when its
+# name, lowercased with `_`/`-` removed, ends with a secret word, unless it
+# ends with `configured` (e.g. api_key_configured). Prints field paths only,
+# never values.
+config_has_no_secret_fields() {
+    python3 - "$RESPONSE_BODY" <<'PY'
+import json
+import sys
+SECRET = ("apikey", "secret", "token", "password", "secretkey", "privatekey",
+          "accesskey", "authorization", "credential", "credentials")
+def secret(key):
+    name = "".join(c for c in key if c not in "_-").lower()
+    return not name.endswith("configured") and name.endswith(SECRET)
+found = []
+def walk(value, path):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else key
+            if secret(key):
+                found.append(child_path)
+            walk(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            walk(child, f"{path}[{index}]")
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        walk(json.load(source), "")
+except ValueError:
+    print("config response is not JSON", file=sys.stderr)
+    sys.exit(1)
+if found:
+    print("secret-looking fields present: " + ", ".join(found[:5]), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 list_excludes_id() {
     expect 200 "$TMP_DIR/other.header" GET /api/v1/agents &&
         python3 - "$RESPONSE_BODY" "$1" <<'PY'
@@ -207,8 +262,12 @@ case "${1:-}" in
                 *) die "Unknown mint argument: $1" ;;
             esac
         done
-        [[ -n "$out" && "$days" =~ ^[1-9][0-9]*$ ]] ||
-            die "Provide a path and a positive integer --exp-days."
+        [[ -n "$out" ]] || die "Provide a path for --out."
+        # Validate before the secret is read or anything is signed.
+        if ! [[ "$days" =~ ^[0-9]{1,6}$ ]] || ((10#$days < 1 || 10#$days > MAX_EXP_DAYS)); then
+            die "--exp-days must be an integer from 1 to $MAX_EXP_DAYS."
+        fi
+        days=$((10#$days))
         require_secret
         umask 077
         mint_jwt "$out" "$days" "$DEMO_TENANT" true
@@ -275,15 +334,25 @@ PY
         check "demo knowledge bases readable" expect 200 "$TMP_DIR/demo.header" GET /api/v1/kb/bases
         check "demo cannot change global config" expect 403 "$TMP_DIR/demo.header" PUT /api/v1/config \
             --header 'Content-Type: application/json' --data '{"gateway":{}}'
-        if fetch "$TMP_DIR/demo.header" GET /api/v1/config; then
-            case "$HTTP_STATUS" in
-                401|403) printf 'PASS demo cannot read global config\n' ;;
-                200) printf 'SKIP older kernel without #290; GET /api/v1/config is still readable\n' ;;
-                *) printf 'FAIL demo config read returned unexpected status\n'; FAIL=$((FAIL + 1)) ;;
-            esac
-        else
+        # Since #295 a control-plane DA token reads GET /api/v1/config (200) and
+        # the kernel scrubs secret fields (scrub_secret_fields in config.rs).
+        # A token without DA must still be refused.
+        if ! fetch "$TMP_DIR/demo.header" GET /api/v1/config; then
             printf 'FAIL demo config read request failed\n'
             FAIL=$((FAIL + 1))
+        elif token_has_role "$DEMO_TOKEN_FILE" DA; then
+            if [[ "$HTTP_STATUS" != 200 ]]; then
+                printf 'FAIL demo DA config read returned %s, expected 200\n' "$HTTP_STATUS"
+                FAIL=$((FAIL + 1))
+            else
+                check "demo DA config read has no secret fields" config_has_no_secret_fields
+            fi
+        else
+            case "$HTTP_STATUS" in
+                401|403) printf 'PASS demo without DA cannot read global config\n' ;;
+                *) printf 'FAIL demo without DA config read returned %s, expected 401/403\n' "$HTTP_STATUS"
+                   FAIL=$((FAIL + 1)) ;;
+            esac
         fi
         if [[ -z "$agent_id" ]]; then
             printf 'FAIL demo agent missing; run seed first\n'

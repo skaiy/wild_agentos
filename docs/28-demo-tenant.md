@@ -15,7 +15,9 @@ The demo names can be changed with `DEMO_TENANT`, `DEMO_PROJECT`, and `DEMO_ACTO
 
 Set `AGENTOS_JWT_SECRET` to the deployment's HS256 signing secret (at least 32 bytes). Set `AGENTOS_PLATFORM_ADMIN_TENANT=platform` on the server, using your actual platform tenant instead of `platform` if different. It must not be `default` or the demo tenant. Use a running local HTTP API with embedding and document storage enabled to seed the sample documents. Keep the signing secret and token files private.
 
-Do not add `DA` to a live demo token until the platform-admin gate (#274) **and** the config-read gate (#290) are deployed. The script reports a skip for the config-read check on older kernels, but that is not approval for rollout.
+Do not add `DA` to a live demo token until the platform-admin gate (#274) **and** the config-read gate (#290) are deployed. With a `DA` token, `verify` expects `GET /api/v1/config` to return 200 with no secret fields (key, token, password and similar fields removed); a token without `DA` must be refused. `--exp-days` accepts 1 to 30.
+
+Until #302 merges, distributed demo tokens must carry only `mcp_invoke` (`DEMO_ROLES=mcp_invoke`, no `DA`). Any `DA` token used for seeding stays local, mode 600, and is deleted after use.
 
 ## Mint, seed, verify
 
