@@ -40,6 +40,19 @@ active supervisor restriction. Plan metadata such as `tools_allowed` is a
 planning hint, not an execution control. Restrictions and on-demand activation
 belong to one run; they are not shared executor state.
 
+Result-reader micro-tools (`read_full_result_*`, `query_*`,
+`get_entity_details_*`, `expand_relation_*`) inherit `file_read` and are never
+available to Plan. This rule applies only to readers the executor registered
+itself. A name prefix alone never makes a tool read-only: an external or plugin
+tool with the same prefix follows the normal role cap, and registering it
+replaces any internal reader of that name.
+
+When a `SyscallGate` is installed, it checks each call against the caller's
+run-local policy. A call without a trusted runtime role or run-local policy is
+rejected; an empty or unknown role is never treated as "skip the role check".
+A supervisor tool restriction reports whether it narrowed an active run; with
+no active run it is logged as not applied.
+
 | Role | Default visible and executable tools |
 | --- | --- |
 | Plan | `file_read`, `file_list`, `glob_search`, `grep_search`, `web_search`, `web_fetch`, `tool_search`, `rag_search`, `knowledge_list`, `knowledge_search`, `kg_search`, `knowledge_extract_code` |
