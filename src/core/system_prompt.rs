@@ -16,6 +16,20 @@ pub enum SystemPromptRegion {
     ExtractionPrompt,
 }
 
+/// Return the stable platform note that belongs in the environment region.
+///
+/// This is operational context, not a second representation of the tool
+/// registry. Tool definitions are supplied only through the per-turn schema.
+pub fn platform_environment_hint() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "[Platform: Windows | bash tool actually uses PowerShell]"
+    } else if cfg!(target_os = "macos") {
+        "[Platform: macOS]"
+    } else {
+        "[Platform: Linux]"
+    }
+}
+
 impl SystemPromptRegion {
     pub fn order(&self) -> usize {
         match self {

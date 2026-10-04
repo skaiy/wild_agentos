@@ -285,12 +285,14 @@ async fn control_plane_routes_require_verified_claims_and_da() {
             "AGENTOS_DATA_DIR",
             data_dir.path().to_string_lossy().into_owned(),
         ),
+        ("AGENTOS_PLATFORM_ADMIN_TENANT", "tenant-a".into()),
     ]);
     write_models_override(data_dir.path(), "http://127.0.0.1:9");
     let state = test_state(data_dir.path());
     let router = app(state.clone());
     let no_da = jwt(&[], Some("project-a"));
     let da = jwt(&["DA"], Some("project-a"));
+    let platform_admin = jwt(&["PLATFORM_ADMIN"], Some("project-a"));
 
     let routes = [
         (Method::GET, "/api/v1/batch/agents", json!(null)),
@@ -401,6 +403,7 @@ async fn control_plane_routes_require_verified_claims_and_da() {
         StatusCode::BAD_REQUEST,
         "the normal model validation result proves the DA request passed the gate"
     );
+    // #274: tightened, explicit tenant DA no longer activates global embedding.
     assert_eq!(
         request(
             &router,
@@ -408,6 +411,19 @@ async fn control_plane_routes_require_verified_claims_and_da() {
             "/api/v1/embedding/activate",
             json!({"resource_id": "embedding-a"}),
             Some(&da),
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    // #274: tightened (success now requires a platform-admin token).
+    assert_eq!(
+        request(
+            &router,
+            Method::POST,
+            "/api/v1/embedding/activate",
+            json!({"resource_id": "embedding-a"}),
+            Some(&platform_admin),
         )
         .await
         .0,
@@ -625,6 +641,20 @@ async fn embedding_activation_rejections_do_not_change_active_config_or_store() 
             "/api/v1/embedding/activate",
             body,
             Some(&no_da),
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let da = jwt(&["DA"], Some("project-a"));
+    // #274: tightened, explicit DA cannot activate embedding.
+    assert_eq!(
+        request(
+            &router,
+            Method::POST,
+            "/api/v1/embedding/activate",
+            json!({"resource_id": "embedding-a"}),
+            Some(&da),
         )
         .await
         .0,

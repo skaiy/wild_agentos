@@ -811,6 +811,7 @@ async fn config_update_requires_control_plane_da() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let _env = setup(dir.path());
+    let _platform_tenant = EnvGuard::set(&[("AGENTOS_PLATFORM_ADMIN_TENANT", "platform".into())]);
     let state = seeded(dir.path()).await;
     let router = app(state.clone());
     let old_calls = Arc::new(AtomicUsize::new(0));
@@ -872,11 +873,28 @@ async fn config_update_requires_control_plane_da() {
     }
     assert_eq!(old_calls.load(Ordering::SeqCst), 2);
     assert_eq!(new_calls.load(Ordering::SeqCst), 0);
-    let admin = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    let da = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    // #274: tightened, an explicit tenant DA no longer writes global config (200 → 403).
+    assert_eq!(
+        request_raw(
+            &router,
+            Method::PUT,
+            "/api/v1/config",
+            patch.clone(),
+            Some(&da)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!path.exists());
+    assert_eq!(state.gateway.default_model(), original_model);
+    let admin = jwt_for("platform", &["PLATFORM_ADMIN"], Some("project-a"));
     assert_eq!(
         request_raw(&router, Method::PUT, "/api/v1/config", patch, Some(&admin))
             .await
             .0,
+        // #274: tightened (success requires the platform-admin claim shape).
         StatusCode::OK
     );
     assert_eq!(state.gateway.default_model(), "new-model");

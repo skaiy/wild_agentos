@@ -705,10 +705,19 @@ pub fn build_router(
 }
 
 #[cfg(test)]
+mod isolation_contract_provider_key_tests;
+
+#[cfg(test)]
 mod control_plane_route_auth_tests;
 
 #[cfg(test)]
 mod isolation_contract_api_clients_tests;
+
+#[cfg(test)]
+mod isolation_contract_platform_config_tests;
+
+#[cfg(test)]
+mod isolation_contract_config_read_tests;
 
 #[cfg(test)]
 mod tests {
