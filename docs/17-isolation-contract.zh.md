@@ -46,7 +46,7 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 无需同时具备 `DA`。即使在非严格开发模式中仍强制此门禁：没有经验证的 JWT
 返回 `401`；其余拒绝均返回 `403`，响应
 仅为 `{"error":"platform_admin_required","message":"platform administrator required for <resource>"}`。
-`GET /api/v1/config` 的读取权限保持不变。
+`GET /api/v1/config` 要求控制面 DA 或平台租户的 `PLATFORM_ADMIN`（#295）。
 
 ### 本地 HS256 实证检查
 
