@@ -709,10 +709,16 @@ pub fn build_router(
 mod isolation_contract_provider_key_tests;
 
 #[cfg(test)]
+mod isolation_contract_api_client_collision_tests;
+
+#[cfg(test)]
 mod control_plane_route_auth_tests;
 
 #[cfg(test)]
 mod isolation_contract_api_clients_tests;
+
+#[cfg(test)]
+mod isolation_contract_demo_tenant_tests;
 
 #[cfg(test)]
 mod isolation_contract_platform_config_tests;
