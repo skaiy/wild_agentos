@@ -401,14 +401,10 @@ pub(crate) async fn list_api_audit_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    let tenant_client_ids: HashSet<String> = state
-        .api_clients
-        .read()
-        .await
-        .iter()
-        .filter(|c| c.tenant_id == tenant)
-        .map(|c| c.id.clone())
-        .collect();
+    // Legacy records without tenant_id are attributed by client_id only, so
+    // ids shared with another tenant (or quarantined at load) are excluded.
+    let tenant_client_ids: HashSet<String> =
+        api_gov::legacy_audit_client_ids(&state.api_clients.read().await, tenant);
     let limit = q.limit.unwrap_or(200).min(1000);
     let items = api_gov::read_audit_for_tenant(
         tenant,

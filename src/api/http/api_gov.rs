@@ -109,10 +109,71 @@ pub fn api_audit_path() -> PathBuf {
 }
 
 pub fn load_api_clients() -> Vec<ApiClient> {
-    match std::fs::read_to_string(api_clients_path()) {
+    let mut clients: Vec<ApiClient> = match std::fs::read_to_string(api_clients_path()) {
         Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
         Err(_) => Vec::new(),
+    };
+    quarantine_cross_tenant_client_ids(&mut clients);
+    clients
+}
+
+/// Status given to every client whose id also appears under another tenant.
+/// Such clients are unusable: inbound auth rejects them with 401 and their
+/// legacy (tenant-less) audit records are hidden. Fail closed.
+pub const CLIENT_ID_CONFLICT_STATUS: &str = "id_conflict";
+
+/// Client ids that appear under more than one tenant, with those tenants (sorted).
+pub fn cross_tenant_client_id_collisions(
+    clients: &[ApiClient],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut tenants_by_id: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    for client in clients {
+        tenants_by_id
+            .entry(client.id.clone())
+            .or_default()
+            .insert(client.tenant_id.clone());
     }
+    tenants_by_id.retain(|_, tenants| tenants.len() > 1);
+    tenants_by_id
+}
+
+/// Marks ALL clients whose id collides across tenants as unusable and logs one
+/// warning per id (id and tenant ids only). Returns the number of clients marked.
+pub fn quarantine_cross_tenant_client_ids(clients: &mut [ApiClient]) -> usize {
+    let collisions = cross_tenant_client_id_collisions(clients);
+    if collisions.is_empty() {
+        return 0;
+    }
+    for (id, tenants) in &collisions {
+        tracing::warn!(
+            client_id = %id,
+            tenants = ?tenants,
+            "api client id is used by more than one tenant; all of these clients are disabled (fail closed)"
+        );
+    }
+    let mut marked = 0;
+    for client in clients.iter_mut() {
+        if collisions.contains_key(&client.id) {
+            client.status = CLIENT_ID_CONFLICT_STATUS.to_string();
+            marked += 1;
+        }
+    }
+    marked
+}
+
+/// Client ids whose legacy audit records (no `tenant_id`) a tenant may read:
+/// the tenant's own clients, minus any id that is (or was, per the conflict
+/// status) shared with another tenant. Ambiguous history is never returned.
+pub fn legacy_audit_client_ids(clients: &[ApiClient], tenant: &str) -> HashSet<String> {
+    let collisions = cross_tenant_client_id_collisions(clients);
+    clients
+        .iter()
+        .filter(|c| c.tenant_id == tenant)
+        .filter(|c| c.status != CLIENT_ID_CONFLICT_STATUS)
+        .filter(|c| !collisions.contains_key(&c.id))
+        .map(|c| c.id.clone())
+        .collect()
 }
 pub fn save_api_clients(clients: &[ApiClient]) -> std::io::Result<()> {
     let path = api_clients_path();
@@ -280,10 +341,27 @@ pub fn resolve_bearer_token(
             }
         }
     }
-    let client = clients
-        .iter()
-        .find(|c| c.id == key.client_id)
-        .ok_or(AuthError::Unauthorized)?;
+    // Never take the first client with this id: when ids collide, select the
+    // one client whose tenant matches the key's generated prefix. Zero or
+    // several matches fail closed with 401.
+    let candidates: Vec<&ApiClient> = clients.iter().filter(|c| c.id == key.client_id).collect();
+    let client = match candidates.as_slice() {
+        [] => return Err(AuthError::Unauthorized),
+        [only] => *only,
+        many => {
+            let owned: Vec<&&ApiClient> = many
+                .iter()
+                .filter(|c| key_prefix_matches_tenant(key, &c.tenant_id))
+                .collect();
+            match owned.as_slice() {
+                [only] => **only,
+                _ => return Err(AuthError::Unauthorized),
+            }
+        }
+    };
+    if client.status == CLIENT_ID_CONFLICT_STATUS {
+        return Err(AuthError::Unauthorized);
+    }
     if client.status != "active" {
         return Err(AuthError::ClientDisabled);
     }
@@ -295,6 +373,29 @@ pub fn resolve_bearer_token(
         owner: client.owner.clone(),
         granted_agent_ids: client.granted_agent_ids.clone(),
     })
+}
+
+/// Whether `key.key_prefix` has the exact shape `generate_key` writes for
+/// `tenant` (`sk-<slug>-<6 chars>`). Used only to disambiguate colliding
+/// client ids. Slugs are lossy (case folding, punctuation → `-`), so two
+/// tenants can share a slug; then both match and the caller gets 401.
+fn key_prefix_matches_tenant(key: &ApiKey, tenant: &str) -> bool {
+    let slug: String = tenant
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "t" } else { slug };
+    let head = format!("sk-{slug}-");
+    key.key_prefix.len() == head.len() + 6
+        && key.key_prefix.starts_with(&head)
+        && !key.key_prefix[head.len()..].contains('-')
 }
 
 // ─── 进程内限流 / 配额 / 并发 ──────────────────────────────────────────────────
