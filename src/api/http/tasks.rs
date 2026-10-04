@@ -236,13 +236,14 @@ pub(crate) async fn stream_task_handler(
         Err(response) => return response,
     };
     if let Some(task_iri) = req.task_iri.as_deref() {
-        // An existing task outside the caller's scope answers like a missing
-        // one (no existence oracle); a supplied task_iri must be in scope.
-        // A platform admin may stream any existing task.
-        let platform_admin = identity.require_platform_admin("task streams").is_ok();
+        // A supplied task_iri must name a Task in the caller's own
+        // tenant+project; anything else answers like a missing one (no
+        // existence oracle). There is no platform-admin exception: executing
+        // with the admin's claims against another scope's task would mix
+        // outputs across scopes. Admins inspect other tasks via read routes.
         let in_scope = matches!(
             state.core.read_node(task_iri).await,
-            Ok(Some(node)) if platform_admin || task_is_in_scope(&node.json_ld, claims)
+            Ok(Some(node)) if task_is_in_scope(&node.json_ld, claims)
         );
         if !in_scope {
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
@@ -1206,6 +1207,110 @@ mod tests {
             .filter(|task| task["tenant_id"] == "tenant-b" && task["project_id"] == "project-b")
             .count();
         assert_eq!(owned_by_b, 1);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_task_stream_has_no_platform_admin_exception() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let saved_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        let saved_pa_tenant = std::env::var_os(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, "platform");
+
+        let (state, calls) = counting_state();
+        let router = task_router(state.clone());
+        let subscribers = state.core.events.subscriber_count();
+        let pa = jwt_with_roles("platform", "ops", vec!["PLATFORM_ADMIN"]);
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let task_a = state
+            .core
+            .init_task_with_claims("tenant a task", None, None, None, None, &tenant_a)
+            .await
+            .unwrap();
+        // An existing node in the admin's own scope that is not a Task.
+        let not_a_task = "iri://node/platform-ops-document";
+        state
+            .core
+            .blackboard
+            .write_node(
+                not_a_task,
+                &json!({"@id": not_a_task, "@type": "Document", "tenant_id": "platform", "project_id": "ops"})
+                    .to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+        assert!(state.core.read_node(not_a_task).await.unwrap().is_some());
+
+        let missing = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&pa),
+            json!({"prompt": "go", "task_iri": "iri://task/missing"}),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing = to_bytes(missing.into_body(), 1024 * 1024).await.unwrap();
+        for task_iri in [task_a.as_str(), not_a_task] {
+            let response = post_json(
+                &router,
+                "/api/v1/tasks/stream",
+                Some(&pa),
+                json!({"prompt": "go", "task_iri": task_iri}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{task_iri}");
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(body, missing, "{task_iri}");
+        }
+        assert_eq!(state.core.events.subscriber_count(), subscribers);
+        assert_eq!(
+            executor_calls(&calls),
+            0,
+            "platform admin must not execute other scopes"
+        );
+
+        // The admin can still stream a task in its own scope.
+        let response = post_json(
+            &router,
+            "/api/v1/tasks",
+            Some(&pa),
+            json!({"user_input": "platform task"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let own_task = serde_json::from_slice::<Value>(&body).unwrap()["task_iri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let own = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&pa),
+            json!({"prompt": "go", "task_iri": own_task}),
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
+        for _ in 0..50 {
+            if executor_calls(&calls) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(executor_calls(&calls), 1);
+        drop(own);
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+        restore_env(
+            crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV,
+            saved_pa_tenant,
+        );
     }
 
     #[tokio::test]
