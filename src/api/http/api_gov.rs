@@ -355,6 +355,13 @@ pub fn resolve_bearer_token(
         (Some(only), None) => only,
         _ => return Err(AuthError::Unauthorized),
     };
+    // Defense in depth: a key minted by `generate_key` carries its tenant's
+    // slug; if that slug is not the resolved client's tenant, the key and the
+    // client do not belong together -> 401. Keys without such a prefix
+    // (legacy/imported) are not covered yet (needs a tenant field on keys).
+    if key_has_generated_tenant_prefix(key) && !key_prefix_matches_tenant(key, &client.tenant_id) {
+        return Err(AuthError::Unauthorized);
+    }
     if client.status == CLIENT_ID_CONFLICT_STATUS {
         return Err(AuthError::Unauthorized);
     }
@@ -400,6 +407,29 @@ pub(crate) fn key_prefix_matches_tenant(key: &ApiKey, tenant: &str) -> bool {
     key.key_prefix.len() == head.len() + 6
         && key.key_prefix.starts_with(&head)
         && !key.key_prefix[head.len()..].contains('-')
+}
+
+/// Whether `key.key_prefix` has the exact shape `generate_key` writes for some
+/// tenant: `sk-<slug>-<6 lowercase hex>`, with a non-empty slug of
+/// `[a-z0-9-]` that does not start or end with `-`.
+fn key_has_generated_tenant_prefix(key: &ApiKey) -> bool {
+    let Some(rest) = key.key_prefix.strip_prefix("sk-") else {
+        return false;
+    };
+    if rest.len() < 8 || !rest.is_ascii() {
+        return false;
+    }
+    let (slug, tail) = rest.split_at(rest.len() - 7);
+    let Some(hex) = tail.strip_prefix('-') else {
+        return false;
+    };
+    hex.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Whether `tenant`'s key prefix cannot be told apart from another tenant that

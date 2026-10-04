@@ -61,6 +61,11 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
 `api_clients.json`（以及相关 key 的 `api_keys.json`），使每个 client id 只属于一个 tenant，然后在文件中把保留的 client `status` 从 `id_conflict` 改回
 `active`，然后启动服务。在此之前该状态会在保存和重新加载后一直保留。
 
+同理，在 id 仍被共用或 client 处于 `id_conflict` 时，`POST /api/v1/api-clients/:id/keys`
+也以 `409` 拒绝，不写入任何 key。恢复过程中删除 client 之前，运维人员必须先撤销该 client id
+下的**全部** key；否则残留的 key（尤其是不带 tenant 前缀的旧 key）可能在该 id 重新只属于一个
+tenant 后变更归属。
+
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、
 [隔离矩阵](17-isolation-matrix.zh.md)、
 [知识摄取](16-knowledge-ingest-import-graph.zh.md)和

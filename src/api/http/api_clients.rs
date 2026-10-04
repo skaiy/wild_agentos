@@ -339,11 +339,19 @@ pub(crate) async fn issue_api_key_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
+    // Check and push under one lock section; order: api_keys before
+    // api_clients (see module docs).
+    let mut guard = state.api_keys.write().await;
+    let clients = state.api_clients.read().await;
+    let Some(owned) = clients.iter().find(|c| c.id == id && c.tenant_id == tenant) else {
+        return client_not_found(&id);
+    };
+    // Same predicate as delete: an id shared with another tenant, or a client
+    // quarantined for that reason, gets no new keys.
+    if owned.status == api_gov::CLIENT_ID_CONFLICT_STATUS
+        || api_gov::cross_tenant_client_id_collisions(&clients).contains_key(&id)
     {
-        let clients = state.api_clients.read().await;
-        if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
-            return client_not_found(&id);
-        }
+        return client_id_conflict(&id);
     }
     let (plaintext, prefix, hash) = api_gov::generate_key(tenant);
     let key = ApiKey {
@@ -357,7 +365,6 @@ pub(crate) async fn issue_api_key_handler(
         expires_at: req.expires_at,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let mut guard = state.api_keys.write().await;
     guard.push(key.clone());
     let _ = api_gov::save_api_keys(&guard);
     (

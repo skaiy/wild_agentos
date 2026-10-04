@@ -71,6 +71,12 @@ exactly one tenant, then resets the remaining clients' `status` from
 `id_conflict` to `active` in the file and starts the service. The status
 persists across saves and reloads until then.
 
+`POST /api/v1/api-clients/:id/keys` is likewise refused with `409` (no key is
+written) while the id is shared or the client is `id_conflict`. Before deleting
+a client during recovery, operators must first revoke **all** keys under that
+client id. Otherwise a leftover key, especially a legacy key without a tenant
+prefix, could change owner once the id belongs to a single tenant again.
+
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and
 [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)

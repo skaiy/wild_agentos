@@ -666,3 +666,112 @@ async fn isolation_contract_api_client_key_lock_order_has_no_deadlock() {
         .await
         .expect("api_keys / api_clients lock-order deadlock (timed out)");
 }
+
+#[tokio::test]
+async fn isolation_contract_issue_key_under_colliding_or_conflicted_client_is_409() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let (key_a, _) = issued("key-a", SHARED, "tenant-a");
+    let (key_b, _) = issued("key-b", SHARED, "tenant-b");
+    let mut conflicted = client(SHARED, "tenant-a");
+    conflicted.status = CLIENT_ID_CONFLICT_STATUS.into();
+    let cases = [
+        // Cross-tenant collision with both clients still `active` (in-memory
+        // state that bypassed the load-time quarantine).
+        vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")],
+        // No collision left, but the client is still quarantined.
+        vec![conflicted],
+    ];
+    for clients in cases {
+        api_gov::save_api_clients(&clients).unwrap();
+        api_gov::save_api_keys(&[key_a.clone(), key_b.clone()]).unwrap();
+        let state = test_state(dir.path());
+        *state.api_clients.write().await = clients;
+        *state.api_keys.write().await = vec![key_a.clone(), key_b.clone()];
+        let router = app(state.clone());
+        let before = snapshot(&state).await;
+
+        let (status, body) = send(
+            &router,
+            Method::POST,
+            &format!("/api/v1/api-clients/{SHARED}/keys"),
+            json!({"name": "new"}),
+            &da("tenant-a"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.get("api_key").is_none(), "no key material on 409");
+        assert!(!body.to_string().contains("tenant-b"));
+        assert_eq!(
+            snapshot(&state).await,
+            before,
+            "refused issue must not touch keys (memory or disk)"
+        );
+    }
+
+    // A unique, active client still gets keys.
+    let state = test_state(dir.path());
+    *state.api_clients.write().await = vec![client("client-a-only", "tenant-a")];
+    let keys_before = state.api_keys.read().await.len();
+    let router = app(state.clone());
+    let (status, _) = send(
+        &router,
+        Method::POST,
+        "/api/v1/api-clients/client-a-only/keys",
+        json!({"name": "ok"}),
+        &da("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(state.api_keys.read().await.len(), keys_before + 1);
+}
+
+#[tokio::test]
+async fn isolation_contract_resolve_rejects_key_whose_tenant_prefix_mismatches_client() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    // A's prefixed key points at an id that (via direct state injection) only
+    // B's client holds, so id lookup alone would hand A's key B's identity.
+    let (key_a, plain_a) = issued("key-a", "client-x", "tenant-a");
+    let (key_b, plain_b) = issued("key-b", "client-x", "tenant-b");
+    let (mut legacy, plain_legacy) = issued("key-legacy", "client-x", "tenant-b");
+    legacy.key_prefix = "legacy0001".into();
+    let clients = vec![client("client-x", "tenant-b")];
+    let keys = vec![key_a, key_b, legacy];
+
+    assert!(is_unauthorized(api_gov::resolve_bearer_token(
+        &plain_a, &keys, &clients
+    )));
+    assert_eq!(
+        api_gov::resolve_bearer_token(&plain_b, &keys, &clients)
+            .unwrap()
+            .tenant_id,
+        "tenant-b"
+    );
+    // Known gap (documented): an un-prefixed legacy key is not covered by
+    // the prefix check yet; it still resolves to the client's tenant.
+    assert_eq!(
+        api_gov::resolve_bearer_token(&plain_legacy, &keys, &clients)
+            .unwrap()
+            .tenant_id,
+        "tenant-b"
+    );
+
+    // Route level: the public gate answers 401 for A's key.
+    let state = test_state(dir.path());
+    *state.api_clients.write().await = clients;
+    *state.api_keys.write().await = keys;
+    let router = app(state);
+    let (status, body) = send(
+        &router,
+        Method::POST,
+        "/api/v1/public/agents/agent-tenant-b/chat",
+        json!({"message": "hi"}),
+        &plain_a,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, json!({"error": "unauthorized"}));
+}
