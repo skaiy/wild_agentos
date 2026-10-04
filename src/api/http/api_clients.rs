@@ -431,18 +431,29 @@ pub(crate) async fn revoke_api_key_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    // The locks never overlap here: release clients before acquiring keys.
-    let owns_client = state
-        .api_clients
-        .read()
-        .await
-        .iter()
-        .any(|c| c.id == id && c.tenant_id == tenant);
-    if !owns_client {
+    // Check and mutate under one lock section; order: api_keys before
+    // api_clients (see module docs).
+    let mut guard = state.api_keys.write().await;
+    let clients = state.api_clients.read().await;
+    if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
         return key_not_found(&kid);
     }
-    let mut guard = state.api_keys.write().await;
-    let key = guard.iter_mut().find(|k| k.id == kid && k.client_id == id);
+    // Same ownership rule as list: under an id shared with another tenant
+    // (legacy or imported data), `client_id` alone does not identify the
+    // owner, so only keys carrying the caller's tenant prefix count. When
+    // another colliding tenant has the same slug the prefix cannot tell them
+    // apart either: refuse with 409 like issue/delete, whatever `kid` is.
+    let collisions = api_gov::cross_tenant_client_id_collisions(&clients);
+    if collisions
+        .get(&id)
+        .is_some_and(|tenants| api_gov::colliding_tenant_slug_is_ambiguous(tenants, tenant))
+    {
+        return client_id_conflict(&id);
+    }
+    // A key that is not the caller's gets the same 404 as a missing key.
+    let key = guard.iter_mut().find(|k| {
+        k.id == kid && k.client_id == id && api_gov::tenant_may_manage_key(&collisions, k, tenant)
+    });
     match key {
         Some(k) => {
             k.status = "revoked".to_string();

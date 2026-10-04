@@ -476,6 +476,182 @@ async fn cross_tenant_revoke_via_own_client_is_not_found() {
 }
 
 #[tokio::test]
+async fn isolation_contract_api_clients_revoke_scopes_keys_with_shared_id() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let state = test_state(dir.path());
+    let router = app(state.clone());
+    let token_a = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    let token_b = jwt_for("tenant-b", &["DA"], Some("project-b"));
+    let body_of = |raw: &[u8]| serde_json::from_slice::<Value>(raw).unwrap();
+
+    // Each tenant creates a client and issues a key under it through the API,
+    // while the ids are still unique.
+    let mut ids = vec![];
+    let mut issued = vec![];
+    for token in [&token_a, &token_b] {
+        let (status, raw) = request_raw(
+            &router,
+            Method::POST,
+            "/api/v1/api-clients",
+            json!({"name": "shared"}),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body_of(&raw)["client"]["id"].as_str().unwrap().to_string();
+        let (status, raw) = request_raw(
+            &router,
+            Method::POST,
+            &format!("/api/v1/api-clients/{id}/keys"),
+            json!({"name": "k"}),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let v = body_of(&raw);
+        issued.push((
+            v["key"]["id"].as_str().unwrap().to_string(),
+            v["api_key"].as_str().unwrap().to_string(),
+        ));
+        ids.push(id);
+    }
+    // Legacy/imported data: tenant B's client (and its key) end up with
+    // tenant A's id.
+    let shared = ids[0].clone();
+    for c in state.api_clients.write().await.iter_mut() {
+        if c.id == ids[1] {
+            c.id = shared.clone();
+        }
+    }
+    for k in state.api_keys.write().await.iter_mut() {
+        if k.client_id == ids[1] {
+            k.client_id = shared.clone();
+        }
+    }
+    api_gov::save_api_clients(&state.api_clients.read().await).unwrap();
+    api_gov::save_api_keys(&state.api_keys.read().await).unwrap();
+    let (kid_a, plaintext_a) = issued[0].clone();
+    let (kid_b, plaintext_b) = issued[1].clone();
+    let before = snapshot(&state, dir.path()).await;
+
+    // Neither tenant can issue a new key under the shared id: 409, no change.
+    for token in [&token_a, &token_b] {
+        let (status, raw) = request_raw(
+            &router,
+            Method::POST,
+            &format!("/api/v1/api-clients/{shared}/keys"),
+            json!({"name": "k2"}),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!raw.windows(b"sk-".len()).any(|w| w == b"sk-"));
+    }
+    assert_eq!(snapshot(&state, dir.path()).await, before);
+
+    // Inbound auth fails closed for every key under the shared id: 401.
+    for plaintext in [&plaintext_a, &plaintext_b] {
+        assert!(matches!(
+            api_gov::resolve_bearer_token(
+                plaintext,
+                &state.api_keys.read().await,
+                &state.api_clients.read().await,
+            ),
+            Err(api_gov::AuthError::Unauthorized)
+        ));
+        let (status, _) = request_raw(
+            &router,
+            Method::POST,
+            "/api/v1/public/agents/missing/chat",
+            json!({"message": "hi"}),
+            Some(plaintext),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // Tenant A's DA cannot revoke tenant B's key through the shared id.
+    let attempt = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_b}"),
+        json!(null),
+        Some(&token_a),
+    )
+    .await;
+    assert_eq!(attempt.0, StatusCode::NOT_FOUND);
+    // Same body as a caller that owns no such client at all.
+    let missing = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_b}"),
+        json!(null),
+        Some(&jwt_for("tenant-c", &["DA"], Some("project-c"))),
+    )
+    .await;
+    assert_eq!(attempt, missing);
+    assert_eq!(snapshot(&state, dir.path()).await, before);
+
+    // Tenant A can still revoke its own key under the shared id.
+    let (status, _) = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_a}"),
+        json!(null),
+        Some(&token_a),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let keys = state.api_keys.read().await;
+        let status_of = |kid: &str| keys.iter().find(|k| k.id == kid).unwrap().status.clone();
+        assert_eq!(status_of(&kid_a), "revoked");
+        assert_eq!(status_of(&kid_b), "active");
+    }
+
+    // A third colliding tenant whose slug equals tenant A's (`TENANT_A` ->
+    // `tenant-a`): A's prefix no longer identifies A's keys, so revoke under
+    // the shared id is 409 whatever the kid, and nothing changes.
+    let mut ambiguous = state
+        .api_clients
+        .read()
+        .await
+        .iter()
+        .find(|c| c.id == shared && c.tenant_id == "tenant-a")
+        .unwrap()
+        .clone();
+    ambiguous.tenant_id = "TENANT_A".into();
+    state.api_clients.write().await.push(ambiguous);
+    api_gov::save_api_clients(&state.api_clients.read().await).unwrap();
+    let before = snapshot(&state, dir.path()).await;
+    for kid in [kid_a.as_str(), kid_b.as_str(), "no-such-key"] {
+        let (status, raw) = request_raw(
+            &router,
+            Method::DELETE,
+            &format!("/api/v1/api-clients/{shared}/keys/{kid}"),
+            json!(null),
+            Some(&token_a),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body_of(&raw)["error"], "client id conflict");
+    }
+    assert_eq!(snapshot(&state, dir.path()).await, before);
+    // Tenant B's slug is still unique among the colliding tenants.
+    let (status, _) = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_b}"),
+        json!(null),
+        Some(&token_b),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn list_returns_only_verified_tenant_clients() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
