@@ -26,6 +26,7 @@ logs/
 .env
 .env.local
 .env.*.local
+demo-tenant.jwt
 
 # K8s 真实密钥(仅提交 secret.example.yaml)
 deploy/k8s/secret.yaml

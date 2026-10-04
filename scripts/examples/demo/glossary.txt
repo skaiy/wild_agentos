@@ -1,0 +1,4 @@
+Example Co. glossary
+
+Sample item: an imaginary entry used for a demonstration.
+Sample request: a practice action with no external effect.
