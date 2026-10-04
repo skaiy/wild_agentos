@@ -2,7 +2,7 @@ use super::*;
 use crate::core::agent_instance::{AgentInstance, AgentRole};
 use crate::isolation::IsolationClaims;
 use crate::jsonld::JsonLdNode;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -457,6 +457,131 @@ fn plan_disallowed_unregistered_tool_name_is_not_echoed() {
             assert!(events[0].get("tools_omitted").is_none());
             assert!(!events[0].to_string().contains("xxxxxxxx"));
             assert_eq!(script.calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+#[test]
+fn check_unadvertised_bash_reaches_model_unchanged_in_both_paths() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        for streaming in [false, true] {
+            let script = ScriptedGateway {
+                responses: Arc::new(AtomicUsize::new(0)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            };
+            let app = Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(
+                        |State(script): State<ScriptedGateway>, Json(request): Json<Value>| async move {
+                            script.requests.lock().unwrap().push(request.clone());
+                            let first = script.responses.fetch_add(1, Ordering::SeqCst) == 0;
+                            if request["stream"] == true {
+                                let content = if first {
+                                    r#"{"action":"tool_call","summary":"checking"}"#
+                                } else {
+                                    r#"{"action":"finish","summary":"complete"}"#
+                                };
+                                let mut body = format!(
+                                    "data: {}\n\n",
+                                    json!({"choices":[{"index":0,"delta":{"content":content}}]})
+                                );
+                                if first {
+                                    body.push_str(&format!(
+                                        "data: {}\n\n",
+                                        json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                                            "index":0,"id":"denied-call",
+                                            "function":{"name":"bash","arguments":"{}"}
+                                        }]}}]})
+                                    ));
+                                }
+                                body.push_str("data: [DONE]\n\n");
+                                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                                    .into_response()
+                            } else {
+                                let message = if first {
+                                    json!({
+                                        "role":"assistant", "content":r#"{"action":"tool_call","summary":"checking"}"#,
+                                        "tool_calls":[{
+                                            "id":"denied-call","type":"function",
+                                            "function":{"name":"bash","arguments":"{}"}
+                                        }]
+                                    })
+                                } else {
+                                    json!({"role":"assistant","content":r#"{"action":"finish","summary":"complete"}"#})
+                                };
+                                Json(json!({"choices":[{"index":0,"message":message,
+                                    "finish_reason":if first {"tool_calls"} else {"stop"}}]}))
+                                    .into_response()
+                            }
+                        },
+                    ),
+                )
+                .with_state(script.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let runner = create_test_runner();
+            runner.gateway.set_base_url(format!("http://{address}"));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = calls.clone();
+            runner.tool_executor.write().register(
+                "bash",
+                "Counted bash handler.",
+                json!({"type":"object","properties":{}}),
+                Arc::new(move |_| {
+                    let handler_calls = handler_calls.clone();
+                    Box::pin(async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"exit_code":0}))
+                    })
+                }),
+                &[],
+            );
+            let agent_id = if streaming {
+                "check-stream-denial"
+            } else {
+                "check-denial"
+            };
+            let claims = IsolationClaims::from_verified("tenant", "project", agent_id).unwrap();
+            let mut agent = AgentInstance::new(agent_id.into(), AgentRole::Check);
+            let ctx = TaskContext::new("iri://task/denied", "Check the task", 2)
+                .with_isolation_claims(claims);
+            if streaming {
+                runner.execute_streaming(&mut agent, ctx, |_| {}).await.unwrap();
+            } else {
+                runner.execute(&mut agent, ctx).await.unwrap();
+            }
+
+            let requests = script.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "streaming={streaming}");
+            assert!(!requests[0]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "bash"));
+            let tool_message = requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap();
+            let content = tool_message["content"].as_str().unwrap();
+            let denial: Value = serde_json::from_str(content.split('\n').next().unwrap()).unwrap();
+            assert_eq!(denial["error"], "Tool not advertised for this turn: bash");
+            assert_eq!(denial["denied_by"], "advertised_gate");
+            assert!(!content.contains("[ToolGuard Intercepted]"));
+            assert!(!content.contains("non-zero"));
+            assert!(!content.contains("stderr"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(!crate::tools::tool_guard::GUARD_AUDIT_LOG
+                .read()
+                .iter()
+                .any(|entry| entry.agent_id == agent_id
+                    && entry.tool_name == "bash"
+                    && !entry.validation_passed));
+            server.abort();
         }
     });
 }

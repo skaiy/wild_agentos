@@ -712,6 +712,7 @@ mod tests {
                 .unwrap();
             assert_eq!(denied["error"], "Tool not allowed for role");
             assert_eq!(denied["role"], "PA");
+            assert_eq!(denied["denied_by"], "role_policy");
             assert_eq!(calls.load(Ordering::SeqCst), 0);
 
             let unadvertised = executor
@@ -728,6 +729,7 @@ mod tests {
                 unadvertised["error"],
                 "Tool not advertised for this turn: file_read"
             );
+            assert_eq!(unadvertised["denied_by"], "advertised_gate");
         });
     }
 
@@ -765,7 +767,23 @@ mod tests {
             assert_eq!(result["error"], "Tool not allowed for role");
             assert_eq!(result["tool"], "bash");
             assert_eq!(result["role"], "CA");
+            assert_eq!(result["denied_by"], "role_policy");
             assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            use crate::tools::hooks::{HookContext, HookManager, HookPoint, HookResult};
+            use crate::tools::tool_guard::ToolGuard;
+            let guard = ToolGuard::new();
+            let hooks = HookManager::new();
+            guard.register_hooks(&hooks);
+            let mut ctx = HookContext::new(HookPoint::SkillAfter, "check-role-denial", "CA")
+                .with_data("tool_name", json!("bash"))
+                .with_data("tool_result", json!(result.to_string()));
+            assert_eq!(
+                hooks.execute(HookPoint::SkillAfter, &mut ctx).await,
+                HookResult::Continue
+            );
+            assert!(ctx.error.is_none());
+            assert!(guard.get_audit_log().is_empty());
         });
     }
 

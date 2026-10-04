@@ -1398,7 +1398,9 @@ impl ToolExecutor {
         if let Some(ref policy) = self.permission_policy {
             match policy.authorize(name, &input_str, None) {
                 PermissionOutcome::Deny { reason } => {
-                    return Ok(json!({"error": format!("Permission denied: {}", reason)}));
+                    return Ok(
+                        json!({"error": format!("Permission denied: {}", reason), "denied_by": "permission_policy"}),
+                    );
                 }
                 PermissionOutcome::Allow => {}
             }
@@ -1445,7 +1447,9 @@ impl ToolExecutor {
                 None,
             );
             if let Err(e) = decision {
-                return Ok(json!({"error": format!("SyscallGate rejected: {}", e)}));
+                return Ok(
+                    json!({"error": format!("SyscallGate rejected: {}", e), "denied_by": "syscall_gate"}),
+                );
             }
         }
 
@@ -1558,6 +1562,7 @@ impl ToolExecutor {
             return Ok(json!({
                 "error": format!("Tool not advertised for this turn: {}", name),
                 "tool": name,
+                "denied_by": "advertised_gate",
             }));
         }
         let role = context.agent_role.parse::<AgentRole>().map_err(|_| {
@@ -1584,24 +1589,24 @@ impl ToolExecutor {
             });
             let Some(skill_iri) = skill_iri else {
                 return Ok(
-                    json!({"error": "Security denied: tool has no registered executable skill", "tool": name}),
+                    json!({"error": "Security denied: tool has no registered executable skill", "tool": name, "denied_by": "security_engine"}),
                 );
             };
             match engine.check_execution(&skill_iri, &context).await {
                 Ok(SecurityDecision::Allowed) => {}
                 Ok(SecurityDecision::Denied { reasons }) => {
                     return Ok(
-                        json!({"error": "Security denied", "tool": name, "skill_iri": skill_iri, "reasons": reasons}),
+                        json!({"error": "Security denied", "tool": name, "skill_iri": skill_iri, "reasons": reasons, "denied_by": "security_engine"}),
                     );
                 }
                 Ok(SecurityDecision::RequiresApproval { approver, reason }) => {
                     return Ok(
-                        json!({"error": "Security approval required", "tool": name, "skill_iri": skill_iri, "approver": approver, "reason": reason}),
+                        json!({"error": "Security approval required", "tool": name, "skill_iri": skill_iri, "approver": approver, "reason": reason, "denied_by": "security_engine"}),
                     );
                 }
                 Err(error) => {
                     return Ok(
-                        json!({"error": format!("Security denied: {error}"), "tool": name, "skill_iri": skill_iri}),
+                        json!({"error": format!("Security denied: {error}"), "tool": name, "skill_iri": skill_iri, "denied_by": "security_engine"}),
                     );
                 }
             }
@@ -1618,6 +1623,7 @@ impl ToolExecutor {
                 "error": "Tool not allowed for role",
                 "tool": name,
                 "role": context.agent_role,
+                "denied_by": "role_policy",
             }));
         }
 

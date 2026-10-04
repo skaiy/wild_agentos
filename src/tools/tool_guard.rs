@@ -99,6 +99,19 @@ fn guard_audit_entry(
     }
 }
 
+fn is_policy_denial(result: &Value) -> bool {
+    matches!(
+        result.get("denied_by").and_then(Value::as_str),
+        Some(
+            "advertised_gate"
+                | "role_policy"
+                | "syscall_gate"
+                | "security_engine"
+                | "permission_policy"
+        )
+    )
+}
+
 impl Default for GuardStats {
     fn default() -> Self {
         Self {
@@ -524,6 +537,10 @@ impl ToolGuard {
                     Err(_) => return HookResult::Continue,
                 };
 
+                if is_policy_denial(&result) {
+                    return HookResult::Continue;
+                }
+
                 if let Some(category) = post_guard.tool_categories.get(&tool_name) {
                     if let Some(rules) = post_guard.validations.read().get(category) {
                         for rule in rules {
@@ -822,7 +839,7 @@ impl ToolGuard {
 // ─── Validator Implementations ───
 
 mod validators {
-    use super::ValidationOutcome;
+    use super::{is_policy_denial, ValidationOutcome};
     use serde_json::Value;
 
     pub fn file_length_check(result: &Value) -> ValidationOutcome {
@@ -907,6 +924,9 @@ mod validators {
     }
 
     pub fn exit_code_check(result: &Value) -> ValidationOutcome {
+        if is_policy_denial(result) {
+            return ValidationOutcome::Pass;
+        }
         if let Some(ec) = result["exit_code"].as_i64() {
             if ec != 0 {
                 let stderr = result["stderr"].as_str().unwrap_or("");
@@ -917,7 +937,11 @@ mod validators {
                 ));
             }
         } else if result.get("error").is_some() {
-            return ValidationOutcome::Fail("Command execution returned error".to_string());
+            // No exit code means the command never ran (or the shape is
+            // unknown); do not Abort with "analyze stderr and retry".
+            return ValidationOutcome::Warn(
+                "Tool returned an error without an exit code".to_string(),
+            );
         }
         ValidationOutcome::Pass
     }
@@ -1105,6 +1129,77 @@ mod tests {
         let result = json!({"exit_code": 1, "stderr": "error occurred"});
         let outcome = validators::exit_code_check(&result);
         assert!(matches!(outcome, ValidationOutcome::Fail(_)));
+    }
+
+    #[test]
+    fn test_exit_code_check_skips_denials_and_unknown_errors() {
+        for result in [
+            json!({"error": "Tool not allowed for role", "denied_by": "role_policy"}),
+            json!({"error": "Tool not advertised for this turn: bash", "denied_by": "advertised_gate"}),
+        ] {
+            assert!(matches!(
+                validators::exit_code_check(&result),
+                ValidationOutcome::Pass
+            ));
+        }
+        assert!(matches!(
+            validators::exit_code_check(&json!({"error": "Unknown failure"})),
+            ValidationOutcome::Warn(_)
+        ));
+        assert!(matches!(
+            validators::exit_code_check(&json!({"exit_code": 1, "stderr": "boom"})),
+            ValidationOutcome::Fail(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_denials_skip_post_validation_and_audit_for_every_category() {
+        let guard = ToolGuard::new();
+        let manager = HookManager::new();
+        guard.register_hooks(&manager);
+        for (tool, denied_by) in [
+            ("bash", "advertised_gate"),
+            ("bash", "role_policy"),
+            ("file_read", "syscall_gate"),
+            ("knowledge_extract", "security_engine"),
+        ] {
+            let mut ctx = HookContext::new(HookPoint::SkillAfter, "policy-test", "CA")
+                .with_data("tool_name", json!(tool))
+                .with_data(
+                    "tool_result",
+                    json!({"error": "Denied", "denied_by": denied_by})
+                        .to_string()
+                        .into(),
+                );
+            assert_eq!(
+                manager.execute(HookPoint::SkillAfter, &mut ctx).await,
+                HookResult::Continue
+            );
+            assert!(ctx.error.is_none());
+        }
+        assert!(guard.get_audit_log().is_empty());
+        assert!(!GUARD_AUDIT_LOG
+            .read()
+            .iter()
+            .any(|entry| entry.agent_id == "policy-test"));
+
+        let mut ctx = HookContext::new(HookPoint::SkillAfter, "execution-test", "DA")
+            .with_data("tool_name", json!("bash"))
+            .with_data(
+                "tool_result",
+                json!({"exit_code": 1, "stderr": "sentinel-stderr"})
+                    .to_string()
+                    .into(),
+            );
+        assert_eq!(
+            manager.execute(HookPoint::SkillAfter, &mut ctx).await,
+            HookResult::Abort
+        );
+        let message = ctx.error.unwrap();
+        assert!(message.contains("Non-zero exit code: 1"));
+        assert!(message.contains("analyze stderr"));
+        assert_eq!(guard.get_audit_log().len(), 1);
+        assert!(!guard.get_audit_log()[0].validation_passed);
     }
 
     #[test]
