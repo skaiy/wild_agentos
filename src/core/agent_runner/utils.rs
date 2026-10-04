@@ -601,17 +601,18 @@ impl super::AgentRunner {
             prompt_builder.set_region(SystemPromptRegion::TimeAwareness, time_text);
         }
 
-        // Region 3: Workspace environment info
+        // Region 3: Workspace environment information, including the platform note.
+        let mut env_info = crate::core::system_prompt::platform_environment_hint().to_string();
         if let Some(ref ws_root) = self.workspace_root {
-            let env_info = format!(
-                "## Workspace\n\n- Workspace path: {}\n\
+            env_info.push_str(&format!(
+                "\n\n## Workspace\n\n- Workspace path: {}\n\
                  - All your file operations (read, write, search, command execution) are limited to the workspace\n\
                  - Files outside the workspace are not relevant to the current task and should not be accessed\n\
                  - The workspace root may contain other directories and files unrelated to the current task — please distinguish carefully",
                 ws_root.display()
-            );
-            prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
+            ));
         }
+        prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
 
         // Region 2: Code of conduct (constitution + methodology)
         {
@@ -679,19 +680,13 @@ impl super::AgentRunner {
             crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
         );
 
-        let mut tool_menu = self.build_readable_tool_menu(&agent.role);
+        // Per-tool definitions are supplied by the exact per-turn schema.
         let group_directory = self
             .tool_executor
             .read()
             .build_tool_group_summary(&agent.role.to_string());
         if !group_directory.is_empty() {
-            if !tool_menu.is_empty() {
-                tool_menu.push_str("\n\n");
-            }
-            tool_menu.push_str(&group_directory);
-        }
-        if !tool_menu.is_empty() {
-            prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
+            prompt_builder.set_region(SystemPromptRegion::Tools, group_directory);
         }
 
         // Region: Extraction prompt area (loaded from config)

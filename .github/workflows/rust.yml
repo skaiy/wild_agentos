@@ -49,6 +49,8 @@ jobs:
       run: cargo clippy --workspace -- -D warnings
     - name: Build
       run: cargo build --workspace --verbose
+    - name: Run tool description lint
+      run: cargo test --lib tool_description_lint --verbose
     - name: Run isolation contract golden suite
       run: cargo test --workspace isolation_contract --verbose
     - name: Run chat vision and isolation contract gate

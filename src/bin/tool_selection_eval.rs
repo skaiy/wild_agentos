@@ -244,19 +244,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         validate_case(case)?;
         let turns = case.turns_or_default();
         let definitions = executor.tool_definitions_for_role(&case.role);
-        let menu = executor.readable_tool_menu_for_role(&case.role);
         let tool_names = definitions
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
         let definition_payload = serde_json::to_string(&definitions)?;
-        let token_estimate = estimate_tokens(&(definition_payload + &menu));
-        let prior = previous_surface.insert(case.role.clone(), (tool_names.clone(), menu.clone()));
+        let token_estimate = estimate_tokens(&definition_payload);
+        let prior = previous_surface.insert(
+            case.role.clone(),
+            (tool_names.clone(), definition_payload.clone()),
+        );
         let (prefix_stable, cache_proxy) = prior
-            .map(|(prior_tools, prior_menu)| {
+            .map(|(prior_tools, prior_definitions)| {
                 (
                     Some(prior_tools == tool_names),
-                    Some(prior_tools == tool_names && prior_menu == menu),
+                    Some(prior_tools == tool_names && prior_definitions == definition_payload),
                 )
             })
             .unwrap_or((None, None));
@@ -266,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let calls = if args.offline {
                 turn.recorded_tool_calls.clone()
             } else {
-                live_calls(&client, &case.role, turn, &definitions, &menu, &history).await?
+                live_calls(&client, &case.role, turn, &definitions, &history).await?
             };
             history.push(format!(
                 "Tool calls: {}\nTool results: {}",
@@ -557,7 +559,6 @@ async fn live_calls(
     role: &str,
     turn: &GoldenTurn,
     definitions: &[Value],
-    menu: &str,
     history: &[String],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let base_url = env::var("TOOL_SELECTION_EVAL_BASE_URL")?;
@@ -568,7 +569,7 @@ async fn live_calls(
         "seed": SEED,
         "tools": definitions,
         "messages": [
-            {"role": "system", "content": format!("You are the {} role. Select only needed tools.\n{}", role, menu)},
+            {"role": "system", "content": format!("You are the {} role. Select only needed tools.", role)},
             {"role": "user", "content": format!("Prior turns:\n{}\n\nTask: {}\nContext: {}\nInjected results:\n{}", history.join("\n===\n"), turn.task, turn.context, turn.injected_tool_results.join("\n---\n"))}
         ]
     });
@@ -817,7 +818,7 @@ fn markdown_summary(report: &Report) -> String {
     }
     output.push_str(&summary_row("Overall", &report.overall));
     output.push_str(
-        "\nToken values are deterministic character-based estimates for serialized function definitions plus the readable system-prompt tool menu. The cache metric is a proxy: it is true only when the previous same-role turn had the identical tools array and menu.\n",
+        "\nThe text tool menu is no longer injected. Token values are deterministic character-based estimates for serialized function definitions only. The cache metric is a proxy: it is true only when the previous same-role turn had identical tool names and serialized definitions.\n",
     );
     output.push_str(&format!(
         "\n## Registry coverage\n\nRegistered: {}; resident/on-demand: {}; hard-coded tool_search catalog: {}; unreachable: {}.\n",
