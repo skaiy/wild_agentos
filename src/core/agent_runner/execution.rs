@@ -21,28 +21,50 @@ use super::{
 };
 
 impl super::AgentRunner {
-    pub(super) async fn emit_pa_disallowed_tool_event(
+    /// Logs and emits AGENT_ERROR for a PA turn that requested disallowed
+    /// tools, and returns the `errors` entry. Tool names come from the model,
+    /// so only sanitized names are echoed (see `sanitize_reported_tool_names`).
+    pub(super) async fn report_pa_disallowed_tools(
         &self,
         agent: &AgentInstance,
         task_iri: &str,
         tools: &[&str],
-    ) {
+    ) -> String {
+        let (tools, omitted) = {
+            let executor = self.tool_executor.read();
+            crate::core::tool_controller::sanitize_reported_tool_names(
+                tools.iter().copied(),
+                |name| executor.get_handler(name).is_some(),
+            )
+        };
+        warn!(
+            "[PA] disallowed tool calls blocked: {:?} (+{} more)",
+            tools, omitted
+        );
         if let Some(event_bus) = &self.event_bus {
+            let mut payload = json!({
+                "error": "pa_disallowed_tool_call",
+                "agent": &agent.agent_id,
+                "role": agent.role.to_string(),
+                "tools": &tools,
+            });
+            if omitted > 0 {
+                payload["tools_omitted"] = json!(omitted);
+            }
             let _ = event_bus
                 .emit(
                     task_iri,
                     "AGENT_ERROR",
                     &agent.agent_id,
-                    &json!({
-                        "error": "pa_disallowed_tool_call",
-                        "agent": &agent.agent_id,
-                        "role": agent.role.to_string(),
-                        "tools": tools,
-                    })
-                    .to_string(),
+                    &payload.to_string(),
                 )
                 .await;
         }
+        let mut error = format!("pa_disallowed_tool_call: {}", tools.join(", "));
+        if omitted > 0 {
+            error.push_str(&format!(" (+{omitted} more)"));
+        }
+        error
     }
 
     pub async fn execute(
@@ -1742,13 +1764,10 @@ Output the summary report directly, not in JSON format."#,
                     .map(|c| c.function.name.as_str()),
             );
             if !disallowed_tools.is_empty() {
-                warn!("[PA] disallowed tool calls blocked: {:?}", disallowed_tools);
-                self.emit_pa_disallowed_tool_event(agent, &ctx.task_iri, &disallowed_tools)
-                    .await;
-                errs.push(format!(
-                    "pa_disallowed_tool_call: {}",
-                    disallowed_tools.join(", ")
-                ));
+                errs.push(
+                    self.report_pa_disallowed_tools(agent, &ctx.task_iri, &disallowed_tools)
+                        .await,
+                );
                 let output_value = Value::String(parsed.content.clone());
                 let jsonld_output =
                     self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);

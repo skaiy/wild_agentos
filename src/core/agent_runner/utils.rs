@@ -891,16 +891,10 @@ impl super::AgentRunner {
                 stream_response.tool_calls.iter().map(|c| c.name.as_str()),
             );
             if !disallowed_tools.is_empty() {
-                warn!(
-                    "[PA Streaming] Disallowed tool calls blocked: {:?}",
-                    disallowed_tools
+                errs.push(
+                    self.report_pa_disallowed_tools(agent, &ctx.task_iri, &disallowed_tools)
+                        .await,
                 );
-                self.emit_pa_disallowed_tool_event(agent, &ctx.task_iri, &disallowed_tools)
-                    .await;
-                errs.push(format!(
-                    "pa_disallowed_tool_call: {}",
-                    disallowed_tools.join(", ")
-                ));
                 pa_disallowed_tool_call = true;
                 last_content = parsed.content;
                 last_summary = "Plan force-ended after a disallowed tool call".to_string();
