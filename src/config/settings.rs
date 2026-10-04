@@ -1,7 +1,143 @@
 pub use crate::tools::tool_groups::{RoleToolConfig, ToolGroupSettings};
 use anyhow::Result;
-use config::{Config, ConfigError, Environment};
+use config::builder::DefaultState;
+use config::{Config, ConfigBuilder, ConfigError, Environment, Value, ValueKind};
 use serde::Deserialize;
+use std::path::Path;
+use std::sync::Once;
+
+/// Scalar settings accepted from the AGENT_OS_ environment.
+pub(crate) const ENV_KEY_MAP: &[(&str, &str)] = &[
+    ("AGENT_OS_API_ENABLE_METRICS", "api.enable_metrics"),
+    ("AGENT_OS_API_GRPC_ADDR", "api.grpc_addr"),
+    ("AGENT_OS_API_HTTP_ADDR", "api.http_addr"),
+    ("AGENT_OS_API_METRICS_PORT", "api.metrics_port"),
+    ("AGENT_OS_EMBEDDING_ENABLED", "embedding.enabled"),
+    (
+        "AGENT_OS_EMBEDDING_FALLBACK_DIMENSION",
+        "embedding.fallback.dimension",
+    ),
+    (
+        "AGENT_OS_EMBEDDING_OLLAMA_BASE_URL",
+        "embedding.ollama.base_url",
+    ),
+    (
+        "AGENT_OS_EMBEDDING_OLLAMA_DIMENSION",
+        "embedding.ollama.dimension",
+    ),
+    ("AGENT_OS_EMBEDDING_OLLAMA_MODEL", "embedding.ollama.model"),
+    (
+        "AGENT_OS_EMBEDDING_ONEAPI_API_KEY",
+        "embedding.oneapi.api_key",
+    ),
+    (
+        "AGENT_OS_EMBEDDING_ONEAPI_BASE_URL",
+        "embedding.oneapi.base_url",
+    ),
+    (
+        "AGENT_OS_EMBEDDING_ONEAPI_DIMENSION",
+        "embedding.oneapi.dimension",
+    ),
+    ("AGENT_OS_EMBEDDING_ONEAPI_MODEL", "embedding.oneapi.model"),
+    ("AGENT_OS_EMBEDDING_PROVIDER", "embedding.provider"),
+    ("AGENT_OS_GATEWAY_API_KEY", "gateway.api_key"),
+    ("AGENT_OS_GATEWAY_BASE_URL", "gateway.base_url"),
+    ("AGENT_OS_GATEWAY_DEFAULT_MODEL", "gateway.default_model"),
+    ("AGENT_OS_GATEWAY_MAX_RETRIES", "gateway.max_retries"),
+    ("AGENT_OS_GATEWAY_RETRY_BASE_MS", "gateway.retry_base_ms"),
+    (
+        "AGENT_OS_GATEWAY_TIMEOUT_SECONDS",
+        "gateway.timeout_seconds",
+    ),
+    (
+        "AGENT_OS_GATEWAY_USE_RESPONSES_API",
+        "gateway.use_responses_api",
+    ),
+    ("AGENT_OS_OUTPUT_DIRECTORY", "output.directory"),
+];
+
+/// Process controls read directly by the application, not Settings fields.
+const PROCESS_ENV_VARS: &[&str] = &[
+    "AGENT_OS_ALLOW_DEFAULT_CONFIG",
+    "AGENT_OS_APPROVAL_ENABLED",
+    "AGENT_OS_APPROVAL_TIMEOUT",
+    "AGENT_OS_CONCURRENCY",
+    "AGENT_OS_CONFIG_PROFILE",
+    "AGENT_OS_HTTP_PORT",
+    "AGENT_OS_L0_PATH",
+    "AGENT_OS_L1_MEMORY_MB",
+    "AGENT_OS_L2_MEMORY_MB",
+    "AGENT_OS_L3_MEMORY_MB",
+    "AGENT_OS_QUEUE_PATH",
+    "AGENT_OS_WORKSPACE_ROOT",
+];
+
+static WARN_UNKNOWN_ENV: Once = Once::new();
+
+fn is_mapped_or_process_var(name: &str) -> bool {
+    ENV_KEY_MAP.iter().any(|(env, _)| *env == name) || PROCESS_ENV_VARS.contains(&name)
+}
+
+fn warn_unrecognized_env_vars(env: &[(String, String)]) {
+    let mut names: Vec<&str> = env
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| name.starts_with("AGENT_OS_") && !is_mapped_or_process_var(name))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if !names.is_empty() {
+        tracing::warn!(
+            "AGENT_OS_ variables not in the explicit mapping table: {}; they only take effect via legacy `_` splitting, which works only for single-word field names",
+            names.join(", ")
+        );
+    }
+}
+
+/// File order is yaml < runtime override < environment. Explicit overrides
+/// must be applied last because config's set_override beats every file source.
+fn config_builder_with_sources(
+    yaml_name: &str,
+    override_path: &Path,
+    env: &[(String, String)],
+) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
+    let legacy = env
+        .iter()
+        .filter(|(name, _)| name.starts_with("AGENT_OS_") && !is_mapped_or_process_var(name))
+        .cloned()
+        .collect();
+    // Legacy splitting is a fallback for existing single-word deployments;
+    // fields containing `_` must use the explicit table instead.
+    let mut builder = Config::builder()
+        .add_source(config::File::with_name(yaml_name).required(false))
+        .add_source(config::File::from(override_path.to_path_buf()).required(false))
+        .add_source(
+            Environment::with_prefix("AGENT_OS")
+                .separator("_")
+                .try_parsing(true)
+                .source(Some(legacy)),
+        );
+    for (name, key) in ENV_KEY_MAP {
+        if let Some((_, value)) = env.iter().find(|(candidate, _)| candidate == name) {
+            // Keep the raw string. `config` coerces strings to bool/integer
+            // when the target field asks for one (`Value::into_bool` /
+            // `into_uint`), while string fields such as keys, URLs and model
+            // names must reach serde verbatim (e.g. `007` or `1e5` must not
+            // be reparsed as numbers).
+            let kind = ValueKind::String(value.clone());
+            builder = builder.set_override(key, Value::new(None, kind))?;
+        }
+    }
+    Ok(builder)
+}
+
+fn load_config() -> Result<Config, ConfigError> {
+    let env: Vec<(String, String)> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("AGENT_OS_"))
+        .collect();
+    WARN_UNKNOWN_ENV.call_once(|| warn_unrecognized_env_vars(&env));
+    config_builder_with_sources("config", &config_override_path(), &env)?.build()
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
@@ -1260,33 +1396,14 @@ impl Settings {
     }
 
     pub fn load() -> Result<Self, ConfigError> {
-        let config = Config::builder()
-            .add_source(config::File::with_name("config").required(false))
-            // 运行期覆盖文件（由 PUT /api/v1/config 写入）：优先级高于 config.yaml，低于环境变量。
-            .add_source(config::File::from(config_override_path()).required(false))
-            .add_source(
-                Environment::with_prefix("AGENT_OS")
-                    .separator("_")
-                    .try_parsing(true),
-            )
-            .build()?;
-
-        config.try_deserialize()
+        load_config()?.try_deserialize()
     }
 
     /// 仅加载 embedding 段（含各字段 serde 默认值），用于运行期热切换。
     /// 相比整份 `load()`，本方法不受其它必填字段（如 api.grpc_addr）约束，
     /// 因此即便 config.yaml 缺省也能稳健读到 config_override.json 的 embedding 覆盖。
     pub fn load_embedding() -> EmbeddingSettings {
-        Config::builder()
-            .add_source(config::File::with_name("config").required(false))
-            .add_source(config::File::from(config_override_path()).required(false))
-            .add_source(
-                Environment::with_prefix("AGENT_OS")
-                    .separator("_")
-                    .try_parsing(true),
-            )
-            .build()
+        load_config()
             .ok()
             .and_then(|c| c.get::<EmbeddingSettings>("embedding").ok())
             .unwrap_or_default()
@@ -1295,15 +1412,7 @@ impl Settings {
     /// 仅加载 models 段(含各字段 serde 默认值),用于运行期热更新模型注册表。
     /// 与 `load_embedding` 同范式:不受其它必填字段约束,稳健读回 config_override.json 覆盖。
     pub fn load_models() -> ModelsSettings {
-        Config::builder()
-            .add_source(config::File::with_name("config").required(false))
-            .add_source(config::File::from(config_override_path()).required(false))
-            .add_source(
-                Environment::with_prefix("AGENT_OS")
-                    .separator("_")
-                    .try_parsing(true),
-            )
-            .build()
+        load_config()
             .ok()
             .and_then(|c| c.get::<ModelsSettings>("models").ok())
             .unwrap_or_default()
@@ -1341,6 +1450,232 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    const FAKE_KEY: &str = "test-fake-gateway-key-278";
+
+    fn test_config(dir: &Path, env: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        let env = env
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect::<Vec<_>>();
+        config_builder_with_sources(
+            dir.join("config").to_str().unwrap(),
+            &dir.join("config_override.json"),
+            &env,
+        )?
+        .build()
+    }
+
+    fn write_full_test_layers(dir: &Path) {
+        std::fs::write(dir.join("config.yaml"), include_str!("../../config.yaml")).unwrap();
+        // Until #277 part a lands, the checked-in YAML has max_projection_size
+        // under memory rather than memory.l2; supply it in the override layer
+        // (harmless once the YAML is fixed).
+        std::fs::write(
+            dir.join("config_override.json"),
+            r#"{"memory":{"l2":{"max_projection_size":500}}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mapped_deployment_variables_work_without_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = [
+            ("AGENT_OS_GATEWAY_BASE_URL", "https://gateway.example.test"),
+            ("AGENT_OS_GATEWAY_API_KEY", FAKE_KEY),
+            ("AGENT_OS_GATEWAY_DEFAULT_MODEL", "test-model"),
+            (
+                "AGENT_OS_EMBEDDING_ONEAPI_BASE_URL",
+                "https://embedding.example.test",
+            ),
+            (
+                "AGENT_OS_EMBEDDING_ONEAPI_API_KEY",
+                "test-fake-embedding-key-278",
+            ),
+            ("AGENT_OS_API_GRPC_ADDR", "127.0.0.1:50052"),
+        ];
+        let config = test_config(dir.path(), &env).unwrap();
+        assert_eq!(config.get::<String>("gateway.base_url").unwrap(), env[0].1);
+        assert_eq!(config.get::<String>("gateway.api_key").unwrap(), env[1].1);
+        assert_eq!(
+            config.get::<String>("gateway.default_model").unwrap(),
+            env[2].1
+        );
+        let embedding: EmbeddingSettings = config.get("embedding").unwrap();
+        assert_eq!(embedding.oneapi.base_url, env[3].1);
+        assert_eq!(embedding.oneapi.api_key, env[4].1);
+        assert_eq!(config.get::<String>("api.grpc_addr").unwrap(), env[5].1);
+
+        write_full_test_layers(dir.path());
+        let settings: Settings = test_config(dir.path(), &env)
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(settings.gateway.base_url, env[0].1);
+        assert_eq!(settings.gateway.api_key, FAKE_KEY);
+        assert_eq!(settings.gateway.default_model, env[2].1);
+        assert_eq!(settings.embedding.oneapi.base_url, env[3].1);
+        assert_eq!(settings.embedding.oneapi.api_key, env[4].1);
+        assert_eq!(settings.api.grpc_addr, env[5].1);
+    }
+
+    #[test]
+    fn every_mapped_key_deserializes_into_its_field() {
+        let dir = tempfile::tempdir().unwrap();
+        write_full_test_layers(dir.path());
+        let keys: Vec<_> = ENV_KEY_MAP.iter().map(|(name, _)| *name).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted);
+        for &(name, path) in ENV_KEY_MAP {
+            let value = if path == "api.enable_metrics"
+                || path.ends_with("enabled")
+                || path.ends_with("use_responses_api")
+            {
+                "false"
+            } else if path.ends_with("dimension")
+                || path.ends_with("port")
+                || path.ends_with("seconds")
+                || path.ends_with("retries")
+                || path.ends_with("ms")
+            {
+                "17"
+            } else {
+                "mapped-test-value"
+            };
+            let settings: Settings = test_config(dir.path(), &[(name, value)])
+                .unwrap()
+                .try_deserialize()
+                .unwrap_or_else(|_| panic!("failed to deserialize {path}"));
+            let actual = match path {
+                "api.enable_metrics" => settings.api.enable_metrics.to_string(),
+                "api.grpc_addr" => settings.api.grpc_addr,
+                "api.http_addr" => settings.api.http_addr,
+                "api.metrics_port" => settings.api.metrics_port.to_string(),
+                "embedding.enabled" => settings.embedding.enabled.to_string(),
+                "embedding.fallback.dimension" => settings.embedding.fallback.dimension.to_string(),
+                "embedding.ollama.base_url" => settings.embedding.ollama.base_url,
+                "embedding.ollama.dimension" => settings.embedding.ollama.dimension.to_string(),
+                "embedding.ollama.model" => settings.embedding.ollama.model,
+                "embedding.oneapi.api_key" => settings.embedding.oneapi.api_key,
+                "embedding.oneapi.base_url" => settings.embedding.oneapi.base_url,
+                "embedding.oneapi.dimension" => settings.embedding.oneapi.dimension.to_string(),
+                "embedding.oneapi.model" => settings.embedding.oneapi.model,
+                "embedding.provider" => settings.embedding.provider,
+                "gateway.api_key" => settings.gateway.api_key,
+                "gateway.base_url" => settings.gateway.base_url,
+                "gateway.default_model" => settings.gateway.default_model,
+                "gateway.max_retries" => settings.gateway.max_retries.to_string(),
+                "gateway.retry_base_ms" => settings.gateway.retry_base_ms.to_string(),
+                "gateway.timeout_seconds" => settings.gateway.timeout_seconds.to_string(),
+                "gateway.use_responses_api" => settings.gateway.use_responses_api.to_string(),
+                "output.directory" => settings.output.directory,
+                _ => panic!("unverified mapping: {path}"),
+            };
+            assert_eq!(actual, value, "{name} -> {path}");
+        }
+    }
+
+    #[test]
+    fn mapped_string_values_are_not_reparsed_as_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        write_full_test_layers(dir.path());
+        for value in ["007", "1e5", "true", "12345"] {
+            let settings: Settings =
+                test_config(dir.path(), &[("AGENT_OS_GATEWAY_API_KEY", value)])
+                    .unwrap()
+                    .try_deserialize()
+                    .unwrap();
+            assert_eq!(settings.gateway.api_key, value);
+        }
+        let settings: Settings = test_config(
+            dir.path(),
+            &[
+                ("AGENT_OS_EMBEDDING_ENABLED", "true"),
+                ("AGENT_OS_GATEWAY_MAX_RETRIES", "9"),
+            ],
+        )
+        .unwrap()
+        .try_deserialize()
+        .unwrap();
+        assert!(settings.embedding.enabled);
+        assert_eq!(settings.gateway.max_retries, 9);
+    }
+
+    #[test]
+    fn mapped_env_has_precedence_over_override_and_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("config.yaml");
+        let override_file = dir.path().join("config_override.json");
+        std::fs::write(&yaml, "gateway:\n  base_url: yaml-value\n").unwrap();
+        let read = |env: &[(&str, &str)]| {
+            test_config(dir.path(), env)
+                .unwrap()
+                .get::<String>("gateway.base_url")
+                .unwrap()
+        };
+        assert_eq!(read(&[]), "yaml-value");
+        std::fs::write(
+            &override_file,
+            r#"{"gateway":{"base_url":"override-value"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read(&[]), "override-value");
+        let env = [("AGENT_OS_GATEWAY_BASE_URL", "env-value")];
+        assert_eq!(read(&env), "env-value");
+        std::fs::remove_file(override_file).unwrap();
+        assert_eq!(read(&env), "env-value");
+        // An explicitly empty environment value also wins over a nonempty file key.
+        std::fs::write(&yaml, "gateway:\n  api_key: yaml-key\n").unwrap();
+        assert!(test_config(dir.path(), &[("AGENT_OS_GATEWAY_API_KEY", "")])
+            .unwrap()
+            .get::<String>("gateway.api_key")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unrecognized_env_warning_lists_only_sorted_names() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_writer({
+                let log = log.clone();
+                move || LogWriter(log.clone())
+            })
+            .finish();
+        let env = vec![
+            ("AGENT_OS_Z_UNKNOWN".into(), FAKE_KEY.into()),
+            ("AGENT_OS_A_UNKNOWN".into(), "private-value-278".into()),
+            ("AGENT_OS_HTTP_PORT".into(), "1234".into()),
+            ("AGENT_OS_GATEWAY_API_KEY".into(), FAKE_KEY.into()),
+        ];
+        tracing::subscriber::with_default(subscriber, || warn_unrecognized_env_vars(&env));
+        let line = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(line.contains("AGENT_OS_A_UNKNOWN, AGENT_OS_Z_UNKNOWN"));
+        assert!(line.contains("only take effect via legacy"));
+        assert!(!line.contains(FAKE_KEY));
+        assert!(!line.contains("private-value-278"));
+        assert!(!line.contains("AGENT_OS_HTTP_PORT"));
+        assert!(!line.contains("AGENT_OS_GATEWAY_API_KEY"));
+    }
 
     #[test]
     fn default_config_fallback_requires_explicit_development_opt_in() {
