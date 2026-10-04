@@ -46,6 +46,37 @@ The isolation diagnostic is intentionally still usable
 without a token because it is a local, read-only filesystem tool. It neither
 creates tenants nor grants HTTP access.
 
+### API client id collisions and recovery
+
+An API client id that appears under more than one tenant in `api_clients.json`
+(for example after a manual import) is treated as ambiguous and fails closed:
+
+- At load, every client with that id is marked `id_conflict` and a warning is
+  logged with the id and the tenant ids only.
+- Public API authentication returns `401` for any key whose `client_id` is
+  shared by more than one client, whatever their status. A client in
+  `id_conflict` also returns `401`.
+- `PUT /api/v1/api-clients/:id` returns `409` for a status change on an
+  `id_conflict` client. `DELETE /api/v1/api-clients/:id` on a shared id is
+  refused with `409` and changes nothing (no client, no keys): deleting one
+  side would end the collision and leave the other tenant with keys it never
+  owned. Under a shared id the client list shows only keys that carry the
+  caller tenant's prefix (none if two tenants share the same slug). Legacy
+  audit records without `tenant_id` under a shared id are never returned.
+
+Recovery is manual. With the service stopped (it rewrites these files from
+memory), an administrator edits `api_clients.json` (and
+`api_keys.json` for the affected keys) so that each client id belongs to
+exactly one tenant, then resets the remaining clients' `status` from
+`id_conflict` to `active` in the file and starts the service. The status
+persists across saves and reloads until then.
+
+`POST /api/v1/api-clients/:id/keys` is likewise refused with `409` (no key is
+written) while the id is shared or the client is `id_conflict`. Before deleting
+a client during recovery, operators must first revoke **all** keys under that
+client id. Otherwise a leftover key, especially a legacy key without a tenant
+prefix, could change owner once the id belongs to a single tenant again.
+
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and
 [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)

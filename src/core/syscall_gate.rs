@@ -11,6 +11,9 @@ use crate::memory::l2_blackboard::Blackboard;
 use crate::tools::skill_registry::SkillRegistry;
 use crate::CoreError;
 
+/// Static role whitelist built from the default `ToolPolicy`. The runtime
+/// executor does not use it for role decisions: `SyscallGate::validate_tool_for_run`
+/// takes the caller's run-local policy and fails closed without one.
 #[derive(Clone)]
 pub struct WhitelistManager {
     role_whitelist: HashMap<AgentRole, HashSet<String>>,
@@ -194,26 +197,76 @@ impl SyscallGate {
         Ok(())
     }
 
+    /// Validates against the static role whitelist. An empty or unknown role
+    /// fails closed: without a trusted caller role there is nothing to check
+    /// the whitelist against (#270-1).
     pub fn validate_tool_with_5w2h(
         &self,
         tool_name: &str,
         agent_role: &str,
         five_w2h_snapshot: Option<&crate::core::five_w2h::Task5W2H>,
     ) -> Result<(), crate::CoreError> {
-        // Check role-based whitelist if role is known
-        if let Ok(role) = agent_role.parse::<crate::core::agent_instance::AgentRole>() {
-            if !self.whitelist_manager.check_permission(&role, tool_name) {
-                warn!(role = %agent_role, tool = %tool_name, "Role-based whitelist denied");
-                return Err(crate::CoreError::Internal {
-                    message: format!(
-                        "Role '{}' is not allowed to use tool '{}'",
-                        agent_role, tool_name
-                    ),
-                });
-            }
+        let role = Self::trusted_role(tool_name, agent_role)?;
+        if !self.whitelist_manager.check_permission(&role, tool_name) {
+            return Err(Self::role_denied(agent_role, tool_name));
         }
-        // Check 5W2H constraints
         self.check_5w2h_constraints(tool_name, five_w2h_snapshot)
+    }
+
+    /// Runtime gate used by the tool executor. The role decision comes from
+    /// the caller's run-local `ToolPolicy` (server tool groups plus per-run
+    /// narrowing), not from the default policy behind `WhitelistManager`.
+    /// It fails closed without a trusted role or without a run-local policy.
+    /// `internal_micro_tool` must only be true for readers the executor
+    /// registered itself.
+    pub fn validate_tool_for_run(
+        &self,
+        tool_name: &str,
+        agent_role: &str,
+        agent_id: &str,
+        run_policy: Option<&crate::core::tool_policy::ToolPolicy>,
+        internal_micro_tool: bool,
+        five_w2h_snapshot: Option<&crate::core::five_w2h::Task5W2H>,
+    ) -> Result<(), crate::CoreError> {
+        let role = Self::trusted_role(tool_name, agent_role)?;
+        let Some(policy) = run_policy else {
+            warn!(role = %agent_role, tool = %tool_name, "SyscallGate denied: no run-local tool policy");
+            return Err(crate::CoreError::Internal {
+                message: format!(
+                    "Tool '{}' denied: no run-local tool policy for this caller",
+                    tool_name
+                ),
+            });
+        };
+        let allowed = policy.is_executable(&role, agent_id, tool_name)
+            || (internal_micro_tool
+                && policy.is_internal_micro_tool_executable(&role, agent_id, tool_name));
+        if !allowed {
+            return Err(Self::role_denied(agent_role, tool_name));
+        }
+        self.check_5w2h_constraints(tool_name, five_w2h_snapshot)
+    }
+
+    fn trusted_role(tool_name: &str, agent_role: &str) -> Result<AgentRole, crate::CoreError> {
+        agent_role.parse::<AgentRole>().map_err(|_| {
+            warn!(role = %agent_role, tool = %tool_name, "SyscallGate denied: no trusted caller role");
+            crate::CoreError::Internal {
+                message: format!(
+                    "Tool '{}' denied: no trusted caller role (got '{}')",
+                    tool_name, agent_role
+                ),
+            }
+        })
+    }
+
+    fn role_denied(agent_role: &str, tool_name: &str) -> crate::CoreError {
+        warn!(role = %agent_role, tool = %tool_name, "Role-based whitelist denied");
+        crate::CoreError::Internal {
+            message: format!(
+                "Role '{}' is not allowed to use tool '{}'",
+                agent_role, tool_name
+            ),
+        }
     }
 
     pub fn set_agent_whitelist(&mut self, agent_id: &str, allowed_iris: Vec<String>) {
@@ -447,6 +500,108 @@ mod tests_5w2h {
         assert!(gate
             .check_5w2h_constraints("file_write", Some(&w2h))
             .is_ok());
+    }
+
+    /// #270-1: an empty or unknown role no longer skips the role whitelist.
+    #[test]
+    fn syscall_gate_fails_closed_without_trusted_role() {
+        let gate = make_gate();
+        for role in ["", "unknown", "system"] {
+            assert!(
+                gate.validate_tool_with_5w2h("file_read", role, None)
+                    .is_err(),
+                "{role:?}"
+            );
+            assert!(
+                gate.validate_tool_with_5w2h("bash", role, None).is_err(),
+                "{role:?}"
+            );
+            let policy = crate::core::tool_policy::ToolPolicy::new();
+            assert!(
+                gate.validate_tool_for_run("file_read", role, "agent", Some(&policy), false, None)
+                    .is_err(),
+                "{role:?}"
+            );
+        }
+        assert!(gate
+            .validate_tool_with_5w2h("file_read", "Plan", None)
+            .is_ok());
+        assert!(gate.validate_tool_with_5w2h("bash", "Plan", None).is_err());
+    }
+
+    /// The runtime gate uses the caller's run-local policy and fails closed
+    /// when there is none (安野's #272 note on the default `ToolPolicy::new()`).
+    #[test]
+    fn syscall_gate_uses_run_local_policy_and_fails_closed_without_it() {
+        let gate = make_gate();
+        assert!(gate
+            .validate_tool_for_run("file_read", "Do", "agent", None, false, None)
+            .is_err());
+
+        let mut policy = crate::core::tool_policy::ToolPolicy::new();
+        assert!(gate
+            .validate_tool_for_run("file_write", "Do", "agent", Some(&policy), false, None)
+            .is_ok());
+        policy.restrict_tools("agent", ["file_read".to_string()]);
+        // The default whitelist would allow Do file_write; the narrowed run must not.
+        assert!(gate
+            .validate_tool_with_5w2h("file_write", "Do", None)
+            .is_ok());
+        assert!(gate
+            .validate_tool_for_run("file_write", "Do", "agent", Some(&policy), false, None)
+            .is_err());
+        assert!(gate
+            .validate_tool_for_run("file_read", "Do", "agent", Some(&policy), false, None)
+            .is_ok());
+        // Another agent in the same run is not affected by this restriction.
+        assert!(gate
+            .validate_tool_for_run("file_write", "Do", "other", Some(&policy), false, None)
+            .is_ok());
+
+        // Server opt-in carried by the run policy (Check bash) is honoured,
+        // which the default whitelist cannot express.
+        let check_bash = crate::core::tool_policy::ToolPolicy::new().with_check_bash_enabled(true);
+        assert!(gate.validate_tool_with_5w2h("bash", "Check", None).is_err());
+        assert!(gate
+            .validate_tool_for_run("bash", "Check", "agent", Some(&check_bash), false, None)
+            .is_ok());
+    }
+
+    /// #270-2 at the gate: a micro-tool name passes only when the executor
+    /// vouches that it is an internal reader.
+    #[test]
+    fn syscall_gate_prefix_rule_only_for_internal_micro_tools() {
+        let gate = make_gate();
+        let policy = crate::core::tool_policy::ToolPolicy::new();
+        for role in ["Check", "Act"] {
+            assert!(
+                gate.validate_tool_for_run(
+                    "query_orders",
+                    role,
+                    "agent",
+                    Some(&policy),
+                    false,
+                    None
+                )
+                .is_err(),
+                "{role}"
+            );
+            assert!(
+                gate.validate_tool_for_run(
+                    "query_orders",
+                    role,
+                    "agent",
+                    Some(&policy),
+                    true,
+                    None
+                )
+                .is_ok(),
+                "{role}"
+            );
+        }
+        assert!(gate
+            .validate_tool_for_run("query_orders", "Plan", "agent", Some(&policy), true, None)
+            .is_err());
     }
 
     #[test]
