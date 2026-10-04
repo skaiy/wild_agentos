@@ -1247,6 +1247,25 @@ fn development_config_fallback_enabled(
         })
 }
 
+/// Deserialize a built [`Config`], naming the field path of any error.
+///
+/// `config` alone reports e.g. ``missing field `max_projection_size` ``
+/// without saying which section is wrong; this wraps the error so an operator
+/// sees ``missing field `max_projection_size` (at `memory.l2`)``.
+fn deserialize_with_field_path<T: serde::de::DeserializeOwned>(
+    config: Config,
+) -> Result<T, ConfigError> {
+    serde_path_to_error::deserialize(config).map_err(|err| {
+        let path = err.path().to_string();
+        let inner = err.into_inner();
+        if path.is_empty() || path == "." {
+            inner
+        } else {
+            ConfigError::Message(format!("{inner} (at `{path}`)"))
+        }
+    })
+}
+
 impl Settings {
     /// Whether an explicitly marked development process may start with defaults
     /// when its configuration cannot be loaded. Production always fails closed.
@@ -1271,7 +1290,7 @@ impl Settings {
             )
             .build()?;
 
-        config.try_deserialize()
+        deserialize_with_field_path(config)
     }
 
     /// 仅加载 embedding 段（含各字段 serde 默认值），用于运行期热切换。
@@ -1605,5 +1624,63 @@ mod tests {
         assert_eq!(settings.snapshot_frequency, 1000);
         assert_eq!(settings.max_full_snapshots, 10);
         assert_eq!(settings.max_projection_size, 500);
+    }
+
+    /// The `config.yaml` shipped at the repository root, without env vars or
+    /// `config_override.json`, exactly as a fresh install reads it.
+    fn shipped_config_yaml_text() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.yaml");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn config_from_yaml(text: &str) -> Config {
+        Config::builder()
+            .add_source(config::File::from_str(text, config::FileFormat::Yaml))
+            .build()
+            .expect("shipped config.yaml must be valid YAML")
+    }
+
+    #[test]
+    fn shipped_config_yaml_deserializes_into_settings() {
+        let settings: Settings =
+            deserialize_with_field_path(config_from_yaml(&shipped_config_yaml_text()))
+                .unwrap_or_else(|e| panic!("shipped config.yaml must load: {e}"));
+        assert_eq!(settings.memory.l2.max_node_size, 2048);
+        assert_eq!(settings.memory.l2.max_projection_size, 500);
+        assert_eq!(settings.agents.sa_execution_timeout_secs, 30);
+        assert_eq!(settings.agents.tool_timeout_secs, 60);
+        assert_eq!(settings.agents.mcp_timeout_secs, 30);
+        assert_eq!(settings.agents.embedding_timeout_secs, 30);
+    }
+
+    #[test]
+    fn shipped_config_yaml_has_no_keys_outside_settings() {
+        let mut ignored = Vec::new();
+        let _settings: Settings =
+            serde_ignored::deserialize(config_from_yaml(&shipped_config_yaml_text()), |path| {
+                ignored.push(path.to_string())
+            })
+            .unwrap_or_else(|e| panic!("shipped config.yaml must load: {e}"));
+        assert!(
+            ignored.is_empty(),
+            "config.yaml keys that no settings struct reads (misplaced or misspelled): {ignored:?}"
+        );
+    }
+
+    #[test]
+    fn config_load_error_names_the_field_path() {
+        // Reproduce the pre-fix layout: `max_projection_size` one level too high.
+        let shipped = shipped_config_yaml_text();
+        let broken = shipped.replacen(
+            "    max_node_size: 2048\n    max_projection_size: 500\n",
+            "    max_node_size: 2048\n  max_projection_size: 500\n",
+            1,
+        );
+        assert_ne!(broken, shipped, "fixture edit must apply");
+        let err = deserialize_with_field_path::<Settings>(config_from_yaml(&broken))
+            .expect_err("misplaced max_projection_size must fail to load")
+            .to_string();
+        assert!(err.contains("max_projection_size"), "{err}");
+        assert!(err.contains("memory.l2"), "{err}");
     }
 }
