@@ -578,3 +578,91 @@ async fn isolation_contract_legacy_audit_with_colliding_client_id_is_hidden() {
         }
     }
 }
+
+/// Lock order: every path that holds both registries takes `api_keys` before
+/// `api_clients`. Concurrent list / delete (both locks) / public-key auth must
+/// never deadlock; a hang is caught by the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolation_contract_api_client_key_lock_order_has_no_deadlock() {
+    const ROUNDS: usize = 200;
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let (auth_key, auth_plain) = issued("key-auth", "client-auth", "tenant-a");
+    let state = test_state(dir.path());
+    *state.api_clients.write().await = vec![client("client-auth", "tenant-a")];
+    *state.api_keys.write().await = vec![auth_key];
+    let router = app(state.clone());
+    let token = da("tenant-a");
+
+    let lister = {
+        let (router, token) = (router.clone(), token.clone());
+        tokio::spawn(async move {
+            for _ in 0..ROUNDS {
+                let (status, _) = send(
+                    &router,
+                    Method::GET,
+                    "/api/v1/api-clients",
+                    Value::Null,
+                    &token,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let deleter = {
+        let (router, token, state) = (router.clone(), token.clone(), state.clone());
+        tokio::spawn(async move {
+            for i in 0..ROUNDS {
+                // Unique, non-colliding id so delete takes both locks.
+                let id = format!("client-del-{i}");
+                let (key, _) = issued(&format!("key-del-{i}"), &id, "tenant-a");
+                state
+                    .api_clients
+                    .write()
+                    .await
+                    .push(client(&id, "tenant-a"));
+                state.api_keys.write().await.push(key);
+                let (status, _) = send(
+                    &router,
+                    Method::DELETE,
+                    &format!("/api/v1/api-clients/{id}"),
+                    Value::Null,
+                    &token,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let authenticator = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            for _ in 0..ROUNDS {
+                let (status, _) = send(
+                    &router,
+                    Method::POST,
+                    "/api/v1/public/agents/agent-tenant-a/chat",
+                    json!({"message": "hi"}),
+                    &auth_plain,
+                )
+                .await;
+                assert_ne!(status, StatusCode::UNAUTHORIZED);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let all = async {
+        let (a, b, c) = tokio::join!(lister, deleter, authenticator);
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), all)
+        .await
+        .expect("api_keys / api_clients lock-order deadlock (timed out)");
+}

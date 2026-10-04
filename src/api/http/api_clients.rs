@@ -1,6 +1,8 @@
 //! 管理面：调用方 & 密钥中心（需 DA 角色）。
 //!
 //! 路由仍由 `mod.rs` 的 `build_router` 组装；持久化模型在 `api_gov`。
+//! Lock order: when both are held, take `api_keys` first, then `api_clients`;
+//! never acquire `api_keys` while holding `api_clients`.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -120,8 +122,9 @@ pub(crate) async fn list_api_clients_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    let clients = state.api_clients.read().await;
+    // Lock order: api_keys before api_clients (see module docs).
     let keys = state.api_keys.read().await;
+    let clients = state.api_clients.read().await;
     // Under a client id shared with another tenant, only keys carrying this
     // tenant's prefix are shown (none if the slugs are ambiguous).
     let collisions = api_gov::cross_tenant_client_id_collisions(&clients);
@@ -298,7 +301,7 @@ pub(crate) async fn delete_api_client_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    // Lock order (see `authenticate_public`): api_keys before api_clients.
+    // Lock order: api_keys before api_clients (see module docs).
     let mut keys = state.api_keys.write().await;
     let mut clients = state.api_clients.write().await;
     if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {

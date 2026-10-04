@@ -6,6 +6,11 @@
  *
  * 持久化：data/api_clients.json、data/api_keys.json（pretty JSON），
  *         data/api_audit.jsonl（滚动追加）。
+ *
+ * 锁顺序 / Lock order: `AppState::api_keys` and `AppState::api_clients` are
+ * separate locks. Any caller that holds both must take `api_keys` first, then
+ * `api_clients` (e.g. before calling `resolve_bearer_token`). This module only
+ * works on slices and takes neither lock itself.
  */
 
 use serde::{Deserialize, Serialize};
