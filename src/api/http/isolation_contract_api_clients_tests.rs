@@ -492,6 +492,109 @@ async fn cross_tenant_revoke_via_own_client_is_not_found() {
 }
 
 #[tokio::test]
+async fn isolation_contract_api_clients_revoke_scopes_keys_with_shared_id() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let state = test_state(dir.path());
+    let router = app(state.clone());
+    let token_a = jwt_for("tenant-a", &["DA"], Some("project-a"));
+    let token_b = jwt_for("tenant-b", &["DA"], Some("project-b"));
+    let body_of = |raw: &[u8]| serde_json::from_slice::<Value>(raw).unwrap();
+
+    // Each tenant creates a client through the API.
+    let mut ids = vec![];
+    for token in [&token_a, &token_b] {
+        let (status, raw) = request_raw(
+            &router,
+            Method::POST,
+            "/api/v1/api-clients",
+            json!({"name": "shared"}),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        ids.push(body_of(&raw)["client"]["id"].as_str().unwrap().to_string());
+    }
+    // Legacy/imported data: tenant B's client ends up with tenant A's id.
+    let shared = ids[0].clone();
+    for c in state.api_clients.write().await.iter_mut() {
+        if c.id == ids[1] {
+            c.id = shared.clone();
+        }
+    }
+    api_gov::save_api_clients(&state.api_clients.read().await).unwrap();
+
+    // Both tenants issue a key under the shared id.
+    let mut issued = vec![];
+    for token in [&token_a, &token_b] {
+        let (status, raw) = request_raw(
+            &router,
+            Method::POST,
+            &format!("/api/v1/api-clients/{shared}/keys"),
+            json!({"name": "k"}),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let v = body_of(&raw);
+        issued.push((
+            v["key"]["id"].as_str().unwrap().to_string(),
+            v["api_key"].as_str().unwrap().to_string(),
+        ));
+    }
+    let (kid_a, _) = issued[0].clone();
+    let (kid_b, plaintext_b) = issued[1].clone();
+    let before = snapshot(&state, dir.path()).await;
+
+    // Tenant A's DA cannot revoke tenant B's key through the shared id.
+    let attempt = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_b}"),
+        json!(null),
+        Some(&token_a),
+    )
+    .await;
+    assert_eq!(attempt.0, StatusCode::NOT_FOUND);
+    // Same body as a kid that does not exist at all.
+    let missing = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_b}"),
+        json!(null),
+        Some(&jwt_for("tenant-c", &["DA"], Some("project-c"))),
+    )
+    .await;
+    assert_eq!(attempt, missing);
+    assert_eq!(snapshot(&state, dir.path()).await, before);
+
+    // Tenant B's key still authenticates afterwards.
+    let caller = api_gov::resolve_bearer_token(
+        &plaintext_b,
+        &state.api_keys.read().await,
+        &state.api_clients.read().await,
+    )
+    .unwrap_or_else(|_| panic!("tenant B key must still authenticate"));
+    assert_eq!(caller.key_id, kid_b);
+
+    // Tenant A can still revoke its own key under the shared id.
+    let (status, _) = request_raw(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{shared}/keys/{kid_a}"),
+        json!(null),
+        Some(&token_a),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = state.api_keys.read().await;
+    let status_of = |kid: &str| keys.iter().find(|k| k.id == kid).unwrap().status.clone();
+    assert_eq!(status_of(&kid_a), "revoked");
+    assert_eq!(status_of(&kid_b), "active");
+}
+
+#[tokio::test]
 async fn list_returns_only_verified_tenant_clients() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();

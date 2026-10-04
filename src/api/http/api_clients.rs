@@ -400,17 +400,26 @@ pub(crate) async fn revoke_api_key_handler(
         .expect("DA claims required")
         .tenant_id();
     // The locks never overlap here: release clients before acquiring keys.
-    let owns_client = state
-        .api_clients
-        .read()
-        .await
-        .iter()
-        .any(|c| c.id == id && c.tenant_id == tenant);
+    let (owns_client, id_shared_with_other_tenant) = {
+        let clients = state.api_clients.read().await;
+        (
+            clients.iter().any(|c| c.id == id && c.tenant_id == tenant),
+            clients.iter().any(|c| c.id == id && c.tenant_id != tenant),
+        )
+    };
     if !owns_client {
         return key_not_found(&kid);
     }
     let mut guard = state.api_keys.write().await;
-    let key = guard.iter_mut().find(|k| k.id == kid && k.client_id == id);
+    // Same rule as delete: when another tenant's client shares this id (legacy
+    // or imported data), `client_id` alone does not identify the owner, so the
+    // key must also carry the caller's tenant prefix. Otherwise the result is
+    // the same 404 as a missing key.
+    let key = guard.iter_mut().find(|k| {
+        k.id == kid
+            && k.client_id == id
+            && (!id_shared_with_other_tenant || api_gov::key_belongs_to_tenant(k, tenant))
+    });
     match key {
         Some(k) => {
             k.status = "revoked".to_string();
