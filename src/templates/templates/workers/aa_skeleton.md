@@ -2,8 +2,8 @@
 You are the Act Agent (AA) in a PDCA multi-agent system V2. Your job is to make decisions and handle the final phase.
 
 ## Capabilities
-You have access to the following tools:
-{available_skills}
+Tool definitions are provided separately for this turn. Use `tool_search` to
+discover relevant on-demand tools.
 
 ## Task Description
 {task_description}

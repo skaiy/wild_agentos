@@ -86,3 +86,49 @@ Plan、Check 与 Act 默认只读。只有在明确开启服务端
 `enabled: false` 会恢复旧的 fallback 工具暴露行为。网关会解析 OpenAI
 兼容的 `prompt_tokens_details.cached_tokens` 或 `cache_read_input_tokens`，
 并记录累计缓存命中率。
+
+## 工具描述规范
+
+每轮函数 schema 是每个工具定义的唯一真源。系统提示词不再重复文本菜单；
+环境区域保留平台提示，并且在适用时保留稳定的按需分组目录。
+
+### 来源与执行时机
+
+内置工具及参数描述是在注册处手写的字面量，运行时不做自动规范化。
+内置工具集合由注册过程记录，而非手工维护名称列表。运行
+`cargo test --lib tool_description_lint` 检查原始定义。外部及生成的
+工具在运行时仅针对该工具记录 warning，不修改也不阻止注册。
+
+### 规则
+
+- 名称使用小写 snake case、全局唯一，不使用数字版本后缀或泛化名称。
+- 描述长度为 80–600 字节，包含字面标记 `Use when:` 与 `Not for:`。
+- 容易混淆的工具在 `Not for:` 中点名真正的同族工具，并说明何时改用它。
+- 参数必须是 object schema，每个属性都要有说明；`required` 名称必须
+  存在于 `properties`。布尔参数说明真实默认值。路径、URL、正则、
+  glob 和类似枚举的输入说明格式，或使用处理器已实施的 schema 约束。
+- 每个角色的常驻序列化 schema 不超过 48,000 字节；测试也检查外部
+  描述的 Jaccard 相似度。
+
+### 易混淆工具族
+
+| 族 | 工具 |
+| --- | --- |
+| 搜索 | `grep_search`, `glob_search`, `rag_search`, `kg_search`, `kb_vector_search`, `knowledge_search`, `knowledge_query`, `knowledge_list` |
+| 写入 | `file_write`, `file_edit` |
+| Shell | `bash`, `powershell` |
+| Web | `web_search`, `web_fetch` |
+| 导入 | `knowledge_import_file`, `knowledge_import_url`, `knowledge_import_directory`, `knowledge_import_json` |
+| 本体校验 | `ontology_validate_turtle`, `ontology_lint_turtle`, `ontology_validate_shacl` |
+
+### 豁免与示例
+
+生成的 micro-tool 只豁免上述标记，仍须检查参数描述。其他豁免
+必须在 `LINT_EXEMPTIONS` 写明原因，并获准增加 `MAX_LINT_EXEMPTIONS`
+（当前为零）；测试会校验两者。
+
+修改前：`file_write` 的描述为 `Write content to a file.`
+
+修改后：`Write the complete supplied content to a file, creating or replacing
+it. Use when: a whole file must be written. Not for: a targeted change in an
+existing file; use file_edit.`
