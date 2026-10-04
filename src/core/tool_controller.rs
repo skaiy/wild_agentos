@@ -1,6 +1,19 @@
 use crate::core::agent_instance::AgentRole;
 use crate::core::tool_policy::ToolPolicy;
 
+pub(crate) fn disallowed_pa_tools<'a>(
+    role: &AgentRole,
+    tool_names: impl IntoIterator<Item = &'a str>,
+) -> Vec<&'a str> {
+    if *role != AgentRole::Plan {
+        return Vec::new();
+    }
+    tool_names
+        .into_iter()
+        .filter(|name| !crate::tools::tool_executor::ToolExecutor::is_pa_readonly_tool(name))
+        .collect()
+}
+
 /// Role/tool queries over the default `ToolPolicy` (built-in groups, no
 /// per-run narrowing, no view of the executor's internal micro-tools).
 /// It is not on the runtime execution path: tool calls are authorised by
@@ -36,10 +49,7 @@ impl ToolController {
     }
 
     pub fn should_force_finish(&self, tool_names: &[&str], role: &AgentRole) -> bool {
-        *role == AgentRole::Plan
-            && tool_names
-                .iter()
-                .any(|name| !crate::tools::tool_executor::ToolExecutor::is_pa_readonly_tool(name))
+        !disallowed_pa_tools(role, tool_names.iter().copied()).is_empty()
     }
 }
 
@@ -235,5 +245,10 @@ mod tests {
             assert!(tc.should_force_finish(&[name], &AgentRole::Plan), "{name}");
         }
         assert!(!tc.should_force_finish(&["file_read"], &AgentRole::Plan));
+        assert!(!tc.should_force_finish(&["file_write"], &AgentRole::Do));
+        assert_eq!(
+            disallowed_pa_tools(&AgentRole::Plan, ["file_read", "file_write", "bash"]),
+            ["file_write", "bash"]
+        );
     }
 }

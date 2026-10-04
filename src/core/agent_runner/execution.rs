@@ -14,7 +14,6 @@ use crate::jsonld::{JsonLdContext, JsonLdNode};
 use crate::memory::l1_session::L1Session;
 use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
-use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
 use super::{
@@ -22,6 +21,30 @@ use super::{
 };
 
 impl super::AgentRunner {
+    pub(super) async fn emit_pa_disallowed_tool_event(
+        &self,
+        agent: &AgentInstance,
+        task_iri: &str,
+        tools: &[&str],
+    ) {
+        if let Some(event_bus) = &self.event_bus {
+            let _ = event_bus
+                .emit(
+                    task_iri,
+                    "AGENT_ERROR",
+                    &agent.agent_id,
+                    &json!({
+                        "error": "pa_disallowed_tool_call",
+                        "agent": &agent.agent_id,
+                        "role": agent.role.to_string(),
+                        "tools": tools,
+                    })
+                    .to_string(),
+                )
+                .await;
+        }
+    }
+
     pub async fn execute(
         &self,
         agent: &mut AgentInstance,
@@ -1709,6 +1732,43 @@ Output the summary report directly, not in JSON format."#,
             // ===== Action Phase =====
             info!("[ReAct Turn {}] ===== Action =====", turn);
 
+            let disallowed_tools = crate::core::tool_controller::disallowed_pa_tools(
+                &agent.role,
+                choice
+                    .message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|c| c.function.name.as_str()),
+            );
+            if !disallowed_tools.is_empty() {
+                warn!("[PA] disallowed tool calls blocked: {:?}", disallowed_tools);
+                self.emit_pa_disallowed_tool_event(agent, &ctx.task_iri, &disallowed_tools)
+                    .await;
+                errs.push(format!(
+                    "pa_disallowed_tool_call: {}",
+                    disallowed_tools.join(", ")
+                ));
+                let output_value = Value::String(parsed.content.clone());
+                let jsonld_output =
+                    self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);
+                return Ok(TaskResult {
+                    task_iri: ctx.task_iri,
+                    status: "failed".to_string(),
+                    verdict: None,
+                    summary: "Plan force-ended after a disallowed tool call".to_string(),
+                    output: Some(output_value),
+                    jsonld_output,
+                    artifacts: vec![],
+                    errors: errs,
+                    turn_count: turn,
+                    tool_call_count: tc,
+                    five_w2h_updates: None,
+                    tracked_actions: Vec::new(),
+                    archive_iri: Some(node_iri.clone()),
+                });
+            }
+
             match action.as_str() {
                 "finish" => {
                     info!("[ReAct] Agent decided to complete task");
@@ -1910,72 +1970,6 @@ Output the summary report directly, not in JSON format."#,
                         let tool_names: Vec<&str> =
                             calls.iter().map(|c| c.function.name.as_str()).collect();
                         debug!("[tool_calls] {} → {:?}", calls.len(), tool_names);
-
-                        // 🔴 PA role may only call its read-only allowlist.
-                        if agent.role == AgentRole::Plan {
-                            let disallowed_tools: Vec<&str> = calls
-                                .iter()
-                                .map(|c| c.function.name.as_str())
-                                .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
-                                .collect();
-
-                            let force_finish = !disallowed_tools.is_empty();
-
-                            if force_finish {
-                                warn!(
-                                    "[PA] detected disallowed tool call: {:?}, forcing finish",
-                                    disallowed_tools
-                                );
-                                info!("[ReAct] PA Agent force-ended (disallowed tool call)");
-
-                                let (final_summary, output_value) =
-                                    if !parsed.content.trim().is_empty() {
-                                        (
-                                            parsed.summary.clone().unwrap_or_else(|| {
-                                                "PA has formulated a plan".to_string()
-                                            }),
-                                            Value::String(parsed.content.clone()),
-                                        )
-                                    } else if let Some((agg_summary, agg_content)) =
-                                        self.aggregate_tool_results(&messages, agent, &ctx).await
-                                    {
-                                        (agg_summary, Value::String(agg_content))
-                                    } else {
-                                        (
-                                            parsed.summary.clone().unwrap_or_else(|| {
-                                                "PA has formulated a plan".to_string()
-                                            }),
-                                            Value::String(parsed.content.clone()),
-                                        )
-                                    };
-                                let jsonld_output = self.apply_output_mapping(
-                                    &output_value,
-                                    &agent.role,
-                                    &ctx.task_iri,
-                                );
-
-                                let pa_archive_iri = if !best_content_iri.is_empty() {
-                                    Some(best_content_iri.clone())
-                                } else {
-                                    Some(node_iri.clone())
-                                };
-                                return Ok(TaskResult {
-                                    task_iri: ctx.task_iri,
-                                    status: "success".to_string(),
-                                    verdict: None,
-                                    summary: final_summary,
-                                    output: Some(output_value),
-                                    jsonld_output,
-                                    artifacts: vec![],
-                                    errors: errs,
-                                    turn_count: turn,
-                                    tool_call_count: tc,
-                                    five_w2h_updates: None,
-                                    tracked_actions: Vec::new(),
-                                    archive_iri: pa_archive_iri,
-                                });
-                            }
-                        }
 
                         let asst_summary = parsed
                             .summary
