@@ -341,23 +341,14 @@ pub fn resolve_bearer_token(
             }
         }
     }
-    // Never take the first client with this id: when ids collide, select the
-    // one client whose tenant matches the key's generated prefix. Zero or
-    // several matches fail closed with 401.
-    let candidates: Vec<&ApiClient> = clients.iter().filter(|c| c.id == key.client_id).collect();
-    let client = match candidates.as_slice() {
-        [] => return Err(AuthError::Unauthorized),
-        [only] => *only,
-        many => {
-            let owned: Vec<&&ApiClient> = many
-                .iter()
-                .filter(|c| key_prefix_matches_tenant(key, &c.tenant_id))
-                .collect();
-            match owned.as_slice() {
-                [only] => **only,
-                _ => return Err(AuthError::Unauthorized),
-            }
-        }
+    // Never take the first client with this id: a client id shared by more
+    // than one client (e.g. across tenants) does not identify the owner, so
+    // any duplicate fails closed with 401 regardless of status. This is the
+    // primary defense; no status change can re-enable a colliding id.
+    let mut candidates = clients.iter().filter(|c| c.id == key.client_id);
+    let client = match (candidates.next(), candidates.next()) {
+        (Some(only), None) => only,
+        _ => return Err(AuthError::Unauthorized),
     };
     if client.status == CLIENT_ID_CONFLICT_STATUS {
         return Err(AuthError::Unauthorized);
@@ -375,11 +366,8 @@ pub fn resolve_bearer_token(
     })
 }
 
-/// Whether `key.key_prefix` has the exact shape `generate_key` writes for
-/// `tenant` (`sk-<slug>-<6 chars>`). Used only to disambiguate colliding
-/// client ids. Slugs are lossy (case folding, punctuation → `-`), so two
-/// tenants can share a slug; then both match and the caller gets 401.
-fn key_prefix_matches_tenant(key: &ApiKey, tenant: &str) -> bool {
+/// Slug that `generate_key` embeds in a tenant's key prefixes.
+fn tenant_key_slug(tenant: &str) -> String {
     let slug: String = tenant
         .chars()
         .map(|c| {
@@ -391,11 +379,53 @@ fn key_prefix_matches_tenant(key: &ApiKey, tenant: &str) -> bool {
         })
         .collect();
     let slug = slug.trim_matches('-');
-    let slug = if slug.is_empty() { "t" } else { slug };
-    let head = format!("sk-{slug}-");
+    if slug.is_empty() {
+        "t".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// Whether `key.key_prefix` has the exact shape `generate_key` writes for
+/// `tenant` (`sk-<slug>-<6 chars>`). Slugs are lossy (case folding,
+/// punctuation → `-`), so a match is not final proof of ownership; see
+/// [`tenant_may_manage_key`] for the fail-closed use.
+pub(crate) fn key_prefix_matches_tenant(key: &ApiKey, tenant: &str) -> bool {
+    let head = format!("sk-{}-", tenant_key_slug(tenant));
     key.key_prefix.len() == head.len() + 6
         && key.key_prefix.starts_with(&head)
         && !key.key_prefix[head.len()..].contains('-')
+}
+
+/// Whether `tenant`'s key prefix cannot be told apart from another tenant that
+/// shares the colliding client id (`tenants` from
+/// [`cross_tenant_client_id_collisions`]).
+pub(crate) fn colliding_tenant_slug_is_ambiguous(
+    tenants: &std::collections::BTreeSet<String>,
+    tenant: &str,
+) -> bool {
+    let slug = tenant_key_slug(tenant);
+    tenants
+        .iter()
+        .any(|t| t != tenant && tenant_key_slug(t) == slug)
+}
+
+/// Management-plane key ownership for a key whose `client_id` names one of
+/// `tenant`'s clients. Unique ids: every key under the id. Ids shared across
+/// tenants: only keys carrying `tenant`'s prefix, and none at all when another
+/// colliding tenant has the same slug (fail closed).
+pub(crate) fn tenant_may_manage_key(
+    collisions: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    key: &ApiKey,
+    tenant: &str,
+) -> bool {
+    match collisions.get(&key.client_id) {
+        None => true,
+        Some(tenants) => {
+            !colliding_tenant_slug_is_ambiguous(tenants, tenant)
+                && key_prefix_matches_tenant(key, tenant)
+        }
+    }
 }
 
 // ─── 进程内限流 / 配额 / 并发 ──────────────────────────────────────────────────

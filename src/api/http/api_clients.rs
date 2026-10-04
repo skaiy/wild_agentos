@@ -39,6 +39,18 @@ fn client_not_found(id: &str) -> Response {
         .into_response()
 }
 
+fn client_id_conflict(id: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "client id conflict",
+            "id": id,
+            "message": "client id is quarantined; an administrator must fix the data first",
+        })),
+    )
+        .into_response()
+}
+
 fn key_not_found(kid: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -110,6 +122,9 @@ pub(crate) async fn list_api_clients_handler(
         .tenant_id();
     let clients = state.api_clients.read().await;
     let keys = state.api_keys.read().await;
+    // Under a client id shared with another tenant, only keys carrying this
+    // tenant's prefix are shown (none if the slugs are ambiguous).
+    let collisions = api_gov::cross_tenant_client_id_collisions(&clients);
     let items: Vec<Value> = clients
         .iter()
         .filter(|c| c.tenant_id == tenant)
@@ -117,6 +132,7 @@ pub(crate) async fn list_api_clients_handler(
             let ckeys: Vec<Value> = keys
                 .iter()
                 .filter(|k| k.client_id == c.id)
+                .filter(|k| api_gov::tenant_may_manage_key(&collisions, k, tenant))
                 .map(key_public_view)
                 .collect();
             json!({
@@ -232,6 +248,12 @@ pub(crate) async fn update_api_client_handler(
         Some(c) => c,
         None => return client_not_found(&id),
     };
+    // A quarantined (colliding) client must not be re-enabled through the API;
+    // the collision has to be fixed in the data first. Second layer: auth also
+    // rejects any duplicate id regardless of status.
+    if req.status.is_some() && client.status == api_gov::CLIENT_ID_CONFLICT_STATUS {
+        return client_id_conflict(&id);
+    }
     if let Some(v) = req.name {
         client.name = v;
     }
@@ -277,14 +299,22 @@ pub(crate) async fn delete_api_client_handler(
         .expect("DA claims required")
         .tenant_id();
     let mut clients = state.api_clients.write().await;
-    let before = clients.len();
-    clients.retain(|c| c.id != id || c.tenant_id != tenant);
-    if clients.len() == before {
+    if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
         return client_not_found(&id);
     }
+    // When another tenant shares this id, keys are removed only if they carry
+    // this tenant's prefix; same-slug tenants cannot be told apart -> 409.
+    let collisions = api_gov::cross_tenant_client_id_collisions(&clients);
+    if collisions
+        .get(&id)
+        .is_some_and(|tenants| api_gov::colliding_tenant_slug_is_ambiguous(tenants, tenant))
+    {
+        return client_id_conflict(&id);
+    }
+    clients.retain(|c| c.id != id || c.tenant_id != tenant);
     let _ = api_gov::save_api_clients(&clients);
     let mut keys = state.api_keys.write().await;
-    keys.retain(|k| k.client_id != id);
+    keys.retain(|k| k.client_id != id || !api_gov::tenant_may_manage_key(&collisions, k, tenant));
     let _ = api_gov::save_api_keys(&keys);
     (
         StatusCode::OK,

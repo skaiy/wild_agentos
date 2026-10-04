@@ -185,48 +185,51 @@ async fn isolation_contract_client_id_collision_at_load_disables_all_and_auth_is
     assert_ne!(status, StatusCode::UNAUTHORIZED);
 }
 
+fn is_unauthorized(result: Result<api_gov::ApiCallerContext, AuthError>) -> bool {
+    matches!(result, Err(AuthError::Unauthorized))
+}
+
 #[test]
-fn isolation_contract_resolve_bearer_token_selects_colliding_client_by_key_tenant() {
-    // Explicit in-memory state that bypasses the load-time quarantine, so the
-    // resolver's own selection is exercised.
-    let clients = vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")];
+fn isolation_contract_resolve_bearer_token_rejects_any_duplicate_client_id() {
+    // Explicit in-memory state that bypasses the load-time quarantine: both
+    // clients are `active`, so only the resolver's duplicate check stands.
     let (key_a, plain_a) = issued("key-a", SHARED, "tenant-a");
     let (key_b, plain_b) = issued("key-b", SHARED, "tenant-b");
-    let (key_x, plain_x) = issued("key-x", SHARED, "tenant-x");
-    let keys = vec![key_a, key_b, key_x];
+    let client_orders = [
+        vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")],
+        vec![client(SHARED, "tenant-b"), client(SHARED, "tenant-a")],
+    ];
+    let key_orders = [
+        vec![key_a.clone(), key_b.clone()],
+        vec![key_b.clone(), key_a.clone()],
+    ];
+    for clients in &client_orders {
+        for keys in &key_orders {
+            for plaintext in [&plain_a, &plain_b] {
+                assert!(
+                    is_unauthorized(api_gov::resolve_bearer_token(plaintext, keys, clients)),
+                    "duplicate client id must be 401 for every key"
+                );
+            }
+        }
+    }
 
-    // B's key maps to tenant B even though tenant A's client comes first.
-    let b = api_gov::resolve_bearer_token(&plain_b, &keys, &clients).unwrap();
-    assert_eq!(b.tenant_id, "tenant-b");
-    assert_eq!(b.granted_agent_ids, vec!["agent-tenant-b".to_string()]);
-    let a = api_gov::resolve_bearer_token(&plain_a, &keys, &clients).unwrap();
-    assert_eq!(a.tenant_id, "tenant-a");
+    // Duplicates within one tenant are rejected too (never first match).
+    let same_tenant = vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-a")];
+    assert!(is_unauthorized(api_gov::resolve_bearer_token(
+        &plain_a,
+        &key_orders[0],
+        &same_tenant
+    )));
 
-    // A key whose prefix matches none of the colliding tenants: 401.
-    assert!(matches!(
-        api_gov::resolve_bearer_token(&plain_x, &keys, &clients),
-        Err(AuthError::Unauthorized)
-    ));
-
-    // Two colliding tenants with the same slug (`Tenant-A` / `tenant-a`): the
-    // prefix matches both, so 401 rather than either one.
-    let same_slug = vec![client(SHARED, "Tenant-A"), client(SHARED, "tenant-a")];
-    assert!(matches!(
-        api_gov::resolve_bearer_token(&plain_a, &keys, &same_slug),
-        Err(AuthError::Unauthorized)
-    ));
-
-    // A quarantined client is never usable, even when it is the only match.
-    let mut quarantined = clients.clone();
-    api_gov::quarantine_cross_tenant_client_ids(&mut quarantined);
-    let only_b: Vec<ApiClient> = quarantined
-        .into_iter()
-        .filter(|c| c.tenant_id == "tenant-b")
-        .collect();
-    assert!(matches!(
-        api_gov::resolve_bearer_token(&plain_b, &keys, &only_b),
-        Err(AuthError::Unauthorized)
-    ));
+    // A quarantined client is never usable, even as the only client left.
+    let mut only_b = vec![client(SHARED, "tenant-b")];
+    only_b[0].status = CLIENT_ID_CONFLICT_STATUS.into();
+    assert!(is_unauthorized(api_gov::resolve_bearer_token(
+        &plain_b,
+        &key_orders[0],
+        &only_b
+    )));
 
     // Unique ids keep today's behavior.
     let unique = vec![client("client-b", "tenant-b")];
@@ -237,6 +240,219 @@ fn isolation_contract_resolve_bearer_token_selects_colliding_client_by_key_tenan
             .tenant_id,
         "tenant-b"
     );
+}
+
+#[tokio::test]
+async fn isolation_contract_id_conflict_client_status_update_is_409_and_auth_stays_401() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let (key_a, plain_a) = issued("key-a", SHARED, "tenant-a");
+    let (key_b, plain_b) = issued("key-b", SHARED, "tenant-b");
+    let mut clients = vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")];
+    api_gov::quarantine_cross_tenant_client_ids(&mut clients);
+    let state = test_state(dir.path());
+    *state.api_clients.write().await = clients;
+    *state.api_keys.write().await = vec![key_a, key_b];
+    let router = app(state.clone());
+
+    for body in [json!({"status": "active"}), json!({"status": "disabled"})] {
+        let (status, _) = send(
+            &router,
+            Method::PUT,
+            &format!("/api/v1/api-clients/{SHARED}"),
+            body,
+            &da("tenant-a"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+    assert!(state
+        .api_clients
+        .read()
+        .await
+        .iter()
+        .all(|c| c.status == CLIENT_ID_CONFLICT_STATUS));
+
+    let chat = |plaintext: String, agent: &'static str| {
+        let router = router.clone();
+        async move {
+            send(
+                &router,
+                Method::POST,
+                &format!("/api/v1/public/agents/{agent}/chat"),
+                json!({"message": "hi"}),
+                &plaintext,
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(
+        chat(plain_a.clone(), "agent-tenant-a").await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Bypass the update API entirely: re-enable both clients in state. The
+    // duplicate id alone still fails closed for both tenants' keys.
+    for c in state.api_clients.write().await.iter_mut() {
+        c.status = "active".into();
+    }
+    {
+        let keys = state.api_keys.read().await;
+        let clients = state.api_clients.read().await;
+        for plaintext in [&plain_a, &plain_b] {
+            assert!(is_unauthorized(api_gov::resolve_bearer_token(
+                plaintext, &keys, &clients
+            )));
+        }
+    }
+    assert_eq!(
+        chat(plain_a.clone(), "agent-tenant-a").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        chat(plain_b.clone(), "agent-tenant-b").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn isolation_contract_delete_colliding_client_keeps_other_tenant_keys() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let (key_a1, _) = issued("key-a1", SHARED, "tenant-a");
+    let (key_a2, _) = issued("key-a2", SHARED, "tenant-a");
+    let (key_b1, _) = issued("key-b1", SHARED, "tenant-b");
+    let (key_b2, _) = issued("key-b2", SHARED, "tenant-b");
+    let mut clients = vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")];
+    api_gov::quarantine_cross_tenant_client_ids(&mut clients);
+    let state = test_state(dir.path());
+    *state.api_clients.write().await = clients;
+    *state.api_keys.write().await = vec![key_a1, key_b1, key_a2, key_b2];
+    let router = app(state.clone());
+    let b_hashes = |keys: &[ApiKey]| -> Vec<String> {
+        keys.iter()
+            .filter(|k| k.id.starts_with("key-b"))
+            .map(|k| k.key_hash.clone())
+            .collect()
+    };
+    let before = b_hashes(&state.api_keys.read().await);
+    assert_eq!(before.len(), 2);
+
+    let (status, _) = send(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{SHARED}"),
+        Value::Null,
+        &da("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = state.api_keys.read().await.clone();
+    assert_eq!(b_hashes(&keys), before, "tenant B's keys must be unchanged");
+    assert_eq!(keys.len(), 2, "only tenant A's keys are removed");
+    assert!(keys.iter().all(|k| k.id.starts_with("key-b")));
+    let persisted = api_gov::load_api_keys();
+    assert_eq!(b_hashes(&persisted), before);
+    let clients = state.api_clients.read().await.clone();
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].tenant_id, "tenant-b");
+
+    // Same-slug tenants cannot be told apart by prefix: 409, nothing removed.
+    let (key_s, _) = issued("key-s", SHARED, "tenant-a");
+    *state.api_clients.write().await = vec![client(SHARED, "Tenant-A"), client(SHARED, "tenant-a")];
+    *state.api_keys.write().await = vec![key_s];
+    let (status, _) = send(
+        &router,
+        Method::DELETE,
+        &format!("/api/v1/api-clients/{SHARED}"),
+        Value::Null,
+        &da("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(state.api_clients.read().await.len(), 2);
+    assert_eq!(state.api_keys.read().await.len(), 1);
+}
+
+#[tokio::test]
+async fn isolation_contract_list_colliding_client_shows_only_own_keys() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let (key_a, _) = issued("key-a-visible", SHARED, "tenant-a");
+    let (mut key_b, _) = issued("key-b-hidden", SHARED, "tenant-b");
+    key_b.name = "tenant-b-secret-name".into();
+    let b_id = key_b.id.clone();
+    let b_prefix = key_b.key_prefix.clone();
+    let b_name = key_b.name.clone();
+    let mut clients = vec![client(SHARED, "tenant-a"), client(SHARED, "tenant-b")];
+    api_gov::quarantine_cross_tenant_client_ids(&mut clients);
+    let state = test_state(dir.path());
+    *state.api_clients.write().await = clients;
+    *state.api_keys.write().await = vec![key_b.clone(), key_a];
+    let router = app(state.clone());
+
+    let (status, body) = send(
+        &router,
+        Method::GET,
+        "/api/v1/api-clients",
+        Value::Null,
+        &da("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.to_string();
+    for hidden in [&b_id, &b_prefix, &b_name] {
+        assert!(!text.contains(hidden.as_str()), "tenant B key leaked");
+    }
+    assert!(text.contains("key-a-visible"));
+
+    // Same-slug tenants: ownership is ambiguous, so no keys are listed.
+    *state.api_clients.write().await = vec![client(SHARED, "Tenant-A"), client(SHARED, "tenant-a")];
+    let (status, body) = send(
+        &router,
+        Method::GET,
+        "/api/v1/api-clients",
+        Value::Null,
+        &da("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.to_string();
+    assert!(!text.contains("key-a-visible") && !text.contains(b_id.as_str()));
+}
+
+#[test]
+fn isolation_contract_id_conflict_status_persists_across_save_and_reload() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let (key_a, plain_a) = issued("key-a", SHARED, "tenant-a");
+    api_gov::save_api_clients(&[client(SHARED, "tenant-a"), client(SHARED, "tenant-b")]).unwrap();
+    api_gov::save_api_keys(&[key_a]).unwrap();
+
+    let loaded = api_gov::load_api_clients();
+    assert!(loaded.iter().all(|c| c.status == CLIENT_ID_CONFLICT_STATUS));
+    api_gov::save_api_clients(&loaded).unwrap();
+
+    // Even after the other tenant's client is gone (no collision left), the
+    // persisted status keeps A's client unusable until an admin resets it.
+    let only_a: Vec<ApiClient> = loaded
+        .into_iter()
+        .filter(|c| c.tenant_id == "tenant-a")
+        .collect();
+    api_gov::save_api_clients(&only_a).unwrap();
+    let reloaded = api_gov::load_api_clients();
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].status, CLIENT_ID_CONFLICT_STATUS);
+    assert!(is_unauthorized(api_gov::resolve_bearer_token(
+        &plain_a,
+        &api_gov::load_api_keys(),
+        &reloaded
+    )));
 }
 
 #[tokio::test]

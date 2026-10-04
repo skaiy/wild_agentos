@@ -46,6 +46,29 @@ The isolation diagnostic is intentionally still usable
 without a token because it is a local, read-only filesystem tool. It neither
 creates tenants nor grants HTTP access.
 
+### API client id collisions and recovery
+
+An API client id that appears under more than one tenant in `api_clients.json`
+(for example after a manual import) is treated as ambiguous and fails closed:
+
+- At load, every client with that id is marked `id_conflict` and a warning is
+  logged with the id and the tenant ids only.
+- Public API authentication returns `401` for any key whose `client_id` is
+  shared by more than one client, whatever their status. A client in
+  `id_conflict` also returns `401`.
+- `PUT /api/v1/api-clients/:id` returns `409` for a status change on an
+  `id_conflict` client. `DELETE` on a shared id removes only keys that carry
+  the caller tenant's prefix (`409` if two tenants share the same slug). The
+  client list shows only those keys. Legacy audit records without `tenant_id`
+  under a shared id are never returned.
+
+Recovery is manual. With the service stopped (it rewrites these files from
+memory), an administrator edits `api_clients.json` (and
+`api_keys.json` for the affected keys) so that each client id belongs to
+exactly one tenant, then resets the remaining clients' `status` from
+`id_conflict` to `active` in the file and starts the service. The status
+persists across saves and reloads until then.
+
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and
 [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
