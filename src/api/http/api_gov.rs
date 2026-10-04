@@ -6,6 +6,11 @@
  *
  * 持久化：data/api_clients.json、data/api_keys.json（pretty JSON），
  *         data/api_audit.jsonl（滚动追加）。
+ *
+ * 锁顺序 / Lock order: `AppState::api_keys` and `AppState::api_clients` are
+ * separate locks. Any caller that holds both must take `api_keys` first, then
+ * `api_clients` (e.g. before calling `resolve_bearer_token`). This module only
+ * works on slices and takes neither lock itself.
  */
 
 use serde::{Deserialize, Serialize};
@@ -109,10 +114,71 @@ pub fn api_audit_path() -> PathBuf {
 }
 
 pub fn load_api_clients() -> Vec<ApiClient> {
-    match std::fs::read_to_string(api_clients_path()) {
+    let mut clients: Vec<ApiClient> = match std::fs::read_to_string(api_clients_path()) {
         Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
         Err(_) => Vec::new(),
+    };
+    quarantine_cross_tenant_client_ids(&mut clients);
+    clients
+}
+
+/// Status given to every client whose id also appears under another tenant.
+/// Such clients are unusable: inbound auth rejects them with 401 and their
+/// legacy (tenant-less) audit records are hidden. Fail closed.
+pub const CLIENT_ID_CONFLICT_STATUS: &str = "id_conflict";
+
+/// Client ids that appear under more than one tenant, with those tenants (sorted).
+pub fn cross_tenant_client_id_collisions(
+    clients: &[ApiClient],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut tenants_by_id: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    for client in clients {
+        tenants_by_id
+            .entry(client.id.clone())
+            .or_default()
+            .insert(client.tenant_id.clone());
     }
+    tenants_by_id.retain(|_, tenants| tenants.len() > 1);
+    tenants_by_id
+}
+
+/// Marks ALL clients whose id collides across tenants as unusable and logs one
+/// warning per id (id and tenant ids only). Returns the number of clients marked.
+pub fn quarantine_cross_tenant_client_ids(clients: &mut [ApiClient]) -> usize {
+    let collisions = cross_tenant_client_id_collisions(clients);
+    if collisions.is_empty() {
+        return 0;
+    }
+    for (id, tenants) in &collisions {
+        tracing::warn!(
+            client_id = %id,
+            tenants = ?tenants,
+            "api client id is used by more than one tenant; all of these clients are disabled (fail closed)"
+        );
+    }
+    let mut marked = 0;
+    for client in clients.iter_mut() {
+        if collisions.contains_key(&client.id) {
+            client.status = CLIENT_ID_CONFLICT_STATUS.to_string();
+            marked += 1;
+        }
+    }
+    marked
+}
+
+/// Client ids whose legacy audit records (no `tenant_id`) a tenant may read:
+/// the tenant's own clients, minus any id that is (or was, per the conflict
+/// status) shared with another tenant. Ambiguous history is never returned.
+pub fn legacy_audit_client_ids(clients: &[ApiClient], tenant: &str) -> HashSet<String> {
+    let collisions = cross_tenant_client_id_collisions(clients);
+    clients
+        .iter()
+        .filter(|c| c.tenant_id == tenant)
+        .filter(|c| c.status != CLIENT_ID_CONFLICT_STATUS)
+        .filter(|c| !collisions.contains_key(&c.id))
+        .map(|c| c.id.clone())
+        .collect()
 }
 pub fn save_api_clients(clients: &[ApiClient]) -> std::io::Result<()> {
     let path = api_clients_path();
@@ -280,10 +346,18 @@ pub fn resolve_bearer_token(
             }
         }
     }
-    let client = clients
-        .iter()
-        .find(|c| c.id == key.client_id)
-        .ok_or(AuthError::Unauthorized)?;
+    // Never take the first client with this id: a client id shared by more
+    // than one client (e.g. across tenants) does not identify the owner, so
+    // any duplicate fails closed with 401 regardless of status. This is the
+    // primary defense; no status change can re-enable a colliding id.
+    let mut candidates = clients.iter().filter(|c| c.id == key.client_id);
+    let client = match (candidates.next(), candidates.next()) {
+        (Some(only), None) => only,
+        _ => return Err(AuthError::Unauthorized),
+    };
+    if client.status == CLIENT_ID_CONFLICT_STATUS {
+        return Err(AuthError::Unauthorized);
+    }
     if client.status != "active" {
         return Err(AuthError::ClientDisabled);
     }
@@ -295,6 +369,68 @@ pub fn resolve_bearer_token(
         owner: client.owner.clone(),
         granted_agent_ids: client.granted_agent_ids.clone(),
     })
+}
+
+/// Slug that `generate_key` embeds in a tenant's key prefixes.
+fn tenant_key_slug(tenant: &str) -> String {
+    let slug: String = tenant
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "t".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// Whether `key.key_prefix` has the exact shape `generate_key` writes for
+/// `tenant` (`sk-<slug>-<6 chars>`). Slugs are lossy (case folding,
+/// punctuation → `-`), so a match is not final proof of ownership; see
+/// [`tenant_may_manage_key`] for the fail-closed use.
+pub(crate) fn key_prefix_matches_tenant(key: &ApiKey, tenant: &str) -> bool {
+    let head = format!("sk-{}-", tenant_key_slug(tenant));
+    key.key_prefix.len() == head.len() + 6
+        && key.key_prefix.starts_with(&head)
+        && !key.key_prefix[head.len()..].contains('-')
+}
+
+/// Whether `tenant`'s key prefix cannot be told apart from another tenant that
+/// shares the colliding client id (`tenants` from
+/// [`cross_tenant_client_id_collisions`]).
+pub(crate) fn colliding_tenant_slug_is_ambiguous(
+    tenants: &std::collections::BTreeSet<String>,
+    tenant: &str,
+) -> bool {
+    let slug = tenant_key_slug(tenant);
+    tenants
+        .iter()
+        .any(|t| t != tenant && tenant_key_slug(t) == slug)
+}
+
+/// Management-plane key ownership for a key whose `client_id` names one of
+/// `tenant`'s clients. Unique ids: every key under the id. Ids shared across
+/// tenants: only keys carrying `tenant`'s prefix, and none at all when another
+/// colliding tenant has the same slug (fail closed).
+pub(crate) fn tenant_may_manage_key(
+    collisions: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    key: &ApiKey,
+    tenant: &str,
+) -> bool {
+    match collisions.get(&key.client_id) {
+        None => true,
+        Some(tenants) => {
+            !colliding_tenant_slug_is_ambiguous(tenants, tenant)
+                && key_prefix_matches_tenant(key, tenant)
+        }
+    }
 }
 
 // ─── 进程内限流 / 配额 / 并发 ──────────────────────────────────────────────────

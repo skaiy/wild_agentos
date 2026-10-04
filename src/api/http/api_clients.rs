@@ -1,6 +1,8 @@
 //! 管理面：调用方 & 密钥中心（需 DA 角色）。
 //!
 //! 路由仍由 `mod.rs` 的 `build_router` 组装；持久化模型在 `api_gov`。
+//! Lock order: when both are held, take `api_keys` first, then `api_clients`;
+//! never acquire `api_keys` while holding `api_clients`.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -35,6 +37,18 @@ fn client_not_found(id: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "client not found", "id": id })),
+    )
+        .into_response()
+}
+
+fn client_id_conflict(id: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "client id conflict",
+            "id": id,
+            "message": "client id is quarantined; an administrator must fix the data first",
+        })),
     )
         .into_response()
 }
@@ -108,8 +122,12 @@ pub(crate) async fn list_api_clients_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    let clients = state.api_clients.read().await;
+    // Lock order: api_keys before api_clients (see module docs).
     let keys = state.api_keys.read().await;
+    let clients = state.api_clients.read().await;
+    // Under a client id shared with another tenant, only keys carrying this
+    // tenant's prefix are shown (none if the slugs are ambiguous).
+    let collisions = api_gov::cross_tenant_client_id_collisions(&clients);
     let items: Vec<Value> = clients
         .iter()
         .filter(|c| c.tenant_id == tenant)
@@ -117,6 +135,7 @@ pub(crate) async fn list_api_clients_handler(
             let ckeys: Vec<Value> = keys
                 .iter()
                 .filter(|k| k.client_id == c.id)
+                .filter(|k| api_gov::tenant_may_manage_key(&collisions, k, tenant))
                 .map(key_public_view)
                 .collect();
             json!({
@@ -232,6 +251,12 @@ pub(crate) async fn update_api_client_handler(
         Some(c) => c,
         None => return client_not_found(&id),
     };
+    // A quarantined (colliding) client must not be re-enabled through the API;
+    // the collision has to be fixed in the data first. Second layer: auth also
+    // rejects any duplicate id regardless of status.
+    if req.status.is_some() && client.status == api_gov::CLIENT_ID_CONFLICT_STATUS {
+        return client_id_conflict(&id);
+    }
     if let Some(v) = req.name {
         client.name = v;
     }
@@ -276,14 +301,21 @@ pub(crate) async fn delete_api_client_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
+    // Lock order: api_keys before api_clients (see module docs).
+    let mut keys = state.api_keys.write().await;
     let mut clients = state.api_clients.write().await;
-    let before = clients.len();
-    clients.retain(|c| c.id != id || c.tenant_id != tenant);
-    if clients.len() == before {
+    if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
         return client_not_found(&id);
     }
+    // A client id shared with another tenant does not identify which keys are
+    // whose (legacy keys may carry no tenant prefix), and deleting one side
+    // would make the collision disappear and hand the leftovers to the other
+    // tenant. Refuse and change nothing; an administrator fixes the data.
+    if api_gov::cross_tenant_client_id_collisions(&clients).contains_key(&id) {
+        return client_id_conflict(&id);
+    }
+    clients.retain(|c| c.id != id || c.tenant_id != tenant);
     let _ = api_gov::save_api_clients(&clients);
-    let mut keys = state.api_keys.write().await;
     keys.retain(|k| k.client_id != id);
     let _ = api_gov::save_api_keys(&keys);
     (
@@ -401,14 +433,10 @@ pub(crate) async fn list_api_audit_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    let tenant_client_ids: HashSet<String> = state
-        .api_clients
-        .read()
-        .await
-        .iter()
-        .filter(|c| c.tenant_id == tenant)
-        .map(|c| c.id.clone())
-        .collect();
+    // Legacy records without tenant_id are attributed by client_id only, so
+    // ids shared with another tenant (or quarantined at load) are excluded.
+    let tenant_client_ids: HashSet<String> =
+        api_gov::legacy_audit_client_ids(&state.api_clients.read().await, tenant);
     let limit = q.limit.unwrap_or(200).min(1000);
     let items = api_gov::read_audit_for_tenant(
         tenant,
