@@ -76,11 +76,15 @@ written) while the id is shared or the client is `id_conflict`. Before deleting
 a client during recovery, operators must first revoke **all** keys under that
 client id. Otherwise a leftover key, especially a legacy key without a tenant
 prefix, could change owner once the id belongs to a single tenant again.
-When a client id collides across tenants (`id_conflict` / ambiguous slug), the
-owner can neither delete the client nor revoke its keys (both return `409`), and
-those keys already fail authentication with `401`; a platform administrator must
-resolve the collision first, after which each tenant should revoke its keys—
-otherwise the keys become usable again once the collision is cleared.
+When a client id collides across tenants (`id_conflict`), the owner still cannot
+delete the client (`409`), but it can revoke its own keys under the shared id
+(`200`; only keys carrying its tenant prefix count, any other key gets the same
+`404` as a missing key). Revoke returns `409` only when the caller's tenant slug
+is ambiguous (another colliding tenant has the same slug); then a platform
+administrator must resolve the collision first. While the id is shared, active
+keys under it fail authentication with `401`; a revoked key fails with `403`
+`key_revoked` instead, shared id or not. Each tenant should revoke its keys
+before the collision is cleared—otherwise they become usable again once it is.
 
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and

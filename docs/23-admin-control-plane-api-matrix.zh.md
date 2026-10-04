@@ -64,10 +64,13 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
 同理，在 id 仍被共用或 client 处于 `id_conflict` 时，`POST /api/v1/api-clients/:id/keys`
 也以 `409` 拒绝，不写入任何 key。恢复过程中删除 client 之前，运维人员必须先撤销该 client id
 下的**全部** key；否则残留的 key（尤其是不带 tenant 前缀的旧 key）可能在该 id 重新只属于一个
-tenant 后变更归属。当 client id 在多个 tenant 间冲突（`id_conflict` / 归属不明的
-slug）时，所属方既不能删除 client，也不能撤销其 key（两者都返回 `409`），这些 key
-当前鉴权也会失败并返回 `401`；必须先由平台管理员解决冲突，之后各 tenant 才应分别
-撤销自己的 key——否则冲突解除后，这些 key 会重新变得可用。
+tenant 后变更归属。当 client id 在多个 tenant 间冲突（`id_conflict`）时，所属方仍不能
+删除 client（`409`），但可以在共用 id 下撤销自己的 key（`200`；只认带本 tenant 前缀的
+key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 tenant 的 slug 归属不明
+（另一个冲突 tenant 的 slug 与之相同）时，撤销才返回 `409`，此时必须先由平台管理员解决
+冲突。id 仍被共用时，其下处于有效状态的 key 鉴权返回 `401`；已撤销的 key 鉴权返回
+`403` `key_revoked`，与是否共用 id 无关。各 tenant 应在冲突解除前撤销自己的 key——
+否则冲突解除后，这些 key 会重新变得可用。
 
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、
 [隔离矩阵](17-isolation-matrix.zh.md)、

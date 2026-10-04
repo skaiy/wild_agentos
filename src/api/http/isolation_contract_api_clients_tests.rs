@@ -11,7 +11,7 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body, Bytes},
-    http::{Method, Request, StatusCode},
+    http::{HeaderMap, Method, Request, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -78,6 +78,29 @@ async fn request_raw(
     (
         status,
         to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+}
+
+/// Like `request_raw`, but also returns the response headers so callers can
+/// assert byte-identical responses.
+async fn request_full(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, HeaderMap, Bytes) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let (parts, body) = response.into_parts();
+    (
+        parts.status,
+        parts.headers,
+        to_bytes(body, usize::MAX).await.unwrap(),
     )
 }
 
@@ -317,8 +340,8 @@ async fn isolation_contract_api_clients_lock_order_with_queued_writers() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let keys_reader = state.api_keys.read().await;
         // Delete queues for keys.write behind this reader. A reversed-order
-        // list would take clients.read, then queue for keys.read behind delete;
-        // delete would in turn wait for clients.write behind that list.
+        // list or revoke would take clients.read, then queue for the keys lock
+        // behind delete; delete would in turn wait for clients.write behind it.
         let delete_router = router.clone();
         let delete_token = da_token.clone();
         let delete = tokio::spawn(async move {
@@ -354,6 +377,12 @@ async fn isolation_contract_api_clients_lock_order_with_queued_writers() {
                     json!({"name":"new"}),
                     issue_token.clone(),
                 ),
+                (
+                    Method::DELETE,
+                    "/api/v1/api-clients/client-b/keys/key-b",
+                    json!(null),
+                    issue_token.clone(),
+                ),
             ] {
                 let router = router.clone();
                 calls.push(tokio::spawn(async move {
@@ -364,16 +393,16 @@ async fn isolation_contract_api_clients_lock_order_with_queued_writers() {
             }
         }
         // Let every spawned request reach its lock acquisition before the
-        // reader goes away; with a reversed-order list this is where list
-        // holds clients.read while queued for keys.read behind delete.
+        // reader goes away; with a reversed-order list or revoke this is where
+        // it holds clients.read while queued for the keys lock behind delete.
         tokio::time::sleep(Duration::from_millis(300)).await;
         drop(keys_reader);
         assert_eq!(delete.await.unwrap(), StatusCode::OK);
         for (index, call) in calls.into_iter().enumerate() {
             let status = call.await.unwrap();
-            match index % 3 {
+            match index % 4 {
                 0 => assert_eq!(status, StatusCode::FORBIDDEN),
-                1 => assert_eq!(status, StatusCode::OK),
+                1 | 3 => assert_eq!(status, StatusCode::OK),
                 _ => assert_eq!(status, StatusCode::CREATED),
             }
         }
@@ -391,6 +420,11 @@ async fn isolation_contract_api_clients_lock_order_with_queued_writers() {
         memory["keys"],
         serde_json::from_slice::<Value>(&keys_file).unwrap()
     );
+    assert!(memory["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k["id"] == "key-b" && k["status"] == "revoked"));
 }
 
 #[tokio::test]
@@ -473,6 +507,39 @@ async fn cross_tenant_revoke_via_own_client_is_not_found() {
         std::fs::read(dir.path().join("api_keys.json")).unwrap(),
         before.2
     );
+}
+
+#[tokio::test]
+async fn isolation_contract_api_clients_revoke_by_non_owner_is_identical_not_found() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let state = seeded(dir.path()).await;
+    // Tenant B's client and key share tenant A's client id.
+    state.api_clients.write().await[1].id = "client-a".into();
+    state.api_keys.write().await[1].client_id = "client-a".into();
+    api_gov::save_api_clients(&state.api_clients.read().await).unwrap();
+    api_gov::save_api_keys(&state.api_keys.read().await).unwrap();
+    let before = snapshot(&state, dir.path()).await;
+    let router = app(state.clone());
+    let uri = "/api/v1/api-clients/client-a/keys/key-b";
+    let missing_dir = tempfile::tempdir().unwrap();
+    let missing = app(test_state(missing_dir.path()));
+    let token_c = jwt_for("tenant-c", &["DA"], Some("project-c"));
+    let absent = request_full(&missing, Method::DELETE, uri, &token_c).await;
+    assert_eq!(absent.0, StatusCode::NOT_FOUND);
+    // Tenant A shares the id but not the key; `Tenant-B` owns no client under
+    // the id but has tenant B's key slug, so the slug ambiguity behind 409 must
+    // not be visible to it; tenant C is unrelated. All get the response of a
+    // key that does not exist: same status, headers and body.
+    for tenant in ["tenant-a", "Tenant-B", "tenant-c"] {
+        let token = jwt_for(tenant, &["DA"], Some("project-x"));
+        let actual = request_full(&router, Method::DELETE, uri, &token).await;
+        assert_eq!(actual.0, absent.0, "{tenant}");
+        assert_eq!(actual.1, absent.1, "{tenant}");
+        assert_eq!(actual.2, absent.2, "{tenant}");
+        assert_eq!(snapshot(&state, dir.path()).await, before, "{tenant}");
+    }
 }
 
 #[tokio::test]
