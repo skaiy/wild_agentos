@@ -68,8 +68,8 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 
 - `input_ref` 的内容只由执行桥拉取；SHA-256 不一致时调用以 `failed` 结束，`error.code = "input_digest_mismatch"`。
 - 触达预算上限时停止执行，调用以 `failed` 结束，`error.code = "budget_exceeded"`。
-- 到达 `deadline` 时停止执行，调用以 `failed` 结束，`error.code = "deadline_exceeded"`。仍在 `queued` 的调用同样处理（`queued → failed` 这条边随执行桥加入）。
-- `metadata` 和其他调用方提供的字段都在资源的 `input` 对象里原样回显：服务端不增、不删、不改任何键或值。同一 tenant/project scope 内的所有 actor 都能读到，不要放敏感内容。
+- 到达 `deadline` 时停止执行，调用以 `failed` 结束，`error.code = "deadline_exceeded"`。仍在 `queued` 的调用同样处理：`queued → failed` 是条件边，只有到期（`error.code = "deadline_exceeded"`）才能走；其他原因的 `queued → failed` 请求一律 `409 illegal_transition`。
+- `metadata` 和其他调用方提供的字段都在资源的 `request` 对象里原样回显（`request.input`、`request.input_ref`、`request.metadata` 等）：服务端不增、不删、不改任何键或值。同一 tenant/project scope 内的所有 actor 都能读到，不要放敏感内容。
 - 凭证、授权（grant）、token exchange、cross-area 身份和修订绑定（revision binding）计算都不属于本 API（§10）。需要绑定的调用方自行计算，并通过 `agent_revision`、`input_ref` 和上面的摘要钉住。
 
 ## 5. 资源（草案）
@@ -81,7 +81,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
   "tenant_id": "…", "project_id": "…", "actor_id": "…",
   "state": "queued",
   "revision": 1,
-  "input": {                     // 调用方提供的创建字段，原样回显
+  "request": {                   // 调用方提供的创建字段，原样回显
     "prompt": "…", "agent_id": null, "agent_revision": null,
     "input": null, "input_ref": null, "budget": null, "deadline": null,
     "metadata": {}
@@ -114,7 +114,7 @@ queued ──► running ──► succeeded
   │  │        └──► cancel_requested ──► cancelled
   │  │                     ├──────────► succeeded
   │  │                     └──────────► failed
-  │  └──────────────────────────────► failed（仅 deadline）
+  │  └──────────────────────────────► failed（仅 deadline_exceeded）
   └──────────────────────────────────► cancelled
 ```
 

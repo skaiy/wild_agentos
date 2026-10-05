@@ -87,9 +87,12 @@ scope and server fields → `400 field_not_allowed` (§3).
   with `error.code = "budget_exceeded"`.
 - When `deadline` passes, execution stops and the invocation ends `failed` with
   `error.code = "deadline_exceeded"`. This also applies to an invocation that
-  is still `queued` (edge `queued → failed`, added with the execution bridge).
+  is still `queued`: `queued → failed` is a conditional edge that only a
+  deadline expiry (`error.code = "deadline_exceeded"`) may take; any other
+  `queued → failed` request is `409 illegal_transition`.
 - `metadata` and all other caller-supplied fields are echoed back unchanged in
-  the resource's `input` object: the server never adds, drops or rewrites keys
+  the resource's `request` object (`request.input`, `request.input_ref`,
+  `request.metadata`, …): the server never adds, drops or rewrites keys
   or values. Every actor in the same tenant/project scope can read them, so do
   not put secrets there.
 - Credentials, grants, token exchange, cross-area identity and revision-binding
@@ -106,7 +109,7 @@ scope and server fields → `400 field_not_allowed` (§3).
   "tenant_id": "…", "project_id": "…", "actor_id": "…",
   "state": "queued",
   "revision": 1,
-  "input": {                     // caller-supplied create fields, echoed unchanged
+  "request": {                   // caller-supplied create fields, echoed unchanged
     "prompt": "…", "agent_id": null, "agent_revision": null,
     "input": null, "input_ref": null, "budget": null, "deadline": null,
     "metadata": {}
@@ -148,7 +151,7 @@ queued ──► running ──► succeeded
   │  │        └──► cancel_requested ──► cancelled
   │  │                     ├──────────► succeeded
   │  │                     └──────────► failed
-  │  └──────────────────────────────► failed (deadline only)
+  │  └──────────────────────────────► failed (deadline_exceeded only)
   └──────────────────────────────────► cancelled
 ```
 
