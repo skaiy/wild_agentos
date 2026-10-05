@@ -72,7 +72,7 @@ scope and server fields → `400 field_not_allowed` (§3).
 | Field | Rule | Error |
 | --- | --- | --- |
 | `prompt` / `input` / `input_ref` | At least one must be present | `400 invalid_request` |
-| `agent_revision` | Must equal the current revision of `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Mismatch → `409 agent_revision_mismatch`; floating word or missing `agent_id` → `400 invalid_request` |
+| `agent_revision` | Must equal the current revision of `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Until agent definition revisions exist ([#317](https://github.com/skaiy/wild_agentos/issues/317)): any value → `422 agent_revision_unsupported`. After #317: mismatch → `409 agent_revision_mismatch`. Floating word or missing `agent_id` → `400 invalid_request` |
 | `input` | Any JSON value, ≤ 8192 bytes as compact JSON | Over limit → `413 payload_too_large` |
 | `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…`; `sha256` is 64 lowercase hex; the scheme must have a registered resolver (§4.2) | Both `input` and `input_ref`, or a `uri` without `<scheme>://` → `400 invalid_request`; unregistered scheme → `422 input_ref_unresolvable` |
 | `budget.*` | Positive integers (≥ 1); `max_cost` is micro-USD; unknown members rejected | `400 invalid_request` |
@@ -82,6 +82,11 @@ scope and server fields → `400 field_not_allowed` (§3).
 
 - `agent_id` that does not resolve to a definition in the caller's scope →
   `422 agent_not_found`, identical for unknown ids and other scopes.
+- Agent definitions on current `main` carry no revision. Until #317 adds
+  definition revisions, any create carrying `agent_revision` is rejected with
+  `422 agent_revision_unsupported` and nothing is persisted. The field is
+  never silently ignored, so a caller can never believe it pinned a revision
+  that the server did not check.
 - `input_ref` content is fetched only by the execution bridge; if its SHA-256
   does not match, the invocation ends `failed` with
   `error.code = "input_digest_mismatch"`.
@@ -116,7 +121,8 @@ scope and server fields → `400 field_not_allowed` (§3).
 - Without `agent_id` the server's default execution path is used.
 - Making orchestrating definitions addressable by id and revision is part of
   the execution bridge
-  ([#317](https://github.com/skaiy/wild_agentos/issues/317)).
+  ([#317](https://github.com/skaiy/wild_agentos/issues/317)). Until then,
+  stored definitions have neither a revision nor a topology; see §11.
 
 ### 4.2 `input_ref` resolvers
 
@@ -195,6 +201,12 @@ scope and server fields → `400 field_not_allowed` (§3).
 - Idempotency records expire after a configurable TTL, default 24 h
   (`AGENTOS_INVOCATION_IDEMPOTENCY_TTL_HOURS`). After expiry the same key
   creates a new invocation.
+- The TTL must not exceed the terminal-record retention (§7.1):
+  `AGENTOS_INVOCATION_IDEMPOTENCY_TTL_HOURS` ≤
+  `AGENTOS_INVOCATION_RETENTION_DAYS` × 24. Otherwise the server refuses to
+  start (fail closed) with a configuration error naming both variables and
+  their values. This guarantees a live idempotency record always points to a
+  resource that still exists, so a replay never meets a swept invocation.
 
 ## 7. Lifecycle
 
@@ -238,6 +250,8 @@ queued ──► running ──► succeeded
 - Terminal invocations are kept for a configurable retention measured from
   `completed_at`: default 7 days, `AGENTOS_INVOCATION_RETENTION_DAYS` (whole
   days, ≥ 1). After that they are removed and read as `404 not_found`.
+  The retention must be at least the idempotency TTL (§6), or the server does
+  not start.
 - Expired terminal records are swept at startup (after restart recovery),
   inside every create, and on demand. Non-terminal invocations are never
   swept. A sweep that removes nothing writes nothing; a sweep that removes
@@ -318,7 +332,7 @@ safe texts and never echo tokens, inputs or the original request.
 | 404 | `not_found` | Unknown id or another scope (identical body) |
 | 409 | `idempotency_key_conflict`, `idempotency_key_in_progress`, `revision_conflict`, `illegal_transition`, `agent_revision_mismatch` | See §4, §6, §7 |
 | 413 | `payload_too_large` | Body > 64 KiB, `input` > 8192 bytes or `metadata` > 16 KiB / 64 keys |
-| 422 | `input_ref_unresolvable`, `agent_not_found` | `input_ref` scheme has no registered resolver; `agent_id` not found in scope |
+| 422 | `input_ref_unresolvable`, `agent_not_found`, `agent_revision_unsupported` | `input_ref` scheme has no registered resolver; `agent_id` not found in scope; `agent_revision` sent before agent definition revisions exist (#317, §4) |
 | 429 | `too_many_active` | Per-scope active limit reached (§7.2); `Retry-After: 5` |
 | 500 | `persistence_failed` | Store write failed; nothing changed |
 | 503 | `execution_disabled`, `invocation_store_full` | Execution switch off (§8); store still full after the retention sweep (§7.1) |
@@ -334,3 +348,18 @@ safe texts and never echo tokens, inputs or the original request.
   tool, policy and context revisions are intentionally not pinned server-side
   in v0.12.0; pinning them is a possible follow-up.
 - `usage` has no partner or source attribution.
+
+## 11. Prerequisites for integrators
+
+- **Exact agent pinning and orchestrating-agent targets require
+  [#317](https://github.com/skaiy/wild_agentos/issues/317).** Both depend on
+  agent definition revisions and a topology stored on the definition, which
+  #317 adds. Before #317, `agent_revision` returns
+  `422 agent_revision_unsupported` (§4) and an orchestrating plan cannot be
+  addressed as a stored definition (§4.1). Integrations that depend on either
+  should wait for #317 before switching over.
+- **Execution switch.** Execution defaults to off and stays off in production
+  until [#310](https://github.com/skaiy/wild_agentos/issues/310) is merged;
+  until then creates return `503 execution_disabled` (§8).
+- **Inputs.** v0.12.0 has no built-in `input_ref` resolver; send inline
+  `input` (≤ 8192 bytes) (§4.2).

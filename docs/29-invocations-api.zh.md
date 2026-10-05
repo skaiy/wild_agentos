@@ -58,7 +58,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | 字段 | 规则 | 错误 |
 | --- | --- | --- |
 | `prompt` / `input` / `input_ref` | 至少出现一个 | `400 invalid_request` |
-| `agent_revision` | 必须等于 `agent_id` 当前修订；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析 | 不一致 → `409 agent_revision_mismatch`；浮动词或缺 `agent_id` → `400 invalid_request` |
+| `agent_revision` | 必须等于 `agent_id` 当前修订；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析 | agent 定义修订（[#317](https://github.com/skaiy/wild_agentos/issues/317)）落地之前：带任何值 → `422 agent_revision_unsupported`。#317 之后：不一致 → `409 agent_revision_mismatch`。浮动词或缺 `agent_id` → `400 invalid_request` |
 | `input` | 任意 JSON 值，紧凑序列化 ≤ 8192 字节 | 超限 → `413 payload_too_large` |
 | `input_ref` | `uri` 与 `sha256` 都必填；`uri` 形如 `<scheme>://…`；`sha256` 为 64 位小写十六进制；scheme 必须有已注册的解析器（§4.2） | 同时带 `input` 和 `input_ref`，或 `uri` 没有 `<scheme>://` → `400 invalid_request`；scheme 未注册 → `422 input_ref_unresolvable` |
 | `budget.*` | 正整数（≥ 1）；`max_cost` 单位为微美元；未知成员拒绝 | `400 invalid_request` |
@@ -67,6 +67,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | 整个请求体 | ≤ 64 KiB | `413 payload_too_large` |
 
 - `agent_id` 在调用方 scope 内找不到对应定义 → `422 agent_not_found`，不存在的 id 与其他 scope 的 id 返回相同。
+- 当前 `main` 上的 agent 定义没有修订号。在 #317 补上定义修订之前，凡是带 `agent_revision` 的创建一律返回 `422 agent_revision_unsupported`，不持久化任何东西。这个字段绝不会被静默忽略，调用方不会误以为钉住了一个服务端根本没校验的修订。
 - `input_ref` 的内容只由执行桥拉取；SHA-256 不一致时调用以 `failed` 结束，`error.code = "input_digest_mismatch"`。
 - 触达预算上限时停止执行，调用以 `failed` 结束，`error.code = "budget_exceeded"`。
 - 到达 `deadline` 时停止执行，调用以 `failed` 结束，`error.code = "deadline_exceeded"`。仍在 `queued` 的调用同样处理：`queued → failed` 是条件边，只有到期（`error.code = "deadline_exceeded"`）才能走；其他原因的 `queued → failed` 请求一律 `409 illegal_transition`。
@@ -78,7 +79,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 - `agent_id` 指向调用方 tenant/project scope 内的一个服务端 agent 定义。它可以是编排型定义，即由 Supervisor Agent 按多 agent 计划执行（拆解、运行子 agent、汇总）的定义，不限于单个 agent。
 - 拓扑（单 agent 还是编排计划、子 agent 上限、是否并行）是服务端定义的属性。`agent_revision` 钉住定义，也就钉住了拓扑；调用方不能在请求里选择或覆盖拓扑。请求体里的 `topology` 等字段属于未知字段 → `400 invalid_request`。
 - 不带 `agent_id` 时走服务端默认执行路径。
-- 让编排型定义可以按 id 和修订寻址，属于执行桥（[#317](https://github.com/skaiy/wild_agentos/issues/317)）的工作。
+- 让编排型定义可以按 id 和修订寻址，属于执行桥（[#317](https://github.com/skaiy/wild_agentos/issues/317)）的工作。在那之前，存储的定义既没有修订也没有拓扑，见 §11。
 
 ### 4.2 `input_ref` 解析器
 
@@ -139,6 +140,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 - 同一个 key 的并发创建只产生一个资源，不出现 `5xx`。
 - 登记 key 与创建资源在同一次原子写入里完成，且先于任何副作用。被拒绝、冲突或非法的创建不留下任何资源、事件、队列项或执行。
 - 幂等记录按可配置 TTL 过期，默认 24 小时（`AGENTOS_INVOCATION_IDEMPOTENCY_TTL_HOURS`）。过期后同一个 key 会创建新的调用。
+- TTL 不得超过终态记录的保留期（§7.1）：`AGENTOS_INVOCATION_IDEMPOTENCY_TTL_HOURS` ≤ `AGENTOS_INVOCATION_RETENTION_DAYS` × 24。否则服务端拒绝启动（fail closed），并给出写明两个变量及其取值的配置错误。这样仍有效的幂等记录指向的资源一定还在，重放不会碰到已被清理的调用。
 
 ## 7. 生命周期
 
@@ -164,7 +166,7 @@ queued ──► running ──► succeeded
 
 ### 7.1 保留与清理
 
-- 终态调用从 `completed_at` 起按可配置的保留期保存：默认 7 天，`AGENTOS_INVOCATION_RETENTION_DAYS`（整天数，≥ 1）。过期后删除，再读返回 `404 not_found`。
+- 终态调用从 `completed_at` 起按可配置的保留期保存：默认 7 天，`AGENTOS_INVOCATION_RETENTION_DAYS`（整天数，≥ 1）。过期后删除，再读返回 `404 not_found`。保留期必须不短于幂等 TTL（§6），否则服务端不启动。
 - 过期的终态记录在启动时（重启恢复之后）、每次创建时以及按需清理。非终态调用永不清理。没有删掉任何记录的清理不写盘；删掉记录的清理与其他写入一样走原子文件替换。
 - 每进程存储容量（10 000 条）按清理后剩下的记录计算。清理后仍满时，创建 → `503 invocation_store_full`。
 
@@ -220,7 +222,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 | 404 | `not_found` | id 不存在或属于其他 scope（body 相同） |
 | 409 | `idempotency_key_conflict`、`idempotency_key_in_progress`、`revision_conflict`、`illegal_transition`、`agent_revision_mismatch` | 见 §4、§6、§7 |
 | 413 | `payload_too_large` | 请求体 > 64 KiB、`input` > 8192 字节或 `metadata` > 16 KiB / 64 个键 |
-| 422 | `input_ref_unresolvable`、`agent_not_found` | `input_ref` 的 scheme 没有已注册的解析器；`agent_id` 在 scope 内不存在 |
+| 422 | `input_ref_unresolvable`、`agent_not_found`、`agent_revision_unsupported` | `input_ref` 的 scheme 没有已注册的解析器；`agent_id` 在 scope 内不存在；agent 定义修订（#317）落地前请求带了 `agent_revision`（§4） |
 | 429 | `too_many_active` | 达到 scope 内活跃调用上限（§7.2）；带 `Retry-After: 5` |
 | 500 | `persistence_failed` | 存储写入失败，状态未改变 |
 | 503 | `execution_disabled`、`invocation_store_full` | 执行开关关闭（§8）；保留期清理后存储仍满（§7.1） |
@@ -234,3 +236,9 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 - v0.12.0 不内置 `input_ref` 解析器（§4.2）。
 - 只钉住 agent 定义（`agent_revision`）。provider、model、工具、策略和上下文的修订在 v0.12.0 有意不在服务端钉住，以后可另开 follow-up。
 - `usage` 不含合作方或来源归因。
+
+## 11. 集成方前提
+
+- **精确钉住 agent 和以编排型 agent 为目标，都依赖 [#317](https://github.com/skaiy/wild_agentos/issues/317)。** 两者都需要 agent 定义修订和存储在定义上的拓扑，这由 #317 补上。#317 之前，`agent_revision` 返回 `422 agent_revision_unsupported`（§4），编排计划也不能作为存储的定义来寻址（§4.1）。依赖其中任一项的集成应等 #317 合入后再切换。
+- **执行开关。** 执行默认关闭，在 [#310](https://github.com/skaiy/wild_agentos/issues/310) 合入前生产环境保持关闭；在此之前创建返回 `503 execution_disabled`（§8）。
+- **输入。** v0.12.0 不内置 `input_ref` 解析器，请使用内联 `input`（≤ 8192 字节）（§4.2）。
