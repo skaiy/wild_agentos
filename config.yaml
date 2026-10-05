@@ -100,6 +100,7 @@ api:
   grpc_addr: "0.0.0.0:50051"
   http_addr: "0.0.0.0:8080"
   enable_metrics: true
+  # Unused: no process listens here. Scrape GET /metrics on http_addr instead (#324).
   metrics_port: 9090
 
 output:

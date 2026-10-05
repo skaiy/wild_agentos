@@ -127,8 +127,9 @@ cargo test --workspace
 
 ## 本地运行
 
-默认 binary 启动 HTTP/SSE server（端口 `8080`）与 gRPC（端口 `50051`）。在
-checkout 根目录使用提供的 `config.yaml` 启动：
+默认 binary 启动 HTTP/SSE server（端口 `8080`）与 gRPC（端口 `50051`）。
+Prometheus 指标通过该 HTTP 口的 `GET /metrics` 抓取（不是 `api.metrics_port` /
+9090——该端口当前没有监听）。在 checkout 根目录使用提供的 `config.yaml` 启动：
 
 ```bash
 cargo run --bin wild-agent-os-core

@@ -6559,6 +6559,7 @@ dependencies = [
  "glob",
  "hex",
  "hyperspace-engine",
+ "ipnet",
  "json-ld",
  "json-syntax 0.12.5",
  "jsonschema",

@@ -80,6 +80,17 @@ fn test_gateway() -> UnifiedGateway {
 }
 
 pub(super) fn test_state(data_dir: &std::path::Path) -> Arc<AppState> {
+    test_state_with_invocations(
+        data_dir,
+        crate::api::http::invocations::InvocationsRuntime::unavailable(),
+    )
+}
+
+/// [`test_state`] with an explicit invocations runtime.
+pub(super) fn test_state_with_invocations(
+    data_dir: &std::path::Path,
+    invocations: crate::api::http::invocations::InvocationsRuntime,
+) -> Arc<AppState> {
     let core = Arc::new(
         SemanticCore::new(CoreConfig {
             l0_storage_path: data_dir.join("l0").to_string_lossy().into_owned(),
@@ -109,6 +120,7 @@ pub(super) fn test_state(data_dir: &std::path::Path) -> Arc<AppState> {
         api_usage: Arc::new(ApiUsageState::default()),
         online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
         online_corpus_queue_capacity: 1,
+        invocations,
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }
