@@ -1593,13 +1593,13 @@ mod tests {
         let bb = Arc::new(Blackboard::new().unwrap());
         seed_task(&bb, TASK_A, "tenant-a", "project-a", CANARY_A);
         seed_task(&bb, TASK_B, "tenant-b", "project-b", CANARY_B);
-        // Tenant B's node planted under tenant A's task IRI: only the tenant
-        // filter keeps it out of A's projection.
+        // Tenant B's node planted under tenant A's task IRI with the same
+        // project id: only the tenant filter keeps it out of A's projection.
         seed_plan_node(
             &bb,
             &format!("{TASK_A}/planted"),
             "tenant-b",
-            "project-b",
+            "project-a",
             CANARY_B,
         );
         seed_plan_node(
@@ -1685,10 +1685,12 @@ mod tests {
         let config = crate::CoreConfig::default();
         let json = serde_json::json!({
             "@id": task, "@type": "Task",
-            "tenant_id": "tenant-a", "project_id": "project-a",
+            "tenant_id": "tenant-a", "project_id": "project-b",
         });
         bb.write_node(task, &json.to_string(), &config).unwrap();
-        let a = claims("tenant-a", "project-a");
+        // Same project id, different tenant: only the tenant part of the
+        // cache key tells the two scopes apart.
+        let a = claims("tenant-a", "project-b");
         let out = engine
             .project(task, "pa_init", HashMap::new(), &a)
             .await
