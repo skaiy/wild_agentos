@@ -1490,8 +1490,8 @@ impl Settings {
         if self.gateway.base_url.is_empty() {
             tracing::warn!("gateway.base_url is not set. LLM features will be unavailable until configured via UI.");
         }
-        if self.gateway.api_key.is_empty() {
-            tracing::warn!("gateway.api_key is not set. LLM features will be unavailable until configured via UI or env var.");
+        if self.gateway.api_key.trim().is_empty() {
+            tracing::warn!("gateway.api_key is not set. LLM calls short-circuit with zero outbound HTTP until configured via UI or env var.");
         }
 
         if self.agents.max_iterations == 0 {
