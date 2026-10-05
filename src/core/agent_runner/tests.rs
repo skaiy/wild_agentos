@@ -1249,7 +1249,6 @@ fn test_task_result_partial_success_status() {
     assert!(result.summary.contains("partially_completed"));
 }
 
-
 /// #310: projection into the agent prompt is bound to verified claims.
 /// Foreign-tenant canaries must not appear in `context_summary`, even when
 /// the caller forges `tenant_id` on the task body / context fields.
@@ -1293,10 +1292,8 @@ fn isolation_contract_prompt_projection_excludes_foreign_and_forged_scope() {
                 .unwrap();
         }
 
-        let claims_a =
-            IsolationClaims::from_verified("tenant-a", "project-a", "agent-a").unwrap();
-        let mut ctx = TaskContext::new(TASK_A, "inspect scope", 1)
-            .with_isolation_claims(claims_a);
+        let claims_a = IsolationClaims::from_verified("tenant-a", "project-a", "agent-a").unwrap();
+        let mut ctx = TaskContext::new(TASK_A, "inspect scope", 1).with_isolation_claims(claims_a);
         // Forged body / context fields must not widen projection scope.
         ctx.tenant_id = Some("tenant-b".to_string());
         ctx.input_data
