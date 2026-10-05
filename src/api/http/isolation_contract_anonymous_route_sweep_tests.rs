@@ -52,7 +52,7 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
         "/api/v1/ontology/types",
         "issue: TBD-P2-ontology-types",
     ),
-    ("GET", "/metrics", "issue: TBD-P2-metrics"),
+    ("GET", "/metrics", "issue: #324"),
     // Prompt routes are tracked by #302 and deliberately untouched here.
     ("GET", "/api/v1/prompts", "issue: #302"),
     ("GET", "/api/v1/prompts/resolve", "issue: #302"),

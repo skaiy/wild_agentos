@@ -635,6 +635,8 @@ pub struct ApiSettings {
     pub grpc_addr: String,
     pub http_addr: String,
     pub enable_metrics: bool,
+    /// Kept for config/env compatibility (`AGENT_OS_API_METRICS_PORT`). No listener
+    /// binds this port; Prometheus text is served as `GET /metrics` on `http_addr` (#324).
     pub metrics_port: u16,
 }
 
