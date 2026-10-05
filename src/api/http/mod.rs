@@ -36,6 +36,7 @@ pub mod corpus_jobs;
 pub mod corpus_watchers;
 pub mod guard;
 pub(crate) mod invocations;
+pub(crate) mod invocations_execution;
 pub(crate) mod invocations_store;
 pub mod kb;
 pub mod market;
@@ -669,6 +670,10 @@ pub fn build_router(
             "/v1/invocations/:id/cancel",
             post(invocations::cancel_invocation_handler),
         )
+        .route(
+            "/v1/invocations/:id/events",
+            get(invocations::events_invocation_handler),
+        )
         // ── OpenAI 兼容层（model = agentId，第三方 SDK 可直连）──
         .route("/v1/models", get(openai_list_models_handler))
         .route(
@@ -746,6 +751,9 @@ mod isolation_contract_config_read_tests;
 
 #[cfg(test)]
 mod isolation_contract_anonymous_route_sweep_tests;
+
+#[cfg(test)]
+mod isolation_contract_invocations_tests;
 
 #[cfg(test)]
 mod tests {
