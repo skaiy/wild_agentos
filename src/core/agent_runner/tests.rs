@@ -13,6 +13,12 @@ use std::sync::{
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn create_test_runner() -> AgentRunner {
+    create_test_runner_with_projection_size(None)
+}
+
+/// When `projection_size` is set, it overrides `AgentSettings::max_projection_size`
+/// so prompt-scope canaries are not truncated out of the projected context.
+fn create_test_runner_with_projection_size(projection_size: Option<usize>) -> AgentRunner {
     use crate::config::settings::AgentSettings;
     use crate::config::settings::GatewaySettings;
     use crate::gateway::unified_gateway::UnifiedGateway;
@@ -49,7 +55,10 @@ fn create_test_runner() -> AgentRunner {
         projection,
         config.clone(),
     )));
-    let settings = AgentSettings::default();
+    let mut settings = AgentSettings::default();
+    if let Some(size) = projection_size {
+        settings.max_projection_size = size;
+    }
 
     AgentRunner::new(
         gateway,
@@ -1238,4 +1247,192 @@ fn test_task_result_partial_success_status() {
     assert_eq!(result.status, "partial_success");
     assert!(!result.errors.is_empty());
     assert!(result.summary.contains("partially_completed"));
+}
+
+
+/// #310: projection into the agent prompt is bound to verified claims.
+/// Foreign-tenant canaries must not appear in `context_summary`, even when
+/// the caller forges `tenant_id` on the task body / context fields.
+#[test]
+fn isolation_contract_prompt_projection_excludes_foreign_and_forged_scope() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let runner = create_test_runner_with_projection_size(Some(65536));
+        let config = crate::CoreConfig::default();
+        const TASK_A: &str = "iri://task/prompt-scope-a";
+        const TASK_B: &str = "iri://task/prompt-scope-b";
+        const CANARY_A: &str = "canary-prompt-a-31d9";
+        const CANARY_B: &str = "canary-prompt-b-8e27";
+
+        for (task, tenant, project, canary) in [
+            (TASK_A, "tenant-a", "project-a", CANARY_A),
+            (TASK_B, "tenant-b", "project-b", CANARY_B),
+        ] {
+            let json = json!({
+                "@id": task,
+                "@type": "Task",
+                "tenant_id": tenant,
+                "project_id": project,
+                "goal": canary,
+                "summary": canary,
+            });
+            runner
+                .blackboard
+                .write_node(task, &json.to_string(), &config)
+                .unwrap();
+            runner
+                .blackboard
+                .sparql_update(&format!(
+                    r#"PREFIX ex: <https://wildagentos.org/ontology/>
+                    INSERT DATA {{
+                        <{task}> a ex:Task ;
+                            ex:tenant_id "{tenant}" ; ex:project_id "{project}" ;
+                            ex:summary "{canary}" ; ex:goal "{canary}" ;
+                            ex:constraints "{canary}" ; ex:status "active" .
+                    }}"#
+                ))
+                .unwrap();
+        }
+
+        let claims_a =
+            IsolationClaims::from_verified("tenant-a", "project-a", "agent-a").unwrap();
+        let mut ctx = TaskContext::new(TASK_A, "inspect scope", 1)
+            .with_isolation_claims(claims_a);
+        // Forged body / context fields must not widen projection scope.
+        ctx.tenant_id = Some("tenant-b".to_string());
+        ctx.input_data
+            .insert("tenant_id".to_string(), json!("tenant-b"));
+        ctx.constraints
+            .insert("tenant_id".to_string(), "tenant-b".to_string());
+
+        let data = runner
+            .gather_context_data_async(AgentRole::Plan, &ctx)
+            .await;
+        let summary = data.get("context_summary").cloned().unwrap_or_default();
+        assert!(
+            !summary.contains(CANARY_B),
+            "prompt projection leaked foreign canary: {summary}"
+        );
+        assert!(
+            summary.contains(CANARY_A),
+            "prompt projection must carry own-tenant canary: {summary}"
+        );
+
+        // Without verified claims, projection is skipped (fail closed).
+        let bare = TaskContext::new(TASK_A, "inspect scope", 1);
+        let bare_data = runner
+            .gather_context_data_async(AgentRole::Plan, &bare)
+            .await;
+        assert!(
+            !bare_data.contains_key("context_summary")
+                || bare_data
+                    .get("context_summary")
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true),
+            "unscoped run must not receive projected context"
+        );
+    });
+}
+
+/// #310 acceptance: fake-LLM capture of the first agent prompt must not
+/// contain another tenant's projection canary (HyperspaceStore unused).
+#[test]
+fn isolation_contract_prompt_e2e_fake_llm_excludes_foreign_canary() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let script = ScriptedGateway {
+            responses: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    move |State(script): State<ScriptedGateway>,
+                          Json(request): Json<Value>| async move {
+                        script.requests.lock().unwrap().push(request);
+                        // Always finish — we only need the first prompt capture.
+                        Json(json!({
+                            "id": "scope-canary",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "{\"action\":\"finish\",\"summary\":\"done\",\"content\":\"done\"}"
+                                },
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                    },
+                ),
+            )
+            .with_state(script.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let runner = create_test_runner_with_projection_size(Some(65536));
+        runner.gateway.set_base_url(format!("http://{address}"));
+        let config = crate::CoreConfig::default();
+        const TASK_A: &str = "iri://task/e2e-scope-a";
+        const TASK_B: &str = "iri://task/e2e-scope-b";
+        const CANARY_A: &str = "canary-e2e-a-4c21";
+        const CANARY_B: &str = "canary-e2e-b-9f08";
+        for (task, tenant, project, canary) in [
+            (TASK_A, "tenant-a", "project-a", CANARY_A),
+            (TASK_B, "tenant-b", "project-b", CANARY_B),
+        ] {
+            let json = json!({
+                "@id": task, "@type": "Task",
+                "tenant_id": tenant, "project_id": project,
+                "goal": canary, "summary": canary,
+            });
+            runner
+                .blackboard
+                .write_node(task, &json.to_string(), &config)
+                .unwrap();
+            runner
+                .blackboard
+                .sparql_update(&format!(
+                    r#"PREFIX ex: <https://wildagentos.org/ontology/>
+                    INSERT DATA {{
+                        <{task}> a ex:Task ;
+                            ex:tenant_id "{tenant}" ; ex:project_id "{project}" ;
+                            ex:summary "{canary}" ; ex:goal "{canary}" ;
+                            ex:constraints "{canary}" ; ex:status "active" .
+                    }}"#
+                ))
+                .unwrap();
+        }
+
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "agent-a").unwrap();
+        let mut ctx = TaskContext::new(TASK_A, "finish quickly", 1).with_isolation_claims(claims);
+        ctx.tenant_id = Some("tenant-b".to_string());
+        ctx.input_data
+            .insert("tenant_id".to_string(), json!("tenant-b"));
+
+        let _ = runner
+            .execute(
+                &mut AgentInstance::new("agent-a".to_string(), AgentRole::Plan),
+                ctx,
+            )
+            .await;
+
+        let requests = script.requests.lock().unwrap();
+        assert!(
+            !requests.is_empty(),
+            "fake LLM must have received at least one prompt"
+        );
+        let blob = serde_json::to_string(&*requests).unwrap();
+        assert!(
+            !blob.contains(CANARY_B),
+            "fake-LLM prompt leaked foreign canary: {blob}"
+        );
+        assert!(
+            blob.contains(CANARY_A),
+            "fake-LLM prompt must carry own-tenant canary: {blob}"
+        );
+        drop(requests);
+        server.abort();
+    });
 }

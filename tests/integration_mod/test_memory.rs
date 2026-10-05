@@ -34,6 +34,12 @@ fn test_memory_pipeline() {
     let node = l2.read_node("iri://task/1/node_1").unwrap().unwrap();
     assert_eq!(node.node_type.as_ref().unwrap(), "Test");
 
+    // Scoped task node required by ProjectionEngine::project (claims must match).
+    let claims =
+        IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap();
+    let task_json = r#"{"@id":"iri://task/1","@type":"Task","tenant_id":"test-tenant","project_id":"test-project"}"#;
+    l2.write_node("iri://task/1", task_json, &config).unwrap();
+
     // L3 projection
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -42,6 +48,7 @@ fn test_memory_pipeline() {
                 "iri://task/1",
                 "reference_only",
                 std::collections::HashMap::new(),
+                &claims,
             )
             .await
             .unwrap();

@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use serde_json::json;
 use wild_agent_os_core::core::validation::{JsonLdValidator, MetaValidator, ValidationEngine};
+use wild_agent_os_core::isolation::IsolationClaims;
 use wild_agent_os_core::memory::l2_blackboard::{Blackboard, GraphPermission};
 use wild_agent_os_core::memory::l3_projection::ProjectionEngine;
 use wild_agent_os_core::tools::skill_registry::SkillRegistry;
@@ -27,6 +28,22 @@ fn create_test_node(
     }
 
     serde_json::to_string(&node).unwrap()
+}
+
+fn scoped_claims() -> IsolationClaims {
+    IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap()
+}
+
+fn seed_scoped_task(blackboard: &Blackboard, task_iri: &str) {
+    let config = CoreConfig::default();
+    let node = json!({
+        "@id": task_iri,
+        "@type": "Task",
+        "tenant_id": "test-tenant",
+        "project_id": "test-project",
+    })
+    .to_string();
+    blackboard.write_node(task_iri, &node, &config).unwrap();
 }
 
 #[test]
@@ -235,6 +252,7 @@ fn test_token_budget_control() {
     let projection = ProjectionEngine::new(blackboard.clone(), 200);
     let config = CoreConfig::default();
 
+    seed_scoped_task(&blackboard, "iri://test");
     for i in 0..10 {
         let node = json!({
             "@id": format!("iri://test/node/{}", i),
@@ -248,11 +266,12 @@ fn test_token_budget_control() {
             .unwrap();
     }
 
+    let claims = scoped_claims();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt
         .block_on(async {
             projection
-                .project("iri://test", "reference_only", HashMap::new())
+                .project("iri://test", "reference_only", HashMap::new(), &claims)
                 .await
         })
         .unwrap();
@@ -541,6 +560,7 @@ fn test_cache_invalidation() {
     let projection = ProjectionEngine::new(blackboard.clone(), 1024);
     let config = CoreConfig::default();
 
+    seed_scoped_task(&blackboard, "iri://test");
     let node = json!({
         "@id": "iri://test/cache",
         "@type": "Test",
@@ -551,11 +571,12 @@ fn test_cache_invalidation() {
         .write_node("iri://test/cache", &node, &config)
         .unwrap();
 
+    let claims = scoped_claims();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _result1 = rt
         .block_on(async {
             projection
-                .project("iri://test", "reference_only", HashMap::new())
+                .project("iri://test", "reference_only", HashMap::new(), &claims)
                 .await
         })
         .unwrap();
@@ -633,12 +654,15 @@ fn test_performance_projection() {
     let projection = ProjectionEngine::new(blackboard.clone(), 5000);
     let config = CoreConfig::default();
 
+    seed_scoped_task(&blackboard, "iri://task/perf");
     for i in 0..30 {
         let node = json!({
             "@id": format!("iri://task/perf/node/{}", i),
             "@type": "TestNode",
             "summary": format!("节点 {}", i),
-            "data": "x".repeat(50)
+            "data": "x".repeat(50),
+            "tenant_id": "test-tenant",
+            "project_id": "test-project",
         })
         .to_string();
         blackboard
@@ -646,12 +670,13 @@ fn test_performance_projection() {
             .unwrap();
     }
 
+    let claims = scoped_claims();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let start = Instant::now();
     let result = rt
         .block_on(async {
             projection
-                .project("iri://task/perf", "summary_only", HashMap::new())
+                .project("iri://task/perf", "summary_only", HashMap::new(), &claims)
                 .await
         })
         .unwrap();
