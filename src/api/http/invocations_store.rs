@@ -136,6 +136,10 @@ pub(crate) const DEADLINE_EXCEEDED_ERROR_CODE: &str = "deadline_exceeded";
 pub(crate) const PROJECTION_CONTEXT_MISSING_ERROR_CODE: &str = "projection_context_missing";
 /// Task node could not be created before the executor starts (#317).
 pub(crate) const TASK_INIT_FAILED_ERROR_CODE: &str = "task_init_failed";
+/// `input_ref` digest mismatch on the execution path (#331).
+pub(crate) const INPUT_DIGEST_MISMATCH_ERROR_CODE: &str = "input_digest_mismatch";
+/// `input_ref` resolver failed before the digest check (#331).
+pub(crate) const INPUT_REF_FETCH_FAILED_ERROR_CODE: &str = "input_ref_fetch_failed";
 /// Actor recorded in audit events written by the store itself.
 pub(crate) const SYSTEM_ACTOR_ID: &str = "system";
 
@@ -325,7 +329,7 @@ impl InvocationState {
 
     /// [`Self::permits`] plus the conditional `queued → failed` edge for
     /// pre-execution system failures: deadline expiry, missing projection
-    /// context (H4), or task init failure (#317).
+    /// context (H4), task init failure (#317), or input_ref fetch/digest (#331).
     pub(crate) fn permits_with(self, next: Self, error: Option<&InvocationErrorInfo>) -> bool {
         self.permits(next)
             || (self == Self::Queued
@@ -336,6 +340,8 @@ impl InvocationState {
                         DEADLINE_EXCEEDED_ERROR_CODE
                             | PROJECTION_CONTEXT_MISSING_ERROR_CODE
                             | TASK_INIT_FAILED_ERROR_CODE
+                            | INPUT_DIGEST_MISMATCH_ERROR_CODE
+                            | INPUT_REF_FETCH_FAILED_ERROR_CODE
                     )
                 }))
     }
@@ -1218,6 +1224,37 @@ impl InvocationStore {
             .collect();
         listed.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
         listed
+    }
+
+
+    /// Oldest `queued` invocation in a tenant/project scope (FIFO by
+    /// `created_at`, then `id`). Used by the running-cap scheduler (#331).
+    pub(crate) async fn oldest_queued_in_scope(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Option<Invocation> {
+        let records = self.records.read().await;
+        records
+            .iter()
+            .filter(|record| {
+                record.state == InvocationState::Queued
+                    && record.tenant_id == tenant_id
+                    && record.project_id == project_id
+            })
+            .min_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)))
+            .cloned()
+    }
+
+    /// Oldest `queued` invocation across all scopes (global FIFO assist when a
+    /// global running slot frees and the releasing scope has nothing waiting).
+    pub(crate) async fn oldest_queued_global(&self) -> Option<Invocation> {
+        let records = self.records.read().await;
+        records
+            .iter()
+            .filter(|record| record.state == InvocationState::Queued)
+            .min_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)))
+            .cloned()
     }
 
     /// Lifecycle write that discards the `changed` flag; see

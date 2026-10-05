@@ -36,6 +36,7 @@ pub mod corpus_jobs;
 pub mod corpus_watchers;
 pub mod guard;
 pub(crate) mod invocations;
+pub(crate) mod invocations_enforcement;
 pub(crate) mod invocations_execution;
 pub(crate) mod invocations_store;
 pub mod kb;
@@ -298,12 +299,19 @@ pub fn build_router(
         match (runtime.store(), task_executor.as_ref()) {
             (Some(store), Some(executor)) => {
                 let bridge = std::sync::Arc::new(
-                    invocations_execution::InvocationExecutionBridge::with_default_gate(
+                    invocations_execution::InvocationExecutionBridge::new_with_enforcement(
                         store,
                         runtime.cancellations().clone(),
                         core.clone(),
                         executor.clone(),
                         shutdown.clone(),
+                        std::sync::Arc::new(
+                            invocations_execution::ScopedProjectionGate,
+                        ),
+                        std::sync::Arc::new(
+                            invocations_enforcement::FifoScheduler::with_defaults(),
+                        ),
+                        runtime.input_refs().clone(),
                     ),
                 );
                 tracing::info!(
