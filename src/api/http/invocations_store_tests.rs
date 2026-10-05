@@ -1231,3 +1231,94 @@ async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
     let no_usage = serde_json::to_value(InvocationResult::default()).unwrap();
     assert!(no_usage.get("usage").is_none());
 }
+
+/// Fills the store with terminal (`succeeded`) records, all inside the
+/// retention window, until it holds exactly [`MAX_STORED_INVOCATIONS`].
+/// Writes memory and disk directly: 10 000 single creates would rewrite the
+/// whole file each time.
+async fn fill_to_capacity(store: &InvocationStore, claims: &IsolationClaims) {
+    let template = invocation_in(store, claims, InvocationState::Succeeded).await;
+    let mut records = store.records.write().await;
+    while records.len() < MAX_STORED_INVOCATIONS {
+        let mut record = template.clone();
+        record.id = format!("inv_{}", uuid::Uuid::new_v4().simple());
+        records.push(record);
+    }
+    persist(store.path(), &records).unwrap();
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_store_full_nothing_expired_is_503_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    fill_to_capacity(&store, &claims).await;
+    let before_disk = std::fs::read(store.path()).unwrap();
+
+    let err = store
+        .create_for_claims(&claims, new_invocation())
+        .await
+        .unwrap_err();
+    assert_eq!(err, InvocationStoreError::StoreFull);
+    let (status, body) = body_bytes(err.into_response()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "invocation_store_full");
+
+    assert_eq!(store.records.read().await.len(), MAX_STORED_INVOCATIONS);
+    assert_eq!(
+        std::fs::read(store.path()).unwrap(),
+        before_disk,
+        "a rejected create writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_store_full_sweep_frees_space_then_create_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    fill_to_capacity(&store, &claims).await;
+
+    // Backdate one terminal record past the retention window.
+    let expired_id = {
+        let mut records = store.records.write().await;
+        let expired = &mut records[0];
+        let past = chrono::Utc::now()
+            - chrono::Duration::days(DEFAULT_RETENTION_DAYS as i64)
+            - chrono::Duration::minutes(1);
+        expired.completed_at = Some(past.to_rfc3339());
+        let id = expired.id.clone();
+        persist(store.path(), &records).unwrap();
+        id
+    };
+
+    let fresh = store
+        .create_for_claims(&claims, new_invocation())
+        .await
+        .expect("the sweep inside create frees one slot");
+    assert_eq!(fresh.state, InvocationState::Queued);
+    assert_eq!(
+        store
+            .get_for_claims(&claims, &expired_id)
+            .await
+            .unwrap_err(),
+        InvocationStoreError::NotFound
+    );
+    assert_eq!(store.records.read().await.len(), MAX_STORED_INVOCATIONS);
+
+    // Sweep and insert were persisted together.
+    let on_disk = disk_records(&store);
+    assert_eq!(on_disk.len(), MAX_STORED_INVOCATIONS);
+    assert!(on_disk.iter().any(|r| r.id == fresh.id));
+    assert!(!on_disk.iter().any(|r| r.id == expired_id));
+
+    // Full again with nothing expired: the next create is rejected.
+    assert_eq!(
+        store
+            .create_for_claims(&claims, new_invocation())
+            .await
+            .unwrap_err(),
+        InvocationStoreError::StoreFull
+    );
+}
