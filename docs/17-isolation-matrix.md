@@ -36,6 +36,7 @@ cargo test --workspace isolation_contract_materialization --verbose
 | Public API-key chat | Public API-key chat has no tenant claims and performs no tenant graph or vector RAG. | `api::http::chat::tests::isolation_contract_public_api_key_chat_performs_no_tenant_rag` |
 | Development `X-Identity` | `X-Identity` can simulate a development identity but never creates `IsolationClaims`. Strict authentication rejects it. | `api::http::iam::tests::isolation_contract_x_identity_never_creates_isolation_claims` |
 | Tool-call spend gate | When `AGENTOS_TENANT_TOOL_CALL_CAP` is unset, the gate does not require claims. When it is set to a valid cap, a metered call without verified claims is rejected. | `spend::tests::isolation_contract_spend_gate_allows_missing_claims_when_cap_is_unset`; `spend::tests::isolation_contract_spend_gate_requires_claims_when_cap_is_configured` |
+| Invocations API (`/v1/invocations`) | Anonymous / unverified callers get `401 verified_isolation_claims_required` on all five routes (STRICT on or off). Cross-tenant, cross-project, and unknown ids return the same byte-identical `404 not_found` (status, headers, body) for get, cancel, and events; responses never echo foreign metadata. | `api::http::invocations::tests::invocations_routes_reject_unverified_callers_with_401`; `api::http::invocations::tests::events_cross_scope_is_byte_identical_404` (plus get/cancel twins in the same module); contract index `api::http::isolation_contract_invocations_tests` (#318) |
 
 ## Historical data requires offline migration
 
