@@ -311,6 +311,10 @@ SELECT ?agent ?task ?operation WHERE {
 
 L3 is an on-demand projection engine that generates tailored context views by Agent role and Token budget.
 
+**Projection scope (required).** `ProjectionEngine::project(task_iri, frame, params, claims)` takes the caller's verified isolation claims. The scope is the `tenant_id` / `project_id` recorded on the task node and must equal those claims; a task with no recorded scope, or a caller without claims, is refused (no fallback to a default tenant, no whole-graph fallback). SPARQL frames bind `?scope_task`, `?scope_tenant` and `?scope_project` as RDF terms, and only match the task itself or nodes under its IRI whose recorded tenant and project equal the scope. Template parameters such as `$target_path` are substituted as escaped literals; a missing parameter is an error. Scoped results are cached under tenant + project + frame + task.
+
+**Whole-graph projection is platform-admin only.** `project_platform_wide` runs a frame without scope binding; it is only called by the HTTP projection handler after the platform-admin check, and its results are never cached. SPARQL frames whose templates carry no scope binding (the workspace frames) are platform-wide only.
+
 ```rust
 pub struct ProjectionEngine {
     blackboard: Arc<Blackboard>,

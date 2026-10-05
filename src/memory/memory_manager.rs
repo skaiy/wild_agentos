@@ -377,25 +377,29 @@ impl MemoryManager {
         &self,
         task_iri: &str,
         frame_name: &str,
+        claims: &crate::isolation::IsolationClaims,
     ) -> Result<Option<String>, CoreError> {
         let params = HashMap::new();
         let handle = tokio::runtime::Handle::try_current();
 
         match handle {
             Ok(_h) => {
-                let frame = self.projection.get_frame(frame_name);
-                let actual_frame = if frame.is_some() {
-                    frame_name
-                } else {
-                    "reference_only"
-                };
+                // An unknown frame is an error, never a silent fallback.
+                if self.projection.get_frame(frame_name).is_none() {
+                    return Err(CoreError::FrameNotFound {
+                        name: frame_name.to_string(),
+                    });
+                }
                 let proj = self.projection.clone();
                 let task_iri = task_iri.to_string();
-                let actual_frame = actual_frame.to_string();
+                let actual_frame = frame_name.to_string();
+                let claims = claims.clone();
 
                 let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { proj.project(&task_iri, &actual_frame, params).await })
+                    tokio::runtime::Handle::current().block_on(async {
+                        proj.project(&task_iri, &actual_frame, params, &claims)
+                            .await
+                    })
                 })?;
                 Ok(Some(result))
             }

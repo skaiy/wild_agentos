@@ -365,9 +365,15 @@ discover relevant on-demand tools.
             AgentRole::Act => "aa_decision",
         };
 
+        // Projection is scoped to the run's verified claims; without them the
+        // prompt gets no projected context at all.
+        let Some(claims) = ctx.isolation_claims.as_ref() else {
+            tracing::warn!(task_iri = %ctx.task_iri, frame = %frame_name, "Projection skipped: run has no verified isolation claims");
+            return context_data;
+        };
         if let Ok(projection_str) = self
             .projection
-            .project(&ctx.task_iri, frame_name, HashMap::new())
+            .project(&ctx.task_iri, frame_name, HashMap::new(), claims)
             .await
         {
             if !projection_str.is_empty() {

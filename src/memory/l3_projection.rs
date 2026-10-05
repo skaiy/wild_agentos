@@ -6,13 +6,77 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, instrument, warn};
 
+use crate::isolation::IsolationClaims;
 use crate::jsonld::framing::{
     apply_frame, estimate_tokens, fit_to_budget, EmbedDirective, FrameTemplate,
 };
 use crate::jsonld::JsonLdContext;
 use crate::memory::hyperspace_store::HyperspaceStore;
-use crate::memory::l2_blackboard::Blackboard;
+use crate::memory::l2_blackboard::{Blackboard, ScopeTerm};
 use crate::CoreError;
+
+/// Template variables a scope-bound SPARQL frame must reference. They are
+/// bound as RDF terms (never spliced into the query text) from the task IRI
+/// and the tenant/project recorded on the task node.
+const SCOPE_TASK_VAR: &str = "scope_task";
+const SCOPE_TENANT_VAR: &str = "scope_tenant";
+const SCOPE_PROJECT_VAR: &str = "scope_project";
+
+/// Expand `{{SCOPE:var}}` in a frame template into the clauses that restrict
+/// `?var` to the bound task (the task itself or a node under its IRI) and to
+/// nodes whose recorded tenant and project equal the bound scope. Both the
+/// JSON-LD write path (`prop/`) and the ontology (`ex:`) predicates count as
+/// recorded scope; a node with neither is excluded.
+fn scope_clauses(var: &str) -> String {
+    format!(
+        r#"
+            ?{var} (<https://wildagentos.org/prop/tenant_id>|<https://wildagentos.org/ontology/tenant_id>) ?{SCOPE_TENANT_VAR} .
+            ?{var} (<https://wildagentos.org/prop/project_id>|<https://wildagentos.org/ontology/project_id>) ?{SCOPE_PROJECT_VAR} .
+            FILTER(?{var} = ?{SCOPE_TASK_VAR} || STRSTARTS(STR(?{var}), CONCAT(STR(?{SCOPE_TASK_VAR}), "/")))
+"#
+    )
+}
+
+/// Expand (`scoped`) or drop (platform-wide) the scope placeholders.
+fn expand_scope_placeholders(template: &str, scoped: bool) -> String {
+    let mut out = template.to_string();
+    for var in ["node", "task"] {
+        let clauses = if scoped {
+            scope_clauses(var)
+        } else {
+            String::new()
+        };
+        out = out.replace(&format!("{{{{SCOPE:{var}}}}}"), &clauses);
+    }
+    out
+}
+
+const SCOPE_PLACEHOLDER: &str = "{{SCOPE:";
+
+/// Tenant/project scope of a projection, resolved from the task node's
+/// recorded `tenant_id` / `project_id` and checked against verified claims.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProjectionScope {
+    tenant_id: String,
+    project_id: String,
+}
+
+/// Escape a value for use inside a SPARQL string literal.
+fn escape_sparql_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone)]
 pub struct MaterializedView {
@@ -146,6 +210,7 @@ impl ProjectionEngine {
                     ?node ex:summary ?summary .
                     ?node ex:status ?status .
                     OPTIONAL { ?node ex:confidence ?conf }
+                    {{SCOPE:node}}
                 }
             "#
                     .to_string(),
@@ -200,6 +265,7 @@ impl ProjectionEngine {
                     OPTIONAL { ?task ex:goal ?goal }
                     OPTIONAL { ?task ex:constraints ?constraints }
                     OPTIONAL { ?task ex:resources ?resources }
+                    {{SCOPE:task}}
                 }
             "#
                     .to_string(),
@@ -248,6 +314,7 @@ impl ProjectionEngine {
                     OPTIONAL { ?node ex:instructions ?instructions }
                     OPTIONAL { ?node ex:dependencies ?deps }
                     OPTIONAL { ?node ex:language ?lang }
+                    {{SCOPE:node}}
                 }
             "#
                     .to_string(),
@@ -444,6 +511,7 @@ impl ProjectionEngine {
             OPTIONAL { ?node task:why ?why }
             OPTIONAL { ?node task:status ?status }
             OPTIONAL { ?node task:summary ?summary }
+            {{SCOPE:node}}
         }
     "#
                     .to_string(),
@@ -564,7 +632,7 @@ impl ProjectionEngine {
         WHERE {
             ?node a ws:File .
             ?node ws:filePath ?path .
-            FILTER(CONTAINS(LCASE(?path), LCASE($target_path)))
+            FILTER(CONTAINS(LCASE(?path), LCASE("$target_path")))
             OPTIONAL { ?node ws:fileSize ?size }
             OPTIONAL { ?node ws:fileExt ?ext }
             OPTIONAL { ?node ws:language ?lang }
@@ -645,12 +713,175 @@ impl ProjectionEngine {
         frames
     }
 
-    #[instrument(skip(self, params))]
+    /// A SPARQL frame is scope-bindable only when its template carries the
+    /// scope placeholder. Any other SPARQL frame (workspace frames, custom
+    /// frames registered without scope clauses) is platform-wide only.
+    fn frame_is_scope_bound(frame: &ProjectionFrame) -> bool {
+        match &frame.sparql_template {
+            None => true,
+            Some(t) => t.contains(SCOPE_PLACEHOLDER),
+        }
+    }
+
+    /// Whether `frame_name` names a SPARQL frame that can only run
+    /// platform-wide (no scope binding in its template).
+    pub fn frame_is_platform_only(&self, frame_name: &str) -> bool {
+        self.frames
+            .get(frame_name)
+            .is_some_and(|f| !Self::frame_is_scope_bound(f))
+    }
+
+    fn scoped_cache_key(scope: &ProjectionScope, frame_name: &str, task_iri: &str) -> String {
+        format!(
+            "scoped\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            scope.tenant_id, scope.project_id, frame_name, task_iri
+        )
+    }
+
+    fn cache_key_matches_task(key: &str, task_iri: &str) -> bool {
+        key.rsplit('\u{1f}').next() == Some(task_iri)
+    }
+
+    /// Resolve the projection scope for `task_iri`: the tenant/project recorded
+    /// on the task node, which must equal the caller's verified claims. A task
+    /// without recorded scope, or one recorded under another scope, is refused.
+    fn resolve_scope(
+        &self,
+        task_iri: &str,
+        claims: &IsolationClaims,
+    ) -> Result<ProjectionScope, CoreError> {
+        let denied = || CoreError::PermissionDenied {
+            agent: claims.actor_id().to_string(),
+            resource: task_iri.to_string(),
+            action: "projection".to_string(),
+        };
+        let node = self.blackboard.read_node(task_iri)?.ok_or_else(denied)?;
+        let value: Value = serde_json::from_str(&node.json_ld).map_err(|_| denied())?;
+        let tenant = value.get("tenant_id").and_then(|v| v.as_str());
+        let project = value.get("project_id").and_then(|v| v.as_str());
+        match (tenant, project) {
+            (Some(t), Some(p)) if t == claims.tenant_id() && p == claims.project_id() => {
+                Ok(ProjectionScope {
+                    tenant_id: t.to_string(),
+                    project_id: p.to_string(),
+                })
+            }
+            _ => Err(denied()),
+        }
+    }
+
+    /// Substitute declared `$name` template parameters with escaped string
+    /// literals. A declared parameter that is missing, or any `$` placeholder
+    /// left unreplaced, is an error.
+    fn substitute_params(
+        frame: &ProjectionFrame,
+        template: &str,
+        params: &HashMap<String, String>,
+    ) -> Result<String, CoreError> {
+        let mut out = template.to_string();
+        for name in &frame.params {
+            let placeholder = format!("\"${name}\"");
+            if !out.contains(&placeholder) {
+                continue;
+            }
+            let value = params
+                .get(name)
+                .ok_or_else(|| CoreError::ValidationFailed {
+                    message: format!(
+                        "projection frame {} requires parameter {}",
+                        frame.name, name
+                    ),
+                })?;
+            out = out.replace(
+                &placeholder,
+                &format!("\"{}\"", escape_sparql_literal(value)),
+            );
+        }
+        if out.contains("\"$") {
+            return Err(CoreError::ValidationFailed {
+                message: format!("projection frame {} has unbound parameters", frame.name),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Project `task_iri` through `frame_name` within the caller's verified
+    /// tenant/project scope. SPARQL frames are bound to the task and to nodes
+    /// recorded under that scope; frames that cannot be bound are refused.
+    #[instrument(skip(self, params, claims))]
     pub async fn project(
         &self,
         task_iri: &str,
         frame_name: &str,
         params: HashMap<String, String>,
+        claims: &IsolationClaims,
+    ) -> Result<String, CoreError> {
+        let frame = self
+            .frames
+            .get(frame_name)
+            .ok_or_else(|| CoreError::FrameNotFound {
+                name: frame_name.to_string(),
+            })?;
+        if !Self::frame_is_scope_bound(frame) {
+            warn!(task_iri = %task_iri, frame = %frame_name, "Projection refused: frame is platform-wide only");
+            return Err(CoreError::PermissionDenied {
+                agent: claims.actor_id().to_string(),
+                resource: task_iri.to_string(),
+                action: format!("projection:{frame_name}"),
+            });
+        }
+        let scope = match self.resolve_scope(task_iri, claims) {
+            Ok(scope) => scope,
+            Err(e) => {
+                warn!(task_iri = %task_iri, frame = %frame_name, "Projection refused: task scope missing or not the caller's");
+                return Err(e);
+            }
+        };
+        self.project_inner(task_iri, frame_name, params, Some(&scope))
+            .await
+    }
+
+    /// Whole-graph projection with no tenant/project binding. Only callable
+    /// after a platform-admin check; results are never cached so they cannot
+    /// be served to a scoped caller.
+    #[instrument(skip(self, params))]
+    pub async fn project_platform_wide(
+        &self,
+        task_iri: &str,
+        frame_name: &str,
+        params: HashMap<String, String>,
+    ) -> Result<String, CoreError> {
+        self.project_inner(task_iri, frame_name, params, None).await
+    }
+
+    /// Task-local projection for frames without a SPARQL template: reads only
+    /// nodes stored under `task_iri`. SPARQL frames are refused. Never cached.
+    pub async fn project_task_local(
+        &self,
+        task_iri: &str,
+        frame_name: &str,
+    ) -> Result<String, CoreError> {
+        let frame = self
+            .frames
+            .get(frame_name)
+            .ok_or_else(|| CoreError::FrameNotFound {
+                name: frame_name.to_string(),
+            })?;
+        if frame.sparql_template.is_some() {
+            return Err(CoreError::ValidationFailed {
+                message: format!("frame {frame_name} is not task-local"),
+            });
+        }
+        self.project_inner(task_iri, frame_name, HashMap::new(), None)
+            .await
+    }
+
+    async fn project_inner(
+        &self,
+        task_iri: &str,
+        frame_name: &str,
+        params: HashMap<String, String>,
+        scope: Option<&ProjectionScope>,
     ) -> Result<String, CoreError> {
         debug!(task_iri = %task_iri, frame = %frame_name, "Executing projection");
 
@@ -661,11 +892,13 @@ impl ProjectionEngine {
                 name: frame_name.to_string(),
             })?;
 
-        let cache_key = format!("{}:{}", task_iri, frame_name);
-        if let Some(cached) = self.materialized_cache.read().get(&cache_key) {
-            if cached.is_valid {
-                debug!(cache_key = %cache_key, "Projection cache hit");
-                return Ok(cached.result_json.clone());
+        let cache_key = scope.map(|scope| Self::scoped_cache_key(scope, frame_name, task_iri));
+        if let Some(cache_key) = cache_key.as_ref() {
+            if let Some(cached) = self.materialized_cache.read().get(cache_key) {
+                if cached.is_valid {
+                    debug!(cache_key = %cache_key, "Projection cache hit");
+                    return Ok(cached.result_json.clone());
+                }
             }
         }
 
@@ -684,8 +917,11 @@ impl ProjectionEngine {
         );
 
         let artifacts = if let Some(sparql_template) = &frame.sparql_template {
+            let sparql = Self::substitute_params(frame, sparql_template, &params)?;
             self.execute_sparql_construct(
-                sparql_template,
+                &sparql,
+                task_iri,
+                scope,
                 &frame.include_properties,
                 frame.max_nodes,
             )?
@@ -731,6 +967,10 @@ impl ProjectionEngine {
             result
         };
 
+        // Whole-graph results are never cached.
+        let Some(cache_key) = cache_key else {
+            return Ok(result);
+        };
         let dependent_nodes: Vec<String> = self.blackboard.get_task_nodes(task_iri);
         let view = MaterializedView {
             cache_key: cache_key.clone(),
@@ -758,12 +998,26 @@ impl ProjectionEngine {
     fn execute_sparql_construct(
         &self,
         sparql: &str,
+        task_iri: &str,
+        scope: Option<&ProjectionScope>,
         include_properties: &[String],
         max_nodes: usize,
     ) -> Result<Vec<serde_json::Value>, CoreError> {
         debug!(sparql_len = sparql.len(), "Executing SPARQL CONSTRUCT");
 
-        let results = self.blackboard.query(sparql)?;
+        let results = match scope {
+            Some(scope) => self.blackboard.query_with_bindings(
+                &expand_scope_placeholders(sparql, true),
+                &[
+                    (SCOPE_TASK_VAR, ScopeTerm::Iri(task_iri)),
+                    (SCOPE_TENANT_VAR, ScopeTerm::Literal(&scope.tenant_id)),
+                    (SCOPE_PROJECT_VAR, ScopeTerm::Literal(&scope.project_id)),
+                ],
+            )?,
+            None => self
+                .blackboard
+                .query(&expand_scope_placeholders(sparql, false))?,
+        };
 
         let mut subject_data: HashMap<String, serde_json::Map<String, serde_json::Value>> =
             HashMap::new();
@@ -984,11 +1238,15 @@ impl ProjectionEngine {
         }
     }
 
+    /// Invalidate every scoped view of `frame_name` for `task_iri`.
     pub fn invalidate_view(&self, frame_name: &str, task_iri: &str) {
-        let cache_key = format!("{}:{}", task_iri, frame_name);
-        if let Some(view) = self.materialized_cache.write().get_mut(&cache_key) {
-            view.is_valid = false;
-            debug!(cache_key = %cache_key, "Materialized view invalidated");
+        let mut cache = self.materialized_cache.write();
+        for (key, view) in cache.iter_mut() {
+            let mut parts = key.rsplit('\u{1f}');
+            if parts.next() == Some(task_iri) && parts.next() == Some(frame_name) {
+                view.is_valid = false;
+                debug!(cache_key = %key, "Materialized view invalidated");
+            }
         }
     }
 
@@ -1021,7 +1279,7 @@ impl ProjectionEngine {
         let mut cache = self.materialized_cache.write();
         let keys_to_invalidate: Vec<String> = cache
             .keys()
-            .filter(|k| k.starts_with(&format!("{}:", task_iri)))
+            .filter(|k| Self::cache_key_matches_task(k, task_iri))
             .cloned()
             .collect();
 
@@ -1277,9 +1535,322 @@ mod tests {
             .unwrap();
 
         let result = engine
-            .project("iri://task_1", "reference_only", HashMap::new())
+            .project_task_local("iri://task_1", "reference_only")
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── Projection scope (tenant/project binding) ──
+
+    const BIG: usize = 65536;
+
+    fn claims(tenant: &str, project: &str) -> IsolationClaims {
+        IsolationClaims::from_verified(tenant, project, format!("{tenant}-actor")).unwrap()
+    }
+
+    /// Task node with recorded scope (JSON-LD write) plus `ex:` triples that
+    /// the SPARQL frames match, carrying `canary` in goal/constraints/summary.
+    fn seed_task(bb: &Blackboard, task: &str, tenant: &str, project: &str, canary: &str) {
+        let config = crate::CoreConfig::default();
+        let json = serde_json::json!({
+            "@id": task, "@type": "Task",
+            "tenant_id": tenant, "project_id": project,
+            "goal": canary, "summary": canary,
+        });
+        bb.write_node(task, &json.to_string(), &config).unwrap();
+        bb.sparql_update(&format!(
+            r#"PREFIX ex: <https://wildagentos.org/ontology/>
+            INSERT DATA {{
+                <{task}> a ex:Task ;
+                    ex:tenant_id "{tenant}" ; ex:project_id "{project}" ;
+                    ex:summary "{canary}" ; ex:goal "{canary}" ;
+                    ex:constraints "{canary}" ; ex:status "active" .
+            }}"#
+        ))
+        .unwrap();
+    }
+
+    /// A plan node stored under `task`'s IRI but recorded under `tenant`.
+    fn seed_plan_node(bb: &Blackboard, node: &str, tenant: &str, project: &str, canary: &str) {
+        bb.sparql_update(&format!(
+            r#"PREFIX ex: <https://wildagentos.org/ontology/>
+            INSERT DATA {{
+                <{node}> a ex:PlanNode ;
+                    ex:tenant_id "{tenant}" ; ex:project_id "{project}" ;
+                    ex:summary "{canary}" ; ex:status "active" ;
+                    ex:instructions "{canary}" .
+            }}"#
+        ))
+        .unwrap();
+    }
+
+    const TASK_A: &str = "iri://task/scope-a";
+    const TASK_B: &str = "iri://task/scope-b";
+    const CANARY_A: &str = "canary-tenant-a-31d9";
+    const CANARY_B: &str = "canary-tenant-b-8e27";
+
+    fn two_tenants() -> (Arc<Blackboard>, ProjectionEngine) {
+        let bb = Arc::new(Blackboard::new().unwrap());
+        seed_task(&bb, TASK_A, "tenant-a", "project-a", CANARY_A);
+        seed_task(&bb, TASK_B, "tenant-b", "project-b", CANARY_B);
+        // Tenant B's node planted under tenant A's task IRI with the same
+        // project id: only the tenant filter keeps it out of A's projection.
+        seed_plan_node(
+            &bb,
+            &format!("{TASK_A}/planted"),
+            "tenant-b",
+            "project-a",
+            CANARY_B,
+        );
+        seed_plan_node(
+            &bb,
+            &format!("{TASK_B}/plan"),
+            "tenant-b",
+            "project-b",
+            CANARY_B,
+        );
+        let engine = ProjectionEngine::new(bb.clone(), BIG);
+        (bb, engine)
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_projection_sparql_frames_never_leak_other_tenant() {
+        let (_bb, engine) = two_tenants();
+        let a = claims("tenant-a", "project-a");
+        let b = claims("tenant-b", "project-b");
+        for frame in ["pa_init", "da_input", "summary_only"] {
+            let out = engine
+                .project(TASK_A, frame, HashMap::new(), &a)
+                .await
+                .unwrap();
+            assert!(
+                !out.contains(CANARY_B),
+                "frame {frame} leaked tenant B: {out}"
+            );
+        }
+        // Positive controls: each tenant sees its own data.
+        let own_a = engine
+            .project(TASK_A, "pa_init", HashMap::new(), &a)
+            .await
+            .unwrap();
+        assert!(own_a.contains(CANARY_A), "A must see its own task: {own_a}");
+        for frame in ["pa_init", "da_input", "summary_only"] {
+            let own_b = engine
+                .project(TASK_B, frame, HashMap::new(), &b)
+                .await
+                .unwrap();
+            assert!(
+                own_b.contains(CANARY_B),
+                "B must see its own {frame}: {own_b}"
+            );
+            assert!(!own_b.contains(CANARY_A), "frame {frame} leaked tenant A");
+        }
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_projection_platform_wide_warm_never_serves_scoped_caller() {
+        let (_bb, engine) = two_tenants();
+        let a = claims("tenant-a", "project-a");
+        for frame in ["pa_init", "da_input", "summary_only"] {
+            // Positive control: the whole-graph result really carries B's canary.
+            let wide = engine
+                .project_platform_wide(TASK_A, frame, HashMap::new())
+                .await
+                .unwrap();
+            assert!(
+                wide.contains(CANARY_B),
+                "platform-wide {frame} must see all"
+            );
+            let out = engine
+                .project(TASK_A, frame, HashMap::new(), &a)
+                .await
+                .unwrap();
+            assert!(!out.contains(CANARY_B), "warm cache leaked via {frame}");
+        }
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_projection_cache_is_keyed_by_scope() {
+        let (bb, engine) = two_tenants();
+        let task = "iri://task/rehomed";
+        seed_task(&bb, task, "tenant-b", "project-b", CANARY_B);
+        let b = claims("tenant-b", "project-b");
+        let warm = engine
+            .project(task, "pa_init", HashMap::new(), &b)
+            .await
+            .unwrap();
+        assert!(warm.contains(CANARY_B));
+        // The task node is re-recorded under tenant A without any cache
+        // invalidation; A must not be served B's cached view.
+        let config = crate::CoreConfig::default();
+        let json = serde_json::json!({
+            "@id": task, "@type": "Task",
+            "tenant_id": "tenant-a", "project_id": "project-b",
+        });
+        bb.write_node(task, &json.to_string(), &config).unwrap();
+        // Same project id, different tenant: only the tenant part of the
+        // cache key tells the two scopes apart.
+        let a = claims("tenant-a", "project-b");
+        let out = engine
+            .project(task, "pa_init", HashMap::new(), &a)
+            .await
+            .unwrap();
+        assert!(!out.contains(CANARY_B), "cache served another scope: {out}");
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_projection_refuses_missing_or_foreign_scope() {
+        let (bb, engine) = two_tenants();
+        let a = claims("tenant-a", "project-a");
+        // Foreign task: claims do not match the recorded scope.
+        let err = engine
+            .project(TASK_B, "pa_init", HashMap::new(), &a)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::PermissionDenied { .. }));
+        // Same tenant, other project.
+        let err = engine
+            .project(
+                TASK_A,
+                "pa_init",
+                HashMap::new(),
+                &claims("tenant-a", "project-x"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::PermissionDenied { .. }));
+        // Task without recorded scope fails closed (no `default` fallback).
+        let config = crate::CoreConfig::default();
+        let bare = "iri://task/unscoped";
+        bb.write_node(
+            bare,
+            &serde_json::json!({"@id": bare, "@type": "Task", "summary": CANARY_B}).to_string(),
+            &config,
+        )
+        .unwrap();
+        for frame in ["pa_init", "reference_only"] {
+            let err = engine
+                .project(bare, frame, HashMap::new(), &a)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CoreError::PermissionDenied { .. }), "{frame}");
+        }
+        // Unknown task node.
+        assert!(engine
+            .project("iri://task/missing", "pa_init", HashMap::new(), &a)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_projection_platform_only_frames_refuse_scoped_callers() {
+        let (_bb, engine) = two_tenants();
+        let a = claims("tenant-a", "project-a");
+        for frame in [
+            "workspace_stale_files",
+            "workspace_file_detail",
+            "workspace_overview",
+        ] {
+            assert!(engine.frame_is_platform_only(frame), "{frame}");
+            let err = engine
+                .project(TASK_A, frame, HashMap::new(), &a)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CoreError::PermissionDenied { .. }), "{frame}");
+        }
+        for frame in ["pa_init", "da_input", "summary_only", "5w2h_summary"] {
+            assert!(!engine.frame_is_platform_only(frame), "{frame}");
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_template_params_are_required_and_escaped() {
+        let (_bb, engine) = two_tenants();
+        let err = engine
+            .project_platform_wide(TASK_A, "workspace_file_detail", HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::ValidationFailed { .. }));
+        let mut params = HashMap::new();
+        params.insert(
+            "target_path".to_string(),
+            r#"x")) } CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o . FILTER(("#.to_string(),
+        );
+        let out = engine
+            .project_platform_wide(TASK_A, "workspace_file_detail", params)
+            .await
+            .unwrap();
+        assert!(
+            !out.contains(CANARY_B),
+            "parameter escaped the literal: {out}"
+        );
+    }
+
+    /// Source guard: every `.project(` call passes verified claims, and the
+    /// whole-graph method is only called from the platform-admin-gated HTTP
+    /// handler.
+    #[test]
+    fn isolation_contract_projection_call_sites_are_scoped() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let wide_needle = [".project_platform_", "wide("].concat();
+        let scoped_needle = [".pro", "ject("].concat();
+        let mut wide_sites = Vec::new();
+        for file in &files {
+            let full = std::fs::read_to_string(file).unwrap();
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.ends_with("tests.rs") {
+                continue;
+            }
+            // Production code only: stop at the first test module.
+            let text = &full[..full.find("#[cfg(test)]").unwrap_or(full.len())];
+            let mut rest = text;
+            while let Some(i) = rest.find(&scoped_needle) {
+                let tail = &rest[i..];
+                let call = &tail[..tail.find(')').map(|j| j + 1).unwrap_or(tail.len())];
+                let end = tail.find(".await").unwrap_or(tail.len().min(200));
+                assert!(
+                    tail[..end].contains("claims"),
+                    "{rel}: projection call without verified claims: {call}"
+                );
+                rest = &tail[scoped_needle.len()..];
+            }
+            for (idx, _) in text.match_indices(&wide_needle) {
+                wide_sites.push((rel.clone(), idx));
+            }
+        }
+        for (rel, idx) in &wide_sites {
+            if rel == "memory/l3_projection.rs" {
+                continue;
+            }
+            assert_eq!(
+                rel, "api/http/core_ops.rs",
+                "whole-graph projection outside allowlist"
+            );
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            let fn_start = text[..*idx].rfind("async fn ").unwrap();
+            let body = &text[fn_start..*idx];
+            assert!(
+                body.starts_with("async fn get_projection_handler")
+                    && body.contains("require_platform_admin"),
+                "whole-graph projection not behind the platform-admin check"
+            );
+        }
     }
 
     #[test]

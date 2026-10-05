@@ -113,12 +113,26 @@ pub(crate) async fn get_projection_handler(
         return core_read_not_found();
     }
     let params = req.params.unwrap_or_default();
-    match state
-        .core
-        .projection
-        .project(&req.task_iri, &frame, params)
-        .await
-    {
+    let result = if whole_graph {
+        // Reached only after `require_platform_admin` above.
+        state
+            .core
+            .projection
+            .project_platform_wide(&req.task_iri, &frame, params)
+            .await
+    } else {
+        match identity.isolation_claims() {
+            Some(claims) => {
+                state
+                    .core
+                    .projection
+                    .project(&req.task_iri, &frame, params, claims)
+                    .await
+            }
+            None => return core_read_not_found(),
+        }
+    };
+    match result {
         Ok(projection) => Json(json!({
             "projection": serde_json::from_str::<Value>(&projection).ok(),
             "frame": frame,

@@ -187,7 +187,7 @@ impl PrefetchEngine {
                 };
 
                 let result = projection
-                    .project(&entity_iri, "reference_only", HashMap::new())
+                    .project_task_local(&entity_iri, "reference_only")
                     .await;
 
                 match result {
