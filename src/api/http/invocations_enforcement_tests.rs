@@ -180,7 +180,11 @@ fn alice_claims() -> IsolationClaims {
     IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap()
 }
 
-async fn create_prompt(h: &EnforcementHarness, auth: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+async fn create_prompt(
+    h: &EnforcementHarness,
+    auth: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let reply = call(
         &h.router,
         "POST",
@@ -248,11 +252,7 @@ async fn fifo_over_cap_stays_queued_then_starts_in_order() {
     let id2 = b2["id"].as_str().unwrap().to_string();
 
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let inv2 = h
-        .store
-        .get_for_claims(&alice_claims(), &id2)
-        .await
-        .unwrap();
+    let inv2 = h.store.get_for_claims(&alice_claims(), &id2).await.unwrap();
     assert_eq!(inv2.state, InvocationState::Queued);
     assert_eq!(h.calls.load(Ordering::SeqCst), 1);
 
@@ -323,17 +323,12 @@ async fn deadline_while_queued_fails_with_deadline_exceeded() {
     wait_calls(&h.calls, 1).await;
 
     let deadline = (chrono::Utc::now() + chrono::Duration::milliseconds(250)).to_rfc3339();
-    let (s2, b2) =
-        create_prompt(&h, &auth, json!({"prompt": "soon", "deadline": deadline})).await;
+    let (s2, b2) = create_prompt(&h, &auth, json!({"prompt": "soon", "deadline": deadline})).await;
     assert_eq!(s2, StatusCode::ACCEPTED, "{b2}");
     let id2 = b2["id"].as_str().unwrap().to_string();
 
     wait_state(&h.store, &alice_claims(), &id2, InvocationState::Failed).await;
-    let inv2 = h
-        .store
-        .get_for_claims(&alice_claims(), &id2)
-        .await
-        .unwrap();
+    let inv2 = h.store.get_for_claims(&alice_claims(), &id2).await.unwrap();
     assert_eq!(
         inv2.error.as_ref().map(|e| e.code.as_str()),
         Some(DEADLINE_EXCEEDED_ERROR_CODE)

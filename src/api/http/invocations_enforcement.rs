@@ -30,8 +30,7 @@ pub(crate) const DEFAULT_MAX_RUNNING_PER_SCOPE: usize = 8;
 /// Env: global running cap (≥ 1).
 pub(crate) const MAX_RUNNING_GLOBAL_ENV: &str = "AGENTOS_INVOCATION_MAX_RUNNING_GLOBAL";
 /// Env: per-scope running cap (≥ 1).
-pub(crate) const MAX_RUNNING_PER_SCOPE_ENV: &str =
-    "AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE";
+pub(crate) const MAX_RUNNING_PER_SCOPE_ENV: &str = "AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE";
 
 /// Running-concurrency limits (distinct from `MAX_ACTIVE` non-terminal create cap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,10 +105,12 @@ impl FifoRunningSlots {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn limits(&self) -> InvocationRunningLimits {
         self.limits
     }
 
+    #[allow(dead_code)]
     pub(crate) fn global_running(&self) -> usize {
         self.global
     }
@@ -174,6 +175,7 @@ impl FifoScheduler {
         &self.notify
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn snapshot(&self) -> (usize, InvocationRunningLimits) {
         let slots = self.slots.lock().await;
         (slots.global_running(), slots.limits())
@@ -219,7 +221,8 @@ impl InputRefRegistry {
     }
 
     pub(crate) async fn resolve(&self, uri: &str) -> Result<Vec<u8>, String> {
-        let scheme = Self::scheme_of(uri).ok_or_else(|| "input_ref.uri missing scheme".to_string())?;
+        let scheme =
+            Self::scheme_of(uri).ok_or_else(|| "input_ref.uri missing scheme".to_string())?;
         let resolver = self
             .by_scheme
             .get(scheme)
@@ -320,7 +323,6 @@ pub(crate) fn deadline_already_due(raw: &str) -> bool {
         None => false,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

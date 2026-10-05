@@ -21,9 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::invocations::InvocationDispatcher;
 use super::invocations_enforcement::{
-    budget_is_exceeded, deadline_already_due, duration_until_deadline,
-    fetch_and_verify_input_ref, FifoScheduler, InputRefRegistry, RunningScope,
-    BUDGET_EXCEEDED_ERROR_CODE,
+    budget_is_exceeded, deadline_already_due, duration_until_deadline, fetch_and_verify_input_ref,
+    FifoScheduler, InputRefRegistry, RunningScope, BUDGET_EXCEEDED_ERROR_CODE,
 };
 use super::invocations_store::{
     scrub_secret_shaped_text, Invocation, InvocationErrorInfo, InvocationResult, InvocationState,
@@ -269,6 +268,7 @@ pub(crate) struct InvocationExecutionBridge {
 }
 
 impl InvocationExecutionBridge {
+    #[allow(dead_code)]
     pub(crate) fn new(
         store: Arc<InvocationStore>,
         cancellations: InvocationCancellationRegistry,
@@ -315,6 +315,7 @@ impl InvocationExecutionBridge {
     }
 
     /// Convenience constructor with the default scoped projection gate.
+    #[allow(dead_code)]
     pub(crate) fn with_default_gate(
         store: Arc<InvocationStore>,
         cancellations: InvocationCancellationRegistry,
@@ -332,10 +333,12 @@ impl InvocationExecutionBridge {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn scheduler(&self) -> Arc<FifoScheduler> {
         self.scheduler.clone()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn input_refs(&self) -> &InputRefRegistry {
         &self.input_refs
     }
@@ -801,7 +804,8 @@ async fn apply_terminal_event(
     let (summary, usage) = parse_terminal_payload(&event.payload);
     if event.event_type == "TASK_COMPLETED" {
         // Budget gate before VAL-016 succeeded write (#331).
-        if let (Some(budget), Some(usage_ref)) = (invocation.request.budget.as_ref(), usage.as_ref())
+        if let (Some(budget), Some(usage_ref)) =
+            (invocation.request.budget.as_ref(), usage.as_ref())
         {
             if budget_is_exceeded(budget, usage_ref) {
                 let _ = fail_running(

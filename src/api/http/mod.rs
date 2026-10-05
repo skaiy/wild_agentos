@@ -305,12 +305,8 @@ pub fn build_router(
                         core.clone(),
                         executor.clone(),
                         shutdown.clone(),
-                        std::sync::Arc::new(
-                            invocations_execution::ScopedProjectionGate,
-                        ),
-                        std::sync::Arc::new(
-                            invocations_enforcement::FifoScheduler::with_defaults(),
-                        ),
+                        std::sync::Arc::new(invocations_execution::ScopedProjectionGate),
+                        std::sync::Arc::new(invocations_enforcement::FifoScheduler::with_defaults()),
                         runtime.input_refs().clone(),
                     ),
                 );

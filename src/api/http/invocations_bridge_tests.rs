@@ -148,8 +148,8 @@ fn make_bridge_harness(mode: MockMode, gate: Arc<dyn ProjectionContextGate>) -> 
         InvocationsRuntime::new(Some(store.clone()), true),
     );
     let input_refs = InputRefRegistry::new();
-    let runtime = InvocationsRuntime::new(Some(store.clone()), true)
-        .with_input_refs(input_refs.clone());
+    let runtime =
+        InvocationsRuntime::new(Some(store.clone()), true).with_input_refs(input_refs.clone());
     let bridge = Arc::new(InvocationExecutionBridge::new_with_enforcement(
         store.clone(),
         runtime.cancellations().clone(),

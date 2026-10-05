@@ -1226,7 +1226,6 @@ impl InvocationStore {
         listed
     }
 
-
     /// Oldest `queued` invocation in a tenant/project scope (FIFO by
     /// `created_at`, then `id`). Used by the running-cap scheduler (#331).
     pub(crate) async fn oldest_queued_in_scope(
@@ -1248,6 +1247,7 @@ impl InvocationStore {
 
     /// Oldest `queued` invocation across all scopes (global FIFO assist when a
     /// global running slot frees and the releasing scope has nothing waiting).
+    #[allow(dead_code)]
     pub(crate) async fn oldest_queued_global(&self) -> Option<Invocation> {
         let records = self.records.read().await;
         records
