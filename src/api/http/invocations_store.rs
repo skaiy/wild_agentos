@@ -22,6 +22,27 @@
 //! [`MAX_STORED_INVOCATIONS`] records per process; creates beyond that are
 //! rejected with [`InvocationStoreError::StoreFull`] instead of degrading.
 //!
+//! # Retention
+//!
+//! Terminal records are kept for [`InvocationStoreConfig::retention`]
+//! (default [`DEFAULT_RETENTION_DAYS`] days, env
+//! [`RETENTION_DAYS_ENV`]), measured from `completed_at`. Expired terminal
+//! records are swept on [`InvocationStore::open`] (after restart recovery),
+//! opportunistically inside every create, and on demand through
+//! [`InvocationStore::sweep_expired`]. Non-terminal records are never swept.
+//! A sweep that removes nothing writes nothing, and a sweep that removes
+//! records persists with the same atomic replace as any other write. The
+//! [`MAX_STORED_INVOCATIONS`] cap counts the records left after the sweep.
+//!
+//! # Active limit
+//!
+//! A create is rejected with [`InvocationStoreError::TooManyActive`]
+//! (`429 too_many_active`, `Retry-After: 5`) when the tenant/project scope
+//! already has [`InvocationStoreConfig::max_active_per_scope`] non-terminal
+//! invocations (default [`DEFAULT_MAX_ACTIVE_PER_SCOPE`], env
+//! [`MAX_ACTIVE_ENV`]). The count and the insert happen under the same write
+//! lock, and nothing is persisted for a rejected create.
+//!
 //! # Recovery
 //!
 //! [`InvocationStore::open`] moves every non-terminal record (`queued`,
@@ -84,7 +105,57 @@ pub(crate) const DEADLINE_EXCEEDED_ERROR_CODE: &str = "deadline_exceeded";
 /// Actor recorded in audit events written by the store itself.
 pub(crate) const SYSTEM_ACTOR_ID: &str = "system";
 
+/// Default retention of terminal records, in days.
+pub(crate) const DEFAULT_RETENTION_DAYS: u64 = 7;
+/// Env override for the terminal-record retention, in whole days (≥ 1).
+pub(crate) const RETENTION_DAYS_ENV: &str = "AGENTOS_INVOCATION_RETENTION_DAYS";
+/// Default limit of non-terminal invocations per tenant/project scope.
+pub(crate) const DEFAULT_MAX_ACTIVE_PER_SCOPE: usize = 32;
+/// Env override for the per-scope active limit (≥ 1).
+pub(crate) const MAX_ACTIVE_ENV: &str = "AGENTOS_INVOCATION_MAX_ACTIVE";
+/// `Retry-After` seconds sent with `429 too_many_active`.
+pub(crate) const TOO_MANY_ACTIVE_RETRY_AFTER_SECS: u64 = 5;
+
 const STORE_FILE_NAME: &str = "invocations.json";
+
+/// Store limits. [`Self::from_env`] reads the documented env overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvocationStoreConfig {
+    /// How long a terminal record is kept after `completed_at`.
+    pub retention: chrono::Duration,
+    /// Maximum non-terminal invocations per tenant/project scope.
+    pub max_active_per_scope: usize,
+}
+
+impl Default for InvocationStoreConfig {
+    fn default() -> Self {
+        Self {
+            retention: chrono::Duration::days(DEFAULT_RETENTION_DAYS as i64),
+            max_active_per_scope: DEFAULT_MAX_ACTIVE_PER_SCOPE,
+        }
+    }
+}
+
+impl InvocationStoreConfig {
+    /// Defaults overridden by [`RETENTION_DAYS_ENV`] and [`MAX_ACTIVE_ENV`].
+    /// Missing, unparsable or zero values keep the default.
+    pub(crate) fn from_env() -> Self {
+        let positive = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .filter(|value| *value >= 1)
+        };
+        let mut config = Self::default();
+        if let Some(days) = positive(RETENTION_DAYS_ENV) {
+            config.retention = chrono::Duration::days(days.min(36_500) as i64);
+        }
+        if let Some(limit) = positive(MAX_ACTIVE_ENV) {
+            config.max_active_per_scope = usize::try_from(limit).unwrap_or(usize::MAX);
+        }
+        config
+    }
+}
 
 /// Lifecycle state of an invocation (epic #313 §3.5).
 ///
@@ -199,6 +270,36 @@ pub(crate) struct InvocationResult {
     pub summary: String,
     #[serde(default)]
     pub artifacts: Vec<Value>,
+    /// Metering for the run; the same numbers the server checks `budget`
+    /// against. Absent when the execution path reported nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<InvocationUsage>,
+}
+
+/// Generic usage of one invocation (`result.usage`). Every field is optional;
+/// `cost` is an integer in micro-USD (1 USD = 1_000_000).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub(crate) struct InvocationUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<InvocationToolCallUsage>>,
+}
+
+/// One tool call in [`InvocationUsage::tool_calls`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub(crate) struct InvocationToolCallUsage {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -321,6 +422,8 @@ pub(crate) enum InvocationStoreError {
     },
     /// The store already holds [`MAX_STORED_INVOCATIONS`] records.
     StoreFull,
+    /// The scope already has `max_active_per_scope` non-terminal records.
+    TooManyActive,
     /// Persisting the snapshot failed; memory and disk are unchanged.
     Persistence(String),
 }
@@ -336,6 +439,7 @@ impl std::fmt::Display for InvocationStoreError {
                 write!(f, "illegal transition {} -> {}", from.as_str(), to.as_str())
             }
             Self::StoreFull => write!(f, "invocation store is full"),
+            Self::TooManyActive => write!(f, "too many active invocations in scope"),
             Self::Persistence(error) => write!(f, "persist invocations: {error}"),
         }
     }
@@ -392,6 +496,21 @@ impl IntoResponse for InvocationStoreError {
                 })),
             )
                 .into_response(),
+            Self::TooManyActive => {
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": "too_many_active",
+                        "message": "too many active invocations; retry later",
+                    })),
+                )
+                    .into_response();
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from(TOO_MANY_ACTIVE_RETRY_AFTER_SECS),
+                );
+                response
+            }
             Self::Persistence(error) => {
                 // Keep file paths and OS detail out of the response body.
                 tracing::error!(error = %error, "persist invocations failed");
@@ -460,6 +579,7 @@ pub(crate) fn parse_if_match(headers: &HeaderMap) -> Result<Option<u64>, Invalid
 #[derive(Debug)]
 pub(crate) struct InvocationStore {
     path: PathBuf,
+    config: InvocationStoreConfig,
     records: RwLock<Vec<Invocation>>,
 }
 
@@ -468,6 +588,8 @@ pub(crate) struct InvocationStore {
 pub(crate) struct RecoveryReport {
     pub loaded: usize,
     pub interrupted: usize,
+    /// Expired terminal records removed by the startup sweep.
+    pub swept: usize,
 }
 
 impl InvocationStore {
@@ -476,16 +598,26 @@ impl InvocationStore {
         super::data_dir().join(STORE_FILE_NAME)
     }
 
-    /// Opens the store at [`Self::default_path`] and runs restart recovery.
+    /// Opens the store at [`Self::default_path`] with
+    /// [`InvocationStoreConfig::from_env`] and runs restart recovery.
     pub(crate) fn open_default() -> Result<(Self, RecoveryReport), InvocationStoreError> {
-        Self::open(Self::default_path())
+        Self::open_with_config(Self::default_path(), InvocationStoreConfig::from_env())
     }
 
-    /// Loads `path` (missing file = empty store) and marks every non-terminal
-    /// record as `failed/interrupted`. A corrupt file is an error rather than
-    /// an empty store, so a later write can never silently discard records.
+    /// [`Self::open_with_config`] with the default limits.
     pub(crate) fn open(
         path: impl Into<PathBuf>,
+    ) -> Result<(Self, RecoveryReport), InvocationStoreError> {
+        Self::open_with_config(path, InvocationStoreConfig::default())
+    }
+
+    /// Loads `path` (missing file = empty store), marks every non-terminal
+    /// record as `failed/interrupted`, then sweeps expired terminal records.
+    /// A corrupt file is an error rather than an empty store, so a later
+    /// write can never silently discard records.
+    pub(crate) fn open_with_config(
+        path: impl Into<PathBuf>,
+        config: InvocationStoreConfig,
     ) -> Result<(Self, RecoveryReport), InvocationStoreError> {
         let path = path.into();
         let mut records: Vec<Invocation> = match std::fs::read(&path) {
@@ -516,20 +648,51 @@ impl InvocationStore {
             });
             interrupted += 1;
         }
-        if interrupted > 0 {
+        let loaded = records.len();
+        let swept = sweep_expired_records(&mut records, config.retention, chrono::Utc::now());
+        if interrupted > 0 || swept > 0 {
             persist(&path, &records)?;
         }
         let report = RecoveryReport {
-            loaded: records.len(),
+            loaded,
             interrupted,
+            swept,
         };
         Ok((
             Self {
                 path,
+                config,
                 records: RwLock::new(records),
             },
             report,
         ))
+    }
+
+    pub(crate) fn config(&self) -> InvocationStoreConfig {
+        self.config
+    }
+
+    /// Removes terminal records whose `completed_at` is older than the
+    /// retention. Returns how many were removed; removing none writes
+    /// nothing. Non-terminal records are never removed.
+    pub(crate) async fn sweep_expired(&self) -> Result<usize, InvocationStoreError> {
+        self.sweep_expired_at(chrono::Utc::now()).await
+    }
+
+    /// [`Self::sweep_expired`] against an explicit clock (tests, schedulers).
+    pub(crate) async fn sweep_expired_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, InvocationStoreError> {
+        let mut records = self.records.write().await;
+        let mut next = records.clone();
+        let swept = sweep_expired_records(&mut next, self.config.retention, now);
+        if swept == 0 {
+            return Ok(0);
+        }
+        persist(&self.path, &next)?;
+        *records = next;
+        Ok(swept)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -537,13 +700,28 @@ impl InvocationStore {
     }
 
     /// Creates a `queued` invocation at revision 1 in the claims' scope.
+    ///
+    /// Under one write lock: sweeps expired terminal records (persisted with
+    /// the new record), rejects with [`InvocationStoreError::TooManyActive`]
+    /// when the scope is at its active limit and with
+    /// [`InvocationStoreError::StoreFull`] when the swept store is at
+    /// [`MAX_STORED_INVOCATIONS`]. A rejected create writes nothing.
     pub(crate) async fn create_for_claims(
         &self,
         claims: &IsolationClaims,
         new: NewInvocation,
     ) -> Result<Invocation, InvocationStoreError> {
         let mut records = self.records.write().await;
-        if records.len() >= MAX_STORED_INVOCATIONS {
+        let active_in_scope = records
+            .iter()
+            .filter(|record| !record.state.is_terminal() && record.is_in_scope(claims))
+            .count();
+        if active_in_scope >= self.config.max_active_per_scope {
+            return Err(InvocationStoreError::TooManyActive);
+        }
+        let mut next = records.clone();
+        sweep_expired_records(&mut next, self.config.retention, chrono::Utc::now());
+        if next.len() >= MAX_STORED_INVOCATIONS {
             return Err(InvocationStoreError::StoreFull);
         }
         let now = now_rfc3339();
@@ -573,7 +751,6 @@ impl InvocationStore {
             revision: 1,
             actor_id: claims.actor_id().to_string(),
         });
-        let mut next = records.clone();
         next.push(invocation.clone());
         persist(&self.path, &next)?;
         *records = next;
@@ -709,6 +886,33 @@ impl InvocationStore {
             changed: true,
         })
     }
+}
+
+/// Drops terminal records completed more than `retention` before `now`.
+/// A terminal record without a parsable `completed_at` falls back to
+/// `updated_at`; if neither parses it is kept.
+fn sweep_expired_records(
+    records: &mut Vec<Invocation>,
+    retention: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let cutoff = now - retention;
+    let before = records.len();
+    records.retain(|record| {
+        if !record.state.is_terminal() {
+            return true;
+        }
+        let at = record
+            .completed_at
+            .as_deref()
+            .unwrap_or(record.updated_at.as_str());
+        let finished = chrono::DateTime::parse_from_rfc3339(at).ok();
+        match finished {
+            Some(at) => at.with_timezone(&chrono::Utc) > cutoff,
+            None => true,
+        }
+    });
+    before - records.len()
 }
 
 fn now_rfc3339() -> String {

@@ -217,6 +217,7 @@ async fn invocations_lifecycle_revision_and_audit_track_each_write() {
                 result: Some(InvocationResult {
                     summary: "canary-result-summary".into(),
                     artifacts: vec![],
+                    usage: None,
                 }),
                 error: None,
             },
@@ -645,7 +646,8 @@ async fn invocations_lifecycle_restart_marks_unfinished_interrupted() {
         report,
         RecoveryReport {
             loaded: 6,
-            interrupted: 3
+            interrupted: 3,
+            swept: 0,
         }
     );
     for old in &before {
@@ -690,7 +692,8 @@ async fn invocations_lifecycle_restart_marks_unfinished_interrupted() {
         report,
         RecoveryReport {
             loaded: 6,
-            interrupted: 0
+            interrupted: 0,
+            swept: 0,
         }
     );
 }
@@ -756,6 +759,7 @@ async fn invocations_lifecycle_outcome_after_cancel_requested_is_recorded() {
                 result: Some(InvocationResult {
                     summary: "finished-before-cancel".into(),
                     artifacts: vec![],
+                    usage: None,
                 }),
                 error: None,
             },
@@ -855,6 +859,7 @@ async fn invocations_lifecycle_same_state_repeat_is_idempotent_success() {
                 result: Some(InvocationResult {
                     summary: "first-delivery".into(),
                     artifacts: vec![],
+                    usage: None,
                 }),
                 error: None,
             },
@@ -872,6 +877,7 @@ async fn invocations_lifecycle_same_state_repeat_is_idempotent_success() {
                 result: Some(InvocationResult {
                     summary: "second-delivery".into(),
                     artifacts: vec![],
+                    usage: None,
                 }),
                 error: None,
             },
@@ -1001,4 +1007,227 @@ async fn invocations_lifecycle_store_queued_to_failed_requires_deadline_reason()
         expired.audit_events.last().map(|e| (e.from, e.to)),
         Some((Some(Queued), Failed))
     );
+}
+
+// --- Retention sweep, active limit and usage (#313 decisions) ---
+
+fn open_store_with(dir: &tempfile::TempDir, config: InvocationStoreConfig) -> InvocationStore {
+    InvocationStore::open_with_config(dir.path().join("invocations.json"), config)
+        .unwrap()
+        .0
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_sweep_removes_expired_terminal_keeps_non_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    let mut terminal = Vec::new();
+    for state in [
+        InvocationState::Succeeded,
+        InvocationState::Failed,
+        InvocationState::Cancelled,
+    ] {
+        terminal.push(invocation_in(&store, &claims, state).await);
+    }
+    let mut live = Vec::new();
+    for state in [
+        InvocationState::Queued,
+        InvocationState::Running,
+        InvocationState::CancelRequested,
+    ] {
+        live.push(invocation_in(&store, &claims, state).await);
+    }
+
+    // Inside the retention window nothing is swept and nothing is written.
+    let before_disk = std::fs::read(store.path()).unwrap();
+    assert_eq!(store.sweep_expired().await.unwrap(), 0);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_disk);
+
+    let later = chrono::Utc::now()
+        + chrono::Duration::days(DEFAULT_RETENTION_DAYS as i64)
+        + chrono::Duration::minutes(1);
+    assert_eq!(store.sweep_expired_at(later).await.unwrap(), 3);
+    for gone in &terminal {
+        assert_eq!(
+            store.get_for_claims(&claims, &gone.id).await.unwrap_err(),
+            InvocationStoreError::NotFound
+        );
+    }
+    let kept: BTreeSet<String> = live.iter().map(|r| r.id.clone()).collect();
+    let listed: BTreeSet<String> = store
+        .list_for_claims(&claims, None)
+        .await
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(listed, kept, "non-terminal records are never swept");
+
+    // Persisted atomically: disk matches memory and no temporary file is left.
+    let on_disk: BTreeSet<String> = disk_records(&store).into_iter().map(|r| r.id).collect();
+    assert_eq!(on_disk, kept);
+    assert!(!store.path().with_extension("json.tmp").exists());
+
+    // Re-sweeping is idempotent: nothing removed, file untouched.
+    let swept_disk = std::fs::read(store.path()).unwrap();
+    assert_eq!(store.sweep_expired_at(later).await.unwrap(), 0);
+    assert_eq!(std::fs::read(store.path()).unwrap(), swept_disk);
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_sweep_runs_on_open_and_on_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let claims = alice();
+    let (done, queued) = {
+        let store = open_store(&dir);
+        (
+            invocation_in(&store, &claims, InvocationState::Succeeded).await,
+            invocation_in(&store, &claims, InvocationState::Queued).await,
+        )
+    };
+    let zero = InvocationStoreConfig {
+        retention: chrono::Duration::zero(),
+        ..InvocationStoreConfig::default()
+    };
+    // Startup: recovery first (queued -> failed/interrupted, completed now),
+    // then the sweep removes the already-expired terminal record.
+    let (store, report) =
+        InvocationStore::open_with_config(dir.path().join("invocations.json"), zero).unwrap();
+    assert_eq!(report.loaded, 2);
+    assert_eq!(report.interrupted, 1);
+    assert!(report.swept >= 1);
+    assert_eq!(
+        store.get_for_claims(&claims, &done.id).await.unwrap_err(),
+        InvocationStoreError::NotFound
+    );
+    assert!(!disk_records(&store).iter().any(|r| r.id == done.id));
+    let _ = queued;
+
+    // Create sweeps opportunistically and persists the sweep with the insert.
+    let finished = invocation_in(&store, &claims, InvocationState::Cancelled).await;
+    let fresh = store
+        .create_for_claims(&claims, new_invocation())
+        .await
+        .unwrap();
+    let ids: Vec<String> = disk_records(&store).into_iter().map(|r| r.id).collect();
+    assert!(ids.contains(&fresh.id));
+    assert!(
+        !ids.contains(&finished.id),
+        "expired terminal swept on create"
+    );
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_active_limit_is_429_and_persists_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store_with(
+        &dir,
+        InvocationStoreConfig {
+            max_active_per_scope: 2,
+            ..InvocationStoreConfig::default()
+        },
+    );
+    let claims = alice();
+    let first = store
+        .create_for_claims(&claims, new_invocation())
+        .await
+        .unwrap();
+    store
+        .create_for_claims(&claims, new_invocation())
+        .await
+        .unwrap();
+    let before_disk = std::fs::read(store.path()).unwrap();
+    let error = store
+        .create_for_claims(&claims, new_invocation())
+        .await
+        .unwrap_err();
+    assert_eq!(error, InvocationStoreError::TooManyActive);
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_disk);
+    assert_eq!(store.list_for_claims(&claims, None).await.len(), 2);
+
+    let response = error.into_response();
+    assert_eq!(
+        response.headers().get(header::RETRY_AFTER).unwrap(),
+        &TOO_MANY_ACTIVE_RETRY_AFTER_SECS.to_string()
+    );
+    let (status, body) = body_bytes(response).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "too_many_active");
+
+    // The limit is per tenant/project scope.
+    store
+        .create_for_claims(
+            &IsolationClaims::from_verified("tenant-a", "project-b", "alice").unwrap(),
+            new_invocation(),
+        )
+        .await
+        .unwrap();
+    // Terminal records do not count.
+    store
+        .transition_for_claims(
+            &claims,
+            &first.id,
+            None,
+            InvocationState::Cancelled,
+            TransitionPatch::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .create_for_claims(&claims, new_invocation())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    let running = invocation_in(&store, &claims, InvocationState::Running).await;
+    let usage = InvocationUsage {
+        provider: Some("provider-x".into()),
+        model: Some("model-y".into()),
+        input_tokens: Some(1200),
+        output_tokens: Some(345),
+        cost: Some(2_500_000),
+        tool_calls: Some(vec![InvocationToolCallUsage {
+            name: "search".into(),
+            transport: Some("mcp".into()),
+        }]),
+    };
+    let done = store
+        .transition_for_claims(
+            &claims,
+            &running.id,
+            None,
+            InvocationState::Succeeded,
+            TransitionPatch {
+                result: Some(InvocationResult {
+                    summary: "ok".into(),
+                    artifacts: vec![],
+                    usage: Some(usage.clone()),
+                }),
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.result.as_ref().unwrap().usage.as_ref(), Some(&usage));
+    let reloaded = disk_records(&store)
+        .into_iter()
+        .find(|r| r.id == done.id)
+        .unwrap();
+    assert_eq!(reloaded.result.unwrap().usage, Some(usage));
+
+    // Absent usage members are omitted, not serialized as null.
+    let sparse = serde_json::to_value(InvocationUsage {
+        cost: Some(7),
+        ..InvocationUsage::default()
+    })
+    .unwrap();
+    assert_eq!(sparse, json!({"cost": 7}));
+    let no_usage = serde_json::to_value(InvocationResult::default()).unwrap();
+    assert!(no_usage.get("usage").is_none());
 }
