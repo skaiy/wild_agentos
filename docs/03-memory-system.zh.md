@@ -371,6 +371,10 @@ SELECT ?agent ?task ?operation WHERE {
 
 L3 是按需投影引擎，根据 Agent 角色和 Token 预算生成定制化的上下文视图。
 
+**投影作用域（必填）。** `ProjectionEngine::project(task_iri, frame, params, claims)` 需要调用方已验证的隔离 claims。作用域取自 task 节点上已落盘的 `tenant_id` / `project_id`，且必须与 claims 一致；task 没有落盘作用域、或调用方没有 claims，一律拒绝（不回退默认租户，也不回退全图）。SPARQL frame 以 RDF term 方式绑定 `?scope_task`、`?scope_tenant`、`?scope_project`，只匹配该 task 本身或其 IRI 之下、且落盘 tenant 与 project 都等于该作用域的节点。`$target_path` 等模板参数以转义后的字面量代入，缺参数直接报错。带作用域的结果按 tenant + project + frame + task 缓存。
+
+**全库投影仅平台管理员可用。** `project_platform_wide` 不做作用域绑定，只有 HTTP 投影入口在平台管理员校验通过后才会调用，结果永不缓存。模板里没有作用域绑定的 SPARQL frame（workspace 系列）只能全库使用。
+
 ```rust
 pub struct ProjectionEngine {
     blackboard: Arc<Blackboard>,

@@ -8,6 +8,7 @@ use wild_agent_os_core::core::agent_instance::AgentRole;
 use wild_agent_os_core::core::event_bus::EventBus;
 use wild_agent_os_core::core::sa::{SupervisorAgent, TaskComplexity};
 use wild_agent_os_core::gateway::UnifiedGateway;
+use wild_agent_os_core::isolation::IsolationClaims;
 use wild_agent_os_core::memory::l0_store::L0Store;
 use wild_agent_os_core::memory::l1_session::L1Session;
 use wild_agent_os_core::memory::l2_blackboard::Blackboard;
@@ -184,11 +185,27 @@ fn test_memory_full_pipeline() {
         "SPARQL should return results after write_node"
     );
 
+    let claims =
+        IsolationClaims::from_verified("test-tenant", "test-project", "test-actor").unwrap();
+    infra
+        .l2
+        .write_node(
+            "iri://task/test_mem",
+            r#"{"@id":"iri://task/test_mem","@type":"Task","tenant_id":"test-tenant","project_id":"test-project"}"#,
+            &config,
+        )
+        .unwrap();
+
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let projection = infra
             .proj
-            .project("iri://task/test_mem", "reference_only", HashMap::new())
+            .project(
+                "iri://task/test_mem",
+                "reference_only",
+                HashMap::new(),
+                &claims,
+            )
             .await
             .unwrap();
         assert!(projection.contains("task_iri"));
