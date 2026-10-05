@@ -394,12 +394,8 @@ impl AgentOSService {
     /// 外部 LLM 网关字段与 GatewaySettings 对齐，供前端 Settings 页展示与对照。
     fn build_config_info(&self) -> serde_json::Value {
         let g = &self.settings.gateway;
-        // api_key_configured: 优先取 settings 中的 key（来自 config.yaml / config_override.json），
-        // 若为空则检查环境变量（AGENT_OS_GATEWAY_API_KEY）作为兜底，确保 ConfigMap/Secret 注入方式也能正确展示。
-        let api_key_configured = !g.api_key.is_empty()
-            || std::env::var("AGENT_OS_GATEWAY_API_KEY")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
+        // Settings already contains the effective file and environment value.
+        let api_key_configured = !g.api_key.is_empty();
         // Embedding（向量化）：脱敏 oneapi.api_key；active_dimension 为当前生效维度（供前端提示重建）。
         let e = &self.settings.embedding;
         let active_dimension = if !e.enabled {
