@@ -74,10 +74,6 @@
 //! else (weak tags, lists, unquoted or non-numeric values) is
 //! [`InvalidIfMatch`], which the routes map to `400 invalid_if_match`.
 
-// The store is consumed by the routes and execution bridge that land in
-// follow-up sub-issues of #313; until then only the unit tests exercise it.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use axum::{
@@ -254,15 +250,45 @@ impl InvocationState {
 }
 
 /// Caller-supplied create fields, echoed back unchanged as `request`.
-/// The remaining create fields (`agent_revision`, `input`, `input_ref`,
-/// `budget`, `deadline`) are added with the create route (#314).
+/// The create route (#314) validates every field before it reaches the store.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub(crate) struct InvocationRequest {
-    pub prompt: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
+    pub agent_revision: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+    #[serde(default)]
+    pub input_ref: Option<InvocationInputRef>,
+    #[serde(default)]
+    pub budget: Option<InvocationBudget>,
+    /// RFC 3339 string exactly as sent by the caller.
+    #[serde(default)]
+    pub deadline: Option<String>,
+    #[serde(default)]
     pub metadata: Map<String, Value>,
+}
+
+/// Immutable input reference (`request.input_ref`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct InvocationInputRef {
+    pub uri: String,
+    pub sha256: String,
+}
+
+/// Optional execution limits (`request.budget`). Absent members are not
+/// echoed, so the object round-trips unchanged. `max_cost` is micro-USD.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub(crate) struct InvocationBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -605,6 +631,9 @@ impl InvocationStore {
     }
 
     /// [`Self::open_with_config`] with the default limits.
+    // Used by tests now; the execution bridge (#317) and scheduled
+    // sweeps consume it in production.
+    #[allow(dead_code)]
     pub(crate) fn open(
         path: impl Into<PathBuf>,
     ) -> Result<(Self, RecoveryReport), InvocationStoreError> {
@@ -668,6 +697,9 @@ impl InvocationStore {
         ))
     }
 
+    // Used by tests now; the execution bridge (#317) and scheduled
+    // sweeps consume it in production.
+    #[allow(dead_code)]
     pub(crate) fn config(&self) -> InvocationStoreConfig {
         self.config
     }
@@ -675,11 +707,17 @@ impl InvocationStore {
     /// Removes terminal records whose `completed_at` is older than the
     /// retention. Returns how many were removed; removing none writes
     /// nothing. Non-terminal records are never removed.
+    // Used by tests now; the execution bridge (#317) and scheduled
+    // sweeps consume it in production.
+    #[allow(dead_code)]
     pub(crate) async fn sweep_expired(&self) -> Result<usize, InvocationStoreError> {
         self.sweep_expired_at(chrono::Utc::now()).await
     }
 
     /// [`Self::sweep_expired`] against an explicit clock (tests, schedulers).
+    // Used by tests now; the execution bridge (#317) and scheduled
+    // sweeps consume it in production.
+    #[allow(dead_code)]
     pub(crate) async fn sweep_expired_at(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -695,6 +733,9 @@ impl InvocationStore {
         Ok(swept)
     }
 
+    // Used by tests now; the execution bridge (#317) and scheduled
+    // sweeps consume it in production.
+    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -792,6 +833,9 @@ impl InvocationStore {
 
     /// Lifecycle write that discards the `changed` flag; see
     /// [`Self::transition_outcome_for_claims`].
+    // Used by tests now; the execution bridge (#317) and scheduled
+    // sweeps consume it in production.
+    #[allow(dead_code)]
     pub(crate) async fn transition_for_claims(
         &self,
         claims: &IsolationClaims,
