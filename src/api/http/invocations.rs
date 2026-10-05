@@ -44,8 +44,8 @@ use super::iam::UserIdentity;
 use super::invocations_store::{
     invocation_not_found_response, parse_if_match, CreateOutcome, IdempotencyLookup,
     IdempotencyRegistration, Invocation, InvocationBudget, InvocationConfigError,
-    InvocationInputRef, InvocationRequest, InvocationState, InvocationStore,
-    InvocationStoreConfig, InvocationStoreError, NewInvocation, TransitionPatch,
+    InvocationInputRef, InvocationRequest, InvocationState, InvocationStore, InvocationStoreConfig,
+    InvocationStoreError, NewInvocation, TransitionPatch,
 };
 use super::AppState;
 use crate::isolation::{IsolationClaims, IsolationScopeProvenance};
@@ -121,7 +121,7 @@ impl InvocationsRuntime {
 
     /// Same runtime with `dispatcher` receiving new invocations.
     // Used by tests now; the execution bridge (#317) installs one in production.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn with_dispatcher(mut self, dispatcher: Arc<dyn InvocationDispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
         self
@@ -649,7 +649,10 @@ pub(crate) async fn create_invocation_handler(
         _reservation = match store.reserve_idempotency_key(claims, key) {
             Ok(reservation) => Some(reservation),
             Err(error) => {
-                tracing::debug!(idempotency_key = key_for_log(key), "idempotency in progress");
+                tracing::debug!(
+                    idempotency_key = key_for_log(key),
+                    "idempotency in progress"
+                );
                 return error.into_response();
             }
         };

@@ -961,7 +961,7 @@ impl InvocationStore {
     /// reported as `IdempotencyKeyConflict` even for the same fingerprint;
     /// callers that want replays use [`Self::create_idempotent_for_claims`].
     // Used by tests now; the execution bridge (#317) creates without a key.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) async fn create_for_claims(
         &self,
         claims: &IsolationClaims,

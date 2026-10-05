@@ -261,7 +261,11 @@ async fn idempotent_replay_survives_a_deadline_that_has_since_passed() {
     assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.json());
     tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     let without_key = post(&h.router, &alice(), None, &body).await;
-    assert_eq!(without_key.status, StatusCode::BAD_REQUEST, "deadline passed");
+    assert_eq!(
+        without_key.status,
+        StatusCode::BAD_REQUEST,
+        "deadline passed"
+    );
     let replay = post(&h.router, &alice(), Some(KEY), &body).await;
     assert_eq!(replay.status, StatusCode::OK);
     assert_eq!(replay.json()["id"], first.json()["id"]);
@@ -326,7 +330,12 @@ async fn idempotency_conflict_on_any_changed_field_is_409_without_echo() {
     ];
     for (name, body) in variants {
         let reply = post(&h.router, &alice(), Some(KEY), &body.to_string()).await;
-        assert_eq!(reply.status, StatusCode::CONFLICT, "{name}: {}", reply.json());
+        assert_eq!(
+            reply.status,
+            StatusCode::CONFLICT,
+            "{name}: {}",
+            reply.json()
+        );
         assert_eq!(reply.code(), "idempotency_key_conflict", "{name}");
         let text = String::from_utf8(reply.bytes.to_vec()).unwrap();
         for canary in forbidden {
@@ -350,7 +359,12 @@ async fn idempotency_key_syntax_is_1_to_255_visible_ascii() {
     let max = "~".repeat(255);
     for key in ["run-1:create", max.as_str(), "!", "a/b?c=d#e"] {
         let reply = post(&h.router, &alice(), Some(key), &body).await;
-        assert_eq!(reply.status, StatusCode::ACCEPTED, "{key}: {}", reply.json());
+        assert_eq!(
+            reply.status,
+            StatusCode::ACCEPTED,
+            "{key}: {}",
+            reply.json()
+        );
     }
     let created = h.disk().len();
     let too_long = "k".repeat(256);
@@ -480,7 +494,12 @@ async fn idempotency_scope_isolates_tenants_and_actors() {
         ("alice other tenant", &alice_t2),
     ] {
         let reply = post(&h.router, auth, Some(KEY), &body).await;
-        assert_eq!(reply.status, StatusCode::ACCEPTED, "{who}: {}", reply.json());
+        assert_eq!(
+            reply.status,
+            StatusCode::ACCEPTED,
+            "{who}: {}",
+            reply.json()
+        );
         assert!(reply.headers.get("idempotent-replayed").is_none(), "{who}");
         ids.push(reply.json()["id"].clone());
     }
@@ -785,7 +804,10 @@ async fn idempotency_record_and_resource_are_one_write() {
     assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.json());
     let disk = h.disk();
     assert_eq!(disk.len(), 1);
-    assert!(disk[0].get("idempotency").is_some(), "binding written with the record");
+    assert!(
+        disk[0].get("idempotency").is_some(),
+        "binding written with the record"
+    );
 
     // A retry replays instead of creating a duplicate.
     let retry = post(&h.router, &alice(), Some(KEY), &body).await;
@@ -850,7 +872,10 @@ fn idempotency_fingerprint_is_canonical_and_covers_every_field() {
     assert_eq!(request_fingerprint(spaced.as_bytes()).unwrap(), reference);
     let changes: Vec<(&str, Value)> = vec![
         ("agent_revision", json!("r2")),
-        ("input_ref", json!({"uri": "s3://b/k", "sha256": "b".repeat(64)})),
+        (
+            "input_ref",
+            json!({"uri": "s3://b/k", "sha256": "b".repeat(64)}),
+        ),
         ("budget", json!({"max_tokens": 11, "max_cost": 5})),
         ("deadline", json!("2999-01-01T00:00:01Z")),
         ("metadata", json!({"z": 2, "a": [1, {"y": 2, "x": 3}]})),
@@ -927,7 +952,10 @@ fn idempotency_ttl_above_retention_refuses_startup() {
     let _env = EnvGuard::set(&[
         (RETENTION_DAYS_ENV, "7".into()),
         (IDEMPOTENCY_TTL_ENV, "169".into()),
-        ("AGENTOS_DATA_DIR", dir.path().to_string_lossy().into_owned()),
+        (
+            "AGENTOS_DATA_DIR",
+            dir.path().to_string_lossy().into_owned(),
+        ),
     ]);
     let _ = InvocationsRuntime::open_default();
 }
@@ -939,7 +967,10 @@ fn idempotency_ttl_equal_to_retention_starts() {
     let _env = EnvGuard::set(&[
         (RETENTION_DAYS_ENV, "7".into()),
         (IDEMPOTENCY_TTL_ENV, "168".into()),
-        ("AGENTOS_DATA_DIR", dir.path().to_string_lossy().into_owned()),
+        (
+            "AGENTOS_DATA_DIR",
+            dir.path().to_string_lossy().into_owned(),
+        ),
     ]);
     // Must not panic: open_default validates TTL ≤ retention × 24.
     let _ = InvocationsRuntime::open_default();
