@@ -8,6 +8,21 @@
 //!
 //! The usage helpers are unit-tested here and will be called from the executor
 //! completion path in a follow-up commit; allow dead_code until that wires them.
+//!
+//! # Isolation / projection context (H4 / #317 acceptance)
+//!
+//! When the real `TaskExecutor` bridge lands, an invocation-driven run MUST
+//! receive a non-empty in-scope projection context. If isolation claims are
+//! missing on the execution path, or projection returns empty because claims
+//! were dropped, the task MUST fail closed (terminal `failed` with an explicit
+//! resource mark such as `error.code = "projection_context_missing"`) — it
+//! MUST NOT warn-and-succeed with empty context. Legacy agent_runner / SA /
+//! scheduler paths that only `warn!` on missing claims are out of scope for
+//! the invocations bridge; do not copy that behaviour here.
+//!
+//! TODO(#317): fail-closed when invocation execution cannot obtain in-scope
+//! projection context; add a positive acceptance test that a task run via
+//! invocation sees non-empty scoped projection output.
 #![allow(dead_code)]
 
 use std::sync::Arc;
