@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = settings.validate() {
         eprintln!("Configuration error: {}", e);
-        eprintln!("Please set AGENT_OS_GATEWAY_API_KEY or configure config.yaml");
+        eprintln!("Check your configuration (config.yaml or the mapped AGENT_OS_* variables)");
         std::process::exit(1);
     }
 

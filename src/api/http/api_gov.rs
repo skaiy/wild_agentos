@@ -264,8 +264,9 @@ pub fn hash_key(plaintext: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// 生成一把新 key，返回 (明文, key_prefix, key_hash)。明文仅此一次可得。
-pub fn generate_key(tenant: &str) -> (String, String, String) {
+/// Slug that `generate_key` embeds in a tenant's key prefixes. Lossy (case
+/// folding, non-alphanumerics → `-`), so distinct tenants can share a slug.
+fn tenant_key_slug(tenant: &str) -> String {
     let slug: String = tenant
         .chars()
         .map(|c| {
@@ -277,14 +278,22 @@ pub fn generate_key(tenant: &str) -> (String, String, String) {
         })
         .collect();
     let slug = slug.trim_matches('-');
-    let slug = if slug.is_empty() { "t" } else { slug };
+    if slug.is_empty() { "t" } else { slug }.to_string()
+}
+
+/// Number of secret characters `generate_key` copies into `key_prefix`.
+const KEY_PREFIX_SECRET_CHARS: usize = 6;
+
+/// 生成一把新 key，返回 (明文, key_prefix, key_hash)。明文仅此一次可得。
+pub fn generate_key(tenant: &str) -> (String, String, String) {
+    let slug = tenant_key_slug(tenant);
     let secret = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
     let plaintext = format!("sk-{slug}-{secret}");
-    let prefix = format!("sk-{slug}-{}", &secret[..6]);
+    let prefix = format!("sk-{slug}-{}", &secret[..KEY_PREFIX_SECRET_CHARS]);
     let hash = hash_key(&plaintext);
     (plaintext, prefix, hash)
 }
@@ -378,33 +387,15 @@ pub fn resolve_bearer_token(
     })
 }
 
-/// Slug that `generate_key` embeds in a tenant's key prefixes.
-fn tenant_key_slug(tenant: &str) -> String {
-    let slug: String = tenant
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "t".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
 /// Whether `key.key_prefix` has the exact shape `generate_key` writes for
 /// `tenant` (`sk-<slug>-<6 chars>`). Slugs are lossy (case folding,
 /// punctuation → `-`), so a match is not final proof of ownership; see
 /// [`tenant_may_manage_key`] for the fail-closed use.
 pub(crate) fn key_prefix_matches_tenant(key: &ApiKey, tenant: &str) -> bool {
+    // Match the whole prefix, not just its start: slugs may contain `-`, so
+    // `sk-a-` alone would also claim a key issued for tenant slug `a-b`.
     let head = format!("sk-{}-", tenant_key_slug(tenant));
-    key.key_prefix.len() == head.len() + 6
+    key.key_prefix.len() == head.len() + KEY_PREFIX_SECRET_CHARS
         && key.key_prefix.starts_with(&head)
         && !key.key_prefix[head.len()..].contains('-')
 }
@@ -416,10 +407,10 @@ fn key_has_generated_tenant_prefix(key: &ApiKey) -> bool {
     let Some(rest) = key.key_prefix.strip_prefix("sk-") else {
         return false;
     };
-    if rest.len() < 8 || !rest.is_ascii() {
+    if rest.len() < KEY_PREFIX_SECRET_CHARS + 2 || !rest.is_ascii() {
         return false;
     }
-    let (slug, tail) = rest.split_at(rest.len() - 7);
+    let (slug, tail) = rest.split_at(rest.len() - (KEY_PREFIX_SECRET_CHARS + 1));
     let Some(hex) = tail.strip_prefix('-') else {
         return false;
     };
