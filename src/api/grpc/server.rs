@@ -366,7 +366,6 @@ impl AgentOSService {
                 gateway: self.gateway.clone(),
                 skills: self.skills.clone(),
                 blackboard: self.blackboard.clone(),
-                l0: self.l0.clone(),
                 l0_root: std::path::PathBuf::from(&self.settings.memory.l0.path),
                 memory_manager: self.memory_manager.clone(),
                 templates: self.templates.clone(),
@@ -395,12 +394,8 @@ impl AgentOSService {
     /// 外部 LLM 网关字段与 GatewaySettings 对齐，供前端 Settings 页展示与对照。
     fn build_config_info(&self) -> serde_json::Value {
         let g = &self.settings.gateway;
-        // api_key_configured: 优先取 settings 中的 key（来自 config.yaml / config_override.json），
-        // 若为空则检查环境变量（AGENT_OS_GATEWAY_API_KEY）作为兜底，确保 ConfigMap/Secret 注入方式也能正确展示。
-        let api_key_configured = !g.api_key.is_empty()
-            || std::env::var("AGENT_OS_GATEWAY_API_KEY")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
+        // Settings already contains the effective file and environment value.
+        let api_key_configured = !g.api_key.is_empty();
         // Embedding（向量化）：脱敏 oneapi.api_key；active_dimension 为当前生效维度（供前端提示重建）。
         let e = &self.settings.embedding;
         let active_dimension = if !e.enabled {
@@ -751,9 +746,6 @@ pub struct HttpTaskExecutor {
     gateway: Arc<UnifiedGateway>,
     skills: Arc<SkillRegistry>,
     blackboard: Arc<Blackboard>,
-    /// Compatibility L0 opened during startup. It is read-only and is used
-    /// only when a request has no verified JWT claims.
-    l0: Arc<L0Store>,
     /// Root under which `open_for_claims` mints a tenant directory on demand.
     l0_root: std::path::PathBuf,
     memory_manager: Arc<tokio::sync::Mutex<MemoryManager>>,
@@ -769,32 +761,29 @@ pub struct HttpTaskExecutor {
 #[async_trait::async_trait]
 impl crate::api::http::TaskExecutor for HttpTaskExecutor {
     async fn execute(&self, spec: crate::api::http::TaskExecSpec) {
-        let l0 = match spec.isolation_claims.as_ref() {
-            Some(claims) => match L0Store::open_for_claims(&self.l0_root, claims) {
-                Ok(l0) => Arc::new(l0),
-                Err(error) => {
-                    let emitter = ExecutionEventEmitter::with_options(
+        let l0 = match L0Store::open_for_claims(&self.l0_root, &spec.isolation_claims) {
+            Ok(l0) => Arc::new(l0),
+            Err(error) => {
+                let emitter = ExecutionEventEmitter::with_options(
+                    &spec.task_iri,
+                    None,
+                    Some(self.event_bus.clone()),
+                    spec.include_thought,
+                    spec.include_tool_calls,
+                );
+                emitter.emit_error("L0InitializationError", &error.to_string(), "L0", false);
+                emitter.emit_completion("failed", &error.to_string(), None);
+                self.event_bus
+                    .emit(
                         &spec.task_iri,
-                        None,
-                        Some(self.event_bus.clone()),
-                        spec.include_thought,
-                        spec.include_tool_calls,
-                    );
-                    emitter.emit_error("L0InitializationError", &error.to_string(), "L0", false);
-                    emitter.emit_completion("failed", &error.to_string(), None);
-                    self.event_bus
-                        .emit(
-                            &spec.task_iri,
-                            "TASK_FAILED",
-                            "SA",
-                            &serde_json::json!({"status": "failed", "summary": error.to_string()})
-                                .to_string(),
-                        )
-                        .await;
-                    return;
-                }
-            },
-            None => self.l0.clone(),
+                        "TASK_FAILED",
+                        "SA",
+                        &serde_json::json!({"status": "failed", "summary": error.to_string()})
+                            .to_string(),
+                    )
+                    .await;
+                return;
+            }
         };
         let mut sa = build_supervisor_agent(
             self.gateway.clone(),
@@ -810,9 +799,7 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             self.vector_store.clone(),
             &self.settings,
         );
-        if let Some(claims) = spec.isolation_claims.clone() {
-            sa = sa.with_isolation_claims(claims);
-        }
+        sa = sa.with_isolation_claims(spec.isolation_claims.clone());
 
         let emitter = ExecutionEventEmitter::with_options(
             &spec.task_iri,
@@ -830,7 +817,7 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                 .ok();
         let remote_task_id = match &a2a_client {
             Some(client) if self.settings.a2a.outbound.enabled => match client
-                .send_task_request(&spec.task_iri, &spec.prompt, spec.isolation_claims.as_ref())
+                .send_task_request(&spec.task_iri, &spec.prompt, Some(&spec.isolation_claims))
                 .await
             {
                 Ok(remote_task_id) => remote_task_id,
@@ -881,7 +868,7 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                                 &result.status,
                                 &result.summary,
                                 result.output.as_ref(),
-                                spec.isolation_claims.as_ref(),
+                                Some(&spec.isolation_claims),
                             )
                             .await
                             .is_err()

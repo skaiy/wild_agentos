@@ -23,6 +23,83 @@ use crate::tools::skill_registry::SkillRegistry;
 use crate::tools::tool_groups::{ActivatedTools, ToolGroupManager};
 use crate::tools::workspace_monitor::{FileState, WorkspaceMonitor};
 
+/// Executor-owned gate that refused a tool call.
+///
+/// This is the only trusted source of "which policy denied this call". It is
+/// carried next to the tool output in [`ToolOutcome`], never parsed back out
+/// of the output itself: a handler (plugin, skill, MCP bridge) can return any
+/// JSON, including a forged `denied_by` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyGate {
+    PermissionPolicy,
+    PreToolHook,
+    SyscallGate,
+    AdvertisedGate,
+    SecurityEngine,
+    RolePolicy,
+}
+
+impl PolicyGate {
+    pub const ALL: [PolicyGate; 6] = [
+        PolicyGate::PermissionPolicy,
+        PolicyGate::PreToolHook,
+        PolicyGate::SyscallGate,
+        PolicyGate::AdvertisedGate,
+        PolicyGate::SecurityEngine,
+        PolicyGate::RolePolicy,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyGate::PermissionPolicy => "permission_policy",
+            PolicyGate::PreToolHook => "pre_tool_hook",
+            PolicyGate::SyscallGate => "syscall_gate",
+            PolicyGate::AdvertisedGate => "advertised_gate",
+            PolicyGate::SecurityEngine => "security_engine",
+            PolicyGate::RolePolicy => "role_policy",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|gate| gate.as_str() == value)
+    }
+}
+
+/// Result of a gated tool call: the model-facing value plus, when an
+/// executor gate refused the call, which gate did it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutcome {
+    pub value: Value,
+    pub policy_denied_by: Option<PolicyGate>,
+}
+
+impl ToolOutcome {
+    fn allowed(value: Value) -> Self {
+        Self {
+            value,
+            policy_denied_by: None,
+        }
+    }
+
+    fn denied(gate: PolicyGate, mut value: Value) -> Self {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("denied_by".to_string(), json!(gate.as_str()));
+        }
+        Self {
+            value,
+            policy_denied_by: Some(gate),
+        }
+    }
+}
+
+/// Removes a top-level `denied_by` from tool-produced output so a handler can
+/// neither impersonate an executor gate to hooks nor to the model.
+fn strip_denied_by(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("denied_by");
+    }
+}
+
 mod builtins;
 pub(crate) mod tool_description_lint;
 
@@ -1387,18 +1464,36 @@ impl ToolExecutor {
         input: Value,
         claims: Option<IsolationClaims>,
     ) -> Result<Value, ToolExecutionError> {
+        self.execute_outcome_with_claims(name, input, claims)
+            .await
+            .map(|outcome| outcome.value)
+    }
+
+    async fn execute_outcome_with_claims(
+        &self,
+        name: &str,
+        input: Value,
+        claims: Option<IsolationClaims>,
+    ) -> Result<ToolOutcome, ToolExecutionError> {
         TOOL_ISOLATION_CLAIMS
             .scope(claims, self.execute_inner(name, input))
             .await
     }
 
-    async fn execute_inner(&self, name: &str, input: Value) -> Result<Value, ToolExecutionError> {
+    async fn execute_inner(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<ToolOutcome, ToolExecutionError> {
         let input_str = input.to_string();
 
         if let Some(ref policy) = self.permission_policy {
             match policy.authorize(name, &input_str, None) {
                 PermissionOutcome::Deny { reason } => {
-                    return Ok(json!({"error": format!("Permission denied: {}", reason)}));
+                    return Ok(ToolOutcome::denied(
+                        PolicyGate::PermissionPolicy,
+                        json!({"error": format!("Permission denied: {}", reason)}),
+                    ));
                 }
                 PermissionOutcome::Allow => {}
             }
@@ -1407,17 +1502,20 @@ impl ToolExecutor {
         if let Some(ref runner) = self.hook_runner {
             let hook_result = runner.run_pre_tool_use(name, &input_str);
             if hook_result.is_denied() {
-                return Ok(
+                return Ok(ToolOutcome::denied(
+                    PolicyGate::PreToolHook,
                     json!({"error": format!("Pre-tool hook denied: {}", hook_result.messages().join("; "))}),
-                );
+                ));
             }
             if hook_result.is_failed() {
-                return Ok(
+                return Ok(ToolOutcome::allowed(
                     json!({"error": format!("Pre-tool hook failed: {}", hook_result.messages().join("; "))}),
-                );
+                ));
             }
             if hook_result.is_cancelled() {
-                return Ok(json!({"error": "Pre-tool hook was cancelled"}));
+                return Ok(ToolOutcome::allowed(
+                    json!({"error": "Pre-tool hook was cancelled"}),
+                ));
             }
         }
 
@@ -1445,7 +1543,10 @@ impl ToolExecutor {
                 None,
             );
             if let Err(e) = decision {
-                return Ok(json!({"error": format!("SyscallGate rejected: {}", e)}));
+                return Ok(ToolOutcome::denied(
+                    PolicyGate::SyscallGate,
+                    json!({"error": format!("SyscallGate rejected: {}", e)}),
+                ));
             }
         }
 
@@ -1492,6 +1593,11 @@ impl ToolExecutor {
                     message,
                 })
         };
+        // Tool-produced output never carries a trusted gate name.
+        let result = result.map(|mut output| {
+            strip_denied_by(&mut output);
+            output
+        });
 
         // Post-tool-use hook
         if let Some(ref runner) = self.hook_runner {
@@ -1501,9 +1607,9 @@ impl ToolExecutor {
                     let post_result =
                         runner.run_post_tool_use(name, &input_str, &output_str, false);
                     if post_result.is_denied() {
-                        return Ok(
+                        return Ok(ToolOutcome::allowed(
                             json!({"error": format!("Post-tool hook denied: {}", post_result.messages().join("; ")), "original_output": output}),
-                        );
+                        ));
                     }
                 }
                 Err(e) => {
@@ -1512,7 +1618,7 @@ impl ToolExecutor {
             }
         }
 
-        result
+        result.map(ToolOutcome::allowed)
     }
 
     /// Execute a tool behind the SkillGraph security gate.
@@ -1554,11 +1660,31 @@ impl ToolExecutor {
         claims: Option<IsolationClaims>,
         policy: &ToolPolicy,
     ) -> Result<Value, ToolExecutionError> {
+        self.execute_guarded(name, input, context, advertised_tools, claims, policy)
+            .await
+            .map(|outcome| outcome.value)
+    }
+
+    /// Same gates as `execute_with_security_context_and_claims_and_policy`,
+    /// but also reports which executor gate (if any) refused the call. The
+    /// runner forwards `policy_denied_by` to SkillAfter hooks out of band.
+    pub async fn execute_guarded(
+        &self,
+        name: &str,
+        input: Value,
+        context: SecurityContext,
+        advertised_tools: &[String],
+        claims: Option<IsolationClaims>,
+        policy: &ToolPolicy,
+    ) -> Result<ToolOutcome, ToolExecutionError> {
         if !advertised_tools.iter().any(|tool| tool == name) {
-            return Ok(json!({
-                "error": format!("Tool not advertised for this turn: {}", name),
-                "tool": name,
-            }));
+            return Ok(ToolOutcome::denied(
+                PolicyGate::AdvertisedGate,
+                json!({
+                    "error": format!("Tool not advertised for this turn: {}", name),
+                    "tool": name,
+                }),
+            ));
         }
         let role = context.agent_role.parse::<AgentRole>().map_err(|_| {
             ToolExecutionError::ExecutionFailed {
@@ -1583,26 +1709,30 @@ impl ToolExecutor {
                     .then(|| "iri://skills/file_read".to_string())
             });
             let Some(skill_iri) = skill_iri else {
-                return Ok(
+                return Ok(ToolOutcome::denied(
+                    PolicyGate::SecurityEngine,
                     json!({"error": "Security denied: tool has no registered executable skill", "tool": name}),
-                );
+                ));
             };
             match engine.check_execution(&skill_iri, &context).await {
                 Ok(SecurityDecision::Allowed) => {}
                 Ok(SecurityDecision::Denied { reasons }) => {
-                    return Ok(
+                    return Ok(ToolOutcome::denied(
+                        PolicyGate::SecurityEngine,
                         json!({"error": "Security denied", "tool": name, "skill_iri": skill_iri, "reasons": reasons}),
-                    );
+                    ));
                 }
                 Ok(SecurityDecision::RequiresApproval { approver, reason }) => {
-                    return Ok(
+                    return Ok(ToolOutcome::denied(
+                        PolicyGate::SecurityEngine,
                         json!({"error": "Security approval required", "tool": name, "skill_iri": skill_iri, "approver": approver, "reason": reason}),
-                    );
+                    ));
                 }
                 Err(error) => {
-                    return Ok(
+                    return Ok(ToolOutcome::denied(
+                        PolicyGate::SecurityEngine,
                         json!({"error": format!("Security denied: {error}"), "tool": name, "skill_iri": skill_iri}),
-                    );
+                    ));
                 }
             }
         }
@@ -1614,11 +1744,14 @@ impl ToolExecutor {
                 tool = %name,
                 "Role tool policy denied execution"
             );
-            return Ok(json!({
-                "error": "Tool not allowed for role",
-                "tool": name,
-                "role": context.agent_role,
-            }));
+            return Ok(ToolOutcome::denied(
+                PolicyGate::RolePolicy,
+                json!({
+                    "error": "Tool not allowed for role",
+                    "tool": name,
+                    "role": context.agent_role,
+                }),
+            ));
         }
 
         let role = context.agent_role.clone();
@@ -1627,8 +1760,10 @@ impl ToolExecutor {
                 Some(context),
                 TOOL_RUN_POLICY.scope(
                     Some(policy.clone()),
-                    TOOL_SEARCH_CALLER_ROLE
-                        .scope(Some(role), self.execute_with_claims(name, input, claims)),
+                    TOOL_SEARCH_CALLER_ROLE.scope(
+                        Some(role),
+                        self.execute_outcome_with_claims(name, input, claims),
+                    ),
                 ),
             )
             .await
