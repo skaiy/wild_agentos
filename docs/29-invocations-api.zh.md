@@ -182,7 +182,7 @@ queued ──► running ──► succeeded
 - 创建成功（且不是幂等重放）后，服务端用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
 - 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
 - 每次运行都计量，用量随终态迁移写入 `result.usage`。
-- 执行受配置开关控制，默认**关闭**。投影按 scope 绑定（[#310](https://github.com/skaiy/wild_agentos/issues/310)）合入前，生产必须保持关闭。
+- 执行受配置开关控制，默认**关闭**。在 [#317](https://github.com/skaiy/wild_agentos/issues/317) 执行桥落地前，生产必须保持关闭（投影按 scope 绑定 #310/#322 已在 main）。
 - 开关关闭时，新的创建请求返回 `503 execution_disabled`，什么都不落盘（没有资源，也没有幂等记录），因此不会有调用永远停在非终态。开关关闭前已登记的 key 重放仍返回 `200` 和原资源。开关在启动时读取；关闭开关需要重启，重启会把执行中的调用改为 `failed/interrupted`。
 
 ### 8.1 事件流
@@ -244,9 +244,9 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 ## 11. 集成方前提
 
 - **精确钉住 agent 和以编排型 agent 为目标，都依赖 [#317](https://github.com/skaiy/wild_agentos/issues/317)。** 两者都需要 agent 定义修订和存储在定义上的拓扑，这由 #317 补上。#317 之前，`agent_revision` 返回 `422 agent_revision_unsupported`（§4），编排计划也不能作为存储的定义来寻址（§4.1）。依赖其中任一项的集成应等 #317 合入后再切换。
-- **执行开关。** 执行默认关闭，在 [#310](https://github.com/skaiy/wild_agentos/issues/310) 合入前生产环境保持关闭；在此之前创建返回 `503 execution_disabled`（§8）。
+- **执行开关。** 执行默认关闭，在 [#317](https://github.com/skaiy/wild_agentos/issues/317) 执行桥落地前生产环境保持关闭；在此之前创建返回 `503 execution_disabled`（§8）。投影按 scope 绑定（#310/#322）已在 main。
 - **输入。** v0.12.0 不内置 `input_ref` 解析器，请使用内联 `input`（≤ 8192 字节）（§4.2）。
 - **幂等依赖 [#315](https://github.com/skaiy/wild_agentos/issues/315)。** #315 之前，带 `Idempotency-Key` 的创建请求返回 `400 idempotency_unsupported`（临时码），而不是静默忽略该 key。依赖幂等重试的集成应等 #315 合入。
-- **切换前提：** #315 + #317 + #310。
+- **切换前提：** #315 + #317（投影按 scope 绑定 #310/#322 已在 main）。
 - **Agent id。** `agent_id` 使用 agent 注册接口返回的服务端生成 UUID，注册时不能自指定 id。编排型 agent 的注册字段和拓扑随 #317 提供（§4.1）。
 - **已知不一致（agent 注册）。** `POST /api/v1/agents` 仍接受 project 为默认补全值的令牌。用这种令牌注册的 agent 会落到 `default` project，同一令牌调用 invocation 会返回 403 / 422。注册 agent 时请使用带显式 project 的令牌。

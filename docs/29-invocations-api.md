@@ -282,8 +282,8 @@ queued ──► running ──► succeeded
 - Usage is metered per run and written to `result.usage` with the terminal
   transition.
 - Execution is behind a configuration switch that defaults to **off**. It must
-  stay off in production until projection scoping
-  ([#310](https://github.com/skaiy/wild_agentos/issues/310)) is merged.
+  stay off in production until the [#317](https://github.com/skaiy/wild_agentos/issues/317)
+  execution bridge lands (projection scoping via #310/#322 is already on main).
 - While the switch is off, a new create is rejected with
   `503 execution_disabled` and nothing is persisted (no resource, no
   idempotency record), so no invocation can stay non-terminal forever. A replay
@@ -368,8 +368,9 @@ with the current revision.
   addressed as a stored definition (§4.1). Integrations that depend on either
   should wait for #317 before switching over.
 - **Execution switch.** Execution defaults to off and stays off in production
-  until [#310](https://github.com/skaiy/wild_agentos/issues/310) is merged;
-  until then creates return `503 execution_disabled` (§8).
+  until the [#317](https://github.com/skaiy/wild_agentos/issues/317) execution
+  bridge lands; until then creates return `503 execution_disabled` (§8).
+  Projection scoping (#310/#322) is already on main.
 - **Inputs.** v0.12.0 has no built-in `input_ref` resolver; send inline
   `input` (≤ 8192 bytes) (§4.2).
 - **Idempotency requires [#315](https://github.com/skaiy/wild_agentos/issues/315).**
@@ -377,7 +378,7 @@ with the current revision.
   `400 idempotency_unsupported` (a temporary code) instead of silently
   ignoring the key. Integrations that rely on idempotent retries should wait
   for #315.
-- **Switch-over prerequisites:** #315 + #317 + #310.
+- **Switch-over prerequisites:** #315 + #317 (projection scoping #310/#322 is already on main).
 - **Agent ids.** Use the server-generated UUID returned by agent registration as
   `agent_id`; ids cannot be self-assigned at registration. Registration fields
   and topology for orchestrating agents come with #317 (§4.1).

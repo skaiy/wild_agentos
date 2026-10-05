@@ -16,9 +16,10 @@ use super::*;
 use crate::api::http::{
     control_plane_route_auth_tests::{test_state_with_invocations, EnvGuard},
     iam::JwtClaims,
-    invocations_store::{InvocationStoreConfig, TransitionPatch},
+    invocations_store::{InvocationState, InvocationStoreConfig, TransitionPatch},
     TEST_ENV_LOCK,
 };
+use crate::isolation::IsolationClaims;
 
 const SECRET: &[u8] = b"test-hs256-secret-at-least-32-bytes-long";
 const CANARY: &str = "canary-inv-meta-5d1e-do-not-leak";
@@ -96,6 +97,7 @@ pub(super) fn router(state: Arc<AppState>) -> Router {
             "/v1/invocations/:id/cancel",
             post(cancel_invocation_handler),
         )
+        .route("/v1/invocations/:id/events", get(events_invocation_handler))
         .with_state(state)
 }
 
@@ -185,6 +187,10 @@ const ROUTES: &[(&str, &str)] = &[
     (
         "POST",
         "/v1/invocations/inv_00000000000000000000000000000000/cancel",
+    ),
+    (
+        "GET",
+        "/v1/invocations/inv_00000000000000000000000000000000/events",
     ),
 ];
 
@@ -928,4 +934,169 @@ async fn list_is_scoped_and_paginates_without_gaps_or_duplicates() {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{bad}");
         assert_eq!(reply.code(), "invalid_request", "{bad}");
     }
+}
+
+#[tokio::test]
+async fn create_registers_cancellation_token_and_cancel_signals_it() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = env(true);
+    let h = harness();
+    let reply = create(&h, &alice(), json!({"prompt": "hold"})).await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.json());
+    let id = reply.json()["id"].as_str().unwrap().to_string();
+    assert!(
+        h.state.invocations.cancellations().contains(&id),
+        "create must register a CancellationToken"
+    );
+
+    // Force running so cancel takes the cancel_requested path.
+    h.store
+        .transition_for_claims(
+            &scope("tenant-a", "project-a", "alice"),
+            &id,
+            None,
+            InvocationState::Running,
+            TransitionPatch::default(),
+        )
+        .await
+        .unwrap();
+
+    let cancel = call(
+        &h.router,
+        "POST",
+        &format!("/v1/invocations/{id}/cancel"),
+        Some(&alice()),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(cancel.status, StatusCode::ACCEPTED, "{}", cancel.json());
+    assert_eq!(cancel.json()["state"], "cancel_requested");
+    // Allow the stub wait task a beat to observe cancel and drop the entry.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !h.state.invocations.cancellations().contains(&id),
+        "cancel must drop the registry entry after signalling"
+    );
+}
+
+#[tokio::test]
+async fn events_route_emits_snapshot_and_closes_on_terminal() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = env(true);
+    let h = harness();
+    let reply = create(&h, &alice(), json!({"prompt": "snap"})).await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.json());
+    let id = reply.json()["id"].as_str().unwrap().to_string();
+    h.store
+        .transition_for_claims(
+            &scope("tenant-a", "project-a", "alice"),
+            &id,
+            None,
+            InvocationState::Cancelled,
+            TransitionPatch::default(),
+        )
+        .await
+        .unwrap();
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/invocations/{id}/events"))
+                .header("authorization", format!("Bearer {}", alice()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("text/event-stream"),
+        "content-type={content_type}"
+    );
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("event: state"), "{body}");
+    assert!(body.contains("\"snapshot\":true"), "{body}");
+    assert!(body.contains("\"state\":\"cancelled\""), "{body}");
+    // cancelled has no result/error follow-up; stream should have closed.
+    assert!(!body.contains("event: result"), "{body}");
+    assert!(!body.contains("event: error"), "{body}");
+}
+
+#[tokio::test]
+async fn events_route_rejects_anonymous_with_401() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = env(true);
+    let h = harness();
+    let reply = call(
+        &h.router,
+        "GET",
+        "/v1/invocations/inv_missing/events",
+        None,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.code(), "verified_isolation_claims_required");
+}
+
+#[tokio::test]
+async fn events_cross_scope_is_byte_identical_404() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = env(true);
+    let h = harness();
+    let created = create(
+        &h,
+        &alice(),
+        json!({"prompt": "secret", "metadata": {"canary": CANARY}}),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.json());
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let other = token("bob", "tenant-b", Some("project-b"), &[]);
+    let missing = call(
+        &h.router,
+        "GET",
+        "/v1/invocations/inv_does_not_exist/events",
+        Some(&alice()),
+        &[],
+        None,
+    )
+    .await;
+    let cross = call(
+        &h.router,
+        "GET",
+        &format!("/v1/invocations/{id}/events"),
+        Some(&other),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(cross.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.headers, cross.headers);
+    assert_eq!(missing.bytes, cross.bytes);
+    assert!(!String::from_utf8_lossy(&cross.bytes).contains(CANARY));
+}
+
+#[tokio::test]
+async fn open_default_reads_execution_enabled_env() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("AGENTOS_INVOCATION_EXECUTION_ENABLED");
+    assert!(!InvocationsRuntime::execution_enabled_from_env());
+    std::env::set_var("AGENTOS_INVOCATION_EXECUTION_ENABLED", "true");
+    assert!(InvocationsRuntime::execution_enabled_from_env());
+    std::env::set_var("AGENTOS_INVOCATION_EXECUTION_ENABLED", "0");
+    assert!(!InvocationsRuntime::execution_enabled_from_env());
+    std::env::remove_var("AGENTOS_INVOCATION_EXECUTION_ENABLED");
 }

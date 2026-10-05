@@ -1,10 +1,12 @@
-//! `/v1/invocations` routes (issue #314): create, get, list and cancel.
+//! `/v1/invocations` routes (issues #314 / #317): create, get, list, cancel
+//! and events (SSE skeleton).
 //!
 //! Authentication and scope come only from verified JWT isolation claims
 //! (no anonymous path, no `X-Identity`, no API-client keys, with or without
 //! `AGENTOS_AUTH_STRICT`). Tenant, project and actor are never read from the
 //! request. Persistence, the lifecycle state machine and the revision check
-//! live in [`super::invocations_store`].
+//! live in [`super::invocations_store`]. Cancellation registration and the
+//! `succeeded` usage contract live in [`super::invocations_execution`].
 //!
 //! `Idempotency-Key` (#315): an optional create header of 1–255 visible
 //! ASCII characters (`0x21..=0x7E`), scoped to `(tenant_id, project_id,
@@ -18,29 +20,40 @@
 //! execution switch, so a retry whose `deadline` has since passed, or a retry
 //! while execution is switched off, still replays the original.
 //!
-//! Not in this module yet:
-//! - The execution bridge (#317). The execution switch is off, so create
-//!   answers `503 execution_disabled` and persists nothing. Tests enable the
-//!   switch to exercise create; the invocation then stays `queued`.
+//! Gaps still tracked elsewhere:
+//! - Real `TaskExecutor` / event-bus drive (#317 follow-up). Create registers
+//!   a [`CancellationToken`] (keyed by invocation id only) and leaves the
+//!   resource `queued`; the SSE route emits a snapshot and closes on a
+//!   terminal state (poll watch). The execution switch defaults to off
+//!   (`AGENTOS_INVOCATION_EXECUTION_ENABLED`), so production create answers
+//!   `503 execution_disabled` and persists nothing. Tests enable the switch
+//!   to exercise create.
 //! - Agent revisions (#317). The agent store has no revisions, so a create
 //!   carrying `agent_revision` is `422 agent_revision_unsupported`.
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use tokio_util::sync::CancellationToken;
 
 use sha2::{Digest, Sha256};
 
 use super::iam::UserIdentity;
+use super::invocations_execution::InvocationCancellationRegistry;
 use super::invocations_store::{
     invocation_not_found_response, parse_if_match, CreateOutcome, IdempotencyLookup,
     IdempotencyRegistration, Invocation, InvocationBudget, InvocationConfigError,
@@ -105,8 +118,13 @@ pub(crate) struct InvocationsRuntime {
     /// `503 invocation_store_unavailable` after authentication.
     store: Option<Arc<InvocationStore>>,
     /// Execution switch (#317). Off: create is `503 execution_disabled`.
+    /// Production default is off (`AGENTOS_INVOCATION_EXECUTION_ENABLED`).
     execution_enabled: bool,
-    /// Called after a successful, non-replayed create. `None` until #317.
+    /// Running / queued invocations that have a cancel token (#317).
+    /// Keyed by invocation id only (no tenant/project dimension).
+    cancellations: InvocationCancellationRegistry,
+    /// Called after a successful, non-replayed create. `None` until the
+    /// execution bridge (#317) installs one in production.
     dispatcher: Option<Arc<dyn InvocationDispatcher>>,
 }
 
@@ -115,6 +133,7 @@ impl InvocationsRuntime {
         Self {
             store,
             execution_enabled,
+            cancellations: InvocationCancellationRegistry::new(),
             dispatcher: None,
         }
     }
@@ -133,15 +152,36 @@ impl InvocationsRuntime {
         Self::new(None, false)
     }
 
+    /// Reads `AGENTOS_INVOCATION_EXECUTION_ENABLED` (default `false`).
+    /// Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive).
+    pub(crate) fn execution_enabled_from_env() -> bool {
+        std::env::var("AGENTOS_INVOCATION_EXECUTION_ENABLED")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Opens the default store with its env config and runs restart recovery.
-    /// The execution switch stays off until the execution bridge (#317) wires
-    /// it to configuration, so production create answers `503`.
+    /// The execution switch is read once at startup from
+    /// `AGENTOS_INVOCATION_EXECUTION_ENABLED` (default off). Keep it off in
+    /// production until the #317 execution bridge lands.
     ///
     /// # Panics
     ///
     /// On an invalid configuration (for example an idempotency TTL above the
     /// retention): startup fails closed instead of running with defaults.
     pub(crate) fn open_default() -> Self {
+        let execution_enabled = Self::execution_enabled_from_env();
+        if execution_enabled {
+            tracing::warn!(
+                "invocation execution enabled via AGENTOS_INVOCATION_EXECUTION_ENABLED; keep off in production until the #317 execution bridge lands"
+            );
+        }
         let config = match InvocationStoreConfig::try_from_env() {
             Ok(config) => config,
             Err(InvocationConfigError(error)) => {
@@ -159,7 +199,7 @@ impl InvocationsRuntime {
                         "invocation store recovered"
                     );
                 }
-                Self::new(Some(Arc::new(store)), false)
+                Self::new(Some(Arc::new(store)), execution_enabled)
             }
             Err(error) => {
                 // A corrupt file must not be replaced by an empty store.
@@ -167,6 +207,27 @@ impl InvocationsRuntime {
                 Self::unavailable()
             }
         }
+    }
+
+    pub(crate) fn cancellations(&self) -> &InvocationCancellationRegistry {
+        &self.cancellations
+    }
+
+    /// Registers a cancel token for a freshly created invocation and holds it
+    /// until cancel or process shutdown (stub executor; no state drive yet).
+    fn register_stub_execution(&self, id: &str, shutdown: CancellationToken) {
+        let token = self.cancellations.register(id);
+        let registry = self.cancellations.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => {}
+                _ = shutdown.cancelled() => {
+                    token.cancel();
+                }
+            }
+            registry.remove(&id);
+        });
     }
 }
 
@@ -686,6 +747,12 @@ pub(crate) async fn create_invocation_handler(
     };
     match store.create_idempotent_for_claims(claims, new).await {
         Ok(CreateOutcome::Created(invocation)) => {
+            // Stub bridge (#317): register a CancellationToken (by id only)
+            // so cancel can signal it. Real TaskExecutor / state drive is a
+            // follow-up.
+            state
+                .invocations
+                .register_stub_execution(&invocation.id, state.shutdown.clone());
             if let Some(dispatcher) = &state.invocations.dispatcher {
                 // TODO(#317): the execution bridge is the production dispatcher.
                 dispatcher.dispatch(&invocation);
@@ -856,7 +923,12 @@ pub(crate) async fn cancel_invocation_handler(
             .await
         {
             Ok(outcome) => {
-                // TODO(#317): signal the running execution's cancellation token.
+                // Signal the stub / future executor. Queued→cancelled also
+                // drops the registry entry via the token's wait task.
+                state.invocations.cancellations().cancel(&id);
+                if outcome.invocation.state.is_terminal() {
+                    state.invocations.cancellations().remove(&id);
+                }
                 let status = if outcome.invocation.state == InvocationState::Cancelled {
                     StatusCode::OK
                 } else {
@@ -868,6 +940,154 @@ pub(crate) async fn cancel_invocation_handler(
             Err(InvocationStoreError::NotFound) => return invocation_not_found_response(),
             Err(error) => return error.into_response(),
         }
+    }
+}
+
+/// `GET /v1/invocations/:id/events` — SSE skeleton (#317 / docs/29 §8.1).
+///
+/// Emits a `state` snapshot (with `snapshot: true` and the resource view),
+/// then watches the store until the invocation is terminal (or shutdown).
+/// On terminal: optional `result` / `error` event, then the stream closes.
+/// Full event-bus forwarding and `Lagged` → `resync` land in a follow-up.
+pub(crate) async fn events_invocation_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(id): Path<String>,
+) -> Response {
+    let claims = match verified_scope(&identity) {
+        Ok(claims) => claims.clone(),
+        Err(error) => return error.into_response(),
+    };
+    let store = match store_of(&state) {
+        Ok(store) => store.clone(),
+        Err(error) => return error.into_response(),
+    };
+    let initial = match store.get_for_claims(&claims, &id).await {
+        Ok(invocation) => invocation,
+        Err(error) => return error.into_response(),
+    };
+
+    let shutdown = state.shutdown.clone();
+    let stream = async_stream::stream! {
+        let mut seq: u64 = 0;
+        let mut last_revision = initial.revision;
+        let mut last_state = initial.state;
+
+        yield Ok::<Event, Infallible>(sse_state_event(
+            &initial,
+            None,
+            true,
+            &mut seq,
+        ));
+
+        if initial.state.is_terminal() {
+            if let Some(event) = sse_terminal_payload(&initial, &mut seq) {
+                yield Ok(event);
+            }
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    let current = match store.get_for_claims(&claims, &id).await {
+                        Ok(invocation) => invocation,
+                        Err(_) => break,
+                    };
+                    if current.revision != last_revision || current.state != last_state {
+                        let previous = last_state;
+                        last_revision = current.revision;
+                        last_state = current.state;
+                        yield Ok(sse_state_event(
+                            &current,
+                            Some(previous),
+                            false,
+                            &mut seq,
+                        ));
+                        if current.state.is_terminal() {
+                            if let Some(event) = sse_terminal_payload(&current, &mut seq) {
+                                yield Ok(event);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn sse_event_id(revision: u64, seq: &mut u64) -> String {
+    let id = format!("{revision}.{seq}");
+    *seq = seq.saturating_add(1);
+    id
+}
+
+fn sse_state_event(
+    invocation: &Invocation,
+    previous_state: Option<InvocationState>,
+    snapshot: bool,
+    seq: &mut u64,
+) -> Event {
+    let mut data = json!({
+        "invocation_id": invocation.id,
+        "revision": invocation.revision,
+        "at": invocation.updated_at,
+        "state": invocation.state.as_str(),
+        "previous_state": previous_state.map(|s| s.as_str()),
+        "snapshot": snapshot,
+    });
+    if snapshot {
+        data["invocation"] = resource_view(invocation);
+    }
+    Event::default()
+        .event("state")
+        .id(sse_event_id(invocation.revision, seq))
+        .data(data.to_string())
+}
+
+fn sse_terminal_payload(invocation: &Invocation, seq: &mut u64) -> Option<Event> {
+    match invocation.state {
+        InvocationState::Succeeded => {
+            let data = json!({
+                "invocation_id": invocation.id,
+                "revision": invocation.revision,
+                "at": invocation.updated_at,
+                "state": "succeeded",
+                "result": invocation.result,
+            });
+            Some(
+                Event::default()
+                    .event("result")
+                    .id(sse_event_id(invocation.revision, seq))
+                    .data(data.to_string()),
+            )
+        }
+        InvocationState::Failed => {
+            let data = json!({
+                "invocation_id": invocation.id,
+                "revision": invocation.revision,
+                "at": invocation.updated_at,
+                "state": "failed",
+                "error": invocation.error,
+                "usage": invocation.result.as_ref().and_then(|r| r.usage.clone()),
+            });
+            Some(
+                Event::default()
+                    .event("error")
+                    .id(sse_event_id(invocation.revision, seq))
+                    .data(data.to_string()),
+            )
+        }
+        InvocationState::Cancelled => None,
+        _ => None,
     }
 }
 
