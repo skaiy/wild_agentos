@@ -575,7 +575,7 @@ async fn idempotency_ttl_uses_the_injected_clock() {
     let live = store
         .find_idempotent_at(&claims, KEY, "fp-1", now + chrono::Duration::hours(23))
         .await;
-    assert_eq!(live, IdempotencyLookup::Replay(created.clone()));
+    assert_eq!(live, IdempotencyLookup::Replay(Box::new(created.clone())));
     assert_eq!(
         store
             .find_idempotent_at(&claims, KEY, "fp-2", now + chrono::Duration::hours(23))

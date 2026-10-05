@@ -564,17 +564,22 @@ pub(crate) enum IdempotencyLookup {
     /// No live binding for the key in the caller's scope.
     Miss,
     /// Live binding with the same fingerprint: the current record.
-    Replay(Invocation),
+    Replay(Box<Invocation>),
     /// Live binding with a different fingerprint.
     Conflict,
 }
+
+/// `(tenant_id, project_id, actor_id, key)`.
+type IdempotencySlot = (String, String, String, String);
+/// Idempotency slots whose create is in flight in this process.
+type InFlightKeys = Arc<Mutex<HashSet<IdempotencySlot>>>;
 
 /// In-flight reservation of one `(tenant, project, actor, key)`; released on
 /// drop. See [`InvocationStore::reserve_idempotency_key`].
 #[derive(Debug)]
 pub(crate) struct IdempotencyReservation {
-    slot: (String, String, String, String),
-    in_flight: Arc<Mutex<HashSet<(String, String, String, String)>>>,
+    slot: IdempotencySlot,
+    in_flight: InFlightKeys,
 }
 
 impl Drop for IdempotencyReservation {
@@ -816,7 +821,7 @@ pub(crate) struct InvocationStore {
     config: InvocationStoreConfig,
     records: RwLock<Vec<Invocation>>,
     /// Idempotency keys whose create is in flight in this process.
-    in_flight: Arc<Mutex<HashSet<(String, String, String, String)>>>,
+    in_flight: InFlightKeys,
     /// Test-only fault injection: after this many more successful writes,
     /// every write fails with `Persistence`.
     #[cfg(test)]
@@ -1102,7 +1107,7 @@ impl InvocationStore {
             .as_ref()
             .is_some_and(|binding| binding.fingerprint == fingerprint);
         if same {
-            IdempotencyLookup::Replay(existing.clone())
+            IdempotencyLookup::Replay(Box::new(existing.clone()))
         } else {
             IdempotencyLookup::Conflict
         }
