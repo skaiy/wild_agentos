@@ -24,6 +24,13 @@ pub struct QueryFilter {
     pub node_type: Option<String>,
 }
 
+/// An RDF term bound into a SPARQL query by [`Blackboard::query_with_bindings`].
+#[derive(Debug, Clone, Copy)]
+pub enum ScopeTerm<'a> {
+    Iri(&'a str),
+    Literal(&'a str),
+}
+
 /// Scope used to select blackboard nodes suitable for prompt construction.
 ///
 /// A scope must be built from verified claims. It is intentionally separate
@@ -605,6 +612,52 @@ impl Blackboard {
     #[allow(deprecated)]
     pub fn query(&self, sparql: &str) -> Result<Vec<serde_json::Value>, CoreError> {
         let results = self.store.query(sparql)?;
+        Self::query_results_to_json(results)
+    }
+
+    /// Run `sparql` with the given variables bound to RDF terms through an
+    /// inline `VALUES` block at the top of the `WHERE` group. IRIs are
+    /// validated and literals are serialized by the RDF model, so values can
+    /// never change the query structure.
+    pub fn query_with_bindings(
+        &self,
+        sparql: &str,
+        bindings: &[(&str, ScopeTerm<'_>)],
+    ) -> Result<Vec<serde_json::Value>, CoreError> {
+        let sparql_error = |e: String| CoreError::SparqlError { message: e };
+        let mut vars = Vec::with_capacity(bindings.len());
+        let mut terms = Vec::with_capacity(bindings.len());
+        for (name, value) in bindings {
+            let variable =
+                oxigraph::model::Variable::new(*name).map_err(|e| sparql_error(e.to_string()))?;
+            let term = match value {
+                ScopeTerm::Iri(iri) => oxigraph::model::NamedNode::new(*iri)
+                    .map_err(|e| sparql_error(e.to_string()))?
+                    .to_string(),
+                ScopeTerm::Literal(v) => {
+                    oxigraph::model::Literal::new_simple_literal(*v).to_string()
+                }
+            };
+            vars.push(variable.to_string());
+            terms.push(term);
+        }
+        let where_at = sparql
+            .find("WHERE")
+            .and_then(|w| sparql[w..].find('{').map(|b| w + b + 1))
+            .ok_or_else(|| sparql_error("query has no WHERE group".to_string()))?;
+        let bound = format!(
+            "{} VALUES ({}) {{ ({}) }} {}",
+            &sparql[..where_at],
+            vars.join(" "),
+            terms.join(" "),
+            &sparql[where_at..]
+        );
+        self.query(&bound)
+    }
+
+    fn query_results_to_json(
+        results: QueryResults<'_>,
+    ) -> Result<Vec<serde_json::Value>, CoreError> {
         let mut values = Vec::new();
 
         match results {
