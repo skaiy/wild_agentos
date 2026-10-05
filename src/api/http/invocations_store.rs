@@ -73,8 +73,42 @@
 //! [`parse_if_match`] accepts one strong tag `"<revision>"` or `*`. Anything
 //! else (weak tags, lists, unquoted or non-numeric values) is
 //! [`InvalidIfMatch`], which the routes map to `400 invalid_if_match`.
+//!
+//! # Idempotency (#315)
+//!
+//! A create may carry an [`IdempotencyRegistration`] (key + request
+//! fingerprint). The binding is scoped to `(tenant_id, project_id, actor_id,
+//! key)`, all taken from the verified claims, and is stored on the created
+//! record itself (`idempotency_key` plus the internal `idempotency` binding),
+//! so registering the key and creating the resource are the **same** atomic
+//! file replace: a failed write leaves neither behind. Only the SHA-256
+//! fingerprint of the canonical request body is stored, never a second copy
+//! of the body.
+//!
+//! Under the create write lock a live binding with the same fingerprint is a
+//! replay ([`CreateOutcome::Replayed`], nothing written), a different
+//! fingerprint is [`InvocationStoreError::IdempotencyKeyConflict`]. Bindings
+//! expire after [`InvocationStoreConfig::idempotency_ttl`] (default
+//! [`DEFAULT_IDEMPOTENCY_TTL_HOURS`] h, env [`IDEMPOTENCY_TTL_ENV`]); expired
+//! bindings are ignored by lookups, dropped lazily inside every create and on
+//! [`InvocationStore::open_with_config`]. The record keeps its public
+//! `idempotency_key` after expiry; only the binding is removed. The TTL must
+//! not exceed the retention ([`InvocationStoreConfig::try_from_env`] refuses
+//! such a configuration), so a live binding never points at a swept record.
+//!
+//! Records moved to `failed/interrupted` by restart recovery keep their
+//! binding: replaying the key returns that failed record, and a resubmission
+//! needs a new key.
+//!
+//! [`InvocationStore::reserve_idempotency_key`] is an in-memory, per-process
+//! reservation the route holds while it validates and creates, so a
+//! concurrent duplicate gets `409 idempotency_key_in_progress` instead of
+//! waiting. It is an optimisation for the caller; the authoritative
+//! duplicate check is the one under the create write lock.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -112,6 +146,14 @@ pub(crate) const MAX_ACTIVE_ENV: &str = "AGENTOS_INVOCATION_MAX_ACTIVE";
 /// `Retry-After` seconds sent with `429 too_many_active`.
 pub(crate) const TOO_MANY_ACTIVE_RETRY_AFTER_SECS: u64 = 5;
 
+/// Default lifetime of an idempotency binding, in hours.
+pub(crate) const DEFAULT_IDEMPOTENCY_TTL_HOURS: u64 = 24;
+/// Env override for the idempotency TTL, in whole hours (≥ 1). Must not
+/// exceed [`RETENTION_DAYS_ENV`] × 24, otherwise startup fails.
+pub(crate) const IDEMPOTENCY_TTL_ENV: &str = "AGENTOS_INVOCATION_IDEMPOTENCY_TTL_HOURS";
+/// `Retry-After` seconds sent with `409 idempotency_key_in_progress`.
+pub(crate) const IDEMPOTENCY_IN_PROGRESS_RETRY_AFTER_SECS: u64 = 1;
+
 const STORE_FILE_NAME: &str = "invocations.json";
 
 /// Store limits. [`Self::from_env`] reads the documented env overrides.
@@ -121,6 +163,8 @@ pub(crate) struct InvocationStoreConfig {
     pub retention: chrono::Duration,
     /// Maximum non-terminal invocations per tenant/project scope.
     pub max_active_per_scope: usize,
+    /// How long an idempotency binding stays live after the create.
+    pub idempotency_ttl: chrono::Duration,
 }
 
 impl Default for InvocationStoreConfig {
@@ -128,28 +172,77 @@ impl Default for InvocationStoreConfig {
         Self {
             retention: chrono::Duration::days(DEFAULT_RETENTION_DAYS as i64),
             max_active_per_scope: DEFAULT_MAX_ACTIVE_PER_SCOPE,
+            idempotency_ttl: chrono::Duration::hours(DEFAULT_IDEMPOTENCY_TTL_HOURS as i64),
         }
     }
 }
 
+/// Invalid invocation configuration. Startup refuses to continue (fail
+/// closed); the message names the variables and their values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvocationConfigError(pub String);
+
+impl std::fmt::Display for InvocationConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvocationConfigError {}
+
 impl InvocationStoreConfig {
-    /// Defaults overridden by [`RETENTION_DAYS_ENV`] and [`MAX_ACTIVE_ENV`].
-    /// Missing, unparsable or zero values keep the default.
-    pub(crate) fn from_env() -> Self {
+    /// Defaults overridden by [`RETENTION_DAYS_ENV`], [`MAX_ACTIVE_ENV`] and
+    /// [`IDEMPOTENCY_TTL_ENV`]; see [`Self::try_from_vars`].
+    pub(crate) fn try_from_env() -> Result<Self, InvocationConfigError> {
+        Self::try_from_vars(|key| std::env::var(key).ok())
+    }
+
+    /// Builds the config from a variable lookup.
+    ///
+    /// Retention and the active limit keep their defaults when missing,
+    /// unparsable or zero (unchanged #316 behaviour). The idempotency TTL is
+    /// strict: a set but unparsable or zero value is an error, and a TTL
+    /// above `retention × 24` is an error naming both variables and their
+    /// values. Nothing silently falls back to a default.
+    pub(crate) fn try_from_vars(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, InvocationConfigError> {
         let positive = |key: &str| {
-            std::env::var(key)
-                .ok()
+            lookup(key)
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
                 .filter(|value| *value >= 1)
         };
         let mut config = Self::default();
+        let mut retention_days = DEFAULT_RETENTION_DAYS;
         if let Some(days) = positive(RETENTION_DAYS_ENV) {
-            config.retention = chrono::Duration::days(days.min(36_500) as i64);
+            retention_days = days.min(36_500);
+            config.retention = chrono::Duration::days(retention_days as i64);
         }
         if let Some(limit) = positive(MAX_ACTIVE_ENV) {
             config.max_active_per_scope = usize::try_from(limit).unwrap_or(usize::MAX);
         }
-        config
+        let mut ttl_hours = DEFAULT_IDEMPOTENCY_TTL_HOURS;
+        if let Some(raw) = lookup(IDEMPOTENCY_TTL_ENV) {
+            ttl_hours = raw
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|hours| *hours >= 1)
+                .ok_or_else(|| {
+                    InvocationConfigError(format!(
+                        "{IDEMPOTENCY_TTL_ENV}={raw:?} must be a whole number of hours >= 1"
+                    ))
+                })?;
+        }
+        let max_ttl_hours = retention_days.saturating_mul(24);
+        if ttl_hours > max_ttl_hours {
+            return Err(InvocationConfigError(format!(
+                "{IDEMPOTENCY_TTL_ENV}={ttl_hours} exceeds {RETENTION_DAYS_ENV}={retention_days} \
+                 x 24 = {max_ttl_hours} hours; the idempotency TTL must not exceed the retention"
+            )));
+        }
+        config.idempotency_ttl = chrono::Duration::hours(ttl_hours.min(i64::MAX as u64) as i64);
+        Ok(config)
     }
 }
 
@@ -380,6 +473,10 @@ pub(crate) struct Invocation {
     pub error: Option<InvocationErrorInfo>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Live idempotency binding for `idempotency_key` (internal, never part
+    /// of the resource view). `None` without a key or after the TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<IdempotencyBinding>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -407,6 +504,91 @@ impl Invocation {
     pub(crate) fn etag(&self) -> HeaderValue {
         etag_for_revision(self.revision)
     }
+
+    /// Whether this record holds a live binding for `key` in the claims'
+    /// `(tenant, project, actor)` scope at `now`.
+    fn binds_key(
+        &self,
+        claims: &IsolationClaims,
+        key: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.is_in_scope(claims)
+            && self.actor_id == claims.actor_id()
+            && self.idempotency_key.as_deref() == Some(key)
+            && self
+                .idempotency
+                .as_ref()
+                .is_some_and(|binding| binding.is_live(now))
+    }
+}
+
+/// Internal idempotency binding stored on the created record.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct IdempotencyBinding {
+    /// Lowercase hex SHA-256 of the canonical create body.
+    pub fingerprint: String,
+    /// RFC 3339; the binding is ignored and dropped from this instant on.
+    pub expires_at: String,
+}
+
+impl IdempotencyBinding {
+    /// Live strictly before `expires_at`. An unparsable timestamp counts as
+    /// expired, so a damaged binding can never block a key forever.
+    fn is_live(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        chrono::DateTime::parse_from_rfc3339(&self.expires_at)
+            .map(|at| now < at.with_timezone(&chrono::Utc))
+            .unwrap_or(false)
+    }
+}
+
+/// Key and request fingerprint to register with a create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdempotencyRegistration {
+    pub key: String,
+    pub fingerprint: String,
+}
+
+/// Result of [`InvocationStore::create_idempotent_for_claims`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CreateOutcome {
+    /// A new record was written (with its binding, if any).
+    Created(Invocation),
+    /// A live binding with the same fingerprint exists; nothing was written.
+    Replayed(Invocation),
+}
+
+/// Result of [`InvocationStore::find_idempotent_for_claims`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdempotencyLookup {
+    /// No live binding for the key in the caller's scope.
+    Miss,
+    /// Live binding with the same fingerprint: the current record.
+    Replay(Box<Invocation>),
+    /// Live binding with a different fingerprint.
+    Conflict,
+}
+
+/// `(tenant_id, project_id, actor_id, key)`.
+type IdempotencySlot = (String, String, String, String);
+/// Idempotency slots whose create is in flight in this process.
+type InFlightKeys = Arc<Mutex<HashSet<IdempotencySlot>>>;
+
+/// In-flight reservation of one `(tenant, project, actor, key)`; released on
+/// drop. See [`InvocationStore::reserve_idempotency_key`].
+#[derive(Debug)]
+pub(crate) struct IdempotencyReservation {
+    slot: IdempotencySlot,
+    in_flight: InFlightKeys,
+}
+
+impl Drop for IdempotencyReservation {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.slot);
+    }
 }
 
 /// Server-side fields for a new invocation. Scope and actor always come from
@@ -415,7 +597,8 @@ impl Invocation {
 pub(crate) struct NewInvocation {
     pub request: InvocationRequest,
     pub task_iri: Option<String>,
-    pub idempotency_key: Option<String>,
+    /// Registered in the same atomic write as the record.
+    pub idempotency: Option<IdempotencyRegistration>,
 }
 
 /// Result of [`InvocationStore::transition_outcome_for_claims`].
@@ -452,6 +635,10 @@ pub(crate) enum InvocationStoreError {
     TooManyActive,
     /// Persisting the snapshot failed; memory and disk are unchanged.
     Persistence(String),
+    /// The key is bound to a different request fingerprint in this scope.
+    IdempotencyKeyConflict,
+    /// Another create with the same key in this scope is still in flight.
+    IdempotencyKeyInProgress,
 }
 
 impl std::fmt::Display for InvocationStoreError {
@@ -467,6 +654,8 @@ impl std::fmt::Display for InvocationStoreError {
             Self::StoreFull => write!(f, "invocation store is full"),
             Self::TooManyActive => write!(f, "too many active invocations in scope"),
             Self::Persistence(error) => write!(f, "persist invocations: {error}"),
+            Self::IdempotencyKeyConflict => write!(f, "idempotency key bound to another request"),
+            Self::IdempotencyKeyInProgress => write!(f, "idempotency key in progress"),
         }
     }
 }
@@ -549,6 +738,30 @@ impl IntoResponse for InvocationStoreError {
                 )
                     .into_response()
             }
+            // Never echoes the original request: code and a fixed message only.
+            Self::IdempotencyKeyConflict => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "idempotency_key_conflict",
+                    "message": "this Idempotency-Key was already used with a different request body",
+                })),
+            )
+                .into_response(),
+            Self::IdempotencyKeyInProgress => {
+                let mut response = (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "idempotency_key_in_progress",
+                        "message": "a request with this Idempotency-Key is still being processed; retry later",
+                    })),
+                )
+                    .into_response();
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from(IDEMPOTENCY_IN_PROGRESS_RETRY_AFTER_SECS),
+                );
+                response
+            }
         }
     }
 }
@@ -607,6 +820,12 @@ pub(crate) struct InvocationStore {
     path: PathBuf,
     config: InvocationStoreConfig,
     records: RwLock<Vec<Invocation>>,
+    /// Idempotency keys whose create is in flight in this process.
+    in_flight: InFlightKeys,
+    /// Test-only fault injection: after this many more successful writes,
+    /// every write fails with `Persistence`.
+    #[cfg(test)]
+    persist_budget: Mutex<Option<usize>>,
 }
 
 /// What [`InvocationStore::open`] did while recovering.
@@ -616,18 +835,14 @@ pub(crate) struct RecoveryReport {
     pub interrupted: usize,
     /// Expired terminal records removed by the startup sweep.
     pub swept: usize,
+    /// Expired idempotency bindings dropped at startup.
+    pub idempotency_expired: usize,
 }
 
 impl InvocationStore {
     /// Default location: `<data_dir>/invocations.json`.
     pub(crate) fn default_path() -> PathBuf {
         super::data_dir().join(STORE_FILE_NAME)
-    }
-
-    /// Opens the store at [`Self::default_path`] with
-    /// [`InvocationStoreConfig::from_env`] and runs restart recovery.
-    pub(crate) fn open_default() -> Result<(Self, RecoveryReport), InvocationStoreError> {
-        Self::open_with_config(Self::default_path(), InvocationStoreConfig::from_env())
     }
 
     /// [`Self::open_with_config`] with the default limits.
@@ -678,20 +893,26 @@ impl InvocationStore {
             interrupted += 1;
         }
         let loaded = records.len();
-        let swept = sweep_expired_records(&mut records, config.retention, chrono::Utc::now());
-        if interrupted > 0 || swept > 0 {
+        let started = chrono::Utc::now();
+        let swept = sweep_expired_records(&mut records, config.retention, started);
+        let idempotency_expired = drop_expired_bindings(&mut records, started);
+        if interrupted > 0 || swept > 0 || idempotency_expired > 0 {
             persist(&path, &records)?;
         }
         let report = RecoveryReport {
             loaded,
             interrupted,
             swept,
+            idempotency_expired,
         };
         Ok((
             Self {
                 path,
                 config,
                 records: RwLock::new(records),
+                in_flight: Arc::new(Mutex::new(HashSet::new())),
+                #[cfg(test)]
+                persist_budget: Mutex::new(None),
             },
             report,
         ))
@@ -728,7 +949,7 @@ impl InvocationStore {
         if swept == 0 {
             return Ok(0);
         }
-        persist(&self.path, &next)?;
+        self.persist(&next)?;
         *records = next;
         Ok(swept)
     }
@@ -741,18 +962,57 @@ impl InvocationStore {
     }
 
     /// Creates a `queued` invocation at revision 1 in the claims' scope.
-    ///
-    /// Under one write lock: sweeps expired terminal records (persisted with
-    /// the new record), rejects with [`InvocationStoreError::TooManyActive`]
-    /// when the scope is at its active limit and with
-    /// [`InvocationStoreError::StoreFull`] when the swept store is at
-    /// [`MAX_STORED_INVOCATIONS`]. A rejected create writes nothing.
+    /// A registration in `new.idempotency` that hits a live binding is
+    /// reported as `IdempotencyKeyConflict` even for the same fingerprint;
+    /// callers that want replays use [`Self::create_idempotent_for_claims`].
+    // Used by tests now; the execution bridge (#317) creates without a key.
+    #[allow(dead_code)]
     pub(crate) async fn create_for_claims(
         &self,
         claims: &IsolationClaims,
         new: NewInvocation,
     ) -> Result<Invocation, InvocationStoreError> {
+        match self.create_idempotent_for_claims(claims, new).await? {
+            CreateOutcome::Created(invocation) => Ok(invocation),
+            CreateOutcome::Replayed(_) => Err(InvocationStoreError::IdempotencyKeyConflict),
+        }
+    }
+
+    /// Creates a `queued` invocation at revision 1 in the claims' scope, or
+    /// replays the record bound to `new.idempotency`.
+    ///
+    /// Under one write lock: a live binding for the key in the claims'
+    /// `(tenant, project, actor)` scope is a replay (same fingerprint,
+    /// nothing written) or [`InvocationStoreError::IdempotencyKeyConflict`].
+    /// Otherwise sweeps expired terminal records and expired bindings
+    /// (persisted with the new record), rejects with
+    /// [`InvocationStoreError::TooManyActive`] when the scope is at its
+    /// active limit and with [`InvocationStoreError::StoreFull`] when the
+    /// swept store is at [`MAX_STORED_INVOCATIONS`]. The record and its
+    /// binding are written in one atomic file replace; a rejected or failed
+    /// create writes nothing.
+    pub(crate) async fn create_idempotent_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        new: NewInvocation,
+    ) -> Result<CreateOutcome, InvocationStoreError> {
         let mut records = self.records.write().await;
+        let now_at = chrono::Utc::now();
+        if let Some(registration) = &new.idempotency {
+            if let Some(existing) = records
+                .iter()
+                .find(|record| record.binds_key(claims, &registration.key, now_at))
+            {
+                let same = existing
+                    .idempotency
+                    .as_ref()
+                    .is_some_and(|binding| binding.fingerprint == registration.fingerprint);
+                if same {
+                    return Ok(CreateOutcome::Replayed(existing.clone()));
+                }
+                return Err(InvocationStoreError::IdempotencyKeyConflict);
+            }
+        }
         let active_in_scope = records
             .iter()
             .filter(|record| !record.state.is_terminal() && record.is_in_scope(claims))
@@ -761,11 +1021,23 @@ impl InvocationStore {
             return Err(InvocationStoreError::TooManyActive);
         }
         let mut next = records.clone();
-        sweep_expired_records(&mut next, self.config.retention, chrono::Utc::now());
+        sweep_expired_records(&mut next, self.config.retention, now_at);
+        drop_expired_bindings(&mut next, now_at);
         if next.len() >= MAX_STORED_INVOCATIONS {
             return Err(InvocationStoreError::StoreFull);
         }
-        let now = now_rfc3339();
+        let now = now_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let (idempotency_key, idempotency) = match new.idempotency {
+            Some(registration) => (
+                Some(registration.key),
+                Some(IdempotencyBinding {
+                    fingerprint: registration.fingerprint,
+                    expires_at: (now_at + self.config.idempotency_ttl)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                }),
+            ),
+            None => (None, None),
+        };
         let mut invocation = Invocation {
             id: format!("inv_{}", uuid::Uuid::new_v4().simple()),
             object: "invocation".to_string(),
@@ -778,7 +1050,8 @@ impl InvocationStore {
             task_iri: new.task_iri,
             result: None,
             error: None,
-            idempotency_key: new.idempotency_key,
+            idempotency_key,
+            idempotency,
             created_at: now.clone(),
             updated_at: now.clone(),
             started_at: None,
@@ -793,9 +1066,99 @@ impl InvocationStore {
             actor_id: claims.actor_id().to_string(),
         });
         next.push(invocation.clone());
-        persist(&self.path, &next)?;
+        // One write for record + binding: never split into two.
+        self.persist(&next)?;
         *records = next;
-        Ok(invocation)
+        Ok(CreateOutcome::Created(invocation))
+    }
+
+    /// Read-only lookup of a live binding for `key` in the claims'
+    /// `(tenant, project, actor)` scope. Other scopes are a [`Miss`]: the
+    /// existence of a key elsewhere is never revealed.
+    ///
+    /// [`Miss`]: IdempotencyLookup::Miss
+    pub(crate) async fn find_idempotent_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        key: &str,
+        fingerprint: &str,
+    ) -> IdempotencyLookup {
+        self.find_idempotent_at(claims, key, fingerprint, chrono::Utc::now())
+            .await
+    }
+
+    /// [`Self::find_idempotent_for_claims`] against an explicit clock.
+    pub(crate) async fn find_idempotent_at(
+        &self,
+        claims: &IsolationClaims,
+        key: &str,
+        fingerprint: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> IdempotencyLookup {
+        let records = self.records.read().await;
+        let Some(existing) = records
+            .iter()
+            .find(|record| record.binds_key(claims, key, now))
+        else {
+            return IdempotencyLookup::Miss;
+        };
+        let same = existing
+            .idempotency
+            .as_ref()
+            .is_some_and(|binding| binding.fingerprint == fingerprint);
+        if same {
+            IdempotencyLookup::Replay(Box::new(existing.clone()))
+        } else {
+            IdempotencyLookup::Conflict
+        }
+    }
+
+    /// Reserves `key` in the claims' `(tenant, project, actor)` scope for the
+    /// duration of one create. A second reservation of the same slot while
+    /// the first is held is [`InvocationStoreError::IdempotencyKeyInProgress`].
+    /// Purely in memory; dropping the guard releases the slot.
+    pub(crate) fn reserve_idempotency_key(
+        &self,
+        claims: &IsolationClaims,
+        key: &str,
+    ) -> Result<IdempotencyReservation, InvocationStoreError> {
+        let slot = (
+            claims.tenant_id().to_string(),
+            claims.project_id().to_string(),
+            claims.actor_id().to_string(),
+            key.to_string(),
+        );
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if !in_flight.insert(slot.clone()) {
+            return Err(InvocationStoreError::IdempotencyKeyInProgress);
+        }
+        Ok(IdempotencyReservation {
+            slot,
+            in_flight: self.in_flight.clone(),
+        })
+    }
+
+    /// Test-only: after `successes` more writes, every write fails.
+    /// `None` removes the fault.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_after(&self, successes: Option<usize>) {
+        *self.persist_budget.lock().unwrap() = successes;
+    }
+
+    fn persist(&self, records: &[Invocation]) -> Result<(), InvocationStoreError> {
+        #[cfg(test)]
+        {
+            let mut budget = self.persist_budget.lock().unwrap();
+            if let Some(remaining) = budget.as_mut() {
+                if *remaining == 0 {
+                    return Err(InvocationStoreError::Persistence(
+                        "injected write failure".to_string(),
+                    ));
+                }
+                *remaining -= 1;
+            }
+        }
+        persist(&self.path, records)
     }
 
     /// Reads one invocation in the claims' scope (any actor in the scope).
@@ -923,7 +1286,7 @@ impl InvocationStore {
             actor_id: claims.actor_id().to_string(),
         });
         let updated = record.clone();
-        persist(&self.path, &next)?;
+        self.persist(&next)?;
         *records = next;
         Ok(TransitionOutcome {
             invocation: updated,
@@ -957,6 +1320,23 @@ fn sweep_expired_records(
         }
     });
     before - records.len()
+}
+
+/// Drops idempotency bindings that are no longer live at `now`. The public
+/// `idempotency_key` stays on the record. Returns how many were dropped.
+fn drop_expired_bindings(records: &mut [Invocation], now: chrono::DateTime<chrono::Utc>) -> usize {
+    let mut dropped = 0;
+    for record in records.iter_mut() {
+        if record
+            .idempotency
+            .as_ref()
+            .is_some_and(|binding| !binding.is_live(now))
+        {
+            record.idempotency = None;
+            dropped += 1;
+        }
+    }
+    dropped
 }
 
 fn now_rfc3339() -> String {
