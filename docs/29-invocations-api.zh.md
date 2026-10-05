@@ -20,7 +20,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | `GET /v1/invocations` | 列出调用方 scope 内的调用；游标分页；可按 `state` 过滤 |
 | `GET /v1/invocations/:id` | 读取单个调用 |
 | `POST /v1/invocations/:id/cancel` | 请求取消；可带 `If-Match: "<revision>"`；结果为 `cancelled` 时返回 `200`，为 `cancel_requested` 时返回 `202` |
-| `GET /v1/invocations/:id/events` | SSE：先发快照，再发实时事件，到终态关闭 |
+| `GET /v1/invocations/:id/events` | SSE：先发快照，再发实时事件，到终态关闭。**该路由及其实现归 [#317](https://github.com/skaiy/wild_agentos/issues/317)；#314 / #321 未实现。在那之前客户端轮询 `GET /v1/invocations/:id`。** |
 
 这些路由在 `/v1/` 下，但**不属于** OpenAI 兼容层（`/v1/models`、`/v1/chat/completions`，用 API client key 鉴权）。Invocations 只接受已校验的 JWT claims。
 
@@ -79,6 +79,8 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 - `agent_id` 指向调用方 tenant/project scope 内的一个服务端 agent 定义。它可以是编排型定义，即由 Supervisor Agent 按多 agent 计划执行（拆解、运行子 agent、汇总）的定义，不限于单个 agent。
 - 拓扑（单 agent 还是编排计划、子 agent 上限、是否并行）是服务端定义的属性。`agent_revision` 钉住定义，也就钉住了拓扑；调用方不能在请求里选择或覆盖拓扑。请求体里的 `topology` 等字段属于未知字段 → `400 invalid_request`。
 - 不带 `agent_id` 时走服务端默认执行路径。
+- `agent_id` 填 agent 注册接口返回的服务端生成 UUID；注册时调用方不能自己指定 id。
+- 编排型 agent 的注册字段和拓扑归 [#317](https://github.com/skaiy/wild_agentos/issues/317)。
 - 让编排型定义可以按 id 和修订寻址，属于执行桥（[#317](https://github.com/skaiy/wild_agentos/issues/317)）的工作。在那之前，存储的定义既没有修订也没有拓扑，见 §11。
 
 ### 4.2 `input_ref` 解析器
@@ -216,16 +218,18 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 
 | 状态码 | `error` | 场景 |
 | --- | --- | --- |
-| 400 | `field_not_allowed`、`invalid_idempotency_key`、`invalid_request`、`invalid_if_match` | 请求体带 scope 或服务端字段；key 格式非法；§4 字段非法（包括没有 scheme 的 `input_ref.uri`）；`If-Match` 格式错误 |
+| 400 | `field_not_allowed`、`invalid_idempotency_key`、`invalid_request`、`invalid_if_match`、`idempotency_unsupported` | 请求体带 scope 或服务端字段；key 格式非法；§4 字段非法（包括没有 scheme 的 `input_ref.uri`）；`If-Match` 格式错误；[#315](https://github.com/skaiy/wild_agentos/issues/315) 之前带了 `Idempotency-Key`（临时码，见 §11） |
 | 401 | `verified_isolation_claims_required` | 没有已校验 claims |
-| 403 | `claims_incomplete` | project 为默认值 |
+| 403 | `claims_incomplete`、`cancel_not_permitted` | project 为默认值（body 可带 `missing_field`）；既不是创建者也不是 DA 的 actor 发起取消 |
 | 404 | `not_found` | id 不存在或属于其他 scope（body 相同） |
-| 409 | `idempotency_key_conflict`、`idempotency_key_in_progress`、`revision_conflict`、`illegal_transition`、`agent_revision_mismatch` | 见 §4、§6、§7 |
+| 409 | `idempotency_key_conflict`、`idempotency_key_in_progress`、`revision_conflict`、`illegal_transition`、`agent_revision_mismatch` | 见 §4、§6、§7；`revision_conflict` 的 body 可带 `current_revision` |
 | 413 | `payload_too_large` | 请求体 > 64 KiB、`input` > 8192 字节或 `metadata` > 16 KiB / 64 个键 |
 | 422 | `input_ref_unresolvable`、`agent_not_found`、`agent_revision_unsupported` | `input_ref` 的 scheme 没有已注册的解析器；`agent_id` 在 scope 内不存在；agent 定义修订（#317）落地前请求带了 `agent_revision`（§4） |
 | 429 | `too_many_active` | 达到 scope 内活跃调用上限（§7.2）；带 `Retry-After: 5` |
 | 500 | `persistence_failed` | 存储写入失败，状态未改变 |
-| 503 | `execution_disabled`、`invocation_store_full` | 执行开关关闭（§8）；保留期清理后存储仍满（§7.1） |
+| 503 | `execution_disabled`、`invocation_store_full`、`invocation_store_unavailable` | 执行开关关闭（§8）；保留期清理后存储仍满（§7.1）；调用存储未配置或不可用 |
+
+除 `error` 和 `message` 外，403 的 body 可带 `missing_field`，409 的 body 可带 `current_revision`。创建成功返回 `202` 并带 `Location: /v1/invocations/<id>` 头；资源响应带当前修订对应的 `ETag`。
 
 ## 10. 不在范围
 
@@ -242,3 +246,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 - **精确钉住 agent 和以编排型 agent 为目标，都依赖 [#317](https://github.com/skaiy/wild_agentos/issues/317)。** 两者都需要 agent 定义修订和存储在定义上的拓扑，这由 #317 补上。#317 之前，`agent_revision` 返回 `422 agent_revision_unsupported`（§4），编排计划也不能作为存储的定义来寻址（§4.1）。依赖其中任一项的集成应等 #317 合入后再切换。
 - **执行开关。** 执行默认关闭，在 [#310](https://github.com/skaiy/wild_agentos/issues/310) 合入前生产环境保持关闭；在此之前创建返回 `503 execution_disabled`（§8）。
 - **输入。** v0.12.0 不内置 `input_ref` 解析器，请使用内联 `input`（≤ 8192 字节）（§4.2）。
+- **幂等依赖 [#315](https://github.com/skaiy/wild_agentos/issues/315)。** #315 之前，带 `Idempotency-Key` 的创建请求返回 `400 idempotency_unsupported`（临时码），而不是静默忽略该 key。依赖幂等重试的集成应等 #315 合入。
+- **切换前提：** #315 + #317 + #310。
+- **Agent id。** `agent_id` 使用 agent 注册接口返回的服务端生成 UUID，注册时不能自指定 id。编排型 agent 的注册字段和拓扑随 #317 提供（§4.1）。
+- **已知不一致（agent 注册）。** `POST /api/v1/agents` 仍接受 project 为默认补全值的令牌。用这种令牌注册的 agent 会落到 `default` project，同一令牌调用 invocation 会返回 403 / 422。注册 agent 时请使用带显式 project 的令牌。

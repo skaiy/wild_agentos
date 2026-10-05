@@ -28,7 +28,7 @@ identity or token system.
 | `GET /v1/invocations` | List the caller's scope; cursor pagination; optional `state` filter |
 | `GET /v1/invocations/:id` | Read one invocation |
 | `POST /v1/invocations/:id/cancel` | Request cancellation; optional `If-Match: "<revision>"`; `200` when the result is `cancelled`, `202` when it is `cancel_requested` |
-| `GET /v1/invocations/:id/events` | Server-Sent Events: snapshot first, then live events, closes on a terminal state |
+| `GET /v1/invocations/:id/events` | Server-Sent Events: snapshot first, then live events, closes on a terminal state. **The route and its implementation belong to [#317](https://github.com/skaiy/wild_agentos/issues/317); #314 / #321 do not implement it. Until then, clients poll `GET /v1/invocations/:id`.** |
 
 These routes live under `/v1/` but are **not** part of the OpenAI-compatible
 layer (`/v1/models`, `/v1/chat/completions`), which authenticates with API-client
@@ -119,6 +119,10 @@ scope and server fields → `400 field_not_allowed` (§3).
   topology in the request. A `topology` or similar field is an unknown field →
   `400 invalid_request`.
 - Without `agent_id` the server's default execution path is used.
+- `agent_id` is the server-generated UUID returned by the agent registration
+  endpoint. A caller cannot choose its own id at registration time.
+- Registration fields and topology for orchestrating agents belong to
+  [#317](https://github.com/skaiy/wild_agentos/issues/317).
 - Making orchestrating definitions addressable by id and revision is part of
   the execution bridge
   ([#317](https://github.com/skaiy/wild_agentos/issues/317)). Until then,
@@ -326,16 +330,21 @@ safe texts and never echo tokens, inputs or the original request.
 
 | Status | `error` | When |
 | --- | --- | --- |
-| 400 | `field_not_allowed`, `invalid_idempotency_key`, `invalid_request`, `invalid_if_match` | Scope or server fields in body; malformed key; invalid §4 field (including a schemeless `input_ref.uri`); malformed `If-Match` |
+| 400 | `field_not_allowed`, `invalid_idempotency_key`, `invalid_request`, `invalid_if_match`, `idempotency_unsupported` | Scope or server fields in body; malformed key; invalid §4 field (including a schemeless `input_ref.uri`); malformed `If-Match`; `Idempotency-Key` sent before [#315](https://github.com/skaiy/wild_agentos/issues/315) (temporary code, §11) |
 | 401 | `verified_isolation_claims_required` | No verified claims |
-| 403 | `claims_incomplete` | Defaulted project |
+| 403 | `claims_incomplete`, `cancel_not_permitted` | Defaulted project (body may carry `missing_field`); cancel by an actor that is neither the creator nor a DA |
 | 404 | `not_found` | Unknown id or another scope (identical body) |
-| 409 | `idempotency_key_conflict`, `idempotency_key_in_progress`, `revision_conflict`, `illegal_transition`, `agent_revision_mismatch` | See §4, §6, §7 |
+| 409 | `idempotency_key_conflict`, `idempotency_key_in_progress`, `revision_conflict`, `illegal_transition`, `agent_revision_mismatch` | See §4, §6, §7; a `revision_conflict` body may carry `current_revision` |
 | 413 | `payload_too_large` | Body > 64 KiB, `input` > 8192 bytes or `metadata` > 16 KiB / 64 keys |
 | 422 | `input_ref_unresolvable`, `agent_not_found`, `agent_revision_unsupported` | `input_ref` scheme has no registered resolver; `agent_id` not found in scope; `agent_revision` sent before agent definition revisions exist (#317, §4) |
 | 429 | `too_many_active` | Per-scope active limit reached (§7.2); `Retry-After: 5` |
 | 500 | `persistence_failed` | Store write failed; nothing changed |
-| 503 | `execution_disabled`, `invocation_store_full` | Execution switch off (§8); store still full after the retention sweep (§7.1) |
+| 503 | `execution_disabled`, `invocation_store_full`, `invocation_store_unavailable` | Execution switch off (§8); store still full after the retention sweep (§7.1); invocation store not configured or unreachable |
+
+Besides `error` and `message`, a 403 body may carry `missing_field` and a 409
+body may carry `current_revision`. A successful create returns `202` with a
+`Location: /v1/invocations/<id>` header; resource responses carry an `ETag`
+with the current revision.
 
 ## 10. Non-goals
 
@@ -363,3 +372,17 @@ safe texts and never echo tokens, inputs or the original request.
   until then creates return `503 execution_disabled` (§8).
 - **Inputs.** v0.12.0 has no built-in `input_ref` resolver; send inline
   `input` (≤ 8192 bytes) (§4.2).
+- **Idempotency requires [#315](https://github.com/skaiy/wild_agentos/issues/315).**
+  Until #315 lands, a create that sends `Idempotency-Key` returns
+  `400 idempotency_unsupported` (a temporary code) instead of silently
+  ignoring the key. Integrations that rely on idempotent retries should wait
+  for #315.
+- **Switch-over prerequisites:** #315 + #317 + #310.
+- **Agent ids.** Use the server-generated UUID returned by agent registration as
+  `agent_id`; ids cannot be self-assigned at registration. Registration fields
+  and topology for orchestrating agents come with #317 (§4.1).
+- **Known inconsistency (agent registration).** `POST /api/v1/agents` still
+  accepts a token whose project was filled in by default. An agent registered
+  with such a token lands in the `default` project, and invocation calls with
+  the same token return 403 / 422. Register agents with a token that carries
+  an explicit project.
