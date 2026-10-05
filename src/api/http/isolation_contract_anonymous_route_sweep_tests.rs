@@ -181,6 +181,7 @@ const MUST_BE_PROTECTED: &[(&str, &str)] = &[
     ("GET", "/v1/invocations"),
     ("GET", "/v1/invocations/:id"),
     ("POST", "/v1/invocations/:id/cancel"),
+    ("GET", "/v1/invocations/:id/events"),
 ];
 
 const ROUTER_SOURCE: &str = include_str!("mod.rs");
