@@ -52,17 +52,17 @@ scope and server fields → `400 field_not_allowed` (§3).
 ```jsonc
 {
   "prompt": "…",                 // required unless `input` or `input_ref` is set
-  "agent_id": "…",               // optional
-  "agent_revision": "…",         // optional exact pin of the agent definition revision; needs agent_id
+  "agent_id": "…",               // optional server-side agent definition (§4.1)
+  "agent_revision": "…",         // optional exact pin of that definition's revision; needs agent_id
   "input": { … },                // optional inline JSON, ≤ 8192 bytes serialized
   "input_ref": {                 // optional immutable reference; mutually exclusive with `input`
-    "uri": "…",
+    "uri": "<scheme>://…",       // scheme selects a registered resolver (§4.2)
     "sha256": "<64 lowercase hex>"
   },
   "budget": {                    // optional; every present member is a positive integer
     "max_tokens": 40000,
     "max_tool_calls": 50,
-    "max_cost": 2500000          // smallest unit of the deployment's cost accounting (e.g. micro-USD)
+    "max_cost": 2500000          // integer micro-USD (1 USD = 1_000_000), so 2.50 USD
   },
   "deadline": "2026-10-05T12:00:00Z",  // optional RFC 3339 with offset; must be in the future
   "metadata": {}                 // optional; ≤ 16 KiB serialized, ≤ 64 top-level keys
@@ -74,12 +74,14 @@ scope and server fields → `400 field_not_allowed` (§3).
 | `prompt` / `input` / `input_ref` | At least one must be present | `400 invalid_request` |
 | `agent_revision` | Must equal the current revision of `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Mismatch → `409 agent_revision_mismatch`; floating word or missing `agent_id` → `400 invalid_request` |
 | `input` | Any JSON value, ≤ 8192 bytes as compact JSON | Over limit → `413 payload_too_large` |
-| `input_ref` | Both `uri` and `sha256` required; `sha256` is 64 lowercase hex; scheme must have a configured resolver | Both `input` and `input_ref` → `400 invalid_request`; no resolver → `422 input_ref_unresolvable` |
-| `budget.*` | Positive integers (≥ 1); unknown members rejected | `400 invalid_request` |
+| `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…`; `sha256` is 64 lowercase hex; the scheme must have a registered resolver (§4.2) | Both `input` and `input_ref`, or a `uri` without `<scheme>://` → `400 invalid_request`; unregistered scheme → `422 input_ref_unresolvable` |
+| `budget.*` | Positive integers (≥ 1); `max_cost` is micro-USD; unknown members rejected | `400 invalid_request` |
 | `deadline` | RFC 3339 with offset, later than server time at create | `400 invalid_request` |
 | `metadata` | JSON object, ≤ 16 KiB compact JSON, ≤ 64 top-level keys | `413 payload_too_large` |
 | whole body | ≤ 64 KiB | `413 payload_too_large` |
 
+- `agent_id` that does not resolve to a definition in the caller's scope →
+  `422 agent_not_found`, identical for unknown ids and other scopes.
 - `input_ref` content is fetched only by the execution bridge; if its SHA-256
   does not match, the invocation ends `failed` with
   `error.code = "input_digest_mismatch"`.
@@ -100,6 +102,33 @@ scope and server fields → `400 field_not_allowed` (§3).
   computes it itself and pins it through `agent_revision`, `input_ref` and the
   digests above.
 
+### 4.1 Agent targets and topology
+
+- `agent_id` names a server-side agent definition in the caller's
+  tenant/project scope. It may name an orchestrating definition, that is one
+  executed by the Supervisor Agent as a multi-agent plan (decompose, run
+  sub-agents, aggregate), not only a single agent.
+- Topology (single agent or orchestrated plan, sub-agent limits, parallelism)
+  is a property of the definition on the server. `agent_revision` pins the
+  definition, and with it the topology; a caller cannot choose or override
+  topology in the request. A `topology` or similar field is an unknown field →
+  `400 invalid_request`.
+- Without `agent_id` the server's default execution path is used.
+- Making orchestrating definitions addressable by id and revision is part of
+  the execution bridge
+  ([#317](https://github.com/skaiy/wild_agentos/issues/317)).
+
+### 4.2 `input_ref` resolvers
+
+- Resolvers are a pluggable registry keyed by URI scheme: `input_ref.uri` must
+  be `<scheme>://…`, and the scheme selects the resolver.
+- A `uri` without a scheme → `400 invalid_request`. A scheme with no
+  registered resolver → `422 input_ref_unresolvable`. Both are checked at
+  create, so nothing is persisted.
+- v0.12.0 ships **no built-in resolver**, so every `input_ref` is `422` until a
+  deployment registers one. First integrations should send inline `input`
+  (≤ 8192 bytes).
+
 ## 5. Resource (draft)
 
 ```jsonc
@@ -115,12 +144,34 @@ scope and server fields → `400 field_not_allowed` (§3).
     "metadata": {}
   },
   "task_iri": "iri://task_…",    // server-generated
-  "result": null,
+  "result": null,                // see below once set
   "error": null,
   "idempotency_key": null,
   "created_at": "…", "updated_at": "…", "started_at": null, "completed_at": null
 }
 ```
+
+`result` once execution has finished:
+
+```jsonc
+{
+  "summary": "…",
+  "artifacts": [],
+  "usage": {                     // optional; every member optional and omitted when unknown
+    "provider": "…",
+    "model": "…",
+    "input_tokens": 1200,
+    "output_tokens": 345,
+    "cost": 18000,               // integer micro-USD, same unit as budget.max_cost
+    "tool_calls": [{ "name": "…", "transport": "…" }]
+  }
+}
+```
+
+- `usage` reports the metering the server already does to enforce `budget`
+  (`budget_exceeded`). It carries no partner or source attribution.
+- A `failed` invocation can still carry `result` with `usage` (for example
+  after `budget_exceeded`) and an empty `summary`.
 
 ## 6. Idempotency
 
@@ -141,7 +192,9 @@ scope and server fields → `400 field_not_allowed` (§3).
 - Registering the key and creating the resource happen in one atomic write
   before any side effect. A rejected, conflicting or invalid create leaves no
   resource, event, queue entry or execution behind.
-- Records expire after a configurable TTL (default 24 h).
+- Idempotency records expire after a configurable TTL, default 24 h
+  (`AGENTOS_INVOCATION_IDEMPOTENCY_TTL_HOURS`). After expiry the same key
+  creates a new invocation.
 
 ## 7. Lifecycle
 
@@ -180,6 +233,26 @@ queued ──► running ──► succeeded
 `error.code` values on a failed invocation: `execution_failed`, `interrupted`,
 `deadline_exceeded`, `budget_exceeded`, `input_digest_mismatch`.
 
+### 7.1 Retention
+
+- Terminal invocations are kept for a configurable retention measured from
+  `completed_at`: default 7 days, `AGENTOS_INVOCATION_RETENTION_DAYS` (whole
+  days, ≥ 1). After that they are removed and read as `404 not_found`.
+- Expired terminal records are swept at startup (after restart recovery),
+  inside every create, and on demand. Non-terminal invocations are never
+  swept. A sweep that removes nothing writes nothing; a sweep that removes
+  records uses the same atomic file replace as every other write.
+- The per-process store capacity (10 000 records) counts the records left
+  after the sweep. When it is still full, create → `503 invocation_store_full`.
+
+### 7.2 Active limit
+
+- At most 32 non-terminal invocations per tenant/project scope by default
+  (`AGENTOS_INVOCATION_MAX_ACTIVE`, ≥ 1).
+- Over the limit, create → `429 too_many_active` with `Retry-After: 5`, and
+  nothing is persisted (no resource, no idempotency record). The count and the
+  insert happen under one write lock.
+
 ## 8. Execution
 
 - After a successful (non-replayed) create, the server creates a task with the
@@ -188,6 +261,8 @@ queued ──► running ──► succeeded
 - Task events drive state transitions. A lagging SSE subscriber receives a
   `resync` event and should re-read the resource; the persisted state is
   authoritative.
+- Usage is metered per run and written to `result.usage` with the terminal
+  transition.
 - Execution is behind a configuration switch that defaults to **off**. It must
   stay off in production until projection scoping
   ([#310](https://github.com/skaiy/wild_agentos/issues/310)) is merged.
@@ -198,6 +273,38 @@ queued ──► running ──► succeeded
   the existing resource. The switch is read at startup; turning it off needs a
   restart, which moves in-flight invocations to `failed/interrupted`.
 
+### 8.1 Event stream
+
+`GET /v1/invocations/:id/events` (`text/event-stream`). Each message has
+`event:`, `id:` and one JSON `data:` line.
+
+- `id` is `<revision>.<n>`: the resource revision when the event was emitted
+  and a counter `n` within that revision, starting at 0. Order by revision,
+  then `n`. Events are not replayed; on reconnect the stream starts again with
+  a snapshot, so `Last-Event-ID` is ignored.
+- Every `data` object carries `invocation_id`, `revision` and `at` (RFC 3339).
+
+| `event` | When | Extra `data` members |
+| --- | --- | --- |
+| `state` | First event (snapshot), then every state transition | `state`, `previous_state` (null in the snapshot), `snapshot` (true only on the first event), `invocation` (full resource, snapshot only) |
+| `progress` | Execution progress; not persisted, `revision` unchanged | `phase` (optional), `message` (optional, safe text) |
+| `result` | Once, on `succeeded` | `state`, `result` (with `usage`) |
+| `error` | Once, on `failed` | `state`, `error` (`{code, message}`), `usage` (optional) |
+| `resync` | Subscriber lagged and events were dropped | none; re-read the resource |
+
+A terminal transition sends its `state` event, then `result` (succeeded) or
+`error` (failed); `cancelled` sends only `state`. The stream then closes.
+
+```text
+event: state
+id: 3.0
+data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","previous_state":"running","snapshot":false}
+
+event: result
+id: 3.1
+data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","result":{"summary":"…","artifacts":[],"usage":{"input_tokens":1200,"output_tokens":345,"cost":18000}}}
+```
+
 ## 9. Error codes (draft)
 
 Error bodies are `{"error": "<code>", "message": "…"}`; messages are fixed,
@@ -205,16 +312,16 @@ safe texts and never echo tokens, inputs or the original request.
 
 | Status | `error` | When |
 | --- | --- | --- |
-| 400 | `field_not_allowed`, `invalid_idempotency_key`, `invalid_request`, `invalid_if_match` | Scope or server fields in body; malformed key; invalid §4 field; malformed `If-Match` |
+| 400 | `field_not_allowed`, `invalid_idempotency_key`, `invalid_request`, `invalid_if_match` | Scope or server fields in body; malformed key; invalid §4 field (including a schemeless `input_ref.uri`); malformed `If-Match` |
 | 401 | `verified_isolation_claims_required` | No verified claims |
 | 403 | `claims_incomplete` | Defaulted project |
 | 404 | `not_found` | Unknown id or another scope (identical body) |
 | 409 | `idempotency_key_conflict`, `idempotency_key_in_progress`, `revision_conflict`, `illegal_transition`, `agent_revision_mismatch` | See §4, §6, §7 |
 | 413 | `payload_too_large` | Body > 64 KiB, `input` > 8192 bytes or `metadata` > 16 KiB / 64 keys |
-| 422 | `input_ref_unresolvable` | `input_ref` scheme has no configured resolver |
-| 429 | `too_many_active_invocations` | Per-scope active limit reached |
+| 422 | `input_ref_unresolvable`, `agent_not_found` | `input_ref` scheme has no registered resolver; `agent_id` not found in scope |
+| 429 | `too_many_active` | Per-scope active limit reached (§7.2); `Retry-After: 5` |
 | 500 | `persistence_failed` | Store write failed; nothing changed |
-| 503 | `execution_disabled`, `invocation_store_full` | Execution switch off (§8); store capacity reached |
+| 503 | `execution_disabled`, `invocation_store_full` | Execution switch off (§8); store still full after the retention sweep (§7.1) |
 
 ## 10. Non-goals
 
@@ -222,3 +329,8 @@ safe texts and never echo tokens, inputs or the original request.
 - No integrator-specific fields or compatibility keys in the public contract.
 - API-client keys are not accepted as credentials in v0.12.0.
 - Existing `/api/v1/tasks*` and OpenAI-compatible routes are unchanged.
+- No built-in `input_ref` resolver in v0.12.0 (§4.2).
+- Only the agent definition is pinned (`agent_revision`). Provider, model,
+  tool, policy and context revisions are intentionally not pinned server-side
+  in v0.12.0; pinning them is a possible follow-up.
+- `usage` has no partner or source attribution.

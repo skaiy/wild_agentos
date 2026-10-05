@@ -38,17 +38,17 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 ```jsonc
 {
   "prompt": "…",                 // 没有 `input` 和 `input_ref` 时必填
-  "agent_id": "…",               // 可选
-  "agent_revision": "…",         // 可选，精确钉住 agent 定义的修订；需同时带 agent_id
+  "agent_id": "…",               // 可选，服务端的 agent 定义（§4.1）
+  "agent_revision": "…",         // 可选，精确钉住该定义的修订；需同时带 agent_id
   "input": { … },                // 可选，内联 JSON，序列化后 ≤ 8192 字节
   "input_ref": {                 // 可选，不可变引用；与 `input` 互斥
-    "uri": "…",
+    "uri": "<scheme>://…",       // scheme 选择已注册的解析器（§4.2）
     "sha256": "<64 位小写十六进制>"
   },
   "budget": {                    // 可选；出现的成员必须是正整数
     "max_tokens": 40000,
     "max_tool_calls": 50,
-    "max_cost": 2500000          // 部署成本核算的最小单位（如微美元）
+    "max_cost": 2500000          // 整数，单位微美元（1 USD = 1_000_000），即 2.50 美元
   },
   "deadline": "2026-10-05T12:00:00Z",  // 可选，带时区偏移的 RFC 3339，必须晚于当前时间
   "metadata": {}                 // 可选；序列化后 ≤ 16 KiB，顶层键 ≤ 64 个
@@ -60,17 +60,31 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | `prompt` / `input` / `input_ref` | 至少出现一个 | `400 invalid_request` |
 | `agent_revision` | 必须等于 `agent_id` 当前修订；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析 | 不一致 → `409 agent_revision_mismatch`；浮动词或缺 `agent_id` → `400 invalid_request` |
 | `input` | 任意 JSON 值，紧凑序列化 ≤ 8192 字节 | 超限 → `413 payload_too_large` |
-| `input_ref` | `uri` 与 `sha256` 都必填；`sha256` 为 64 位小写十六进制；scheme 必须有已配置的解析器 | 同时带 `input` 和 `input_ref` → `400 invalid_request`；没有解析器 → `422 input_ref_unresolvable` |
-| `budget.*` | 正整数（≥ 1）；未知成员拒绝 | `400 invalid_request` |
+| `input_ref` | `uri` 与 `sha256` 都必填；`uri` 形如 `<scheme>://…`；`sha256` 为 64 位小写十六进制；scheme 必须有已注册的解析器（§4.2） | 同时带 `input` 和 `input_ref`，或 `uri` 没有 `<scheme>://` → `400 invalid_request`；scheme 未注册 → `422 input_ref_unresolvable` |
+| `budget.*` | 正整数（≥ 1）；`max_cost` 单位为微美元；未知成员拒绝 | `400 invalid_request` |
 | `deadline` | 带时区偏移的 RFC 3339，晚于创建时的服务端时间 | `400 invalid_request` |
 | `metadata` | JSON 对象，紧凑序列化 ≤ 16 KiB，顶层键 ≤ 64 个 | `413 payload_too_large` |
 | 整个请求体 | ≤ 64 KiB | `413 payload_too_large` |
 
+- `agent_id` 在调用方 scope 内找不到对应定义 → `422 agent_not_found`，不存在的 id 与其他 scope 的 id 返回相同。
 - `input_ref` 的内容只由执行桥拉取；SHA-256 不一致时调用以 `failed` 结束，`error.code = "input_digest_mismatch"`。
 - 触达预算上限时停止执行，调用以 `failed` 结束，`error.code = "budget_exceeded"`。
 - 到达 `deadline` 时停止执行，调用以 `failed` 结束，`error.code = "deadline_exceeded"`。仍在 `queued` 的调用同样处理：`queued → failed` 是条件边，只有到期（`error.code = "deadline_exceeded"`）才能走；其他原因的 `queued → failed` 请求一律 `409 illegal_transition`。
 - `metadata` 和其他调用方提供的字段都在资源的 `request` 对象里原样回显（`request.input`、`request.input_ref`、`request.metadata` 等）：服务端不增、不删、不改任何键或值。同一 tenant/project scope 内的所有 actor 都能读到，不要放敏感内容。
 - 凭证、授权（grant）、token exchange、cross-area 身份和修订绑定（revision binding）计算都不属于本 API（§10）。需要绑定的调用方自行计算，并通过 `agent_revision`、`input_ref` 和上面的摘要钉住。
+
+### 4.1 Agent 目标与拓扑
+
+- `agent_id` 指向调用方 tenant/project scope 内的一个服务端 agent 定义。它可以是编排型定义，即由 Supervisor Agent 按多 agent 计划执行（拆解、运行子 agent、汇总）的定义，不限于单个 agent。
+- 拓扑（单 agent 还是编排计划、子 agent 上限、是否并行）是服务端定义的属性。`agent_revision` 钉住定义，也就钉住了拓扑；调用方不能在请求里选择或覆盖拓扑。请求体里的 `topology` 等字段属于未知字段 → `400 invalid_request`。
+- 不带 `agent_id` 时走服务端默认执行路径。
+- 让编排型定义可以按 id 和修订寻址，属于执行桥（[#317](https://github.com/skaiy/wild_agentos/issues/317)）的工作。
+
+### 4.2 `input_ref` 解析器
+
+- 解析器是按 URI scheme 注册的可插拔注册表：`input_ref.uri` 必须是 `<scheme>://…`，由 scheme 选择解析器。
+- `uri` 没有 scheme → `400 invalid_request`；scheme 没有已注册的解析器 → `422 input_ref_unresolvable`。两者都在创建时检查，什么都不落盘。
+- v0.12.0 **不内置任何解析器**，部署方注册之前所有 `input_ref` 都返回 `422`。首批集成应使用内联 `input`（≤ 8192 字节）。
 
 ## 5. 资源（草案）
 
@@ -87,12 +101,32 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
     "metadata": {}
   },
   "task_iri": "iri://task_…",    // 服务端生成
-  "result": null,
+  "result": null,                // 写入后的形状见下
   "error": null,
   "idempotency_key": null,
   "created_at": "…", "updated_at": "…", "started_at": null, "completed_at": null
 }
 ```
+
+执行结束后的 `result`：
+
+```jsonc
+{
+  "summary": "…",
+  "artifacts": [],
+  "usage": {                     // 可选；所有成员都可选，未知时省略
+    "provider": "…",
+    "model": "…",
+    "input_tokens": 1200,
+    "output_tokens": 345,
+    "cost": 18000,               // 整数，单位微美元，与 budget.max_cost 相同
+    "tool_calls": [{ "name": "…", "transport": "…" }]
+  }
+}
+```
+
+- `usage` 报告的是服务端为执行 `budget`（`budget_exceeded`）本来就在做的计量，不含任何合作方或来源归因。
+- `failed` 的调用也可以带 `result`，其中只有 `usage`（例如 `budget_exceeded` 之后），`summary` 为空。
 
 ## 6. 幂等
 
@@ -104,7 +138,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 - 第一个请求还在提交时来了并发重复请求 → `409 idempotency_key_in_progress`，带 `Retry-After`。
 - 同一个 key 的并发创建只产生一个资源，不出现 `5xx`。
 - 登记 key 与创建资源在同一次原子写入里完成，且先于任何副作用。被拒绝、冲突或非法的创建不留下任何资源、事件、队列项或执行。
-- 记录按可配置 TTL 过期（默认 24 小时）。
+- 幂等记录按可配置 TTL 过期，默认 24 小时（`AGENTOS_INVOCATION_IDEMPOTENCY_TTL_HOURS`）。过期后同一个 key 会创建新的调用。
 
 ## 7. 生命周期
 
@@ -128,12 +162,51 @@ queued ──► running ──► succeeded
 
 失败调用的 `error.code` 取值：`execution_failed`、`interrupted`、`deadline_exceeded`、`budget_exceeded`、`input_digest_mismatch`。
 
+### 7.1 保留与清理
+
+- 终态调用从 `completed_at` 起按可配置的保留期保存：默认 7 天，`AGENTOS_INVOCATION_RETENTION_DAYS`（整天数，≥ 1）。过期后删除，再读返回 `404 not_found`。
+- 过期的终态记录在启动时（重启恢复之后）、每次创建时以及按需清理。非终态调用永不清理。没有删掉任何记录的清理不写盘；删掉记录的清理与其他写入一样走原子文件替换。
+- 每进程存储容量（10 000 条）按清理后剩下的记录计算。清理后仍满时，创建 → `503 invocation_store_full`。
+
+### 7.2 活跃上限
+
+- 每个 tenant/project scope 默认最多 32 个非终态调用（`AGENTOS_INVOCATION_MAX_ACTIVE`，≥ 1）。
+- 超限时创建 → `429 too_many_active`，带 `Retry-After: 5`，什么都不落盘（没有资源，也没有幂等记录）。计数和写入在同一把写锁里完成。
+
 ## 8. 执行
 
 - 创建成功（且不是幂等重放）后，服务端用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
 - 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
+- 每次运行都计量，用量随终态迁移写入 `result.usage`。
 - 执行受配置开关控制，默认**关闭**。投影按 scope 绑定（[#310](https://github.com/skaiy/wild_agentos/issues/310)）合入前，生产必须保持关闭。
 - 开关关闭时，新的创建请求返回 `503 execution_disabled`，什么都不落盘（没有资源，也没有幂等记录），因此不会有调用永远停在非终态。开关关闭前已登记的 key 重放仍返回 `200` 和原资源。开关在启动时读取；关闭开关需要重启，重启会把执行中的调用改为 `failed/interrupted`。
+
+### 8.1 事件流
+
+`GET /v1/invocations/:id/events`（`text/event-stream`）。每条消息有 `event:`、`id:` 和一行 JSON `data:`。
+
+- `id` 为 `<revision>.<n>`：发出事件时资源的 revision，加上该 revision 内从 0 开始的计数 `n`。先按 revision、再按 `n` 排序。事件不重放；重连后从快照重新开始，因此忽略 `Last-Event-ID`。
+- 每个 `data` 对象都带 `invocation_id`、`revision` 和 `at`（RFC 3339）。
+
+| `event` | 何时 | `data` 额外成员 |
+| --- | --- | --- |
+| `state` | 第一条（快照），之后每次状态迁移 | `state`、`previous_state`（快照中为 null）、`snapshot`（仅第一条为 true）、`invocation`（完整资源，仅快照） |
+| `progress` | 执行进度；不落盘，`revision` 不变 | `phase`（可选）、`message`（可选，安全文案） |
+| `result` | 到达 `succeeded` 时发一次 | `state`、`result`（含 `usage`） |
+| `error` | 到达 `failed` 时发一次 | `state`、`error`（`{code, message}`）、`usage`（可选） |
+| `resync` | 订阅者跟不上，事件被丢弃 | 无；请重新读取资源 |
+
+终态迁移先发 `state`，再发 `result`（succeeded）或 `error`（failed）；`cancelled` 只发 `state`。之后流关闭。
+
+```text
+event: state
+id: 3.0
+data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","previous_state":"running","snapshot":false}
+
+event: result
+id: 3.1
+data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","result":{"summary":"…","artifacts":[],"usage":{"input_tokens":1200,"output_tokens":345,"cost":18000}}}
+```
 
 ## 9. 错误码（草案）
 
@@ -141,16 +214,16 @@ queued ──► running ──► succeeded
 
 | 状态码 | `error` | 场景 |
 | --- | --- | --- |
-| 400 | `field_not_allowed`、`invalid_idempotency_key`、`invalid_request`、`invalid_if_match` | 请求体带 scope 或服务端字段；key 格式非法；§4 字段非法；`If-Match` 格式错误 |
+| 400 | `field_not_allowed`、`invalid_idempotency_key`、`invalid_request`、`invalid_if_match` | 请求体带 scope 或服务端字段；key 格式非法；§4 字段非法（包括没有 scheme 的 `input_ref.uri`）；`If-Match` 格式错误 |
 | 401 | `verified_isolation_claims_required` | 没有已校验 claims |
 | 403 | `claims_incomplete` | project 为默认值 |
 | 404 | `not_found` | id 不存在或属于其他 scope（body 相同） |
 | 409 | `idempotency_key_conflict`、`idempotency_key_in_progress`、`revision_conflict`、`illegal_transition`、`agent_revision_mismatch` | 见 §4、§6、§7 |
 | 413 | `payload_too_large` | 请求体 > 64 KiB、`input` > 8192 字节或 `metadata` > 16 KiB / 64 个键 |
-| 422 | `input_ref_unresolvable` | `input_ref` 的 scheme 没有已配置的解析器 |
-| 429 | `too_many_active_invocations` | 达到 scope 内活跃调用上限 |
+| 422 | `input_ref_unresolvable`、`agent_not_found` | `input_ref` 的 scheme 没有已注册的解析器；`agent_id` 在 scope 内不存在 |
+| 429 | `too_many_active` | 达到 scope 内活跃调用上限（§7.2）；带 `Retry-After: 5` |
 | 500 | `persistence_failed` | 存储写入失败，状态未改变 |
-| 503 | `execution_disabled`、`invocation_store_full` | 执行开关关闭（§8）；存储容量已满 |
+| 503 | `execution_disabled`、`invocation_store_full` | 执行开关关闭（§8）；保留期清理后存储仍满（§7.1） |
 
 ## 10. 不在范围
 
@@ -158,3 +231,6 @@ queued ──► running ──► succeeded
 - 公开契约里不放集成方特有字段或兼容键。
 - v0.12.0 不接受 API client key 作为凭证。
 - 现有 `/api/v1/tasks*` 和 OpenAI 兼容路由不变。
+- v0.12.0 不内置 `input_ref` 解析器（§4.2）。
+- 只钉住 agent 定义（`agent_revision`）。provider、model、工具、策略和上下文的修订在 v0.12.0 有意不在服务端钉住，以后可另开 follow-up。
+- `usage` 不含合作方或来源归因。
