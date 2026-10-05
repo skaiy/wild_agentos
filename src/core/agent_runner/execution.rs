@@ -2113,8 +2113,8 @@ Output the summary report directly, not in JSON format."#,
                             // also applies executor security, permission, hook and
                             // syscall policies.
                             let executor = self.tool_executor.read().clone();
-                            let mut result = executor
-                                .execute_with_security_context_and_claims_and_policy(
+                            let (mut result, policy_denied_by) = match executor
+                                .execute_guarded(
                                     name,
                                     args,
                                     crate::skill_graph::security::SecurityContext::new(
@@ -2127,7 +2127,10 @@ Output the summary report directly, not in JSON format."#,
                                     activated_tools.policy(),
                                 )
                                 .await
-                                .unwrap_or_else(|e| json!({"error": e}));
+                            {
+                                Ok(outcome) => (outcome.value, outcome.policy_denied_by),
+                                Err(e) => (json!({"error": e}), None),
+                            };
                             if name == "tool_search" {
                                 let activation = executor.activate_on_demand_from_search(
                                     &agent.role.to_string(),
@@ -2285,6 +2288,12 @@ Output the summary report directly, not in JSON format."#,
                                 .with_isolation_claims(ctx.isolation_claims.clone())
                                 .with_data("tool_name", Value::String(name.clone()))
                                 .with_data("tool_result", Value::String(raw_result_str.clone()));
+                                // The gate name comes only from the executor,
+                                // never from the tool's returned JSON.
+                                if let Some(gate) = policy_denied_by {
+                                    hook_ctx = hook_ctx
+                                        .with_data("policy_denied_by", json!(gate.as_str()));
+                                }
                                 let hook_result = self
                                     .hook_manager
                                     .execute(HookPoint::SkillAfter, &mut hook_ctx)
