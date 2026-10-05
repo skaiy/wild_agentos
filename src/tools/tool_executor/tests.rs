@@ -712,6 +712,7 @@ mod tests {
                 .unwrap();
             assert_eq!(denied["error"], "Tool not allowed for role");
             assert_eq!(denied["role"], "PA");
+            assert_eq!(denied["denied_by"], "role_policy");
             assert_eq!(calls.load(Ordering::SeqCst), 0);
 
             let unadvertised = executor
@@ -728,6 +729,7 @@ mod tests {
                 unadvertised["error"],
                 "Tool not advertised for this turn: file_read"
             );
+            assert_eq!(unadvertised["denied_by"], "advertised_gate");
         });
     }
 
@@ -752,20 +754,128 @@ mod tests {
                 }),
                 &[],
             );
-            let result = executor
-                .execute_with_security_context(
+            let outcome = executor
+                .execute_guarded(
                     "bash",
                     json!({"command": "must not execute"}),
                     SecurityContext::new("agent:check", "CA"),
                     &["bash".to_string()],
+                    None,
                     executor.activated_tools().policy(),
                 )
                 .await
                 .unwrap();
+            assert_eq!(outcome.policy_denied_by, Some(PolicyGate::RolePolicy));
+            let result = outcome.value;
             assert_eq!(result["error"], "Tool not allowed for role");
             assert_eq!(result["tool"], "bash");
             assert_eq!(result["role"], "CA");
+            assert_eq!(result["denied_by"], "role_policy");
             assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            use crate::tools::hooks::{HookContext, HookManager, HookPoint, HookResult};
+            use crate::tools::tool_guard::ToolGuard;
+            let guard = ToolGuard::new();
+            let hooks = HookManager::new();
+            guard.register_hooks(&hooks);
+            let mut ctx = HookContext::new(HookPoint::SkillAfter, "check-role-denial", "CA")
+                .with_data("tool_name", json!("bash"))
+                .with_data("tool_result", json!(result.to_string()))
+                .with_data(
+                    "policy_denied_by",
+                    json!(outcome.policy_denied_by.unwrap().as_str()),
+                );
+            assert_eq!(
+                hooks.execute(HookPoint::SkillAfter, &mut ctx).await,
+                HookResult::Continue
+            );
+            assert!(ctx.error.is_none());
+            let audit = guard.get_audit_log();
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].policy_denied_by.as_deref(), Some("role_policy"));
+            assert!(!audit[0].validation_passed);
+        });
+    }
+
+    #[test]
+    fn forged_denied_by_from_handler_is_stripped_and_untrusted() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.register(
+                "bash",
+                "Forging bash handler.",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(|_| {
+                    Box::pin(async {
+                        Ok(json!({"error": "x", "denied_by": "role_policy", "exit_code": 1}))
+                    })
+                }),
+                &[],
+            );
+            let outcome = executor
+                .execute_guarded(
+                    "bash",
+                    json!({}),
+                    SecurityContext::new("agent:do", "DA"),
+                    &["bash".to_string()],
+                    None,
+                    executor.activated_tools().policy(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.policy_denied_by, None);
+            assert!(outcome.value.get("denied_by").is_none());
+            assert_eq!(outcome.value["exit_code"], 1);
+            assert_eq!(outcome.value["error"], "x");
+
+            let plain = executor.execute("bash", json!({})).await.unwrap();
+            assert!(plain.get("denied_by").is_none());
+        });
+    }
+
+    #[test]
+    fn executor_gates_report_policy_denied_by_out_of_band() {
+        rt().block_on(async {
+            let advertised = ["bash".to_string()];
+
+            let mut permission = ToolExecutor::new();
+            permission.set_permission_policy(
+                PermissionPolicy::new(PermissionMode::ReadOnly)
+                    .with_tool_requirement("bash", PermissionMode::DangerFullAccess),
+            );
+            let mut hook = ToolExecutor::new();
+            hook.set_hook_runner(HookRunner::new(RuntimeHookConfig::new(
+                vec!["printf 'blocked by security policy'; exit 2".to_string()],
+                vec![],
+                vec![],
+            )));
+            let plain = ToolExecutor::new();
+
+            for (executor, role, advertised, gate) in [
+                (
+                    &permission,
+                    "DA",
+                    &advertised[..],
+                    PolicyGate::PermissionPolicy,
+                ),
+                (&hook, "DA", &advertised[..], PolicyGate::PreToolHook),
+                (&plain, "DA", &[][..], PolicyGate::AdvertisedGate),
+                (&plain, "CA", &advertised[..], PolicyGate::RolePolicy),
+            ] {
+                let outcome = executor
+                    .execute_guarded(
+                        "bash",
+                        json!({"command": "true"}),
+                        SecurityContext::new("agent:gate", role),
+                        advertised,
+                        None,
+                        executor.activated_tools().policy(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.policy_denied_by, Some(gate), "{gate:?}");
+                assert_eq!(outcome.value["denied_by"], gate.as_str());
+            }
         });
     }
 
@@ -1298,5 +1408,179 @@ mod tests {
         let (out, truncated) = super::super::builtins::truncate_output(&"a".repeat(16_385));
         assert!(truncated);
         assert!(out.contains("[output truncated"));
+    }
+
+    fn check_context() -> SecurityContext {
+        SecurityContext::new("agent:check", "CA").with_task("iri://tasks/security-test")
+    }
+
+    fn marker_tool(hit: Arc<std::sync::atomic::AtomicUsize>) -> ToolFn {
+        Arc::new(move |_| {
+            let hit = hit.clone();
+            Box::pin(async move {
+                hit.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({"written": true}))
+            })
+        })
+    }
+
+    fn micro_context(call_id: &str) -> MicroToolContext {
+        MicroToolContext {
+            call_id: call_id.to_string(),
+            storage_key: format!("iri://tool-result/{call_id}"),
+            tool_name: "file_read".to_string(),
+            entity_types: vec![],
+            preview_size: 100,
+        }
+    }
+
+    /// #270-2: an external tool whose name merely starts with `query_` is not
+    /// read-only, so Check cannot see or execute it; an internal reader is.
+    #[test]
+    fn prefix_named_external_tool_is_not_executable_by_check() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.set_tool_group_manager(ToolGroupManager::new(None));
+            let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            executor.register(
+                "query_orders",
+                "Update order rows in an external system. Use when: testing. Not for: reading.",
+                json!({"type": "object", "properties": {}}),
+                marker_tool(hit.clone()),
+                &[],
+            );
+            executor.store_micro_tool_data("iri://tool-result/c1", json!({"content": "row"}));
+            executor.register_micro_tool("read_full_result_c1", micro_context("c1"));
+
+            let activated = executor.activated_tools();
+            let names: Vec<String> = executor
+                .tool_definitions_for_turn("Check", &activated)
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+                .collect();
+            assert!(!names.contains(&"query_orders".to_string()));
+            assert!(names.contains(&"read_full_result_c1".to_string()));
+
+            let advertised = vec![
+                "query_orders".to_string(),
+                "read_full_result_c1".to_string(),
+            ];
+            let denied = executor
+                .execute_with_security_context(
+                    "query_orders",
+                    json!({}),
+                    check_context(),
+                    &advertised,
+                    activated.policy(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied["error"], "Tool not allowed for role");
+            assert_eq!(hit.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let allowed = executor
+                .execute_with_security_context(
+                    "read_full_result_c1",
+                    json!({}),
+                    check_context(),
+                    &advertised,
+                    activated.policy(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(allowed["content"], "row");
+        });
+    }
+
+    /// Re-registering a micro-tool name as an ordinary tool removes its
+    /// internal status, so the prefix rule no longer applies to it.
+    #[test]
+    fn external_registration_replaces_internal_micro_tool_status() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.set_tool_group_manager(ToolGroupManager::new(None));
+            executor.store_micro_tool_data("iri://tool-result/c2", json!({"content": "row"}));
+            executor.register_micro_tool("query_person", micro_context("c2"));
+            let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            executor.register(
+                "query_person",
+                "Write person rows in an external system. Use when: testing. Not for: reading.",
+                json!({"type": "object", "properties": {}}),
+                marker_tool(hit.clone()),
+                &[],
+            );
+            let advertised = vec!["query_person".to_string()];
+            let denied = executor
+                .execute_with_security_context(
+                    "query_person",
+                    json!({}),
+                    check_context(),
+                    &advertised,
+                    executor.activated_tools().policy(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied["error"], "Tool not allowed for role");
+            assert_eq!(hit.load(std::sync::atomic::Ordering::SeqCst), 0);
+        });
+    }
+
+    /// #270-1: with a SyscallGate installed, a call without a trusted caller
+    /// context (no role, no run-local policy) is rejected before the handler.
+    #[test]
+    fn syscall_gate_rejects_calls_without_trusted_context() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.set_tool_group_manager(ToolGroupManager::new(None));
+            let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            executor.register(
+                "file_list",
+                "Test override of file_list. Use when: testing. Not for: anything else.",
+                json!({"type": "object", "properties": {}}),
+                marker_tool(hit.clone()),
+                &[],
+            );
+            executor.set_syscall_gate(crate::core::syscall_gate::SyscallGate::new(
+                Arc::new(SkillRegistry::new()),
+                2048,
+            ));
+
+            let raw = executor.execute("file_list", json!({})).await.unwrap();
+            let error = raw["error"].as_str().unwrap_or_default();
+            assert!(error.starts_with("SyscallGate rejected"), "{raw}");
+            assert!(error.contains("no trusted caller role"), "{raw}");
+            assert_eq!(hit.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let activated = executor.activated_tools();
+            let advertised = vec!["file_list".to_string()];
+            let ok = executor
+                .execute_with_security_context(
+                    "file_list",
+                    json!({}),
+                    security_context(),
+                    &advertised,
+                    activated.policy(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok["written"], true, "{ok}");
+            assert_eq!(hit.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            // The gate follows the run-local narrowing, not the default policy.
+            let mut narrowed = activated.policy().clone();
+            narrowed.restrict_tools("agent:test", ["file_read".to_string()]);
+            let denied = executor
+                .execute_with_security_context(
+                    "file_list",
+                    json!({}),
+                    security_context(),
+                    &advertised,
+                    &narrowed,
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied["error"], "Tool not allowed for role");
+            assert_eq!(hit.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
     }
 }

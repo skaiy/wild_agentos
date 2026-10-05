@@ -44,6 +44,34 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
 隔离诊断无需 token 是刻意设计：它是本地、只读的文件系统工具，
 既不创建 tenant，也不授予 HTTP 访问。
 
+### API client id 冲突与恢复
+
+如果同一个 API client id 在 `api_clients.json` 中出现在多个 tenant 下（例如手工导入后），
+系统视为归属不明，并 fail closed：
+
+- 加载时，所有使用该 id 的 client 都被标记为 `id_conflict`，并记录一条只含 id 与 tenant id 的警告。
+- 对外 API 鉴权时，只要 key 的 `client_id` 被多个 client 共用，无论状态如何都返回 `401`；
+  状态为 `id_conflict` 的 client 同样返回 `401`。
+- 对 `id_conflict` client 的 `PUT /api/v1/api-clients/:id` 状态变更返回 `409`。对共用 id 的
+  `DELETE /api/v1/api-clients/:id` 一律以 `409` 拒绝，不做任何改动（不删 client，也不删 key）：
+  只删一方会让冲突消失，使另一方租户得到本不属于它的 key。共用 id 下，client 列表只展示带调用方
+  tenant 前缀的 key（两个 tenant slug 相同时不展示）。共用 id 下不带 `tenant_id` 的旧审计记录永不返回。
+
+恢复需人工处理：先停止服务（服务会用内存数据覆盖这些文件），管理员再修改
+`api_clients.json`（以及相关 key 的 `api_keys.json`），使每个 client id 只属于一个 tenant，然后在文件中把保留的 client `status` 从 `id_conflict` 改回
+`active`，然后启动服务。在此之前该状态会在保存和重新加载后一直保留。
+
+同理，在 id 仍被共用或 client 处于 `id_conflict` 时，`POST /api/v1/api-clients/:id/keys`
+也以 `409` 拒绝，不写入任何 key。恢复过程中删除 client 之前，运维人员必须先撤销该 client id
+下的**全部** key；否则残留的 key（尤其是不带 tenant 前缀的旧 key）可能在该 id 重新只属于一个
+tenant 后变更归属。当 client id 在多个 tenant 间冲突（`id_conflict`）时，所属方仍不能
+删除 client（`409`），但可以在共用 id 下撤销自己的 key（`200`；只认带本 tenant 前缀的
+key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 tenant 的 slug 归属不明
+（另一个冲突 tenant 的 slug 与之相同）时，撤销才返回 `409`，此时必须先由平台管理员解决
+冲突。id 仍被共用时，其下处于有效状态的 key 鉴权返回 `401`；已撤销的 key 鉴权返回
+`403` `key_revoked`，与是否共用 id 无关。各 tenant 应在冲突解除前撤销自己的 key——
+否则冲突解除后，这些 key 会重新变得可用。
+
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、
 [隔离矩阵](17-isolation-matrix.zh.md)、
 [知识摄取](16-knowledge-ingest-import-graph.zh.md)和

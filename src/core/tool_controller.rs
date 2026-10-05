@@ -1,6 +1,65 @@
 use crate::core::agent_instance::AgentRole;
 use crate::core::tool_policy::ToolPolicy;
 
+/// At most this many tool names are echoed into errors / AGENT_ERROR.
+pub(crate) const MAX_REPORTED_TOOLS: usize = 8;
+/// Each echoed tool name is cut to this many bytes (on a char boundary).
+pub(crate) const MAX_REPORTED_TOOL_NAME_BYTES: usize = 64;
+/// Placeholder for a model-supplied name that is not a registered tool.
+pub(crate) const UNREGISTERED_TOOL_NAME: &str = "<unregistered>";
+
+/// Makes model-generated tool names safe to echo into errors and events
+/// (which may be fanned out over SSE): registered names are kept, anything
+/// else becomes `<unregistered>`, names are capped at 64 bytes, duplicates
+/// of a kept name are folded and at most 8 are kept. Returns the kept names
+/// and how many further names were dropped.
+pub(crate) fn sanitize_reported_tool_names<'a>(
+    tool_names: impl IntoIterator<Item = &'a str>,
+    is_registered: impl Fn(&str) -> bool,
+) -> (Vec<String>, usize) {
+    let mut reported: Vec<String> = Vec::new();
+    let mut omitted = 0;
+    for name in tool_names {
+        let name = if is_registered(name) {
+            let mut end = name.len().min(MAX_REPORTED_TOOL_NAME_BYTES);
+            while !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            &name[..end]
+        } else {
+            UNREGISTERED_TOOL_NAME
+        };
+        if reported.iter().any(|seen| seen == name) {
+            continue;
+        }
+        if reported.len() < MAX_REPORTED_TOOLS {
+            reported.push(name.to_string());
+        } else {
+            omitted += 1;
+        }
+    }
+    (reported, omitted)
+}
+
+pub(crate) fn disallowed_pa_tools<'a>(
+    role: &AgentRole,
+    tool_names: impl IntoIterator<Item = &'a str>,
+) -> Vec<&'a str> {
+    if *role != AgentRole::Plan {
+        return Vec::new();
+    }
+    tool_names
+        .into_iter()
+        .filter(|name| !crate::tools::tool_executor::ToolExecutor::is_pa_readonly_tool(name))
+        .collect()
+}
+
+/// Role/tool queries over the default `ToolPolicy` (built-in groups, no
+/// per-run narrowing, no view of the executor's internal micro-tools).
+/// It is not on the runtime execution path: tool calls are authorised by
+/// `ToolExecutor::execute_with_security_context_and_claims_and_policy` with
+/// the caller's run-local policy, so this type can only answer "what does the
+/// default cap allow", never widen a run.
 #[derive(Clone)]
 pub struct ToolController {
     policy: ToolPolicy,
@@ -30,10 +89,7 @@ impl ToolController {
     }
 
     pub fn should_force_finish(&self, tool_names: &[&str], role: &AgentRole) -> bool {
-        *role == AgentRole::Plan
-            && tool_names
-                .iter()
-                .any(|name| !crate::tools::tool_executor::ToolExecutor::is_pa_readonly_tool(name))
+        !disallowed_pa_tools(role, tool_names.iter().copied()).is_empty()
     }
 }
 
@@ -106,9 +162,16 @@ mod tests {
             allowed_for(AgentRole::Plan),
             plan_main.into_iter().collect()
         );
-        assert!(!tc.is_tool_allowed_for_role("read_full_result_test", &AgentRole::Plan));
-        for role in [AgentRole::Do, AgentRole::Check, AgentRole::Act] {
-            assert!(tc.is_tool_allowed_for_role("read_full_result_test", &role));
+        // #270-2: the controller cannot see the executor's internal
+        // micro-tool registry, so a micro-tool-like name is denied for every
+        // role here; registered internal readers are allowed by the executor.
+        for role in [
+            AgentRole::Plan,
+            AgentRole::Do,
+            AgentRole::Check,
+            AgentRole::Act,
+        ] {
+            assert!(!tc.is_tool_allowed_for_role("read_full_result_test", &role));
         }
         assert_eq!(
             allowed_for(AgentRole::Do),
@@ -222,5 +285,53 @@ mod tests {
             assert!(tc.should_force_finish(&[name], &AgentRole::Plan), "{name}");
         }
         assert!(!tc.should_force_finish(&["file_read"], &AgentRole::Plan));
+        assert!(!tc.should_force_finish(&["file_write"], &AgentRole::Do));
+        assert_eq!(
+            disallowed_pa_tools(&AgentRole::Plan, ["file_read", "file_write", "bash"]),
+            ["file_write", "bash"]
+        );
+    }
+
+    #[test]
+    fn reported_tool_names_are_registered_bounded_and_capped() {
+        let long_registered = "r".repeat(100);
+        let long_unregistered = "u".repeat(10 * 1024);
+        let registered = |name: &str| {
+            name == "file_write" || name == long_registered || name.starts_with("tool_")
+        };
+        let (names, omitted) = sanitize_reported_tool_names(
+            [
+                "file_write",
+                long_unregistered.as_str(),
+                long_registered.as_str(),
+            ],
+            registered,
+        );
+        assert_eq!(
+            names,
+            [
+                "file_write".to_string(),
+                UNREGISTERED_TOOL_NAME.to_string(),
+                "r".repeat(MAX_REPORTED_TOOL_NAME_BYTES),
+            ]
+        );
+        assert_eq!(omitted, 0);
+
+        // Multi-byte names are cut on a char boundary.
+        let wide = "é".repeat(40); // 80 bytes
+        let (names, _) = sanitize_reported_tool_names([wide.as_str()], |_| true);
+        assert!(names[0].len() <= MAX_REPORTED_TOOL_NAME_BYTES);
+        assert!(wide.starts_with(&names[0]));
+
+        // Duplicates fold; at most MAX_REPORTED_TOOLS are kept.
+        let many: Vec<String> = (0..50).map(|i| format!("tool_{i}")).collect();
+        let mut input: Vec<&str> = many.iter().map(String::as_str).collect();
+        input.extend(["junk-a", "junk-b", "tool_0"]);
+        let (names, omitted) = sanitize_reported_tool_names(input, registered);
+        assert_eq!(names.len(), MAX_REPORTED_TOOLS);
+        assert_eq!(names[0], "tool_0");
+        // 42 more registered names + 2 unregistered ones; the repeated
+        // tool_0 folds into the kept entry.
+        assert_eq!(omitted, 50 - MAX_REPORTED_TOOLS + 2);
     }
 }

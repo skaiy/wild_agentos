@@ -26,6 +26,12 @@ pub struct TaskRequest {
     pub user_id: Option<String>,
     /// 会话标识，用于多轮上下文隔离（可选）。
     pub session_id: Option<String>,
+    /// Ignored for scoping: the task scope comes only from verified claims.
+    /// A value that differs from the claims is rejected with 403.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +40,38 @@ pub struct StreamTaskRequest {
     pub task_iri: Option<String>,
     pub include_thought: Option<bool>,
     pub include_tool_calls: Option<bool>,
+    /// Same rule as `TaskRequest`: must match the verified claims if present.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// Require verified claims for task creation/execution and reject a body
+/// scope that differs from them. Task scope is never taken from the body.
+#[allow(clippy::result_large_err)]
+fn authorize_task_write<'a>(
+    identity: &'a UserIdentity,
+    body_tenant: Option<&str>,
+    body_project: Option<&str>,
+) -> Result<&'a crate::isolation::IsolationClaims, axum::response::Response> {
+    let Some(claims) = identity.isolation_claims() else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verified isolation claims are required"})),
+        )
+            .into_response());
+    };
+    let mismatch = body_tenant.is_some_and(|tenant| tenant != claims.tenant_id())
+        || body_project.is_some_and(|project| project != claims.project_id());
+    if mismatch {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "task scope must come from verified claims"})),
+        )
+            .into_response());
+    }
+    Ok(claims)
 }
 
 #[derive(Deserialize)]
@@ -52,40 +90,36 @@ pub(crate) async fn create_task_handler(
     identity: UserIdentity,
     Json(req): Json<TaskRequest>,
 ) -> impl IntoResponse {
-    let result = if let Some(claims) = identity.isolation_claims() {
-        state
-            .core
-            .init_task_with_claims(
-                &req.user_input,
-                None,
-                None,
-                req.user_id.as_deref(),
-                req.session_id.as_deref(),
-                claims,
-            )
-            .await
-    } else {
-        state
-            .core
-            .init_task_with_tenant(
-                &req.user_input,
-                None,
-                None,
-                req.user_id.as_deref(),
-                req.session_id.as_deref(),
-                None,
-            )
-            .await
+    let claims = match authorize_task_write(
+        &identity,
+        req.tenant_id.as_deref(),
+        req.project_id.as_deref(),
+    ) {
+        Ok(claims) => claims,
+        Err(response) => return response,
     };
+    let result = state
+        .core
+        .init_task_with_claims(
+            &req.user_input,
+            None,
+            None,
+            req.user_id.as_deref(),
+            req.session_id.as_deref(),
+            claims,
+        )
+        .await;
     match result {
         Ok(task_iri) => (
             StatusCode::CREATED,
             Json(json!({"task_iri": task_iri, "status": "created"})),
-        ),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
-        ),
+        )
+            .into_response(),
     }
 }
 
@@ -190,10 +224,50 @@ pub(crate) async fn stream_task_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Json(req): Json<StreamTaskRequest>,
-) -> impl IntoResponse {
-    let task_iri = req
-        .task_iri
-        .unwrap_or_else(|| format!("iri://stream/{}", uuid::Uuid::new_v4().hyphenated()));
+) -> axum::response::Response {
+    // Authenticate and scope-check before subscribing or spawning anything,
+    // so a rejected caller never gets an SSE stream or an execution.
+    let claims = match authorize_task_write(
+        &identity,
+        req.tenant_id.as_deref(),
+        req.project_id.as_deref(),
+    ) {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    if let Some(task_iri) = req.task_iri.as_deref() {
+        // A supplied task_iri must name a Task in the caller's own
+        // tenant+project; anything else answers like a missing one (no
+        // existence oracle). There is no platform-admin exception: executing
+        // with the admin's claims against another scope's task would mix
+        // outputs across scopes. Admins inspect other tasks via read routes.
+        let in_scope = matches!(
+            state.core.read_node(task_iri).await,
+            Ok(Some(node)) if task_is_in_scope(&node.json_ld, claims)
+        );
+        if !in_scope {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+        }
+    }
+    // Without a supplied task_iri the server creates the task itself, so its
+    // persisted scope is the caller's verified claims.
+    let task_iri = match req.task_iri.clone() {
+        Some(task_iri) => task_iri,
+        None => match state
+            .core
+            .init_task_with_claims(&req.prompt, None, None, None, None, claims)
+            .await
+        {
+            Ok(task_iri) => task_iri,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": error.to_string()})),
+                )
+                    .into_response()
+            }
+        },
+    };
 
     let event_bus = state.core.events.clone();
     let task_iri_clone = task_iri.clone();
@@ -210,7 +284,7 @@ pub(crate) async fn stream_task_handler(
                 include_thought: req.include_thought.unwrap_or(true),
                 include_tool_calls: req.include_tool_calls.unwrap_or(true),
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                isolation_claims: identity.isolation_claims().cloned(),
+                isolation_claims: claims.clone(),
             };
             let task_iri = spec.task_iri.clone();
             let cancellation = spec.cancellation.clone();
@@ -879,6 +953,364 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn jwt_with_roles(tenant_id: &str, project_id: &str, roles: Vec<&str>) -> String {
+        encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: format!("{tenant_id}-user"),
+                tenant_id: tenant_id.into(),
+                project_id: Some(project_id.into()),
+                roles: roles.into_iter().map(str::to_owned).collect(),
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
+    async fn post_json(
+        router: &Router,
+        uri: &str,
+        token: Option<&str>,
+        body: Value,
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        router
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Fake executor that only counts invocations (stands in for the LLM run).
+    struct CountingExecutor(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::api::http::TaskExecutor for CountingExecutor {
+        async fn execute(&self, _spec: crate::api::http::TaskExecSpec) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn counting_state() -> (Arc<AppState>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut state = Arc::try_unwrap(test_state()).ok().expect("unique state");
+        state.task_executor = Some(Arc::new(CountingExecutor(calls.clone())));
+        (Arc::new(state), calls)
+    }
+
+    fn executor_calls(calls: &std::sync::atomic::AtomicUsize) -> usize {
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn task_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/api/v1/tasks", axum::routing::post(create_task_handler))
+            .route(
+                "/api/v1/tasks/stream",
+                axum::routing::post(stream_task_handler),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_task_create_requires_claims_and_creates_nothing() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = test_state();
+        let router = task_router(state.clone());
+        let before = state.core.blackboard.list_task_summaries().len();
+        let response = post_json(
+            &router,
+            "/api/v1/tasks",
+            None,
+            json!({"user_input": "anonymous task"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.core.blackboard.list_task_summaries().len(), before);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_task_create_rejects_body_scope_mismatch() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = test_state();
+        let router = task_router(state.clone());
+        let da_b = jwt_with_roles("tenant-b", "project-b", vec!["DA"]);
+        let before = state.core.blackboard.list_task_summaries().len();
+        for body in [
+            json!({"user_input": "x", "tenant_id": "tenant-a"}),
+            json!({"user_input": "x", "project_id": "project-a"}),
+            json!({"user_input": "x", "tenant_id": "tenant-a", "project_id": "project-a"}),
+        ] {
+            let response = post_json(&router, "/api/v1/tasks", Some(&da_b), body).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(state.core.blackboard.list_task_summaries().len(), before);
+
+        // Matching (or absent) body scope is accepted; the task lands in the
+        // caller's verified scope.
+        let response = post_json(
+            &router,
+            "/api/v1/tasks",
+            Some(&da_b),
+            json!({"user_input": "x", "tenant_id": "tenant-b", "project_id": "project-b"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let task_iri = serde_json::from_slice::<Value>(&body).unwrap()["task_iri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let node = state.core.blackboard.read_node(&task_iri).unwrap().unwrap();
+        let task: Value = serde_json::from_str(&node.json_ld).unwrap();
+        assert_eq!(task["tenant_id"], "tenant-b");
+        assert_eq!(task["project_id"], "project-b");
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_task_stream_rejects_before_stream() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, calls) = counting_state();
+        let tasks_before = state.core.blackboard.list_task_summaries().len();
+        let router = task_router(state.clone());
+        let subscribers = state.core.events.subscriber_count();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            post_json(
+                &router,
+                "/api/v1/tasks/stream",
+                None,
+                json!({"prompt": "go"}),
+            ),
+        )
+        .await
+        .expect("anonymous stream must not hang");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(!content_type.contains("text/event-stream"));
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("data:"));
+        assert_eq!(state.core.events.subscriber_count(), subscribers);
+        assert_eq!(executor_calls(&calls), 0);
+        assert_eq!(
+            state.core.blackboard.list_task_summaries().len(),
+            tasks_before
+        );
+
+        // A verified caller cannot stream into another scope's task, and a
+        // body scope that differs from the claims is rejected.
+        let user_a = jwt("tenant-a", "project-a");
+        let response = post_json(
+            &router,
+            "/api/v1/tasks",
+            Some(&user_a),
+            json!({"user_input": "tenant a task"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let task_a = serde_json::from_slice::<Value>(&body).unwrap()["task_iri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let da_b = jwt_with_roles("tenant-b", "project-b", vec!["DA"]);
+        let cross = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&da_b),
+            json!({"prompt": "go", "task_iri": task_a}),
+        )
+        .await;
+        assert_eq!(cross.status(), StatusCode::NOT_FOUND);
+        let cross = to_bytes(cross.into_body(), 1024 * 1024).await.unwrap();
+        let missing = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&da_b),
+            json!({"prompt": "go", "task_iri": "iri://task/missing"}),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing = to_bytes(missing.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(cross, missing);
+        let mismatch = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&da_b),
+            json!({"prompt": "go", "tenant_id": "tenant-a"}),
+        )
+        .await;
+        assert_eq!(mismatch.status(), StatusCode::FORBIDDEN);
+        assert_eq!(state.core.events.subscriber_count(), subscribers);
+        assert_eq!(
+            executor_calls(&calls),
+            0,
+            "rejected streams must not execute"
+        );
+
+        // The owner can stream its own task, and it executes once.
+        let own = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&user_a),
+            json!({"prompt": "go", "task_iri": task_a}),
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
+        let content_type = own
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(content_type.contains("text/event-stream"));
+        for _ in 0..50 {
+            if executor_calls(&calls) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(executor_calls(&calls), 1);
+        drop(own);
+
+        // Without a task_iri the server creates a task owned by the caller.
+        let fresh = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&da_b),
+            json!({"prompt": "new"}),
+        )
+        .await;
+        assert_eq!(fresh.status(), StatusCode::OK);
+        drop(fresh);
+        let owned_by_b = state
+            .core
+            .blackboard
+            .list_task_summaries()
+            .into_iter()
+            .filter_map(|summary| state.core.blackboard.read_node(&summary.task_iri).ok()?)
+            .filter_map(|node| serde_json::from_str::<Value>(&node.json_ld).ok())
+            .filter(|task| task["tenant_id"] == "tenant-b" && task["project_id"] == "project-b")
+            .count();
+        assert_eq!(owned_by_b, 1);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_task_stream_has_no_platform_admin_exception() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let saved_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        let saved_pa_tenant = std::env::var_os(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, "platform");
+
+        let (state, calls) = counting_state();
+        let router = task_router(state.clone());
+        let subscribers = state.core.events.subscriber_count();
+        let pa = jwt_with_roles("platform", "ops", vec!["PLATFORM_ADMIN"]);
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let task_a = state
+            .core
+            .init_task_with_claims("tenant a task", None, None, None, None, &tenant_a)
+            .await
+            .unwrap();
+        // An existing node in the admin's own scope that is not a Task.
+        let not_a_task = "iri://node/platform-ops-document";
+        state
+            .core
+            .blackboard
+            .write_node(
+                not_a_task,
+                &json!({"@id": not_a_task, "@type": "Document", "tenant_id": "platform", "project_id": "ops"})
+                    .to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+        assert!(state.core.read_node(not_a_task).await.unwrap().is_some());
+
+        let missing = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&pa),
+            json!({"prompt": "go", "task_iri": "iri://task/missing"}),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing = to_bytes(missing.into_body(), 1024 * 1024).await.unwrap();
+        for task_iri in [task_a.as_str(), not_a_task] {
+            let response = post_json(
+                &router,
+                "/api/v1/tasks/stream",
+                Some(&pa),
+                json!({"prompt": "go", "task_iri": task_iri}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{task_iri}");
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(body, missing, "{task_iri}");
+        }
+        assert_eq!(state.core.events.subscriber_count(), subscribers);
+        assert_eq!(
+            executor_calls(&calls),
+            0,
+            "platform admin must not execute other scopes"
+        );
+
+        // The admin can still stream a task in its own scope.
+        let response = post_json(
+            &router,
+            "/api/v1/tasks",
+            Some(&pa),
+            json!({"user_input": "platform task"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let own_task = serde_json::from_slice::<Value>(&body).unwrap()["task_iri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let own = post_json(
+            &router,
+            "/api/v1/tasks/stream",
+            Some(&pa),
+            json!({"prompt": "go", "task_iri": own_task}),
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
+        for _ in 0..50 {
+            if executor_calls(&calls) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(executor_calls(&calls), 1);
+        drop(own);
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+        restore_env(
+            crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV,
+            saved_pa_tenant,
+        );
     }
 
     #[tokio::test]

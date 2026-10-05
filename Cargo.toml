@@ -119,6 +119,8 @@ regex = "1.10"
 
 # 配置
 config = "0.14"
+# Reports the field path (e.g. `memory.l2`) when config deserialization fails.
+serde_path_to_error = "0.1"
 dotenv = "0.15"
 
 # 消息队列
@@ -158,6 +160,8 @@ arc-swap = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Lets the shipped config.yaml test fail on keys no settings struct reads.
+serde_ignored = "0.1"
 mockall = "0.12"
 criterion = "0.5"
 testcontainers = "0.15"
