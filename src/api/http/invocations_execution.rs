@@ -79,11 +79,6 @@ impl InvocationCancellationRegistry {
     pub(crate) fn contains(&self, id: &str) -> bool {
         self.tokens.contains_key(id)
     }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.tokens.len()
-    }
 }
 
 /// VAL-016: `succeeded` requires non-empty `model`, both token counts, and
