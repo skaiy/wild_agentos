@@ -167,21 +167,63 @@ scope and server fields → `400 field_not_allowed` (§3).
 {
   "summary": "…",
   "artifacts": [],
-  "usage": {                     // optional; every member optional and omitted when unknown
-    "provider": "…",
-    "model": "…",
-    "input_tokens": 1200,
-    "output_tokens": 345,
-    "cost": 18000,               // integer micro-USD, same unit as budget.max_cost
-    "tool_calls": [{ "name": "…", "transport": "…" }]
+  "usage": {
+    "provider": "…",             // optional
+    "model": "…",                // required when status = succeeded
+    "input_tokens": 1200,        // required when status = succeeded
+    "output_tokens": 345,        // required when status = succeeded
+    "cost": 18000,               // required when status = succeeded; integer micro-USD
+    "tool_calls": [{ "name": "…", "transport": "mcp" }]  // optional; see transport below
   }
 }
 ```
 
+- **Succeeded usage (VAL-016 / VAL-017).** When `status` is `succeeded`,
+  `result.usage` **MUST** be present and include a non-empty `model`,
+  `input_tokens`, `output_tokens`, and an integer `cost` (micro-USD, same unit
+  as `budget.max_cost`). Missing any of these fields means the run **MUST NOT**
+  be recorded as `succeeded` (fail closed: transition to `failed` with
+  `error.code = "incomplete_usage"`, or refuse the terminal write). `provider`
+  and `tool_calls` remain optional on every terminal state.
+- On `failed` / `cancelled` / `interrupted`, `usage` is optional; if present,
+  its shape must still be valid (unknown members rejected; `cost` integer when
+  set). A `failed` invocation can carry `result` with only `usage` (for example
+  after `budget_exceeded`) and an empty `summary`.
 - `usage` reports the metering the server already does to enforce `budget`
   (`budget_exceeded`). It carries no partner or source attribution.
-- A `failed` invocation can still carry `result` with `usage` (for example
-  after `budget_exceeded`) and an empty `summary`.
+- **`tool_calls[].transport` vocabulary (closed set).** Each tool-call entry
+  MAY include `transport` with one of:
+  `mcp` | `http` | `a2a` | `local` | `unknown`.
+  - `mcp` — tool invoked through an MCP server binding.
+  - `http` — direct HTTP tool call (not via A2A).
+  - `a2a` — tool call that went through the A2A outbound path; **do not overload
+    `http` for A2A**. A2A invocations use `transport = "a2a"` as a distinct value.
+  - `local` — in-process / built-in tool with no network hop.
+  - `unknown` — transport could not be classified; prefer an explicit value when
+    known. Values outside this set are rejected at write time.
+
+### 5.1 List response
+
+`GET /v1/invocations` returns a cursor page of resources in the caller's
+tenant/project scope (any actor in the scope; newest `created_at` first, `id`
+as tie-breaker):
+
+```jsonc
+{
+  "object": "list",
+  "data": [ /* Invocation resources as in §5; audit_events omitted */ ],
+  "has_more": true,
+  "next_cursor": "…"             // opaque; omit / null when has_more is false
+}
+```
+
+| Query | Rules |
+| --- | --- |
+| `limit` | Optional integer 1–100; default **20** |
+| `state` | Optional exact lifecycle state (`queued`, `running`, …); unknown → `400 invalid_request` |
+| `after` | Opaque cursor from a previous `next_cursor`; malformed → `400 invalid_request` |
+
+Cross-scope rows never appear. Anonymous → `401`; defaulted project → `403`.
 
 ## 6. Idempotency
 
@@ -280,7 +322,8 @@ queued ──► running ──► succeeded
   `resync` event and should re-read the resource; the persisted state is
   authoritative.
 - Usage is metered per run and written to `result.usage` with the terminal
-  transition.
+  transition. A `succeeded` write requires complete usage per §5 (VAL-016 /
+  VAL-017); incomplete usage must not be persisted as `succeeded`.
 - Execution is behind a configuration switch that defaults to **off**. It must
   stay off in production until projection scoping
   ([#310](https://github.com/skaiy/wild_agentos/issues/310)) is merged.
@@ -342,9 +385,11 @@ safe texts and never echo tokens, inputs or the original request.
 | 503 | `execution_disabled`, `invocation_store_full`, `invocation_store_unavailable` | Execution switch off (§8); store still full after the retention sweep (§7.1); invocation store not configured or unreachable |
 
 Besides `error` and `message`, a 403 body may carry `missing_field` and a 409
-body may carry `current_revision`. A successful create returns `202` with a
-`Location: /v1/invocations/<id>` header; resource responses carry an `ETag`
-with the current revision.
+`revision_conflict` body may carry `current_revision`. **409 responses that
+identify the current resource also carry `ETag: "<revision>"`** (at least
+`revision_conflict`, matching `current_revision`). A successful create returns
+`202` with a `Location: /v1/invocations/<id>` header; 2xx resource responses
+carry an `ETag` with the current revision.
 
 ## 10. Non-goals
 
@@ -383,8 +428,11 @@ with the current revision.
   and topology for orchestrating agents come with #317 (§4.1).
 - **Known inconsistency (agent registration).** `POST /api/v1/agents` still
   accepts a token whose project was filled in by default. An agent registered
-  with such a token lands in the `default` project, and invocation calls with
-  the same token return 403 / 422. Register agents with a token that carries
+  with such a token lands in the `default` project. The **same defaulted
+  token** on any `/v1/invocations` route returns **`403 claims_incomplete`**
+  (body may carry `missing_field: "project_id"`). After switching to an
+  explicit-project token, looking up that agent under the new project returns
+  **`422 agent_not_found`**. Register agents with a token that already carries
   an explicit project.
 
 ## 12. Docs and matrix close-out (#318)

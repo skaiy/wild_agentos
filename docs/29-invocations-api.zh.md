@@ -117,19 +117,48 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 {
   "summary": "…",
   "artifacts": [],
-  "usage": {                     // 可选；所有成员都可选，未知时省略
-    "provider": "…",
-    "model": "…",
-    "input_tokens": 1200,
-    "output_tokens": 345,
-    "cost": 18000,               // 整数，单位微美元，与 budget.max_cost 相同
-    "tool_calls": [{ "name": "…", "transport": "…" }]
+  "usage": {
+    "provider": "…",             // 可选
+    "model": "…",                // status = succeeded 时必填
+    "input_tokens": 1200,        // status = succeeded 时必填
+    "output_tokens": 345,        // status = succeeded 时必填
+    "cost": 18000,               // status = succeeded 时必填；整数微美元
+    "tool_calls": [{ "name": "…", "transport": "mcp" }]  // 可选；transport 见下
   }
 }
 ```
 
+- **成功态 usage（VAL-016 / VAL-017）。** 当 `status` 为 `succeeded` 时，`result.usage` **必须**存在，且包含非空 `model`、`input_tokens`、`output_tokens` 以及整数 `cost`（微美元，与 `budget.max_cost` 同单位）。缺任一项就**不得**记为 `succeeded`（失败关闭：迁到 `failed` 且 `error.code = "incomplete_usage"`，或拒绝该终态写入）。`provider` 与 `tool_calls` 在所有终态上仍可选。
+- 在 `failed` / `cancelled` / `interrupted` 路径上，`usage` 可选；若带了，结构仍须合法（未知成员拒绝；有 `cost` 时必须是整数）。`failed` 的调用也可以带 `result`，其中只有 `usage`（例如 `budget_exceeded` 之后），`summary` 为空。
 - `usage` 报告的是服务端为执行 `budget`（`budget_exceeded`）本来就在做的计量，不含任何合作方或来源归因。
-- `failed` 的调用也可以带 `result`，其中只有 `usage`（例如 `budget_exceeded` 之后），`summary` 为空。
+- **`tool_calls[].transport` 词表（闭集）。** 每条 tool-call 可带 `transport`，取值只能是：
+  `mcp` | `http` | `a2a` | `local` | `unknown`。
+  - `mcp` — 经 MCP 服务绑定调用的工具。
+  - `http` — 直连 HTTP 工具调用（**不是** A2A）。
+  - `a2a` — 走 A2A 出站路径的工具调用；**不要用 `http` 兼指 A2A**。A2A 调用使用独立取值 `transport = "a2a"`。
+  - `local` — 进程内 / 内置工具，无网络跳转。
+  - `unknown` — 无法判定时使用；已知时优先写明确取值。闭集以外的值在写入时拒绝。
+
+### 5.1 列表响应
+
+`GET /v1/invocations` 返回调用方 tenant/project scope 内的游标分页（该 scope 内任意 actor 可读；按 `created_at` 新到旧，`id` 作并列键）：
+
+```jsonc
+{
+  "object": "list",
+  "data": [ /* 与 §5 相同的 Invocation 资源；不含 audit_events */ ],
+  "has_more": true,
+  "next_cursor": "…"             // 不透明；has_more 为 false 时省略 / null
+}
+```
+
+| 查询参数 | 规则 |
+| --- | --- |
+| `limit` | 可选整数 1–100；默认 **20** |
+| `state` | 可选，精确匹配生命周期状态（`queued`、`running` 等）；未知 → `400 invalid_request` |
+| `after` | 上一页 `next_cursor` 的不透明游标；格式错误 → `400 invalid_request` |
+
+跨 scope 的行不会出现。匿名 → `401`；project 为默认补全 → `403`。
 
 ## 6. 幂等
 
@@ -181,7 +210,7 @@ queued ──► running ──► succeeded
 
 - 创建成功（且不是幂等重放）后，服务端用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
 - 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
-- 每次运行都计量，用量随终态迁移写入 `result.usage`。
+- 每次运行都计量，用量随终态迁移写入 `result.usage`。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。
 - 执行受配置开关控制，默认**关闭**。投影按 scope 绑定（[#310](https://github.com/skaiy/wild_agentos/issues/310)）合入前，生产必须保持关闭。
 - 开关关闭时，新的创建请求返回 `503 execution_disabled`，什么都不落盘（没有资源，也没有幂等记录），因此不会有调用永远停在非终态。开关关闭前已登记的 key 重放仍返回 `200` 和原资源。开关在启动时读取；关闭开关需要重启，重启会把执行中的调用改为 `failed/interrupted`。
 
@@ -229,7 +258,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 | 500 | `persistence_failed` | 存储写入失败，状态未改变 |
 | 503 | `execution_disabled`、`invocation_store_full`、`invocation_store_unavailable` | 执行开关关闭（§8）；保留期清理后存储仍满（§7.1）；调用存储未配置或不可用 |
 
-除 `error` 和 `message` 外，403 的 body 可带 `missing_field`，409 的 body 可带 `current_revision`。创建成功返回 `202` 并带 `Location: /v1/invocations/<id>` 头；资源响应带当前修订对应的 `ETag`。
+除 `error` 和 `message` 外，403 的 body 可带 `missing_field`，409 `revision_conflict` 的 body 可带 `current_revision`。**标识当前资源的 409 响应同时带 `ETag: "<revision>"`**（至少 `revision_conflict`，与 `current_revision` 一致）。创建成功返回 `202` 并带 `Location: /v1/invocations/<id>` 头；2xx 资源响应带当前修订对应的 `ETag`。
 
 ## 10. 不在范围
 
@@ -249,7 +278,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 - **幂等依赖 [#315](https://github.com/skaiy/wild_agentos/issues/315)。** #315 之前，带 `Idempotency-Key` 的创建请求返回 `400 idempotency_unsupported`（临时码），而不是静默忽略该 key。依赖幂等重试的集成应等 #315 合入。
 - **切换前提：** #315 + #317 + #310。
 - **Agent id。** `agent_id` 使用 agent 注册接口返回的服务端生成 UUID，注册时不能自指定 id。编排型 agent 的注册字段和拓扑随 #317 提供（§4.1）。
-- **已知不一致（agent 注册）。** `POST /api/v1/agents` 仍接受 project 为默认补全值的令牌。用这种令牌注册的 agent 会落到 `default` project，同一令牌调用 invocation 会返回 403 / 422。注册 agent 时请使用带显式 project 的令牌。
+- **已知不一致（agent 注册）。** `POST /api/v1/agents` 仍接受 project 为默认补全值的令牌。用这种令牌注册的 agent 会落到 `default` project。**同一张 defaulted 令牌**访问任意 `/v1/invocations` 路由一律返回 **`403 claims_incomplete`**（body 可带 `missing_field: "project_id"`）。换成带显式 project 的令牌后再查那个落在 `default` 的 agent，会得到 **`422 agent_not_found`**。注册 agent 时请直接使用带显式 project 的令牌。
 
 ## 12. 文档与矩阵收尾（#318）
 
