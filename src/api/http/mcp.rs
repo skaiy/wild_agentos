@@ -382,7 +382,7 @@ fn blocked_outbound_ip(ip: IpAddr) -> bool {
             if ip.is_unspecified() || ip.is_loopback() {
                 return true;
             }
-            if let Some(v4) = ip.to_ipv4() {
+            if let Some(v4) = embedded_outbound_ipv4(ip) {
                 return blocked_outbound_ip(IpAddr::V4(v4));
             }
             let first = ip.segments()[0];
@@ -391,18 +391,48 @@ fn blocked_outbound_ip(ip: IpAddr) -> bool {
     }
 }
 
-// These targets are not usable destinations, even with an explicit opt-in.
+/// IPv4 address carried inside an IPv6 address (IPv4-mapped, IPv4-compatible,
+/// or the NAT64 well-known prefix `64:ff9b::/96`). Loopback and unspecified
+/// IPv6 addresses are not treated as embedded IPv4.
+fn embedded_outbound_ipv4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    if let Some(v4) = ip.to_ipv4() {
+        return Some(v4);
+    }
+    let segments = ip.segments();
+    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let [_, _, _, _, _, _, _, _, _, _, _, _, a, b, c, d] = ip.octets();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
+// These targets are never usable destinations, even when the exact origin is
+// in MCP_OUTBOUND_ALLOWED_ORIGINS or the address is inside an explicitly
+// allowed CIDR: link-local (which includes cloud instance metadata such as
+// 169.254.169.254), well-known metadata addresses outside link-local,
+// unspecified, multicast, and broadcast.
 fn never_permitted_outbound_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            let [first, _, _, _] = ip.octets();
-            first == 0 || (224..240).contains(&first) || ip.is_broadcast()
+            let [a, b, _, _] = ip.octets();
+            a == 0
+                || a == 169 && b == 254
+                || (224..240).contains(&a)
+                || ip.is_broadcast()
+                // Alibaba Cloud instance metadata (inside 100.64.0.0/10).
+                || ip == std::net::Ipv4Addr::new(100, 100, 100, 200)
         }
         IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
             ip.is_unspecified()
-                || ip.segments()[0] & 0xff00 == 0xff00
-                || ip
-                    .to_ipv4()
+                || first & 0xff00 == 0xff00
+                || first & 0xffc0 == 0xfe80
+                // AWS IPv6 instance metadata (inside fc00::/7).
+                || ip == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                || embedded_outbound_ipv4(ip)
                     .is_some_and(|v4| never_permitted_outbound_ip(IpAddr::V4(v4)))
         }
     }
@@ -416,8 +446,7 @@ fn local_development_outbound_ip(ip: IpAddr) -> bool {
         }
         IpAddr::V6(ip) => {
             ip.is_loopback()
-                || ip
-                    .to_ipv4()
+                || embedded_outbound_ipv4(ip)
                     .is_some_and(|v4| local_development_outbound_ip(IpAddr::V4(v4)))
                 || ip.segments()[0] & 0xfe00 == 0xfc00
         }
@@ -426,7 +455,7 @@ fn local_development_outbound_ip(ip: IpAddr) -> bool {
 
 fn outbound_ip_in_cidr(ip: IpAddr, cidr: &IpNet) -> bool {
     cidr.contains(&ip)
-        || matches!((ip, cidr), (IpAddr::V6(v6), IpNet::V4(v4)) if v6.to_ipv4().is_some_and(|ip| v4.contains(&ip)))
+        || matches!((ip, cidr), (IpAddr::V6(v6), IpNet::V4(v4)) if embedded_outbound_ipv4(v6).is_some_and(|ip| v4.contains(&ip)))
 }
 
 #[derive(Debug)]
@@ -465,22 +494,29 @@ async fn vetted_outbound_mcp_addresses(
     }
     let origins =
         configured_outbound_mcp_origins().map_err(|_| OutboundMcpResolutionError::NotAllowed)?;
-    let literal_permitted = literal.is_some()
-        && origins
-            .as_ref()
-            .is_none_or(|origins| origins.contains(&url.origin().ascii_serialization()));
+    // An endpoint whose exact origin an operator listed in
+    // MCP_OUTBOUND_ALLOWED_ORIGINS (IP literal or hostname) may reach private
+    // and loopback addresses, e.g. a sidecar addressed by its container name.
+    // The hostname is still resolved once and the vetted answer is pinned.
+    let origin_listed = origins
+        .as_ref()
+        .is_some_and(|origins| origins.contains(&url.origin().ascii_serialization()));
+    let permits_blocked = |ip: IpAddr| {
+        origin_listed
+            || if literal.is_some() {
+                // Non-strict local development with no origin allowlist.
+                origins.is_none() && local_development_outbound_ip(ip)
+            } else {
+                private_cidrs
+                    .iter()
+                    .any(|cidr| outbound_ip_in_cidr(ip, cidr))
+            }
+    };
     if addresses.iter().any(|address| {
         let ip = address.ip();
         address.port() != port
             || never_permitted_outbound_ip(ip)
-            || blocked_outbound_ip(ip)
-                && !(if literal.is_some() {
-                    literal_permitted && (origins.is_some() || local_development_outbound_ip(ip))
-                } else {
-                    private_cidrs
-                        .iter()
-                        .any(|cidr| outbound_ip_in_cidr(ip, cidr))
-                })
+            || blocked_outbound_ip(ip) && !permits_blocked(ip)
     }) {
         return Err(OutboundMcpResolutionError::NotAllowed);
     }
@@ -1439,6 +1475,9 @@ mod tests {
             ("2606:4700::1", false),
             ("192.0.2.1", false),
             ("2001:db8::1", false),
+            ("64:ff9b::a9fe:a9fe", true),
+            ("64:ff9b::7f00:1", true),
+            ("64:ff9b::808:808", false),
         ];
         for (ip, blocked) in cases {
             assert_eq!(blocked_outbound_ip(ip.parse().unwrap()), blocked, "{ip}");
@@ -1450,8 +1489,32 @@ mod tests {
             "::",
             "ff02::1",
             "::ffff:224.0.0.1",
+            "169.254.0.1",
+            "169.254.169.254",
+            "169.254.255.255",
+            "::ffff:169.254.169.254",
+            "::169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "fe80::1",
+            "febf::1",
+            "fd00:ec2::254",
+            "100.100.100.200",
         ] {
             assert!(never_permitted_outbound_ip(ip.parse().unwrap()), "{ip}");
+        }
+        // Private and loopback targets stay reachable through an explicit rule.
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "fc00::1",
+            "fd00:ec2::253",
+        ] {
+            assert!(!never_permitted_outbound_ip(ip.parse().unwrap()), "{ip}");
         }
     }
 
@@ -1472,10 +1535,9 @@ mod tests {
         let b_addr = b.local_addr().unwrap();
         let b_accepts = counted_sidecar(b).await;
         let endpoint = format!("http://rebind.mcp.test:{}/mcp", a_addr.port());
-        std::env::set_var(
-            "MCP_OUTBOUND_ALLOWED_ORIGINS",
-            endpoint_origin(&endpoint).unwrap(),
-        );
+        // The origin is not listed, so only the CIDR opt-in can permit the
+        // private answer.
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
         let resolver = FlippingResolver::new(Ok(vec![a_addr]), vec![b_addr]);
         let (status, body) = outbound_test_invoke(&endpoint, &resolver).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1524,22 +1586,35 @@ mod tests {
             ),
         );
 
+        // A hostname whose exact origin is listed may resolve to loopback.
         let resolver = FlippingResolver::new(Ok(vec![address]), vec![]);
         let (status, body) = outbound_test_invoke(&hostname, &resolver).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(accepts.load(Ordering::SeqCst), 0);
-        let (status, body) = outbound_test_invoke(&literal, &resolver).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        let (status, body) = outbound_test_invoke(&literal, &resolver).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
 
+        // Metadata stays blocked even when its origin is listed and a CIDR
+        // covers it, for hostnames and IP literals alike.
         let metadata =
             FlippingResolver::new(Ok(vec!["169.254.169.254:80".parse().unwrap()]), vec![]);
-        std::env::set_var("MCP_OUTBOUND_ALLOWED_ORIGINS", "http://metadata.mcp.test");
+        std::env::set_var(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            "http://metadata.mcp.test,http://169.254.169.254",
+        );
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS", "169.254.0.0/16");
         let (status, body) = outbound_test_invoke("http://metadata.mcp.test/mcp", &metadata).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("mcp_endpoint_not_allowed"));
+        assert!(!body.contains("169.254"));
         assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+        let (status, body) = outbound_test_invoke("http://169.254.169.254/mcp", &metadata).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS");
         std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
         let (status, body) = outbound_test_invoke("http://169.254.169.254/mcp", &metadata).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -1554,7 +1629,94 @@ mod tests {
             assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
             assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
         }
-        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        restore_outbound_test_env(saved);
+    }
+
+    #[tokio::test]
+    async fn catalog_invoke_permits_private_answers_only_for_listed_hostnames() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = save_outbound_test_env();
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let a_accepts = counted_sidecar(a).await;
+        let b = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let b_accepts = counted_sidecar(b).await;
+        let listed = format!("http://sidecar.mcp.test:{}/mcp", a_addr.port());
+        let unlisted = format!("http://other.mcp.test:{}/mcp", a_addr.port());
+
+        // No origin allowlist and no CIDR: a hostname resolving to loopback is
+        // rejected before any connection or JWT minting.
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let resolver = FlippingResolver::new(Ok(vec![a_addr]), vec![]);
+        let (status, body) = outbound_test_invoke(&listed, &resolver).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("mcp_endpoint_not_allowed"));
+        assert!(!body.contains("127."));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 0);
+
+        // Allowlist set: a hostname whose origin is absent is refused before
+        // DNS resolution.
+        std::env::set_var(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            endpoint_origin(&listed).unwrap(),
+        );
+        let resolver = FlippingResolver::new(Ok(vec![a_addr]), vec![]);
+        let (status, body) = outbound_test_invoke(&unlisted, &resolver).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("mcp_endpoint_not_allowed"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 0);
+
+        // Listed hostname: resolved once and pinned, even if a later lookup
+        // would rebind it elsewhere.
+        let resolver = FlippingResolver::new(
+            Ok(vec![a_addr]),
+            vec![SocketAddr::new(b_addr.ip(), a_addr.port())],
+        );
+        let (status, body) = outbound_test_invoke(&listed, &resolver).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(b_accepts.load(Ordering::SeqCst), 0);
+
+        // Listed hostname with any never-permitted answer is rejected as a
+        // whole, even with a CIDR that covers everything.
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS", "0.0.0.0/0,::/0");
+        std::env::remove_var("MCP_JWT_SECRET");
+        let port = a_addr.port();
+        for bad in [
+            "169.254.169.254",
+            "169.254.1.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "fe80::1",
+            "fd00:ec2::254",
+            "100.100.100.200",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ] {
+            let bad = SocketAddr::new(bad.parse().unwrap(), port);
+            for answers in [vec![bad], vec![a_addr, bad]] {
+                let resolver = FlippingResolver::new(Ok(answers), vec![a_addr]);
+                let (status, body) = outbound_test_invoke(&listed, &resolver).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{bad}: {body}");
+                assert!(body.contains("mcp_endpoint_not_allowed"));
+                assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+            }
+        }
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(b_accepts.load(Ordering::SeqCst), 0);
         restore_outbound_test_env(saved);
     }
 

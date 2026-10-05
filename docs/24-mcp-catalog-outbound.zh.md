@@ -67,19 +67,32 @@ HTTP redirect 永远不会被跟随。
 
 默认阻止 loopback、link-local（包括 metadata）、IPv4/IPv6 私有地址、unspecified、
 shared/CGNAT、`192.0.0.0/24`、benchmark、multicast 及 reserved 地址，也包括
-IPv4-mapped IPv6 形式。有三条运维显式放行规则：
+IPv4-mapped、IPv4-compatible 和 NAT64（`64:ff9b::/96`）IPv6 形式。有三条显式
+放行规则：
 
-1. 若 IP 字面量 endpoint 的精确 origin 存在于
-   `MCP_OUTBOUND_ALLOWED_ORIGINS` 中，则可使用被阻止的地址，例如本地 sidecar。
-2. 非严格的本地开发环境中，若 origin allowlist **未设置**，IP 字面量 endpoint
-   可使用 loopback 或私有地址；link-local、unspecified、multicast 和 broadcast
-   字面量仍被阻止。
-3. **Hostname** 可以解析到 `MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS` 内的地址
-   （逗号分隔的 CIDR 列表，示例如上），但每个解析地址都必须获许可。
-   Unspecified、multicast 和 broadcast 地址即使显式配置也永远不能放行。
+1. **已列入的 origin。** endpoint（hostname 或 IP 字面量）的精确 origin
+   （scheme、host 和 port）出现在 `MCP_OUTBOUND_ALLOWED_ORIGINS` 中时，可以解析到
+   私有地址、loopback 或其他被阻止的地址，例如按容器 hostname 访问的 sidecar。
+   Hostname 仍然只解析一次，已审查的全部地址都会被固定，且不经过代理。
+2. **本地开发。** 非严格的本地开发环境中，若 origin allowlist **未设置**，
+   IP 字面量 endpoint 可使用 loopback 或私有地址。
+3. **可选的 CIDR 放行。** 不符合规则 1 的 hostname 可以解析到
+   `MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS` 内的地址（逗号分隔的 CIDR 列表，示例如上），
+   即整段放行。每个解析地址都必须获许可。
 
-CIDR 选择性放行仅开放选定网段，而不是通过一个「允许所有私有地址」的布尔开关
-暴露整个私有网络。无效 CIDR 会 fail-closed：调用返回
+不符合以上任一规则、且解析到被阻止地址的 hostname 会被拒绝。尤其是在未设置
+origin allowlist、也未配置 CIDR 时，解析到私有地址或 loopback 的 hostname 返回
+`403`。
+
+以下地址**永远不能**放行，即使 origin 已列入、或配置的 CIDR 覆盖了它们：
+link-local（`169.254.0.0/16` 和 `fe80::/10`，其中包括 `169.254.169.254` 实例
+metadata 地址）、其他知名 metadata 地址（`fd00:ec2::254`、`100.100.100.200`）、
+unspecified、multicast 和 broadcast，包括它们的各种 IPv6 内嵌形式。
+
+规则 1 按运维列出的具体 origin 放行，而不是按整个网段放行。若部署的 sidecar
+origin 已在 `MCP_OUTBOUND_ALLOWED_ORIGINS` 中，则无需任何配置变更。需要让未逐个
+列出的 hostname 访问整个网段时，仍可使用 CIDR 放行；它永远不是「允许所有私有地址」
+的布尔开关。无效 CIDR 会 fail-closed：调用返回
 `503 mcp_outbound_allowlist_required`，严格模式下还会阻止启动。
 被拒绝的地址返回 `403 mcp_endpoint_not_allowed`；DNS 错误或空结果返回
 `502 outbound_mcp_call_failed`。响应均不包含解析出的地址。

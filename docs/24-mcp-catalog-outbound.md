@@ -78,22 +78,38 @@ IP-literal endpoints do not require DNS resolution.
 
 By default, loopback, link-local (including metadata), private IPv4 and IPv6,
 unspecified, shared/CGNAT, `192.0.0.0/24`, benchmark, multicast, and reserved
-addresses are blocked, including IPv4-mapped IPv6 forms. Three explicit
-permission rules apply:
+addresses are blocked, including IPv4-mapped, IPv4-compatible, and NAT64
+(`64:ff9b::/96`) IPv6 forms. Three explicit permission rules apply:
 
-1. An IP-literal endpoint with its exact origin in
-   `MCP_OUTBOUND_ALLOWED_ORIGINS` may use a blocked address, such as a local
-   sidecar.
-2. In non-strict local development with the origin allowlist **unset**, an
-   IP-literal endpoint may use loopback or private addresses. Link-local,
-   unspecified, multicast, and broadcast literals remain blocked.
-3. A **hostname** may resolve into `MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS` (a
-   comma-separated CIDR list, as shown above). Every resolved address must be
-   permitted. Unspecified, multicast, and broadcast addresses are never
-   permitted, even by an explicit rule.
+1. **Listed origin.** An endpoint (hostname or IP literal) whose exact origin
+   (scheme, host, and port) appears in `MCP_OUTBOUND_ALLOWED_ORIGINS` may
+   resolve to private, loopback, or other blocked addresses, such as a sidecar
+   addressed by its container hostname. A hostname is still resolved only once;
+   every vetted address is pinned and no proxy is used.
+2. **Local development.** In non-strict local development with the origin
+   allowlist **unset**, an IP-literal endpoint may use loopback or private
+   addresses.
+3. **Optional CIDR opt-in.** A hostname that is not covered by rule 1 may
+   resolve into `MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS` (a comma-separated CIDR
+   list, as shown above), which permits the whole segment. Every resolved
+   address must be permitted.
 
-The CIDR opt-in limits hostname access to chosen network segments instead of
-letting a boolean "allow private" switch expose every private network.
+A hostname that matches none of these rules and resolves to a blocked address
+is rejected. In particular, with the origin allowlist unset and no CIDR
+configured, a hostname resolving to a private or loopback address returns
+`403`.
+
+The following addresses are **never** permitted, even when the origin is listed
+or a configured CIDR covers them: link-local (`169.254.0.0/16` and
+`fe80::/10`, which include the `169.254.169.254` instance metadata address),
+other well-known metadata addresses (`fd00:ec2::254`, `100.100.100.200`),
+unspecified, multicast, and broadcast, in any IPv6-embedded form.
+
+Rule 1 grants access to specific, operator-listed origins instead of whole
+network segments. A deployment whose sidecar origin is already in
+`MCP_OUTBOUND_ALLOWED_ORIGINS` needs no configuration change. The CIDR opt-in
+remains available when a whole segment must be reachable by hostnames that are
+not listed individually; it never acts as a boolean "allow private" switch.
 Malformed CIDRs fail closed with `503 mcp_outbound_allowlist_required` on invoke
 and prevent startup in strict mode. Rejected addresses return
 `403 mcp_endpoint_not_allowed`; failed or empty DNS answers return
