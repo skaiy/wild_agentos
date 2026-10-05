@@ -221,6 +221,7 @@ async fn invocations_lifecycle_revision_and_audit_track_each_write() {
                     usage: None,
                 }),
                 error: None,
+                task_iri: None,
             },
         )
         .await
@@ -766,6 +767,7 @@ async fn invocations_lifecycle_outcome_after_cancel_requested_is_recorded() {
                     usage: None,
                 }),
                 error: None,
+                task_iri: None,
             },
         ),
         (
@@ -773,6 +775,7 @@ async fn invocations_lifecycle_outcome_after_cancel_requested_is_recorded() {
             TransitionPatch {
                 result: None,
                 error: Some(InvocationErrorInfo::new("execution_failed", "boom")),
+                task_iri: None,
             },
         ),
     ] {
@@ -866,6 +869,7 @@ async fn invocations_lifecycle_same_state_repeat_is_idempotent_success() {
                     usage: None,
                 }),
                 error: None,
+                task_iri: None,
             },
         )
         .await
@@ -884,6 +888,7 @@ async fn invocations_lifecycle_same_state_repeat_is_idempotent_success() {
                     usage: None,
                 }),
                 error: None,
+                task_iri: None,
             },
         )
         .await
@@ -931,9 +936,16 @@ async fn invocations_lifecycle_same_state_repeat_is_idempotent_success() {
 }
 
 #[test]
-fn invocations_lifecycle_queued_to_failed_only_for_deadline() {
+fn invocations_lifecycle_queued_to_failed_only_for_approved_pre_exec_codes() {
+    use crate::api::http::invocations_store::{
+        PROJECTION_CONTEXT_MISSING_ERROR_CODE, TASK_INIT_FAILED_ERROR_CODE,
+    };
     use InvocationState::*;
-    let deadline = InvocationErrorInfo::new(DEADLINE_EXCEEDED_ERROR_CODE, "deadline passed");
+    let approved = [
+        InvocationErrorInfo::new(DEADLINE_EXCEEDED_ERROR_CODE, "deadline passed"),
+        InvocationErrorInfo::new(PROJECTION_CONTEXT_MISSING_ERROR_CODE, "no projection"),
+        InvocationErrorInfo::new(TASK_INIT_FAILED_ERROR_CODE, "init failed"),
+    ];
     let other = InvocationErrorInfo::new("execution_failed", "boom");
     for from in InvocationState::ALL {
         for to in InvocationState::ALL {
@@ -948,18 +960,21 @@ fn invocations_lifecycle_queued_to_failed_only_for_deadline() {
                 from.permits(to),
                 "{from:?}->{to:?}"
             );
-            assert_eq!(
-                from.permits_with(to, Some(&deadline)),
-                from.permits(to) || conditional,
-                "{from:?}->{to:?}"
-            );
+            for code in &approved {
+                assert_eq!(
+                    from.permits_with(to, Some(code)),
+                    from.permits(to) || conditional,
+                    "{from:?}->{to:?} code={}",
+                    code.code
+                );
+            }
         }
     }
     assert!(!Queued.permits(Failed));
 }
 
 #[tokio::test]
-async fn invocations_lifecycle_store_queued_to_failed_requires_deadline_reason() {
+async fn invocations_lifecycle_store_queued_to_failed_requires_approved_reason() {
     use InvocationState::*;
     let dir = tempfile::tempdir().unwrap();
     let store = open_store(&dir);
@@ -970,6 +985,7 @@ async fn invocations_lifecycle_store_queued_to_failed_requires_deadline_reason()
         TransitionPatch {
             result: None,
             error: Some(InvocationErrorInfo::new("execution_failed", "boom")),
+            task_iri: None,
         },
     ] {
         assert_eq!(
@@ -998,6 +1014,7 @@ async fn invocations_lifecycle_store_queued_to_failed_requires_deadline_reason()
                     DEADLINE_EXCEEDED_ERROR_CODE,
                     "deadline passed",
                 )),
+                task_iri: None,
             },
         )
         .await
@@ -1010,6 +1027,30 @@ async fn invocations_lifecycle_store_queued_to_failed_requires_deadline_reason()
     assert_eq!(
         expired.audit_events.last().map(|e| (e.from, e.to)),
         Some((Some(Queued), Failed))
+    );
+
+    let queued2 = invocation_in(&store, &claims, Queued).await;
+    let missing = store
+        .transition_for_claims(
+            &claims,
+            &queued2.id,
+            None,
+            Failed,
+            TransitionPatch {
+                result: None,
+                error: Some(InvocationErrorInfo::new(
+                    crate::api::http::invocations_store::PROJECTION_CONTEXT_MISSING_ERROR_CODE,
+                    "empty projection",
+                )),
+                task_iri: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.state, Failed);
+    assert_eq!(
+        missing.error.unwrap().code,
+        crate::api::http::invocations_store::PROJECTION_CONTEXT_MISSING_ERROR_CODE
     );
 }
 
@@ -1214,6 +1255,7 @@ async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
                     usage: Some(usage.clone()),
                 }),
                 error: None,
+                task_iri: None,
             },
         )
         .await

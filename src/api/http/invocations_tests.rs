@@ -54,7 +54,7 @@ fn token_exp(sub: &str, tenant: &str, project: Option<&str>, roles: &[&str], ttl
     .unwrap()
 }
 
-fn alice() -> String {
+pub(super) fn alice() -> String {
     token("alice", "tenant-a", Some("project-a"), &[])
 }
 

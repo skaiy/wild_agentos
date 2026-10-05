@@ -324,9 +324,11 @@ queued ──► running ──► succeeded
 - Usage is metered per run and written to `result.usage` with the terminal
   transition. A `succeeded` write requires complete usage per §5 (VAL-016 /
   VAL-017); incomplete usage must not be persisted as `succeeded`.
-- Execution is behind a configuration switch that defaults to **off**. It must
-  stay off in production until the [#317](https://github.com/skaiy/wild_agentos/issues/317)
-  execution bridge lands (projection scoping via #310/#322 is already on main).
+- Execution is behind a configuration switch that defaults to **off**
+  (`AGENTOS_INVOCATION_EXECUTION_ENABLED`). Keep it off in production until you
+  intentionally enable the TaskExecutor bridge. Projection scoping (#310/#322)
+  and VAL-PROJ-CTX fail-closed (missing/empty scoped projection →
+  `failed` / `projection_context_missing`) are enforced when the bridge runs.
 - While the switch is off, a new create is rejected with
   `503 execution_disabled` and nothing is persisted (no resource, no
   idempotency record), so no invocation can stay non-terminal forever. A replay
