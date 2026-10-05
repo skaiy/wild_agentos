@@ -242,6 +242,9 @@ pub(crate) struct McpSkillExposureRequest {
 
 /// GET /api/v1/mcp/skill-exposures — DA-only tenant-local exposure configuration.
 pub(crate) async fn list_skill_exposures_handler(identity: UserIdentity) -> impl IntoResponse {
+    if let Err(error) = identity.require_verified_isolation_claims("skill exposures") {
+        return error.into_response();
+    }
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
     }

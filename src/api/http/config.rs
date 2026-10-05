@@ -428,19 +428,14 @@ pub(crate) async fn update_config_handler(
                 let gateway = obj.entry("gateway").or_insert(json!({}));
                 if let Some(gateway_obj) = gateway.as_object_mut() {
                     for (k, v) in gw_patch {
-                        if k == "api_key" {
-                            // api_key_configured: 新 key 非空 OR 环境变量有配置（兜底）。
-                            let new_key = v.as_str().unwrap_or("");
-                            let env_key =
-                                std::env::var("AGENT_OS_GATEWAY_API_KEY").unwrap_or_default();
-                            gateway_obj.insert(
-                                "api_key_configured".into(),
-                                json!(!new_key.is_empty() || !env_key.is_empty()),
-                            );
-                        } else {
+                        if k != "api_key" {
                             gateway_obj.insert(k.clone(), v.clone());
                         }
                     }
+                    gateway_obj.insert(
+                        "api_key_configured".into(),
+                        json!(state.gateway.api_key_configured()),
+                    );
                 }
             }
         }
@@ -449,11 +444,14 @@ pub(crate) async fn update_config_handler(
             let mut clean = emb_patch.clone();
             if let Some(o) = clean.as_object_mut() {
                 if let Some(oneapi) = o.get_mut("oneapi").and_then(|v| v.as_object_mut()) {
-                    let key_now = oneapi.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
-                    if oneapi.contains_key("api_key") {
-                        oneapi.insert("api_key_configured".into(), json!(!key_now.is_empty()));
-                        oneapi.remove("api_key");
-                    }
+                    oneapi.remove("api_key");
+                    oneapi.insert(
+                        "api_key_configured".into(),
+                        json!(!crate::config::settings::Settings::load_embedding()
+                            .oneapi
+                            .api_key
+                            .is_empty()),
+                    );
                 }
             }
             if let Some(obj) = info.as_object_mut() {
@@ -464,36 +462,20 @@ pub(crate) async fn update_config_handler(
         // Models 快照：整体替换；每个 provider 的 api_key 转为 api_key_configured，不回显明文。
         if let Some(models_patch) = patch.get("models") {
             let mut clean = models_patch.clone();
+            let effective = crate::config::settings::Settings::load_models();
             if let Some(provs) = clean.get_mut("providers").and_then(|v| v.as_array_mut()) {
                 for p in provs.iter_mut() {
                     if let Some(o) = p.as_object_mut() {
-                        let key_now = o
-                            .get("api_key")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        // 已配置：本次提供了非空 key，或此前已有同 id 的持久化 key。
-                        let pid = o
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let prev_configured = info
-                            .get("models")
-                            .and_then(|m| m.get("providers"))
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter().any(|x| {
-                                    x.get("id").and_then(|v| v.as_str()) == Some(&pid)
-                                        && x.get("api_key_configured")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(false);
+                        let pid = o.get("id").and_then(|v| v.as_str()).unwrap_or("");
                         o.insert(
                             "api_key_configured".into(),
-                            json!(!key_now.is_empty() || prev_configured),
+                            json!(
+                                effective
+                                    .providers
+                                    .iter()
+                                    .any(|provider| provider.id == pid
+                                        && !provider.api_key.is_empty())
+                            ),
                         );
                         o.remove("api_key");
                     }
@@ -650,6 +632,8 @@ mod tests {
     use crate::gateway::unified_gateway::UnifiedGateway;
     use crate::tools::prompt_registry::PromptRegistry;
 
+    const FAKE_KEY: &str = "test-fake-gateway-key-278";
+
     /// 构造一个最小可用的 UnifiedGateway（不触网，仅满足 AppState 依赖）。
     fn test_gateway() -> UnifiedGateway {
         UnifiedGateway::new(&crate::config::GatewaySettings {
@@ -674,6 +658,7 @@ mod tests {
         )]);
         let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
         let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_gateway_key = std::env::var_os("AGENT_OS_GATEWAY_API_KEY");
         // 构造一个包含 api_key 的测试配置
         let test_config = json!({
             "version": "0.1.0-test",
@@ -743,7 +728,7 @@ mod tests {
                 "/api/v1/config",
                 get(config_handler).put(update_config_handler),
             )
-            .with_state(state);
+            .with_state(state.clone());
 
         let req = axum::http::Request::builder()
             .uri("/api/v1/config")
@@ -864,7 +849,6 @@ mod tests {
         // A defaulted project must fail before touching either the runtime or disk.
         assert!(!tmp.join("config_override.json").exists());
 
-        let secret_value = "test-only-gateway-key";
         let rejected = router
             .clone()
             .oneshot(put_config(
@@ -876,13 +860,35 @@ mod tests {
         // #274: tightened
         assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
         assert!(!tmp.join("config_override.json").exists());
+
+        // An environment key not used to initialize this gateway is not effective.
+        std::env::set_var("AGENT_OS_GATEWAY_API_KEY", FAKE_KEY);
+        let empty = router
+            .clone()
+            .oneshot(put_config(
+                // #274: platform admin required for config writes
+                Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
+                json!({"gateway": {"api_key": ""}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert!(!state.gateway.api_key_configured());
+        let body = axum::body::to_bytes(empty.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let snapshot: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["config"]["gateway"]["api_key_configured"], false);
+        assert!(!String::from_utf8_lossy(&body).contains(FAKE_KEY));
+
         let updated = router
+            .clone()
             .oneshot(put_config(
                 Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
                 json!({
                     "gateway": {
                         "base_url": "https://configured.example",
-                        "api_key": secret_value
+                        "api_key": FAKE_KEY
                     }
                 }),
             ))
@@ -890,10 +896,106 @@ mod tests {
             .unwrap();
         // #274: tightened (success now requires a platform-admin token)
         assert_eq!(updated.status(), StatusCode::OK);
+        assert!(state.gateway.api_key_configured());
+        let body = axum::body::to_bytes(updated.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let snapshot: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["config"]["gateway"]["api_key_configured"], true);
+        assert!(!String::from_utf8_lossy(&body).contains(FAKE_KEY));
+        let unchanged = router
+            .clone()
+            .oneshot(put_config(
+                Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
+                json!({"gateway": {"api_key": ""}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(unchanged.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let snapshot: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["config"]["gateway"]["api_key_configured"], true);
+        assert!(state.gateway.api_key_configured());
+        assert!(!String::from_utf8_lossy(&body).contains(FAKE_KEY));
+        let get = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/config")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", token_for(vec!["DA"], Some("test-project"))),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // #295: GET requires DA or platform admin; tightened to assert success.
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(FAKE_KEY));
+
+        // Pre-existing guarantee, checked before any embedding/models key is
+        // written below: no api_key at all in config_override.json.
         let override_contents = std::fs::read_to_string(tmp.join("config_override.json")).unwrap();
-        assert!(!override_contents.contains(secret_value));
+        assert!(!override_contents.contains(FAKE_KEY));
         assert!(
             !override_contents.contains("\"api_key\""),
+            "gateway api_key must never persist in config_override.json"
+        );
+
+        // Empty provider and embedding keys preserve the persisted effective
+        // keys, rather than replacing their snapshot flags with false.
+        for (patch, path) in [
+            (
+                json!({"models": {"providers": [{"id": "test-provider", "base_url": "https://provider.example", "api_key": FAKE_KEY}], "resources": []}}),
+                "models",
+            ),
+            (
+                json!({"models": {"providers": [{"id": "test-provider", "base_url": "https://provider.example", "api_key": ""}], "resources": []}}),
+                "models",
+            ),
+            (
+                json!({"embedding": {"enabled": false, "oneapi": {"api_key": FAKE_KEY}}}),
+                "embedding",
+            ),
+            (
+                json!({"embedding": {"enabled": false, "oneapi": {"api_key": ""}}}),
+                "embedding",
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(put_config(
+                    Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
+                    patch,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let snapshot: Value = serde_json::from_slice(&body).unwrap();
+            let configured = if path == "models" {
+                &snapshot["config"]["models"]["providers"][0]["api_key_configured"]
+            } else {
+                &snapshot["config"]["embedding"]["oneapi"]["api_key_configured"]
+            };
+            assert_eq!(configured, &json!(true));
+            assert!(!String::from_utf8_lossy(&body).contains(FAKE_KEY));
+        }
+
+        let override_contents = std::fs::read_to_string(tmp.join("config_override.json")).unwrap();
+        let persisted: Value = serde_json::from_str(&override_contents).unwrap();
+        assert!(!persisted["gateway"].to_string().contains(FAKE_KEY));
+        assert!(
+            persisted["gateway"].get("api_key").is_none(),
             "gateway api_key must never persist in config_override.json"
         );
 
@@ -907,6 +1009,11 @@ mod tests {
             std::env::set_var("AGENTOS_AUTH_MODE", value);
         } else {
             std::env::remove_var("AGENTOS_AUTH_MODE");
+        }
+        if let Some(value) = previous_gateway_key {
+            std::env::set_var("AGENT_OS_GATEWAY_API_KEY", value);
+        } else {
+            std::env::remove_var("AGENT_OS_GATEWAY_API_KEY");
         }
         let _ = std::fs::remove_dir_all(tmp);
     }

@@ -1712,3 +1712,116 @@ Output only JSON."#,
         })
     }
 }
+
+#[cfg(test)]
+mod plan_policy_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn failed_plan_does_not_complete_perception_or_dispatch_do() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let l0 = Arc::new(
+                crate::memory::l0_store::L0Store::new(
+                    dir.path().join("l0").to_string_lossy().as_ref(),
+                )
+                .unwrap(),
+            );
+            let l2 = Arc::new(crate::memory::l2_blackboard::Blackboard::new().unwrap());
+            let projection = Arc::new(crate::memory::l3_projection::ProjectionEngine::new(
+                l2.clone(),
+                500,
+            ));
+            let memory = Arc::new(tokio::sync::Mutex::new(
+                crate::memory::memory_manager::MemoryManager::new(
+                    l0.clone(),
+                    l2.clone(),
+                    projection,
+                    crate::CoreConfig::default(),
+                ),
+            ));
+            let templates = Arc::new(
+                crate::templates::template_engine::TemplateEngine::new(dir.path()).unwrap(),
+            );
+            let settings = crate::config::settings::GatewaySettings {
+                base_url: "http://localhost:3000".into(),
+                api_key: "test-key".into(),
+                default_model: "deepseek-v4-pro".into(),
+                timeout_seconds: 30,
+                max_retries: 0,
+                retry_base_ms: 500,
+                use_responses_api: false,
+                model_mapping: Default::default(),
+            };
+            let runner = Arc::new(crate::core::agent_runner::AgentRunner::new(
+                Arc::new(crate::gateway::unified_gateway::UnifiedGateway::new(&settings).unwrap()),
+                Arc::new(crate::tools::skill_registry::SkillRegistry::new()),
+                l2,
+                l0,
+                memory,
+                templates.clone(),
+                Default::default(),
+            ));
+            let events = Arc::new(crate::core::event_bus::EventBus::new(16));
+            let skills = Arc::new(crate::tools::skill_registry::SkillRegistry::new());
+            let sa = SupervisorAgent::new(runner, templates, skills, events, 2);
+            let plan =
+                sa.analyze_task("Build a web application with user authentication and database");
+            assert_eq!(plan.steps[0].role, AgentRole::Plan);
+            assert_eq!(plan.steps[1].role, AgentRole::Do);
+            let wf = crate::core::workflow::adapter::plan_to_workflow(&plan, "iri://task/guard");
+            let dag = crate::core::workflow::loader::build_dag(&wf).unwrap();
+            let order = crate::core::workflow::loader::topological_order(&dag).unwrap();
+            let result = TaskResult {
+                task_iri: "iri://task/guard".into(),
+                status: "failed".into(),
+                verdict: None,
+                summary: "Plan force-ended after a disallowed tool call".into(),
+                output: Some(serde_json::json!("Partial plan")),
+                jsonld_output: None,
+                artifacts: vec![],
+                errors: vec!["pa_disallowed_tool_call: file_write".into()],
+                turn_count: 1,
+                tool_call_count: 0,
+                five_w2h_updates: None,
+                tracked_actions: vec![],
+                archive_iri: None,
+            };
+            let mut prev_summary = None;
+            let mut da_output = None;
+            let mut last_result = None;
+            let mut completed = Default::default();
+            let mut skipped = Default::default();
+            let mut five_w2h = crate::core::five_w2h::Task5W2H::new("Task", "User task");
+            let stopped = sa
+                .handle_step_result(
+                    result,
+                    plan.steps[0].clone(),
+                    order[0],
+                    0,
+                    &mut prev_summary,
+                    &mut da_output,
+                    &mut last_result,
+                    &mut completed,
+                    &mut skipped,
+                    &mut five_w2h,
+                    "iri://task/guard",
+                    "cycle",
+                    &plan,
+                    &dag,
+                    &order,
+                    "iri://task/guard/5w2h",
+                )
+                .await
+                .unwrap()
+                .expect("SA must stop before Plan completion and Do dispatch");
+            assert_eq!(stopped.status, "failed");
+            assert_eq!(stopped.errors, ["pa_disallowed_tool_call: file_write"]);
+            assert!(prev_summary.is_none());
+            assert!(last_result.is_none());
+            assert!(completed.is_empty());
+            assert!(da_output.is_none());
+        });
+    }
+}
