@@ -1,0 +1,694 @@
+//! `/v1/invocations` routes (issue #314): create, get, list and cancel.
+//!
+//! Authentication and scope come only from verified JWT isolation claims
+//! (no anonymous path, no `X-Identity`, no API-client keys, with or without
+//! `AGENTOS_AUTH_STRICT`). Tenant, project and actor are never read from the
+//! request. Persistence, the lifecycle state machine and the revision check
+//! live in [`super::invocations_store`].
+//!
+//! Not in this module yet:
+//! - `Idempotency-Key` (#315). Until it lands, a create carrying the header
+//!   is rejected with `400 idempotency_unsupported` instead of silently
+//!   ignoring the key.
+//! - The execution bridge (#317). The execution switch is off, so create
+//!   answers `503 execution_disabled` and persists nothing. Tests enable the
+//!   switch to exercise create; the invocation then stays `queued`.
+//! - Agent revisions (#317). The agent store has no revisions, so a create
+//!   carrying `agent_revision` is `422 agent_revision_unsupported`.
+
+use std::sync::Arc;
+
+use axum::{
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+
+use super::iam::UserIdentity;
+use super::invocations_store::{
+    invocation_not_found_response, parse_if_match, Invocation, InvocationBudget,
+    InvocationInputRef, InvocationRequest, InvocationState, InvocationStore, InvocationStoreError,
+    NewInvocation, TransitionPatch,
+};
+use super::AppState;
+use crate::isolation::{IsolationClaims, IsolationScopeProvenance};
+
+/// Whole create body, in bytes.
+pub(crate) const MAX_CREATE_BODY_BYTES: usize = 64 * 1024;
+/// Inline `input`, as compact JSON.
+pub(crate) const MAX_INPUT_BYTES: usize = 8192;
+/// `metadata`, as compact JSON.
+pub(crate) const MAX_METADATA_BYTES: usize = 16 * 1024;
+/// Top-level `metadata` keys.
+pub(crate) const MAX_METADATA_KEYS: usize = 64;
+/// `agent_id` / `agent_revision` length.
+const MAX_ID_BYTES: usize = 256;
+/// List page size.
+pub(crate) const DEFAULT_LIST_LIMIT: usize = 20;
+pub(crate) const MAX_LIST_LIMIT: usize = 100;
+
+/// Scope and server-owned fields a caller may never send (`field_not_allowed`).
+const FORBIDDEN_FIELDS: &[&str] = &[
+    "tenant_id",
+    "project_id",
+    "actor_id",
+    "id",
+    "task_iri",
+    "state",
+    "revision",
+];
+/// Every create field the API accepts; anything else is `invalid_request`.
+const CREATE_FIELDS: &[&str] = &[
+    "prompt",
+    "agent_id",
+    "agent_revision",
+    "input",
+    "input_ref",
+    "budget",
+    "deadline",
+    "metadata",
+];
+/// `agent_revision` values that would float; they are never resolved.
+const FLOATING_REVISIONS: &[&str] = &["latest", "current", "head", "tip", "active", "default", "*"];
+
+/// Invocation runtime shared through `AppState`.
+#[derive(Clone)]
+pub(crate) struct InvocationsRuntime {
+    /// `None` when the store could not be opened; every route then answers
+    /// `503 invocation_store_unavailable` after authentication.
+    store: Option<Arc<InvocationStore>>,
+    /// Execution switch (#317). Off: create is `503 execution_disabled`.
+    execution_enabled: bool,
+}
+
+impl InvocationsRuntime {
+    pub(crate) fn new(store: Option<Arc<InvocationStore>>, execution_enabled: bool) -> Self {
+        Self {
+            store,
+            execution_enabled,
+        }
+    }
+
+    /// No store and execution off. Used when the store fails to open and by
+    /// test states that do not exercise invocations.
+    pub(crate) fn unavailable() -> Self {
+        Self::new(None, false)
+    }
+
+    /// Opens the default store with its env config and runs restart recovery.
+    /// The execution switch stays off until the execution bridge (#317) wires
+    /// it to configuration, so production create answers `503`.
+    pub(crate) fn open_default() -> Self {
+        match InvocationStore::open_default() {
+            Ok((store, report)) => {
+                if report.interrupted > 0 || report.swept > 0 {
+                    tracing::info!(
+                        loaded = report.loaded,
+                        interrupted = report.interrupted,
+                        swept = report.swept,
+                        "invocation store recovered"
+                    );
+                }
+                Self::new(Some(Arc::new(store)), false)
+            }
+            Err(error) => {
+                // A corrupt file must not be replaced by an empty store.
+                tracing::error!(error = %error, "invocation store unavailable");
+                Self::unavailable()
+            }
+        }
+    }
+}
+
+/// Error body `{"error", "message"}` (plus `missing_field` for 403), kept
+/// small so validation helpers can return it by value.
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    missing_field: Option<&'static str>,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            missing_field: None,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let mut body = json!({"error": self.code, "message": self.message});
+        if let Some(field) = self.missing_field {
+            body["missing_field"] = json!(field);
+        }
+        (self.status, Json(body)).into_response()
+    }
+}
+
+fn error_response(status: StatusCode, code: &'static str, message: &str) -> Response {
+    ApiError::new(status, code, message).into_response()
+}
+
+fn invalid_request(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+}
+
+fn invalid_request_response(message: &str) -> Response {
+    invalid_request(message).into_response()
+}
+
+fn payload_too_large(message: &str) -> ApiError {
+    ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
+}
+
+/// Verified claims with an explicit tenant and project, or 401 / 403.
+fn verified_scope(identity: &UserIdentity) -> Result<&IsolationClaims, ApiError> {
+    let Some(claims) = identity.isolation_claims() else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "verified_isolation_claims_required",
+            "verified isolation claims required for invocations",
+        ));
+    };
+    if claims.provenance() != IsolationScopeProvenance::VerifiedExplicit {
+        let missing = claims
+            .missing_scope_field()
+            .map(|field| field.as_str())
+            .unwrap_or("project_id");
+        let mut error = ApiError::new(
+            StatusCode::FORBIDDEN,
+            "claims_incomplete",
+            "invocations require an explicit tenant and project in the token",
+        );
+        error.missing_field = Some(missing);
+        return Err(error);
+    }
+    Ok(claims)
+}
+
+fn store_of(state: &AppState) -> Result<&Arc<InvocationStore>, ApiError> {
+    state.invocations.store.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invocation_store_unavailable",
+            "invocation store is unavailable",
+        )
+    })
+}
+
+/// Public view of a record: everything except the internal audit trail.
+fn resource_view(invocation: &Invocation) -> Value {
+    let mut value = serde_json::to_value(invocation).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut value {
+        map.remove("audit_events");
+    }
+    value
+}
+
+fn resource_response(status: StatusCode, invocation: &Invocation) -> Response {
+    let mut response = (status, Json(resource_view(invocation))).into_response();
+    response
+        .headers_mut()
+        .insert(header::ETAG, invocation.etag());
+    response
+}
+
+fn compact_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn optional<'a>(body: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    body.get(key).filter(|value| !value.is_null())
+}
+
+fn bounded_id(value: &Value, field: &str) -> Result<String, ApiError> {
+    let Some(text) = value.as_str() else {
+        return Err(invalid_request(format!("{field} must be a string")));
+    };
+    if text.trim().is_empty() || text.len() > MAX_ID_BYTES {
+        return Err(invalid_request(format!(
+            "{field} must be 1-{MAX_ID_BYTES} bytes"
+        )));
+    }
+    Ok(text.to_string())
+}
+
+fn has_uri_scheme(uri: &str) -> bool {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && !rest.is_empty()
+}
+
+fn parse_input_ref(value: &Value) -> Result<InvocationInputRef, ApiError> {
+    let Some(object) = value.as_object() else {
+        return Err(invalid_request("input_ref must be an object"));
+    };
+    if object.keys().any(|key| key != "uri" && key != "sha256") {
+        return Err(invalid_request("input_ref accepts only uri and sha256"));
+    }
+    let uri = object.get("uri").and_then(Value::as_str);
+    let sha256 = object.get("sha256").and_then(Value::as_str);
+    let (Some(uri), Some(sha256)) = (uri, sha256) else {
+        return Err(invalid_request("input_ref requires uri and sha256 strings"));
+    };
+    if !has_uri_scheme(uri) {
+        return Err(invalid_request("input_ref.uri must be <scheme>://..."));
+    }
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid_request(
+            "input_ref.sha256 must be 64 lowercase hex characters",
+        ));
+    }
+    Ok(InvocationInputRef {
+        uri: uri.to_string(),
+        sha256: sha256.to_string(),
+    })
+}
+
+fn parse_budget(value: &Value) -> Result<InvocationBudget, ApiError> {
+    let Some(object) = value.as_object() else {
+        return Err(invalid_request("budget must be an object"));
+    };
+    let mut budget = InvocationBudget::default();
+    for (key, member) in object {
+        let slot = match key.as_str() {
+            "max_tokens" => &mut budget.max_tokens,
+            "max_tool_calls" => &mut budget.max_tool_calls,
+            "max_cost" => &mut budget.max_cost,
+            _ => return Err(invalid_request("budget has an unknown member")),
+        };
+        match member.as_u64().filter(|n| *n >= 1) {
+            Some(n) => *slot = Some(n),
+            None => return Err(invalid_request("budget members must be positive integers")),
+        }
+    }
+    Ok(budget)
+}
+
+fn parse_deadline(value: &Value) -> Result<String, ApiError> {
+    let Some(text) = value.as_str() else {
+        return Err(invalid_request("deadline must be an RFC 3339 string"));
+    };
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(text) else {
+        return Err(invalid_request(
+            "deadline must be RFC 3339 with a UTC offset",
+        ));
+    };
+    if at.with_timezone(&chrono::Utc) <= chrono::Utc::now() {
+        return Err(invalid_request("deadline must be in the future"));
+    }
+    Ok(text.to_string())
+}
+
+/// Validates a create body into the stored request. Pure: no I/O, no store.
+/// Errors are `400` / `413` / `422`; the order is scope fields, unknown
+/// fields, per-field rules, then cross-field rules.
+pub(crate) fn parse_create_request(raw: &[u8]) -> Result<InvocationRequest, ApiError> {
+    if raw.len() > MAX_CREATE_BODY_BYTES {
+        return Err(payload_too_large("request body exceeds 64 KiB"));
+    }
+    let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(raw) else {
+        return Err(invalid_request("request body must be a JSON object"));
+    };
+    if body
+        .keys()
+        .any(|key| FORBIDDEN_FIELDS.contains(&key.as_str()))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "field_not_allowed",
+            "scope and server fields are taken from the token and the server",
+        ));
+    }
+    if body
+        .keys()
+        .any(|key| !CREATE_FIELDS.contains(&key.as_str()))
+    {
+        return Err(invalid_request("request body has an unknown field"));
+    }
+
+    let mut request = InvocationRequest::default();
+    if let Some(prompt) = optional(&body, "prompt") {
+        let Some(text) = prompt.as_str() else {
+            return Err(invalid_request("prompt must be a string"));
+        };
+        request.prompt = Some(text.to_string());
+    }
+    if let Some(agent_id) = optional(&body, "agent_id") {
+        request.agent_id = Some(bounded_id(agent_id, "agent_id")?);
+    }
+    if let Some(revision) = optional(&body, "agent_revision") {
+        let revision = bounded_id(revision, "agent_revision")?;
+        if FLOATING_REVISIONS
+            .iter()
+            .any(|word| revision.trim().eq_ignore_ascii_case(word))
+        {
+            return Err(invalid_request(
+                "agent_revision must be an exact revision, not a floating name",
+            ));
+        }
+        if request.agent_id.is_none() {
+            return Err(invalid_request("agent_revision requires agent_id"));
+        }
+        request.agent_revision = Some(revision);
+    }
+    if let Some(input) = optional(&body, "input") {
+        if compact_len(input) > MAX_INPUT_BYTES {
+            return Err(payload_too_large("input exceeds 8192 bytes"));
+        }
+        request.input = Some(input.clone());
+    }
+    if let Some(input_ref) = optional(&body, "input_ref") {
+        if request.input.is_some() {
+            return Err(invalid_request(
+                "input and input_ref are mutually exclusive",
+            ));
+        }
+        request.input_ref = Some(parse_input_ref(input_ref)?);
+    }
+    if let Some(budget) = optional(&body, "budget") {
+        request.budget = Some(parse_budget(budget)?);
+    }
+    if let Some(deadline) = optional(&body, "deadline") {
+        request.deadline = Some(parse_deadline(deadline)?);
+    }
+    if let Some(metadata) = optional(&body, "metadata") {
+        let Some(map) = metadata.as_object() else {
+            return Err(invalid_request("metadata must be an object"));
+        };
+        if map.len() > MAX_METADATA_KEYS {
+            return Err(payload_too_large("metadata exceeds 64 top-level keys"));
+        }
+        if compact_len(metadata) > MAX_METADATA_BYTES {
+            return Err(payload_too_large("metadata exceeds 16 KiB"));
+        }
+        request.metadata = map.clone();
+    }
+    let has_prompt = request
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty());
+    if !has_prompt && request.input.is_none() && request.input_ref.is_none() {
+        return Err(invalid_request(
+            "prompt is required unless input or input_ref is set",
+        ));
+    }
+    if request.input_ref.is_some() {
+        // v0.12.0 registers no input_ref resolver (docs §4.2).
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "input_ref_unresolvable",
+            "no resolver is registered for the input_ref scheme",
+        ));
+    }
+    Ok(request)
+}
+
+/// `agent_id` must name a user agent definition in the caller's scope.
+/// Unknown ids and other scopes get the same body.
+async fn resolve_agent(
+    state: &AppState,
+    claims: &IsolationClaims,
+    request: &InvocationRequest,
+) -> Result<(), ApiError> {
+    let Some(agent_id) = request.agent_id.as_deref() else {
+        return Ok(());
+    };
+    let found = state.user_agents.read().await.iter().any(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(agent_id)
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    });
+    if !found {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "agent_not_found",
+            "agent_id does not name an agent definition in this scope",
+        ));
+    }
+    if request.agent_revision.is_some() {
+        // TODO(#317): agent definitions carry no revision yet, so a pin can
+        // neither match nor be checked. Reject rather than ignore it.
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "agent_revision_unsupported",
+            "agent revisions are not available yet",
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /v1/invocations`
+pub(crate) async fn create_invocation_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let claims = match verified_scope(&identity) {
+        Ok(claims) => claims,
+        Err(error) => return error.into_response(),
+    };
+    if headers.contains_key("idempotency-key") {
+        // TODO(#315): idempotent replay. Rejected so a retry can never
+        // create a second invocation while callers believe it is deduplicated.
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "idempotency_unsupported",
+            "Idempotency-Key is not supported yet",
+        );
+    }
+    let request = match parse_create_request(&body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = resolve_agent(&state, claims, &request).await {
+        return error.into_response();
+    }
+    let store = match store_of(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    if !state.invocations.execution_enabled {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "execution_disabled",
+            "invocation execution is disabled on this server",
+        );
+    }
+    let new = NewInvocation {
+        request,
+        task_iri: None,
+        idempotency_key: None,
+    };
+    match store.create_for_claims(claims, new).await {
+        Ok(invocation) => {
+            // TODO(#317): hand the invocation to the execution bridge.
+            let mut response = resource_response(StatusCode::ACCEPTED, &invocation);
+            if let Ok(location) =
+                HeaderValue::from_str(&format!("/v1/invocations/{}", invocation.id))
+            {
+                response.headers_mut().insert(header::LOCATION, location);
+            }
+            response
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /v1/invocations/:id`
+pub(crate) async fn get_invocation_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(id): Path<String>,
+) -> Response {
+    let claims = match verified_scope(&identity) {
+        Ok(claims) => claims,
+        Err(error) => return error.into_response(),
+    };
+    let store = match store_of(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    match store.get_for_claims(claims, &id).await {
+        Ok(invocation) => resource_response(StatusCode::OK, &invocation),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListQuery {
+    limit: Option<String>,
+    after: Option<String>,
+    state: Option<String>,
+}
+
+fn encode_cursor(invocation: &Invocation) -> String {
+    let raw = json!([invocation.created_at, invocation.id]).to_string();
+    URL_SAFE_NO_PAD.encode(raw)
+}
+
+fn decode_cursor(cursor: &str) -> Option<(String, String)> {
+    let raw = URL_SAFE_NO_PAD.decode(cursor).ok()?;
+    let (created_at, id): (String, String) = serde_json::from_slice(&raw).ok()?;
+    Some((created_at, id))
+}
+
+/// `GET /v1/invocations?limit=&after=&state=`
+pub(crate) async fn list_invocations_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    query: Option<Query<ListQuery>>,
+) -> Response {
+    let claims = match verified_scope(&identity) {
+        Ok(claims) => claims,
+        Err(error) => return error.into_response(),
+    };
+    let Some(Query(query)) = query else {
+        return invalid_request_response("invalid query string");
+    };
+    let limit = match query.limit.as_deref() {
+        None => DEFAULT_LIST_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=MAX_LIST_LIMIT).contains(&n) => n,
+            _ => return invalid_request_response("limit must be an integer from 1 to 100"),
+        },
+    };
+    let filter = match query.state.as_deref() {
+        None => None,
+        Some(raw) => match InvocationState::ALL.iter().find(|s| s.as_str() == raw) {
+            Some(state) => Some(*state),
+            None => return invalid_request_response("unknown state filter"),
+        },
+    };
+    let after = match query.after.as_deref() {
+        None => None,
+        Some(raw) => match decode_cursor(raw) {
+            Some(position) => Some(position),
+            None => return invalid_request_response("invalid cursor"),
+        },
+    };
+    let store = match store_of(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    // Newest first, `id` as tie-breaker (same order as the store).
+    let listed = store.list_for_claims(claims, filter).await;
+    let start = match &after {
+        None => 0,
+        Some((created_at, id)) => listed
+            .iter()
+            .position(|inv| (&inv.created_at, &inv.id) < (created_at, id))
+            .unwrap_or(listed.len()),
+    };
+    let page: Vec<&Invocation> = listed.iter().skip(start).take(limit).collect();
+    let has_more = start + page.len() < listed.len();
+    let next_cursor = if has_more {
+        page.last().map(|inv| encode_cursor(inv))
+    } else {
+        None
+    };
+    Json(json!({
+        "object": "list",
+        "data": page.iter().map(|inv| resource_view(inv)).collect::<Vec<_>>(),
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }))
+    .into_response()
+}
+
+/// `POST /v1/invocations/:id/cancel` with optional `If-Match: "<revision>"`.
+/// Any actor in the scope may read; only the creating actor or a DA may
+/// cancel (`403 cancel_not_permitted`). `200` when the result is
+/// `cancelled`, `202` when it is `cancel_requested`.
+pub(crate) async fn cancel_invocation_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let claims = match verified_scope(&identity) {
+        Ok(claims) => claims,
+        Err(error) => return error.into_response(),
+    };
+    let expected_revision = match parse_if_match(&headers) {
+        Ok(revision) => revision,
+        Err(error) => return error.into_response(),
+    };
+    let store = match store_of(&state) {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    // A second attempt covers a state change between the read and the write
+    // (for example queued -> running), which changes the cancel target.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let current = match store.get_for_claims(claims, &id).await {
+            Ok(invocation) => invocation,
+            Err(error) => return error.into_response(),
+        };
+        if current.actor_id != claims.actor_id() && !identity.has_role("DA") {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "cancel_not_permitted",
+                "only the creating actor or a DA may cancel this invocation",
+            );
+        }
+        let Some(target) = current.state.cancel_target() else {
+            return InvocationStoreError::IllegalTransition {
+                from: current.state,
+                to: InvocationState::Cancelled,
+            }
+            .into_response();
+        };
+        match store
+            .transition_outcome_for_claims(
+                claims,
+                &id,
+                expected_revision,
+                target,
+                TransitionPatch::default(),
+            )
+            .await
+        {
+            Ok(outcome) => {
+                // TODO(#317): signal the running execution's cancellation token.
+                let status = if outcome.invocation.state == InvocationState::Cancelled {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                };
+                return resource_response(status, &outcome.invocation);
+            }
+            Err(InvocationStoreError::IllegalTransition { .. }) if attempts < 2 => continue,
+            Err(InvocationStoreError::NotFound) => return invocation_not_found_response(),
+            Err(error) => return error.into_response(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "invocations_tests.rs"]
+mod tests;
