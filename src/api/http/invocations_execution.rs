@@ -21,8 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::invocations::InvocationDispatcher;
 use super::invocations_store::{
-    Invocation, InvocationErrorInfo, InvocationResult, InvocationState, InvocationStore,
-    InvocationUsage, TransitionPatch, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
+    scrub_secret_shaped_text, Invocation, InvocationErrorInfo, InvocationResult, InvocationState,
+    InvocationStore, InvocationUsage, TransitionPatch, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
     TASK_INIT_FAILED_ERROR_CODE,
 };
 use super::{TaskExecSpec, TaskExecutor};
@@ -34,8 +34,8 @@ use crate::isolation::IsolationClaims;
 pub(crate) const INCOMPLETE_USAGE_ERROR_CODE: &str = "incomplete_usage";
 /// Executor join failed with a panic / unexpected abort.
 pub(crate) const EXECUTOR_PANIC_ERROR_CODE: &str = "executor_panic";
-/// No `TaskExecutor` was injected while the execution switch is on.
-pub(crate) const EXECUTOR_NOT_CONFIGURED_ERROR_CODE: &str = "executor_not_configured";
+/// Executor finished (or was abandoned) without a TASK_COMPLETED / TASK_FAILED event.
+pub(crate) const TERMINAL_EVENT_MISSING_ERROR_CODE: &str = "terminal_event_missing";
 /// Soft upper bound for persisted result summaries (#317 scrub).
 pub(crate) const MAX_RESULT_SUMMARY_CHARS: usize = 4_096;
 /// Scoped frame used for the H4 projection gate (non-SPARQL, task-local).
@@ -134,15 +134,8 @@ pub(crate) fn succeeded_patch_or_reject(
 
 /// Truncate + lightly scrub a result summary before persisting.
 pub(crate) fn scrub_result_summary(summary: &str) -> String {
-    let mut out: String = summary.chars().take(MAX_RESULT_SUMMARY_CHARS).collect();
-    // Strip common secret-shaped substrings from free text.
-    for needle in ["api_key", "api-key", "secret", "password", "token="] {
-        if out.to_ascii_lowercase().contains(needle) {
-            out = out.replace(needle, "[redacted]");
-            out = out.replace(&needle.to_ascii_uppercase(), "[redacted]");
-        }
-    }
-    out
+    let truncated: String = summary.chars().take(MAX_RESULT_SUMMARY_CHARS).collect();
+    scrub_secret_shaped_text(&truncated)
 }
 
 /// Whether a projection JSON string counts as non-empty in-scope context (H4).
@@ -321,13 +314,24 @@ impl InvocationDispatcher for InvocationExecutionBridge {
         let id = invocation.id.clone();
 
         tokio::spawn(async move {
-            let shutdown_watch = shutdown.clone();
-            let token_for_shutdown = token.clone();
-            tokio::spawn(async move {
-                shutdown_watch.cancelled().await;
-                token_for_shutdown.cancel();
-            });
-            run_invocation(store, core, executor, events, gate, invocation, token).await;
+            let run = run_invocation(
+                store,
+                core,
+                executor,
+                events,
+                gate,
+                invocation,
+                token.clone(),
+            );
+            tokio::pin!(run);
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    token.cancel();
+                    run.await;
+                }
+                _ = &mut run => {}
+            }
             cancellations.remove(&id);
         });
     }
@@ -567,7 +571,7 @@ async fn run_invocation(
             &store,
             &claims,
             &invocation.id,
-            EXECUTOR_NOT_CONFIGURED_ERROR_CODE,
+            TERMINAL_EVENT_MISSING_ERROR_CODE,
             "execution ended without a terminal task event",
             None,
         )
@@ -701,7 +705,7 @@ async fn fail_running(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::http::invocations_store::InvocationToolCallUsage;
+    use crate::api::http::invocations_store::{InvocationErrorInfo, InvocationToolCallUsage};
 
     fn complete_usage() -> InvocationUsage {
         InvocationUsage {
@@ -803,6 +807,13 @@ mod tests {
         assert!(projection_context_is_nonempty(
             r#"{"task_iri":"iri://t","frame":"reference_only","artifacts":[{"@id":"iri://t"}]}"#
         ));
+    }
+
+    #[test]
+    fn error_message_is_scrubbed() {
+        let err = InvocationErrorInfo::new("x", "leak api_key=secret here");
+        assert!(err.message.contains("[redacted]"));
+        assert!(!err.message.to_ascii_lowercase().contains("api_key"));
     }
 
     #[test]

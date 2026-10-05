@@ -433,6 +433,18 @@ pub(crate) struct InvocationToolCallUsage {
     pub transport: Option<String>,
 }
 
+/// Lightly redact secret-shaped substrings from persisted free text.
+pub(crate) fn scrub_secret_shaped_text(input: &str) -> String {
+    let mut out = input.to_string();
+    for needle in ["api_key", "api-key", "secret", "password", "token="] {
+        if out.to_ascii_lowercase().contains(needle) {
+            out = out.replace(needle, "[redacted]");
+            out = out.replace(&needle.to_ascii_uppercase(), "[redacted]");
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct InvocationErrorInfo {
     pub code: String,
@@ -442,7 +454,7 @@ pub(crate) struct InvocationErrorInfo {
 impl InvocationErrorInfo {
     /// Builds a persisted error, truncating the message on a char boundary.
     pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        let mut message = message.into();
+        let mut message = scrub_secret_shaped_text(&message.into());
         if message.len() > MAX_ERROR_MESSAGE_BYTES {
             let mut end = MAX_ERROR_MESSAGE_BYTES;
             while !message.is_char_boundary(end) {
