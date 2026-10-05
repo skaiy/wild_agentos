@@ -88,7 +88,13 @@ impl MemoryScheduler {
         &self,
         agent_role: AgentRole,
         task_iri: &str,
+        claims: Option<&crate::isolation::IsolationClaims>,
     ) -> Result<String, CoreError> {
+        // Context is only served within the caller's verified scope.
+        let Some(claims) = claims else {
+            tracing::warn!(task_iri = %task_iri, "Context request refused: no verified isolation claims");
+            return Ok(String::new());
+        };
         let frame_name = match agent_role {
             AgentRole::Plan => "pa_init",
             AgentRole::Do => "da_input",
@@ -97,7 +103,10 @@ impl MemoryScheduler {
         };
 
         let params = HashMap::new();
-        let projection_result = self.projection.project(task_iri, frame_name, params).await;
+        let projection_result = self
+            .projection
+            .project(task_iri, frame_name, params, claims)
+            .await;
 
         if let Ok(result) = projection_result {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
@@ -159,6 +168,7 @@ impl MemoryScheduler {
         agent_role: AgentRole,
         task_iri: &str,
         decay_lambda: f64,
+        claims: Option<&crate::isolation::IsolationClaims>,
     ) -> Result<String, CoreError> {
         self.recall_requests.fetch_add(1, Ordering::Relaxed);
         RECALL_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -174,7 +184,9 @@ impl MemoryScheduler {
                 return Ok(contents.join("\n"));
             }
         }
-        let fallback = self.on_context_request(agent_role, task_iri).await?;
+        let fallback = self
+            .on_context_request(agent_role, task_iri, claims)
+            .await?;
         if !fallback.trim().is_empty() {
             self.recall_hits.fetch_add(1, Ordering::Relaxed);
             RECALL_HITS.fetch_add(1, Ordering::Relaxed);

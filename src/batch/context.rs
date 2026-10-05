@@ -6,6 +6,7 @@ use tracing::{debug, warn};
 use crate::batch::error::BatchError;
 use crate::batch::types::{BatchAgentConfig, EmphasisItem, PromptContext};
 use crate::batch::window::SlidingWindow;
+use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::memory::l0_store::L0Store;
 use crate::memory::l3_projection::ProjectionEngine;
@@ -13,6 +14,7 @@ use crate::memory::l3_projection::ProjectionEngine;
 pub struct ContextCollector {
     l0_store: Option<Arc<L0Store>>,
     projection: Option<Arc<ProjectionEngine>>,
+    isolation_claims: Option<IsolationClaims>,
     kg_store: Option<Arc<KnowledgeGraphStore>>,
 }
 
@@ -25,8 +27,16 @@ impl ContextCollector {
         Self {
             l0_store,
             projection,
+            isolation_claims: None,
             kg_store,
         }
+    }
+
+    /// Attach the verified claims projections are scoped to. Without them the
+    /// context summary is never loaded.
+    pub fn with_isolation_claims(mut self, claims: IsolationClaims) -> Self {
+        self.isolation_claims = Some(claims);
+        self
     }
 
     pub async fn collect(
@@ -144,8 +154,15 @@ impl ContextCollector {
             None => return Ok(None),
         };
 
+        let Some(claims) = self.isolation_claims.as_ref() else {
+            warn!(task_iri = %task_iri, frame = "summary_only", "Projection skipped: batch has no verified isolation claims");
+            return Ok(None);
+        };
         let params = std::collections::HashMap::new();
-        match projection.project(task_iri, "summary_only", params).await {
+        match projection
+            .project(task_iri, "summary_only", params, claims)
+            .await
+        {
             Ok(json_str) => {
                 // Try to extract a meaningful summary from the projection JSON
                 let parsed: Value =

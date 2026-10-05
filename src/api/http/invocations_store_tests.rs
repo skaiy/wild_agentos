@@ -25,7 +25,7 @@ fn new_invocation() -> NewInvocation {
             ..InvocationRequest::default()
         },
         task_iri: None,
-        idempotency_key: None,
+        idempotency: None,
     }
 }
 
@@ -282,6 +282,7 @@ fn invocations_lifecycle_audit_events_are_capped() {
         result: None,
         error: None,
         idempotency_key: None,
+        idempotency: None,
         created_at: String::new(),
         updated_at: String::new(),
         started_at: None,
@@ -649,6 +650,7 @@ async fn invocations_lifecycle_restart_marks_unfinished_interrupted() {
             loaded: 6,
             interrupted: 3,
             swept: 0,
+            idempotency_expired: 0,
         }
     );
     for old in &before {
@@ -695,6 +697,7 @@ async fn invocations_lifecycle_restart_marks_unfinished_interrupted() {
             loaded: 6,
             interrupted: 0,
             swept: 0,
+            idempotency_expired: 0,
         }
     );
 }
