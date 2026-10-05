@@ -633,7 +633,7 @@ impl InvocationStore {
     /// [`Self::open_with_config`] with the default limits.
     // Used by tests now; the execution bridge (#317) and scheduled
     // sweeps consume it in production.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn open(
         path: impl Into<PathBuf>,
     ) -> Result<(Self, RecoveryReport), InvocationStoreError> {
@@ -699,7 +699,7 @@ impl InvocationStore {
 
     // Used by tests now; the execution bridge (#317) and scheduled
     // sweeps consume it in production.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn config(&self) -> InvocationStoreConfig {
         self.config
     }
@@ -709,7 +709,7 @@ impl InvocationStore {
     /// nothing. Non-terminal records are never removed.
     // Used by tests now; the execution bridge (#317) and scheduled
     // sweeps consume it in production.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) async fn sweep_expired(&self) -> Result<usize, InvocationStoreError> {
         self.sweep_expired_at(chrono::Utc::now()).await
     }
@@ -717,7 +717,7 @@ impl InvocationStore {
     /// [`Self::sweep_expired`] against an explicit clock (tests, schedulers).
     // Used by tests now; the execution bridge (#317) and scheduled
     // sweeps consume it in production.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) async fn sweep_expired_at(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -735,7 +735,7 @@ impl InvocationStore {
 
     // Used by tests now; the execution bridge (#317) and scheduled
     // sweeps consume it in production.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -835,7 +835,7 @@ impl InvocationStore {
     /// [`Self::transition_outcome_for_claims`].
     // Used by tests now; the execution bridge (#317) and scheduled
     // sweeps consume it in production.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) async fn transition_for_claims(
         &self,
         claims: &IsolationClaims,
