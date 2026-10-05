@@ -18,7 +18,7 @@ fn alice() -> IsolationClaims {
 
 fn new_invocation() -> NewInvocation {
     NewInvocation {
-        input: InvocationInput {
+        request: InvocationRequest {
             prompt: CANARY_PROMPT.to_string(),
             agent_id: None,
             metadata: Map::new(),
@@ -275,7 +275,7 @@ fn invocations_lifecycle_audit_events_are_capped() {
         actor_id: "a".into(),
         state: InvocationState::Queued,
         revision: 1,
-        input: InvocationInput::default(),
+        request: InvocationRequest::default(),
         task_iri: None,
         result: None,
         error: None,
@@ -917,5 +917,88 @@ async fn invocations_lifecycle_same_state_repeat_is_idempotent_success() {
             )
             .await,
         Err(InvocationStoreError::NotFound)
+    );
+}
+
+#[test]
+fn invocations_lifecycle_queued_to_failed_only_for_deadline() {
+    use InvocationState::*;
+    let deadline = InvocationErrorInfo::new(DEADLINE_EXCEEDED_ERROR_CODE, "deadline passed");
+    let other = InvocationErrorInfo::new("execution_failed", "boom");
+    for from in InvocationState::ALL {
+        for to in InvocationState::ALL {
+            let conditional = from == Queued && to == Failed;
+            assert_eq!(
+                from.permits_with(to, None),
+                from.permits(to),
+                "{from:?}->{to:?}"
+            );
+            assert_eq!(
+                from.permits_with(to, Some(&other)),
+                from.permits(to),
+                "{from:?}->{to:?}"
+            );
+            assert_eq!(
+                from.permits_with(to, Some(&deadline)),
+                from.permits(to) || conditional,
+                "{from:?}->{to:?}"
+            );
+        }
+    }
+    assert!(!Queued.permits(Failed));
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_store_queued_to_failed_requires_deadline_reason() {
+    use InvocationState::*;
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    let queued = invocation_in(&store, &claims, Queued).await;
+    for patch in [
+        TransitionPatch::default(),
+        TransitionPatch {
+            result: None,
+            error: Some(InvocationErrorInfo::new("execution_failed", "boom")),
+        },
+    ] {
+        assert_eq!(
+            store
+                .transition_for_claims(&claims, &queued.id, Some(1), Failed, patch)
+                .await,
+            Err(InvocationStoreError::IllegalTransition {
+                from: Queued,
+                to: Failed
+            })
+        );
+        assert_eq!(
+            store.get_for_claims(&claims, &queued.id).await.unwrap(),
+            queued
+        );
+    }
+    let expired = store
+        .transition_for_claims(
+            &claims,
+            &queued.id,
+            Some(1),
+            Failed,
+            TransitionPatch {
+                result: None,
+                error: Some(InvocationErrorInfo::new(
+                    DEADLINE_EXCEEDED_ERROR_CODE,
+                    "deadline passed",
+                )),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired.state, Failed);
+    assert_eq!(expired.revision, 2);
+    assert!(expired.completed_at.is_some());
+    assert!(expired.started_at.is_none());
+    assert_eq!(expired.error.unwrap().code, DEADLINE_EXCEEDED_ERROR_CODE);
+    assert_eq!(
+        expired.audit_events.last().map(|e| (e.from, e.to)),
+        Some((Some(Queued), Failed))
     );
 }

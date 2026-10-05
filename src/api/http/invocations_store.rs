@@ -32,7 +32,7 @@
 //!
 //! Restart recovery is the single privileged write path: it is the only code
 //! that bypasses [`InvocationState::permits`] (for example `queued → failed`
-//! is not a lifecycle edge), and it can only move a non-terminal record to
+//! is not an unconditional lifecycle edge), and it can only move a non-terminal record to
 //! `failed/interrupted`. Terminal records are never touched. Every other write
 //! goes through [`InvocationStore::transition_for_claims`].
 //!
@@ -78,6 +78,9 @@ pub(crate) const MAX_AUDIT_EVENTS: usize = 32;
 pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
 /// Error code recorded for invocations interrupted by a process restart.
 pub(crate) const INTERRUPTED_ERROR_CODE: &str = "interrupted";
+/// Error code for an invocation stopped by its `deadline`. It is also the
+/// only reason that unlocks the `queued → failed` edge.
+pub(crate) const DEADLINE_EXCEEDED_ERROR_CODE: &str = "deadline_exceeded";
 /// Actor recorded in audit events written by the store itself.
 pub(crate) const SYSTEM_ACTOR_ID: &str = "system";
 
@@ -87,15 +90,21 @@ const STORE_FILE_NAME: &str = "invocations.json";
 ///
 /// ```text
 /// queued ──► running ──► succeeded
-///   │           ├──────► failed
-///   │           └──► cancel_requested ──► cancelled
-///   │                        ├──────────► succeeded
-///   │                        └──────────► failed
+///   │  │        ├──────► failed
+///   │  │        └──► cancel_requested ──► cancelled
+///   │  │                     ├──────────► succeeded
+///   │  │                     └──────────► failed
+///   │  └──────────────────────────────► failed (deadline_exceeded only)
 ///   └──────────────────────────────────► cancelled
 /// ```
 ///
 /// `cancel_requested → succeeded | failed` records the real outcome when
 /// execution finishes before the cancel request takes effect.
+///
+/// `queued → failed` is a *conditional* edge: it is not in [`Self::permits`]
+/// and is accepted only when the transition patch carries
+/// `error.code = "deadline_exceeded"` (see [`Self::permits_with`]). Any other
+/// `queued → failed` request is `IllegalTransition`.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InvocationState {
@@ -150,6 +159,15 @@ impl InvocationState {
         )
     }
 
+    /// [`Self::permits`] plus the conditional `queued → failed` edge, which
+    /// only a deadline expiry (`error.code = "deadline_exceeded"`) may take.
+    pub(crate) fn permits_with(self, next: Self, error: Option<&InvocationErrorInfo>) -> bool {
+        self.permits(next)
+            || (self == Self::Queued
+                && next == Self::Failed
+                && error.is_some_and(|e| e.code == DEADLINE_EXCEEDED_ERROR_CODE))
+    }
+
     /// The state a cancel request moves to, or `None` when cancel would leave
     /// a terminal outcome (`succeeded` / `failed`). A repeated cancel targets
     /// the current state (`cancel_requested` / `cancelled`), which the store
@@ -164,8 +182,11 @@ impl InvocationState {
     }
 }
 
+/// Caller-supplied create fields, echoed back unchanged as `request`.
+/// The remaining create fields (`agent_revision`, `input`, `input_ref`,
+/// `budget`, `deadline`) are added with the create route (#314).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
-pub(crate) struct InvocationInput {
+pub(crate) struct InvocationRequest {
     pub prompt: String,
     #[serde(default)]
     pub agent_id: Option<String>,
@@ -223,7 +244,7 @@ pub(crate) struct Invocation {
     pub actor_id: String,
     pub state: InvocationState,
     pub revision: u64,
-    pub input: InvocationInput,
+    pub request: InvocationRequest,
     #[serde(default)]
     pub task_iri: Option<String>,
     #[serde(default)]
@@ -265,7 +286,7 @@ impl Invocation {
 /// the verified claims passed to [`InvocationStore::create_for_claims`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NewInvocation {
-    pub input: InvocationInput,
+    pub request: InvocationRequest,
     pub task_iri: Option<String>,
     pub idempotency_key: Option<String>,
 }
@@ -534,7 +555,7 @@ impl InvocationStore {
             actor_id: claims.actor_id().to_string(),
             state: InvocationState::Queued,
             revision: 1,
-            input: new.input,
+            request: new.request,
             task_iri: new.task_iri,
             result: None,
             error: None,
@@ -612,7 +633,8 @@ impl InvocationStore {
     /// Checks, in order and under one write lock: scope (`NotFound`),
     /// same-state repeat (idempotent no-op, `changed = false`),
     /// `expected_revision` (`RevisionConflict`), lifecycle edge
-    /// (`IllegalTransition`). On success state, revision, timestamps, patch
+    /// (`IllegalTransition`; `queued → failed` only with
+    /// `error.code = "deadline_exceeded"`). On success state, revision, timestamps, patch
     /// and the audit event are persisted in one atomic file replace before
     /// memory is updated. Who may request which transition (for example
     /// cancel only by the creating actor or a DA) is decided by the caller.
@@ -646,7 +668,7 @@ impl InvocationStore {
             }
         }
         let from = current.state;
-        if from.is_terminal() || !from.permits(next_state) {
+        if from.is_terminal() || !from.permits_with(next_state, patch.error.as_ref()) {
             return Err(InvocationStoreError::IllegalTransition {
                 from,
                 to: next_state,
