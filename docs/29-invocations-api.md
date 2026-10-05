@@ -386,3 +386,9 @@ with the current revision.
   with such a token lands in the `default` project, and invocation calls with
   the same token return 403 / 422. Register agents with a token that carries
   an explicit project.
+
+## 12. Docs and matrix close-out (#318)
+
+- `docs/23` gains an Invocations row; Interpretation notes this resource is not an Admin screen and not part of the OpenAI-compatible layer.
+- `docs/17` isolation matrix gains the cross-scope 404 / anonymous 401 row.
+- Route-level contract index: `src/api/http/isolation_contract_invocations_tests.rs` (lands with the #314/#317 stack).

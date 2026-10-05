@@ -250,3 +250,9 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 - **切换前提：** #315 + #317 + #310。
 - **Agent id。** `agent_id` 使用 agent 注册接口返回的服务端生成 UUID，注册时不能自指定 id。编排型 agent 的注册字段和拓扑随 #317 提供（§4.1）。
 - **已知不一致（agent 注册）。** `POST /api/v1/agents` 仍接受 project 为默认补全值的令牌。用这种令牌注册的 agent 会落到 `default` project，同一令牌调用 invocation 会返回 403 / 422。注册 agent 时请使用带显式 project 的令牌。
+
+## 12. 文档与矩阵收尾（#318）
+
+- `docs/23` 矩阵已补 Invocations 行，并在「解读与边界」写明：本资源不属于 Admin 屏、不属于 OpenAI 兼容层。
+- `docs/17` 隔离矩阵已补跨 scope 404 / 匿名 401 行。
+- 路由级契约测试索引见 `src/api/http/isolation_contract_invocations_tests.rs`（随 #314/#317 栈落地）。

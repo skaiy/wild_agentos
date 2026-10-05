@@ -31,9 +31,17 @@ inferred from a screen name.
 | No-Code IDE | — | — | — | **Not doing** |
 | Second Grafana | — | — | — | **Not doing** |
 | Admin create-tenant form | — | — | Tenant scope comes from verified JWT claims, not an Admin tenant-creation API. | **Not doing** |
+| Invocations (integrator API) | — | `POST /v1/invocations`; `GET /v1/invocations`; `GET /v1/invocations/:id`; `POST /v1/invocations/:id/cancel`; `GET /v1/invocations/:id/events` | Verified JWT `IsolationClaims` only (no API-client keys, no `X-Identity`). Cross-scope reads/cancels/events → byte-identical `404`. | **Planned** — epic [#313](https://github.com/skaiy/wild_agentos/issues/313); design [`docs/29-invocations-api.md`](29-invocations-api.md); contract tests #318 |
 | Business orchestration | — | — | — | **Not doing** |
 
 ## Interpretation and boundaries
+
+`/v1/invocations` is an **integrator-facing kernel API**, not an Admin control-plane
+screen and not part of the OpenAI-compatible layer (`/v1/models`,
+`/v1/chat/completions`, which authenticate with API-client keys). It has no Admin
+hash route; clients call the kernel paths directly with a verified IdP JWT. See
+[`docs/29-invocations-api.md`](29-invocations-api.md) and epic
+[#313](https://github.com/skaiy/wild_agentos/issues/313).
 
 The v0.7.0 release includes the claims-scoped Runs list, redacted and
 claims-scoped Guard audit/statistics, and claims-scoped Blackboard task and node

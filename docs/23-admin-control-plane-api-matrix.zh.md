@@ -31,9 +31,12 @@ Admin 页面，不是内核路径。“所需 claims”只陈述当前内核行�
 | No-Code IDE | — | — | — | **不做** |
 | 第二套 Grafana | — | — | — | **不做** |
 | Admin 建租户表单 | — | — | tenant 作用域来自已验证 JWT claims，不来自 Admin tenant-creation API。 | **不做** |
+| Invocations（集成方 API） | — | `POST /v1/invocations`；`GET /v1/invocations`；`GET /v1/invocations/:id`；`POST /v1/invocations/:id/cancel`；`GET /v1/invocations/:id/events` | 仅已校验 JWT `IsolationClaims`（不接受 API client key、不接受 `X-Identity`）。跨 scope 读/取消/事件 → 与不存在逐字节一致的 `404`。 | **规划中** — epic [#313](https://github.com/skaiy/wild_agentos/issues/313)；设计见 [`docs/29-invocations-api.zh.md`](29-invocations-api.zh.md)；契约测试 #318 |
 | 业务编排 | — | — | — | **不做** |
 
 ## 解读与边界
+
+`/v1/invocations` 是面向集成方的**内核 API**，不属于 Admin 控制面屏，也不属于 OpenAI 兼容层（`/v1/models`、`/v1/chat/completions`，用 API client key 鉴权）。没有对应的 Admin hash 路由；客户端用已校验的 IdP JWT 直接调内核路径。见 [`docs/29-invocations-api.zh.md`](29-invocations-api.zh.md) 与 epic [#313](https://github.com/skaiy/wild_agentos/issues/313)。
 
 v0.7.0 已交付按 claims 作用域的 Runs 列表、脱敏且按 claims 作用域的 Guard
 audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#221](https://github.com/skaiy/wild_agentos/issues/221)、
