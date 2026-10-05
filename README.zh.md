@@ -136,7 +136,8 @@ cargo run --bin wild-agent-os-core
 
 使用 LLM-backed feature 前需配置 LLM gateway。仓库内的 config 保留空的
 gateway credential；deployment credential 应始终存放在 version control
-之外。生产环境请设置 `AGENTOS_ENV=production`，并配置[隔离契约](docs/17-isolation-contract.zh.md)
+之外。`gateway.api_key`（或按 model 解析到的 provider key）为空/仅空白时会在出网前短路，
+不发起任何 LLM HTTP，也不重试。生产环境请设置 `AGENTOS_ENV=production`，并配置[隔离契约](docs/17-isolation-contract.zh.md)
 所述必需 OIDC/JWKS environment value。server 会拒绝 production HS256
 configuration。
 
