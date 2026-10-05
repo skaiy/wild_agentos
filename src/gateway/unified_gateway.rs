@@ -512,6 +512,10 @@ impl UnifiedGateway {
         *self.api_key.write().unwrap() = key;
     }
 
+    pub fn api_key_configured(&self) -> bool {
+        !self.api_key.read().unwrap().is_empty()
+    }
+
     pub fn set_default_model(&self, model: String) {
         *self.default_model.write().unwrap() = model.clone();
         self.model_mapping

@@ -13,7 +13,6 @@ use crate::jsonld::{generate_iri, validate_jsonld_node, JsonLdContext, JsonLdNod
 use crate::memory::l1_session::L1Session;
 use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
-use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
 use super::{
@@ -766,6 +765,7 @@ impl super::AgentRunner {
         let mut tc = 0u32;
         let mut turn = 0u32;
         let mut errs = Vec::new();
+        let mut pa_disallowed_tool_call = false;
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
         let mut tool_error_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
@@ -886,25 +886,25 @@ impl super::AgentRunner {
                 supports_reasoning,
             );
 
+            let disallowed_tools = crate::core::tool_controller::disallowed_pa_tools(
+                &agent.role,
+                stream_response.tool_calls.iter().map(|c| c.name.as_str()),
+            );
+            if !disallowed_tools.is_empty() {
+                errs.push(
+                    self.report_pa_disallowed_tools(agent, &ctx.task_iri, &disallowed_tools)
+                        .await,
+                );
+                pa_disallowed_tool_call = true;
+                last_content = parsed.content;
+                last_summary = "Plan force-ended after a disallowed tool call".to_string();
+                break;
+            }
+
             match parsed.action.as_deref() {
                 Some("tool_call") => {
                     if !stream_response.tool_calls.is_empty() {
                         let tool_calls = &stream_response.tool_calls;
-                        if agent.role == AgentRole::Plan {
-                            let disallowed_tools: Vec<&str> = tool_calls
-                                .iter()
-                                .map(|c| c.name.as_str())
-                                .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
-                                .collect();
-                            let force_finish = !disallowed_tools.is_empty();
-                            if force_finish {
-                                warn!(
-                                    "[PA Streaming] Disallowed tool calls blocked: {:?}",
-                                    disallowed_tools
-                                );
-                                break;
-                            }
-                        }
 
                         let asst_summary = parsed
                             .summary
@@ -1284,7 +1284,12 @@ impl super::AgentRunner {
         (
             Ok(TaskResult {
                 task_iri: ctx.task_iri,
-                status: "success".to_string(),
+                status: if pa_disallowed_tool_call {
+                    "failed"
+                } else {
+                    "success"
+                }
+                .to_string(),
                 verdict: None,
                 summary: final_summary,
                 output: Some(output_value),

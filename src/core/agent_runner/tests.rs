@@ -204,6 +204,263 @@ async fn immediate_finish(Json(_request): Json<Value>) -> Json<Value> {
     }))
 }
 
+#[derive(Clone)]
+struct PlanToolScript {
+    tool: &'static str,
+    /// Assistant content of the first (tool-calling) turn.
+    first_content: &'static str,
+    /// finish_reason of the first turn.
+    first_finish: &'static str,
+    calls: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
+}
+
+const PLAN_TOOL_CALL_CONTENT: &str =
+    r#"{"action":"tool_call","content":"Partial plan","summary":"Looks complete"}"#;
+
+async fn scripted_plan_tool(
+    State(script): State<PlanToolScript>,
+    Json(request): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let first = script.requests.fetch_add(1, Ordering::SeqCst) == 0;
+    let content = if first {
+        script.first_content
+    } else {
+        r#"{"action":"finish","content":"Plan complete","summary":"Plan complete"}"#
+    };
+    let tool_call = json!({
+        "id": "call-1", "type": "function",
+        "function": {"name": script.tool, "arguments": r#"{"path":"argument-sentinel"}"#}
+    });
+    if request["stream"] == true {
+        let mut frames = vec![json!({"choices":[{"index":0,"delta":{"content":content}}]})];
+        if first {
+            frames.push(json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                "index":0,"id":"call-1","function":{"name":script.tool,"arguments":r#"{"path":"argument-sentinel"}"#}
+            }]}}]}));
+        }
+        frames.push(json!({"choices":[{"index":0,"delta":{},"finish_reason":
+            if first {script.first_finish} else {"stop"}
+        }]}));
+        let body = frames
+            .into_iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>();
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+            .into_response()
+    } else {
+        Json(json!({"choices":[{
+            "index":0,
+            "message":{"role":"assistant","content":content,
+                "tool_calls": if first {json!([tool_call])} else {Value::Null}},
+            "finish_reason": if first {script.first_finish} else {"stop"}
+        }]}))
+        .into_response()
+    }
+}
+
+#[test]
+fn plan_tool_guard_fails_both_runner_paths_without_invoking_handler() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        for streaming in [false, true] {
+            for tool in ["file_write", "file_read"] {
+                let script = PlanToolScript {
+                    tool,
+                    first_content: PLAN_TOOL_CALL_CONTENT,
+                    first_finish: "tool_calls",
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    requests: Arc::new(AtomicUsize::new(0)),
+                };
+                let app = Router::new()
+                    .route("/v1/chat/completions", post(scripted_plan_tool))
+                    .with_state(script.clone());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut runner = create_test_runner();
+                runner.gateway.set_base_url(format!("http://{address}"));
+                let events = Arc::new(crate::core::event_bus::EventBus::new(32));
+                let mut receiver = events.subscribe();
+                runner.set_event_bus(events);
+                let calls = script.calls.clone();
+                runner.tool_executor.write().register(
+                    tool,
+                    "Test tool handler.",
+                    json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                    Arc::new(move |_| {
+                        let calls = calls.clone();
+                        Box::pin(async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(json!({"content":"read"}))
+                        })
+                    }),
+                    &[],
+                );
+                let mut agent = AgentInstance::new("agent:plan".into(), AgentRole::Plan);
+                let context = TaskContext::new("iri://task/plan-guard", "Plan", 2);
+                let result = if streaming {
+                    runner.execute_streaming(&mut agent, context, |_| {}).await
+                } else {
+                    runner.execute(&mut agent, context).await
+                }
+                .unwrap();
+                if tool == "file_write" {
+                    assert_eq!(result.status, "failed");
+                    assert_eq!(result.errors, ["pa_disallowed_tool_call: file_write"]);
+                    assert!(result.summary.contains("force-ended"));
+                    assert_eq!(result.output, Some(json!("Partial plan")));
+                    assert_eq!(script.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(script.requests.load(Ordering::SeqCst), 1);
+                    let event = std::iter::from_fn(|| receiver.try_recv().ok())
+                        .find(|event| event.event_type == "AGENT_ERROR")
+                        .expect("policy violation must emit AGENT_ERROR");
+                    assert_eq!(event.event_type, "AGENT_ERROR");
+                    assert_eq!(event.source_agent_iri, "agent:plan");
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&event.payload).unwrap(),
+                        json!({"error":"pa_disallowed_tool_call","agent":"agent:plan","role":"PA","tools":["file_write"]})
+                    );
+                    assert!(!event.payload.contains("argument-sentinel"));
+                } else {
+                    assert_eq!(result.status, "success");
+                    assert_eq!(script.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(script.requests.load(Ordering::SeqCst), 2);
+                    assert!(std::iter::from_fn(|| receiver.try_recv().ok())
+                        .all(|event| event.event_type != "AGENT_ERROR"));
+                }
+                server.abort();
+            }
+        }
+    });
+}
+
+/// Runs one PA turn against `script`; returns the result and AGENT_ERROR payloads.
+async fn run_plan_tool_script(
+    script: &PlanToolScript,
+    streaming: bool,
+) -> (TaskResult, Vec<Value>) {
+    let app = Router::new()
+        .route("/v1/chat/completions", post(scripted_plan_tool))
+        .with_state(script.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut runner = create_test_runner();
+    runner.gateway.set_base_url(format!("http://{address}"));
+    let events = Arc::new(crate::core::event_bus::EventBus::new(32));
+    let mut receiver = events.subscribe();
+    runner.set_event_bus(events);
+    let calls = script.calls.clone();
+    // Long names stand for model-invented tools and stay unregistered.
+    let registered: &[&str] = if script.tool.len() > 64 {
+        &["file_write"]
+    } else {
+        &[script.tool, "file_write"]
+    };
+    for &tool in registered {
+        let calls = calls.clone();
+        runner.tool_executor.write().register(
+            tool,
+            "Test tool handler.",
+            json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            Arc::new(move |_| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"content":"read"}))
+                })
+            }),
+            &[],
+        );
+    }
+    let mut agent = AgentInstance::new("agent:plan".into(), AgentRole::Plan);
+    let context = TaskContext::new("iri://task/plan-guard", "Plan", 2);
+    let result = if streaming {
+        runner.execute_streaming(&mut agent, context, |_| {}).await
+    } else {
+        runner.execute(&mut agent, context).await
+    }
+    .unwrap();
+    let errors = std::iter::from_fn(|| receiver.try_recv().ok())
+        .filter(|event| event.event_type == "AGENT_ERROR")
+        .map(|event| serde_json::from_str::<Value>(&event.payload).unwrap())
+        .collect();
+    server.abort();
+    (result, errors)
+}
+
+// The PA guard must not depend on the model's declared action: moving the
+// check back inside the `tool_call` branch has to fail this test.
+#[test]
+fn plan_tool_calls_fail_regardless_of_declared_action_in_both_paths() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let contents = [
+            r#"{"action":"plan","content":"Partial plan","summary":"s"}"#,
+            r#"{"action":"done","content":"Partial plan","summary":"s"}"#,
+            r#"{"action":"finish","content":"Partial plan","summary":"s"}"#,
+            r#"{"action":"","content":"Partial plan","summary":"s"}"#,
+            r#"{"content":"Partial plan","summary":"s"}"#,
+            r#"{"action":"xyz","content":"Partial plan","summary":"s"}"#,
+            "Partial plan, not JSON",
+        ];
+        for streaming in [false, true] {
+            for first_content in contents {
+                for first_finish in ["tool_calls", "stop"] {
+                    let script = PlanToolScript {
+                        tool: "file_write",
+                        first_content,
+                        first_finish,
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        requests: Arc::new(AtomicUsize::new(0)),
+                    };
+                    let label =
+                        format!("streaming={streaming} finish={first_finish} {first_content}");
+                    let (result, events) = run_plan_tool_script(&script, streaming).await;
+                    assert_eq!(result.status, "failed", "{label}");
+                    assert_eq!(
+                        result.errors,
+                        ["pa_disallowed_tool_call: file_write"],
+                        "{label}"
+                    );
+                    assert_eq!(script.calls.load(Ordering::SeqCst), 0, "{label}");
+                    assert_eq!(script.requests.load(Ordering::SeqCst), 1, "{label}");
+                    assert_eq!(events.len(), 1, "{label}");
+                    assert_eq!(events[0]["tools"], json!(["file_write"]), "{label}");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn plan_disallowed_unregistered_tool_name_is_not_echoed() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let long_name: &'static str = Box::leak("x".repeat(10 * 1024).into_boxed_str());
+        for streaming in [false, true] {
+            let script = PlanToolScript {
+                tool: long_name,
+                first_content: PLAN_TOOL_CALL_CONTENT,
+                first_finish: "tool_calls",
+                calls: Arc::new(AtomicUsize::new(0)),
+                requests: Arc::new(AtomicUsize::new(0)),
+            };
+            let (result, events) = run_plan_tool_script(&script, streaming).await;
+            assert_eq!(result.status, "failed", "streaming={streaming}");
+            assert_eq!(result.errors, ["pa_disallowed_tool_call: <unregistered>"]);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["tools"], json!(["<unregistered>"]));
+            assert!(events[0].get("tools_omitted").is_none());
+            assert!(!events[0].to_string().contains("xxxxxxxx"));
+            assert_eq!(script.calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
 #[test]
 fn agent_runner_first_turn_prompts_use_only_turn_schemas() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
