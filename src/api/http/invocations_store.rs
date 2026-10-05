@@ -36,6 +36,17 @@
 //! `failed/interrupted`. Terminal records are never touched. Every other write
 //! goes through [`InvocationStore::transition_for_claims`].
 //!
+//! # Same-state repeats
+//!
+//! A transition whose target equals the current state (a duplicate worker
+//! delivery, or a cancel retried on a `cancel_requested` / `cancelled`
+//! invocation) is an idempotent success: nothing is written, the revision is
+//! not bumped, no audit event is added, any patch is ignored and the current
+//! record is returned. Following RFC 9110 §13.1.1, this holds even when the
+//! caller's `If-Match` revision is stale, because the requested final state is
+//! already reflected and a no-op cannot lose an update. Moving a terminal
+//! record into a *different* state stays `IllegalTransition`.
+//!
 //! # `If-Match`
 //!
 //! [`parse_if_match`] accepts one strong tag `"<revision>"` or `*`. Anything
@@ -122,7 +133,8 @@ impl InvocationState {
     }
 
     /// Whether `self -> next` is an edge of the lifecycle graph. Terminal
-    /// states have no outgoing edges and there are no self-loops.
+    /// states have no outgoing edges and there are no self-loops; same-state
+    /// repeats are handled as no-ops by the store, not as edges.
     pub(crate) fn permits(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -138,13 +150,16 @@ impl InvocationState {
         )
     }
 
-    /// The state a cancel request moves to, or `None` when cancel is not an
-    /// allowed edge from `self` (already cancelling or terminal).
+    /// The state a cancel request moves to, or `None` when cancel would leave
+    /// a terminal outcome (`succeeded` / `failed`). A repeated cancel targets
+    /// the current state (`cancel_requested` / `cancelled`), which the store
+    /// answers as an idempotent no-op.
     pub(crate) fn cancel_target(self) -> Option<Self> {
         match self {
             Self::Queued => Some(Self::Cancelled),
-            Self::Running => Some(Self::CancelRequested),
-            _ => None,
+            Self::Running | Self::CancelRequested => Some(Self::CancelRequested),
+            Self::Cancelled => Some(Self::Cancelled),
+            Self::Succeeded | Self::Failed => None,
         }
     }
 }
@@ -253,6 +268,16 @@ pub(crate) struct NewInvocation {
     pub input: InvocationInput,
     pub task_iri: Option<String>,
     pub idempotency_key: Option<String>,
+}
+
+/// Result of [`InvocationStore::transition_outcome_for_claims`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransitionOutcome {
+    /// The record after the call (unchanged for a same-state repeat).
+    pub invocation: Invocation,
+    /// `false` when the target equalled the current state and nothing was
+    /// written (no revision bump, no audit event, patch ignored).
+    pub changed: bool,
 }
 
 /// Optional fields written together with a transition.
@@ -567,14 +592,8 @@ impl InvocationStore {
         listed
     }
 
-    /// The single write entry point for lifecycle changes.
-    ///
-    /// Checks, in order and under one write lock: scope (`NotFound`),
-    /// `expected_revision` (`RevisionConflict`), lifecycle edge
-    /// (`IllegalTransition`). On success state, revision, timestamps, patch
-    /// and the audit event are persisted in one atomic file replace before
-    /// memory is updated. Who may request which transition (for example
-    /// cancel only by the creating actor or a DA) is decided by the caller.
+    /// Lifecycle write that discards the `changed` flag; see
+    /// [`Self::transition_outcome_for_claims`].
     pub(crate) async fn transition_for_claims(
         &self,
         claims: &IsolationClaims,
@@ -583,12 +602,42 @@ impl InvocationStore {
         next_state: InvocationState,
         patch: TransitionPatch,
     ) -> Result<Invocation, InvocationStoreError> {
+        self.transition_outcome_for_claims(claims, id, expected_revision, next_state, patch)
+            .await
+            .map(|outcome| outcome.invocation)
+    }
+
+    /// The single write entry point for lifecycle changes.
+    ///
+    /// Checks, in order and under one write lock: scope (`NotFound`),
+    /// same-state repeat (idempotent no-op, `changed = false`),
+    /// `expected_revision` (`RevisionConflict`), lifecycle edge
+    /// (`IllegalTransition`). On success state, revision, timestamps, patch
+    /// and the audit event are persisted in one atomic file replace before
+    /// memory is updated. Who may request which transition (for example
+    /// cancel only by the creating actor or a DA) is decided by the caller.
+    pub(crate) async fn transition_outcome_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        id: &str,
+        expected_revision: Option<u64>,
+        next_state: InvocationState,
+        patch: TransitionPatch,
+    ) -> Result<TransitionOutcome, InvocationStoreError> {
         let mut records = self.records.write().await;
         let index = records
             .iter()
             .position(|record| record.id == id && record.is_in_scope(claims))
             .ok_or(InvocationStoreError::NotFound)?;
         let current = &records[index];
+        if current.state == next_state {
+            // Already in the requested state: nothing to write (RFC 9110
+            // §13.1.1 allows 2xx even if If-Match is stale).
+            return Ok(TransitionOutcome {
+                invocation: current.clone(),
+                changed: false,
+            });
+        }
         if let Some(expected) = expected_revision {
             if expected != current.revision {
                 return Err(InvocationStoreError::RevisionConflict {
@@ -633,7 +682,10 @@ impl InvocationStore {
         let updated = record.clone();
         persist(&self.path, &next)?;
         *records = next;
-        Ok(updated)
+        Ok(TransitionOutcome {
+            invocation: updated,
+            changed: true,
+        })
     }
 }
 

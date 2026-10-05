@@ -112,9 +112,15 @@ fn invocations_lifecycle_permits_matches_graph_exactly() {
             assert!(InvocationState::ALL.iter().all(|to| !from.permits(*to)));
         }
     }
+    for state in InvocationState::ALL {
+        assert!(!state.permits(state), "no self-loop edge for {state:?}");
+    }
     assert_eq!(Queued.cancel_target(), Some(Cancelled));
     assert_eq!(Running.cancel_target(), Some(CancelRequested));
-    for state in [CancelRequested, Succeeded, Failed, Cancelled] {
+    // Repeated cancels target the current state (idempotent no-op).
+    assert_eq!(CancelRequested.cancel_target(), Some(CancelRequested));
+    assert_eq!(Cancelled.cancel_target(), Some(Cancelled));
+    for state in [Succeeded, Failed] {
         assert_eq!(state.cancel_target(), None);
     }
 }
@@ -128,7 +134,7 @@ async fn invocations_lifecycle_store_enforces_all_36_pairs() {
         for to in InvocationState::ALL {
             let invocation = invocation_in(&store, &claims, from).await;
             let outcome = store
-                .transition_for_claims(
+                .transition_outcome_for_claims(
                     &claims,
                     &invocation.id,
                     Some(invocation.revision),
@@ -136,11 +142,21 @@ async fn invocations_lifecycle_store_enforces_all_36_pairs() {
                     TransitionPatch::default(),
                 )
                 .await;
-            if from.permits(to) {
-                let updated = outcome.unwrap_or_else(|e| panic!("{from:?}->{to:?}: {e}"));
+            if from == to {
+                // 6 diagonal pairs: idempotent success, nothing written.
+                let outcome = outcome.unwrap_or_else(|e| panic!("{from:?}->{to:?}: {e}"));
+                assert!(!outcome.changed, "{from:?} -> {to:?}");
+                assert_eq!(outcome.invocation, invocation);
+                let unchanged = store.get_for_claims(&claims, &invocation.id).await.unwrap();
+                assert_eq!(unchanged, invocation);
+            } else if from.permits(to) {
+                let outcome = outcome.unwrap_or_else(|e| panic!("{from:?}->{to:?}: {e}"));
+                assert!(outcome.changed);
+                let updated = outcome.invocation;
                 assert_eq!(updated.state, to);
                 assert_eq!(updated.revision, invocation.revision + 1);
             } else {
+                let outcome = outcome.map(|o| o.invocation);
                 assert_eq!(
                     outcome,
                     Err(InvocationStoreError::IllegalTransition { from, to }),
@@ -380,7 +396,7 @@ async fn invocations_lifecycle_stress_16_writers_1000_random_transitions() {
                     _ => Some((roll >> 16) % 5),
                 };
                 match store
-                    .transition_for_claims(
+                    .transition_outcome_for_claims(
                         &claims,
                         &id,
                         expected,
@@ -389,7 +405,8 @@ async fn invocations_lifecycle_stress_16_writers_1000_random_transitions() {
                     )
                     .await
                 {
-                    Ok(updated) => won.push(updated.revision),
+                    Ok(outcome) if outcome.changed => won.push(outcome.invocation.revision),
+                    Ok(_) => {}
                     Err(
                         InvocationStoreError::RevisionConflict { .. }
                         | InvocationStoreError::IllegalTransition { .. },
@@ -772,4 +789,133 @@ async fn invocations_lifecycle_outcome_after_cancel_requested_is_recorded() {
             _ => assert_eq!(done.error.unwrap().code, "execution_failed"),
         }
     }
+}
+
+#[tokio::test]
+async fn invocations_lifecycle_same_state_repeat_is_idempotent_success() {
+    use InvocationState::*;
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+
+    // Repeated cancel on a running invocation: first moves to
+    // cancel_requested, second is a no-op even with a stale If-Match.
+    let running = invocation_in(&store, &claims, Running).await;
+    let first = store
+        .transition_outcome_for_claims(
+            &claims,
+            &running.id,
+            Some(running.revision),
+            running.state.cancel_target().unwrap(),
+            TransitionPatch::default(),
+        )
+        .await
+        .unwrap();
+    assert!(first.changed);
+    assert_eq!(first.invocation.state, CancelRequested);
+    let disk_before = disk_records(&store);
+    let again = store
+        .transition_outcome_for_claims(
+            &claims,
+            &running.id,
+            Some(running.revision),
+            first.invocation.state.cancel_target().unwrap(),
+            TransitionPatch::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!again.changed);
+    assert_eq!(again.invocation, first.invocation);
+    assert_eq!(disk_records(&store), disk_before);
+
+    // Repeated cancel on a cancelled invocation.
+    let cancelled = invocation_in(&store, &claims, Cancelled).await;
+    let again = store
+        .transition_outcome_for_claims(
+            &claims,
+            &cancelled.id,
+            None,
+            cancelled.state.cancel_target().unwrap(),
+            TransitionPatch::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!again.changed);
+    assert_eq!(again.invocation, cancelled);
+
+    // Duplicate worker delivery of a terminal outcome: the stored result is
+    // kept, the duplicate patch is ignored.
+    let done = store
+        .transition_for_claims(
+            &claims,
+            &invocation_in(&store, &claims, Running).await.id,
+            None,
+            Succeeded,
+            TransitionPatch {
+                result: Some(InvocationResult {
+                    summary: "first-delivery".into(),
+                    artifacts: vec![],
+                }),
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let disk_before = disk_records(&store);
+    let duplicate = store
+        .transition_outcome_for_claims(
+            &claims,
+            &done.id,
+            Some(done.revision),
+            Succeeded,
+            TransitionPatch {
+                result: Some(InvocationResult {
+                    summary: "second-delivery".into(),
+                    artifacts: vec![],
+                }),
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!duplicate.changed);
+    assert_eq!(duplicate.invocation, done);
+    assert_eq!(
+        duplicate.invocation.result.unwrap().summary,
+        "first-delivery"
+    );
+    assert_eq!(disk_records(&store), disk_before);
+
+    // Leaving a terminal state for a different one is still 409.
+    for (terminal, other) in [
+        (Succeeded, Cancelled),
+        (Failed, Succeeded),
+        (Cancelled, Failed),
+    ] {
+        let record = invocation_in(&store, &claims, terminal).await;
+        assert_eq!(
+            store
+                .transition_for_claims(&claims, &record.id, None, other, TransitionPatch::default())
+                .await,
+            Err(InvocationStoreError::IllegalTransition {
+                from: terminal,
+                to: other
+            })
+        );
+    }
+
+    // Scope is still checked first: a repeat from another scope is 404.
+    let outsider = IsolationClaims::from_verified("tenant-b", "project-a", "alice").unwrap();
+    assert_eq!(
+        store
+            .transition_for_claims(
+                &outsider,
+                &done.id,
+                None,
+                Succeeded,
+                TransitionPatch::default()
+            )
+            .await,
+        Err(InvocationStoreError::NotFound)
+    );
 }
