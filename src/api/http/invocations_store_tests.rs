@@ -19,9 +19,10 @@ fn alice() -> IsolationClaims {
 fn new_invocation() -> NewInvocation {
     NewInvocation {
         request: InvocationRequest {
-            prompt: CANARY_PROMPT.to_string(),
+            prompt: Some(CANARY_PROMPT.to_string()),
             agent_id: None,
             metadata: Map::new(),
+            ..InvocationRequest::default()
         },
         task_iri: None,
         idempotency_key: None,
