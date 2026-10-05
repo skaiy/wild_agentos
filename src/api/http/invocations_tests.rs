@@ -24,7 +24,7 @@ use crate::isolation::IsolationClaims;
 const SECRET: &[u8] = b"test-hs256-secret-at-least-32-bytes-long";
 const CANARY: &str = "canary-inv-meta-5d1e-do-not-leak";
 
-fn env(strict: bool) -> EnvGuard {
+pub(super) fn env(strict: bool) -> EnvGuard {
     EnvGuard::set(&[
         ("AGENTOS_AUTH_MODE", "hs256".into()),
         (
@@ -35,7 +35,7 @@ fn env(strict: bool) -> EnvGuard {
     ])
 }
 
-fn token(sub: &str, tenant: &str, project: Option<&str>, roles: &[&str]) -> String {
+pub(super) fn token(sub: &str, tenant: &str, project: Option<&str>, roles: &[&str]) -> String {
     token_exp(sub, tenant, project, roles, 3600)
 }
 
@@ -86,7 +86,7 @@ fn harness() -> Harness {
     harness_with(true, InvocationStoreConfig::default())
 }
 
-fn router(state: Arc<AppState>) -> Router {
+pub(super) fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route(
             "/v1/invocations",
@@ -101,17 +101,17 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-struct Reply {
-    status: StatusCode,
-    headers: HeaderMap,
-    bytes: Bytes,
+pub(super) struct Reply {
+    pub(super) status: StatusCode,
+    pub(super) headers: HeaderMap,
+    pub(super) bytes: Bytes,
 }
 
 impl Reply {
-    fn json(&self) -> Value {
+    pub(super) fn json(&self) -> Value {
         serde_json::from_slice(&self.bytes).unwrap_or(Value::Null)
     }
-    fn code(&self) -> String {
+    pub(super) fn code(&self) -> String {
         self.json()["error"]
             .as_str()
             .unwrap_or_default()
@@ -119,7 +119,7 @@ impl Reply {
     }
 }
 
-async fn call(
+pub(super) async fn call(
     router: &Router,
     method: &str,
     uri: &str,
@@ -577,17 +577,19 @@ async fn create_validation_rejects_without_persisting() {
     }
     assert_eq!(agent_not_found_bodies[0], agent_not_found_bodies[1]);
 
+    // A malformed Idempotency-Key is rejected before anything is stored
+    // (full coverage in invocations_idempotency_tests.rs, #315).
     let reply = call(
         &h.router,
         "POST",
         "/v1/invocations",
         Some(&alice()),
-        &[("idempotency-key", "run-1:create")],
+        &[("idempotency-key", "has space")],
         Some(json!({"prompt": "p"}).to_string()),
     )
     .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert_eq!(reply.code(), "idempotency_unsupported");
+    assert_eq!(reply.code(), "invalid_idempotency_key");
     assert_eq!(stored_count(&h).await, 0);
 
     // Boundaries pass: input 8192 bytes, metadata 16 KiB / 64 keys, in-scope agent.

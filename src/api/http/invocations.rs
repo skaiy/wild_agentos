@@ -8,13 +8,26 @@
 //! live in [`super::invocations_store`]. Cancellation registration and the
 //! `succeeded` usage contract live in [`super::invocations_execution`].
 //!
+//! `Idempotency-Key` (#315): an optional create header of 1–255 visible
+//! ASCII characters (`0x21..=0x7E`), scoped to `(tenant_id, project_id,
+//! actor_id, key)` from the claims. The fingerprint is the SHA-256 of the
+//! canonical JSON body (object keys sorted, no insignificant whitespace);
+//! headers are not part of it. Same key and fingerprint → `200` with the
+//! current resource and `Idempotent-Replayed: true`, nothing executed; a
+//! different fingerprint → `409 idempotency_key_conflict` (no echo); a
+//! concurrent duplicate → `409 idempotency_key_in_progress` with
+//! `Retry-After`. The replay lookup runs before field validation and the
+//! execution switch, so a retry whose `deadline` has since passed, or a retry
+//! while execution is switched off, still replays the original.
+//!
 //! Gaps still tracked elsewhere:
-//! - `Idempotency-Key` (#315). Until it lands, a create carrying the header
-//!   is rejected with `400 idempotency_unsupported` instead of silently
-//!   ignoring the key.
 //! - Real `TaskExecutor` / event-bus drive (#317 follow-up). Create registers
-//!   a [`CancellationToken`] and leaves the resource `queued`; the SSE route
-//!   emits a snapshot and closes on a terminal state (poll watch).
+//!   a [`CancellationToken`] (keyed by invocation id only) and leaves the
+//!   resource `queued`; the SSE route emits a snapshot and closes on a
+//!   terminal state (poll watch). The execution switch defaults to off
+//!   (`AGENTOS_INVOCATION_EXECUTION_ENABLED`), so production create answers
+//!   `503 execution_disabled` and persists nothing. Tests enable the switch
+//!   to exercise create.
 //! - Agent revisions (#317). The agent store has no revisions, so a create
 //!   carrying `agent_revision` is `422 agent_revision_unsupported`.
 
@@ -37,12 +50,15 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use sha2::{Digest, Sha256};
+
 use super::iam::UserIdentity;
 use super::invocations_execution::InvocationCancellationRegistry;
 use super::invocations_store::{
-    invocation_not_found_response, parse_if_match, Invocation, InvocationBudget,
-    InvocationInputRef, InvocationRequest, InvocationState, InvocationStore, InvocationStoreError,
-    NewInvocation, TransitionPatch,
+    invocation_not_found_response, parse_if_match, CreateOutcome, IdempotencyLookup,
+    IdempotencyRegistration, Invocation, InvocationBudget, InvocationConfigError,
+    InvocationInputRef, InvocationRequest, InvocationState, InvocationStore, InvocationStoreConfig,
+    InvocationStoreError, NewInvocation, TransitionPatch,
 };
 use super::AppState;
 use crate::isolation::{IsolationClaims, IsolationScopeProvenance};
@@ -57,6 +73,10 @@ pub(crate) const MAX_METADATA_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_METADATA_KEYS: usize = 64;
 /// `agent_id` / `agent_revision` length.
 const MAX_ID_BYTES: usize = 256;
+/// `Idempotency-Key` length, in bytes (all visible ASCII).
+pub(crate) const MAX_IDEMPOTENCY_KEY_BYTES: usize = 255;
+/// Response header marking an idempotent replay.
+pub(crate) const IDEMPOTENT_REPLAYED_HEADER: &str = "idempotent-replayed";
 /// List page size.
 pub(crate) const DEFAULT_LIST_LIMIT: usize = 20;
 pub(crate) const MAX_LIST_LIMIT: usize = 100;
@@ -85,6 +105,12 @@ const CREATE_FIELDS: &[&str] = &[
 /// `agent_revision` values that would float; they are never resolved.
 const FLOATING_REVISIONS: &[&str] = &["latest", "current", "head", "tip", "active", "default", "*"];
 
+/// Receives each newly created invocation exactly once (never a replay).
+/// The execution bridge (#317) implements this; tests use a counting mock.
+pub(crate) trait InvocationDispatcher: Send + Sync {
+    fn dispatch(&self, invocation: &Invocation);
+}
+
 /// Invocation runtime shared through `AppState`.
 #[derive(Clone)]
 pub(crate) struct InvocationsRuntime {
@@ -95,7 +121,11 @@ pub(crate) struct InvocationsRuntime {
     /// Production default is off (`AGENTOS_INVOCATION_EXECUTION_ENABLED`).
     execution_enabled: bool,
     /// Running / queued invocations that have a cancel token (#317).
+    /// Keyed by invocation id only (no tenant/project dimension).
     cancellations: InvocationCancellationRegistry,
+    /// Called after a successful, non-replayed create. `None` until the
+    /// execution bridge (#317) installs one in production.
+    dispatcher: Option<Arc<dyn InvocationDispatcher>>,
 }
 
 impl InvocationsRuntime {
@@ -104,7 +134,16 @@ impl InvocationsRuntime {
             store,
             execution_enabled,
             cancellations: InvocationCancellationRegistry::new(),
+            dispatcher: None,
         }
+    }
+
+    /// Same runtime with `dispatcher` receiving new invocations.
+    // Used by tests now; the execution bridge (#317) installs one in production.
+    #[allow(dead_code)]
+    pub(crate) fn with_dispatcher(mut self, dispatcher: Arc<dyn InvocationDispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
     }
 
     /// No store and execution off. Used when the store fails to open and by
@@ -129,21 +168,34 @@ impl InvocationsRuntime {
 
     /// Opens the default store with its env config and runs restart recovery.
     /// The execution switch is read once at startup from
-    /// `AGENTOS_INVOCATION_EXECUTION_ENABLED` (default off).
+    /// `AGENTOS_INVOCATION_EXECUTION_ENABLED` (default off). Keep it off in
+    /// production until the #317 execution bridge lands.
+    ///
+    /// # Panics
+    ///
+    /// On an invalid configuration (for example an idempotency TTL above the
+    /// retention): startup fails closed instead of running with defaults.
     pub(crate) fn open_default() -> Self {
         let execution_enabled = Self::execution_enabled_from_env();
         if execution_enabled {
             tracing::warn!(
-                "invocation execution enabled via AGENTOS_INVOCATION_EXECUTION_ENABLED;                  keep off in production until #310 lands"
+                "invocation execution enabled via AGENTOS_INVOCATION_EXECUTION_ENABLED; keep off in production until the #317 execution bridge lands"
             );
         }
-        match InvocationStore::open_default() {
+        let config = match InvocationStoreConfig::try_from_env() {
+            Ok(config) => config,
+            Err(InvocationConfigError(error)) => {
+                panic!("invalid invocation configuration: {error}")
+            }
+        };
+        match InvocationStore::open_with_config(InvocationStore::default_path(), config) {
             Ok((store, report)) => {
-                if report.interrupted > 0 || report.swept > 0 {
+                if report.interrupted > 0 || report.swept > 0 || report.idempotency_expired > 0 {
                     tracing::info!(
                         loaded = report.loaded,
                         interrupted = report.interrupted,
                         swept = report.swept,
+                        idempotency_expired = report.idempotency_expired,
                         "invocation store recovered"
                     );
                 }
@@ -261,11 +313,13 @@ fn store_of(state: &AppState) -> Result<&Arc<InvocationStore>, ApiError> {
     })
 }
 
-/// Public view of a record: everything except the internal audit trail.
+/// Public view of a record: everything except the internal audit trail and
+/// the internal idempotency binding.
 fn resource_view(invocation: &Invocation) -> Value {
     let mut value = serde_json::to_value(invocation).unwrap_or(Value::Null);
     if let Value::Object(map) = &mut value {
         map.remove("audit_events");
+        map.remove("idempotency");
     }
     value
 }
@@ -479,6 +533,102 @@ pub(crate) fn parse_create_request(raw: &[u8]) -> Result<InvocationRequest, ApiE
     Ok(request)
 }
 
+/// Optional `Idempotency-Key`: absent → `None`; present → 1–255 visible
+/// ASCII characters (`0x21..=0x7E`), exactly one header. Anything else is
+/// `400 invalid_idempotency_key`; the key is never echoed.
+pub(crate) fn parse_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_idempotency_key",
+            "Idempotency-Key must be 1-255 visible ASCII characters",
+        )
+    };
+    let mut values = headers.get_all("idempotency-key").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    let raw = value.as_bytes();
+    if raw.is_empty()
+        || raw.len() > MAX_IDEMPOTENCY_KEY_BYTES
+        || !raw.iter().all(|b| (0x21..=0x7e).contains(b))
+    {
+        return Err(invalid());
+    }
+    // Every byte is visible ASCII, so this is valid UTF-8.
+    Ok(Some(String::from_utf8_lossy(raw).into_owned()))
+}
+
+/// Writes `value` as canonical JSON: object keys sorted by their UTF-8
+/// bytes, no insignificant whitespace, scalars as `serde_json` prints them.
+/// Independent of `serde_json`'s map ordering features.
+fn write_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            out.push('{');
+            for (index, (key, member)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                write_canonical_json(member, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+/// Lowercase hex SHA-256 of the canonical create body, or `None` when the
+/// body is too large or not JSON (validation rejects those anyway). Only
+/// this digest is stored, never the body.
+pub(crate) fn request_fingerprint(raw: &[u8]) -> Option<String> {
+    if raw.len() > MAX_CREATE_BODY_BYTES {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    let mut canonical = String::with_capacity(raw.len());
+    write_canonical_json(&value, &mut canonical);
+    Some(hex::encode(Sha256::digest(canonical.as_bytes())))
+}
+
+/// First 16 characters of a key, for debug logs only.
+fn key_for_log(key: &str) -> &str {
+    &key[..key.len().min(16)]
+}
+
+fn replay_response(invocation: &Invocation) -> Response {
+    let mut response = resource_response(StatusCode::OK, invocation);
+    insert_location(&mut response, invocation);
+    response.headers_mut().insert(
+        header::HeaderName::from_static(IDEMPOTENT_REPLAYED_HEADER),
+        HeaderValue::from_static("true"),
+    );
+    response
+}
+
+fn insert_location(response: &mut Response, invocation: &Invocation) {
+    if let Ok(location) = HeaderValue::from_str(&format!("/v1/invocations/{}", invocation.id)) {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+}
+
 /// `agent_id` must name a user agent definition in the caller's scope.
 /// Unknown ids and other scopes get the same body.
 async fn resolve_agent(
@@ -513,7 +663,13 @@ async fn resolve_agent(
     Ok(())
 }
 
-/// `POST /v1/invocations`
+/// `POST /v1/invocations` with optional `Idempotency-Key`.
+///
+/// Order: claims (401/403) → key syntax (400) → replay lookup on the
+/// fingerprint (200 replay / 409 conflict) → in-flight reservation (409 in
+/// progress) → body validation (400/413/422) → agent (422) → store (503) →
+/// execution switch (503) → atomic create of record + binding. Every
+/// rejection writes nothing, so the same key can be used again afterwards.
 pub(crate) async fn create_invocation_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
@@ -524,14 +680,47 @@ pub(crate) async fn create_invocation_handler(
         Ok(claims) => claims,
         Err(error) => return error.into_response(),
     };
-    if headers.contains_key("idempotency-key") {
-        // TODO(#315): idempotent replay. Rejected so a retry can never
-        // create a second invocation while callers believe it is deduplicated.
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "idempotency_unsupported",
-            "Idempotency-Key is not supported yet",
-        );
+    let key = match parse_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
+    // With a key and a parsable body: replay before anything that can change
+    // over time (deadline, agent registry, execution switch).
+    let mut registration = None;
+    let mut _reservation = None;
+    if let (Some(key), Some(fingerprint)) = (key.as_deref(), request_fingerprint(&body)) {
+        let store = match store_of(&state) {
+            Ok(store) => store,
+            Err(error) => return error.into_response(),
+        };
+        match store
+            .find_idempotent_for_claims(claims, key, &fingerprint)
+            .await
+        {
+            IdempotencyLookup::Replay(invocation) => {
+                tracing::debug!(idempotency_key = key_for_log(key), "invocation replayed");
+                return replay_response(&invocation);
+            }
+            IdempotencyLookup::Conflict => {
+                tracing::debug!(idempotency_key = key_for_log(key), "idempotency conflict");
+                return InvocationStoreError::IdempotencyKeyConflict.into_response();
+            }
+            IdempotencyLookup::Miss => {}
+        }
+        _reservation = match store.reserve_idempotency_key(claims, key) {
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                tracing::debug!(
+                    idempotency_key = key_for_log(key),
+                    "idempotency in progress"
+                );
+                return error.into_response();
+            }
+        };
+        registration = Some(IdempotencyRegistration {
+            key: key.to_string(),
+            fingerprint,
+        });
     }
     let request = match parse_create_request(&body) {
         Ok(request) => request,
@@ -554,23 +743,25 @@ pub(crate) async fn create_invocation_handler(
     let new = NewInvocation {
         request,
         task_iri: None,
-        idempotency_key: None,
+        idempotency: registration,
     };
-    match store.create_for_claims(claims, new).await {
-        Ok(invocation) => {
-            // Stub bridge (#317): register a CancellationToken so cancel can
-            // signal it. Real TaskExecutor / state drive is a follow-up.
+    match store.create_idempotent_for_claims(claims, new).await {
+        Ok(CreateOutcome::Created(invocation)) => {
+            // Stub bridge (#317): register a CancellationToken (by id only)
+            // so cancel can signal it. Real TaskExecutor / state drive is a
+            // follow-up.
             state
                 .invocations
                 .register_stub_execution(&invocation.id, state.shutdown.clone());
-            let mut response = resource_response(StatusCode::ACCEPTED, &invocation);
-            if let Ok(location) =
-                HeaderValue::from_str(&format!("/v1/invocations/{}", invocation.id))
-            {
-                response.headers_mut().insert(header::LOCATION, location);
+            if let Some(dispatcher) = &state.invocations.dispatcher {
+                // TODO(#317): the execution bridge is the production dispatcher.
+                dispatcher.dispatch(&invocation);
             }
+            let mut response = resource_response(StatusCode::ACCEPTED, &invocation);
+            insert_location(&mut response, &invocation);
             response
         }
+        Ok(CreateOutcome::Replayed(invocation)) => replay_response(&invocation),
         Err(error) => error.into_response(),
     }
 }
@@ -903,3 +1094,7 @@ fn sse_terminal_payload(invocation: &Invocation, seq: &mut u64) -> Option<Event>
 #[cfg(test)]
 #[path = "invocations_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "invocations_idempotency_tests.rs"]
+mod idempotency_tests;

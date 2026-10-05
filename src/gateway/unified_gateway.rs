@@ -378,6 +378,21 @@ impl UnifiedGateway {
         serde_json::json!(tool_choice)
     }
 
+    /// Shared outbound gate: empty/blank resolved API key must never hit the network
+    /// (no TCP/HTTP, no retries). Covers chat*, stream, and any future send_* callers.
+    fn ensure_outbound_api_key(api_key: &str) -> Result<(), CoreError> {
+        if api_key.trim().is_empty() {
+            warn!(
+                "llm_not_configured: gateway/provider API key is empty or blank; skipping outbound LLM HTTP"
+            );
+            return Err(CoreError::Internal {
+                message: "llm_not_configured: gateway/provider API key is empty; outbound LLM HTTP skipped"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     async fn send_request(
         &self,
         url: &str,
@@ -412,6 +427,8 @@ impl UnifiedGateway {
     where
         F: Fn(&Value) -> Result<ChatCompletionResponse, CoreError>,
     {
+        Self::ensure_outbound_api_key(api_key)?;
+
         let mut last_error = None;
 
         for attempt in 0..=self.max_retries {
@@ -513,7 +530,7 @@ impl UnifiedGateway {
     }
 
     pub fn api_key_configured(&self) -> bool {
-        !self.api_key.read().unwrap().is_empty()
+        !self.api_key.read().unwrap().trim().is_empty()
     }
 
     pub fn set_default_model(&self, model: String) {
@@ -955,6 +972,8 @@ impl UnifiedGateway {
         api_key: &str,
         body: Value,
     ) -> Result<MessageStream, CoreError> {
+        Self::ensure_outbound_api_key(api_key)?;
+
         let req = self
             .client
             .post(url)
@@ -1363,5 +1382,176 @@ mod tests {
         });
         let err = UnifiedGateway::parse_responses_response(&json).unwrap_err();
         assert!(err.to_string().contains("max_output_tokens"));
+    }
+
+    fn user_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: ChatContent::text(content),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// Mock upstream that counts every accepted TCP connection / HTTP request.
+    async fn spawn_counting_mock() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_handler = hits.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let hits_handler = hits_handler.clone();
+                async move {
+                    hits_handler.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "id": "ok",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "pong"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, hits, server)
+    }
+
+    fn gateway_with(base_url: &str, api_key: &str, max_retries: u32) -> UnifiedGateway {
+        let settings = GatewaySettings {
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            default_model: "test-model".to_string(),
+            timeout_seconds: 5,
+            max_retries,
+            retry_base_ms: 1,
+            use_responses_api: false,
+            model_mapping: HashMap::from([("default".to_string(), "test-model".to_string())]),
+        };
+        UnifiedGateway::new(&settings).unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_api_key_short_circuits_chat_with_zero_http() {
+        use std::sync::atomic::Ordering;
+
+        let (base, hits, server) = spawn_counting_mock().await;
+        let gateway = gateway_with(&base, "", 3);
+        let err = gateway
+            .chat_with_model("test-model", vec![user_msg("hi")])
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("llm_not_configured"),
+            "expected llm_not_configured error, got: {msg}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "empty key must not open TCP/HTTP"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn blank_api_key_short_circuits_with_zero_http() {
+        use std::sync::atomic::Ordering;
+
+        let (base, hits, server) = spawn_counting_mock().await;
+        let gateway = gateway_with(&base, "     ", 3);
+        let err = gateway.chat(vec![user_msg("hi")]).await.unwrap_err();
+        assert!(err.to_string().contains("llm_not_configured"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_provider_mapped_key_short_circuits_even_if_gateway_key_set() {
+        use std::sync::atomic::Ordering;
+
+        let (base, hits, server) = spawn_counting_mock().await;
+        // Gateway itself has a key, but the model resolves to a provider with empty key.
+        let gateway = gateway_with(&base, "sk-gateway-fallback", 3);
+        let mut providers = HashMap::new();
+        providers.insert(
+            "empty-prov".to_string(),
+            ProviderRuntime {
+                base_url: base.clone(),
+                api_key: String::new(),
+                timeout_seconds: 5,
+            },
+        );
+        gateway.set_provider_registry(providers);
+        gateway.set_model_provider_mapping(HashMap::from([(
+            "routed-model".to_string(),
+            "empty-prov".to_string(),
+        )]));
+
+        let err = gateway
+            .chat_with_params("routed-model", vec![user_msg("hi")], None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("llm_not_configured"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_api_key_stream_short_circuits_with_zero_http() {
+        use std::sync::atomic::Ordering;
+
+        let (base, hits, server) = spawn_counting_mock().await;
+        let gateway = gateway_with(&base, "", 3);
+        let result = gateway
+            .stream_chat_with_params("test-model", vec![user_msg("hi")], None, None, None, None)
+            .await;
+        let err = match result {
+            Ok(_) => panic!("empty key must not start a stream"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("llm_not_configured"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_api_key_still_reaches_upstream() {
+        use std::sync::atomic::Ordering;
+
+        let (base, hits, server) = spawn_counting_mock().await;
+        let gateway = gateway_with(&base, "sk-test-key", 0);
+        let resp = gateway
+            .chat_with_model("test-model", vec![user_msg("hi")])
+            .await
+            .expect("configured key must still call upstream");
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("pong"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(gateway.api_key_configured());
+        server.abort();
+    }
+
+    #[test]
+    fn api_key_configured_treats_blank_as_unset() {
+        let gateway = gateway_with("http://127.0.0.1:9", "  ", 0);
+        assert!(!gateway.api_key_configured());
+        gateway.set_api_key("sk-x".to_string());
+        assert!(gateway.api_key_configured());
     }
 }

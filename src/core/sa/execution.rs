@@ -116,7 +116,12 @@ impl SupervisorAgent {
         let prev_summary = if sharing_permitted && prev_summary.is_none() {
             if let Some(ref sched) = self.scheduler {
                 match sched
-                    .context_request_with_decay(role, &context.task_iri, 0.5)
+                    .context_request_with_decay(
+                        role,
+                        &context.task_iri,
+                        0.5,
+                        context.isolation_claims.as_ref(),
+                    )
                     .await
                 {
                     Ok(recalled) if !recalled.trim().is_empty() => Some(recalled),

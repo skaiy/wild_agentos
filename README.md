@@ -152,7 +152,8 @@ cargo run --bin wild-agent-os-core
 
 Configure an LLM gateway before using LLM-backed features. The supplied config
 contains empty gateway credentials; keep deployment credentials outside version
-control. For production, set `AGENTOS_ENV=production` and configure the required
+control. An empty or blank `gateway.api_key` (or provider-mapped key) short-circuits
+before any outbound LLM HTTP — no retries. For production, set `AGENTOS_ENV=production` and configure the required
 OIDC/JWKS environment values described in the
 [Isolation Contract](docs/17-isolation-contract.md). The server refuses a
 production HS256 configuration.
