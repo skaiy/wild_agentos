@@ -194,9 +194,10 @@ pub struct TaskExecSpec {
     /// Cancel this task's execution, for example when its request timeout
     /// expires. This remains distinct from the process-wide shutdown token.
     pub cancellation: tokio_util::sync::CancellationToken,
-    /// Claims minted by the verified HTTP authentication boundary. Absent
-    /// claims deliberately leave L0 writes on the legacy read-only path.
-    pub isolation_claims: Option<crate::isolation::IsolationClaims>,
+    /// Claims minted by the verified HTTP authentication boundary. Required:
+    /// the HTTP entry points reject callers without verified claims, so a task
+    /// can never execute in the default tenant.
+    pub isolation_claims: crate::isolation::IsolationClaims,
 }
 
 /// 任务执行器抽象：把「触发并驱动一次任务端到端执行」与 HTTP 传输层解耦。
@@ -724,6 +725,9 @@ mod isolation_contract_platform_config_tests;
 
 #[cfg(test)]
 mod isolation_contract_config_read_tests;
+
+#[cfg(test)]
+mod isolation_contract_anonymous_route_sweep_tests;
 
 #[cfg(test)]
 mod tests {

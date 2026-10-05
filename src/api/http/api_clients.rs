@@ -6,6 +6,12 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+#[cfg(test)]
+use std::{collections::HashMap, sync::LazyLock};
+
+#[cfg(test)]
+use tokio::sync::Notify;
+
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -18,6 +24,35 @@ use serde_json::{json, Value};
 use super::api_gov::{self, ApiClient, ApiKey};
 use super::iam::UserIdentity;
 use super::AppState;
+
+#[cfg(test)]
+type IssuePause = (Arc<Notify>, Arc<Notify>);
+
+#[cfg(test)]
+static ISSUE_KEY_PAUSE: LazyLock<std::sync::Mutex<HashMap<String, IssuePause>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(super) fn arm_issue_key_pause(id: &str) -> IssuePause {
+    let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    ISSUE_KEY_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string(), pause.clone());
+    pause
+}
+
+#[cfg(test)]
+async fn issue_key_test_pause(id: &str) {
+    let pause = ISSUE_KEY_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
+    if let Some((reached, resume)) = pause {
+        reached.notify_one();
+        resume.notified().await;
+    }
+}
 
 /// 密钥对外视图（绝不含 key_hash）。
 fn key_public_view(k: &ApiKey) -> Value {
@@ -339,6 +374,10 @@ pub(crate) async fn issue_api_key_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
+    // Test hook: lets a test run a concurrent delete before this handler
+    // takes its locks.
+    #[cfg(test)]
+    issue_key_test_pause(&id).await;
     // Check and push under one lock section; order: api_keys before
     // api_clients (see module docs).
     let mut guard = state.api_keys.write().await;
@@ -392,20 +431,29 @@ pub(crate) async fn revoke_api_key_handler(
         .isolation_claims()
         .expect("DA claims required")
         .tenant_id();
-    // Release the client lock before taking the key lock: `authenticate_public`
-    // acquires keys then clients, so holding both here in the opposite order
-    // could deadlock behind a queued writer.
-    let owns_client = state
-        .api_clients
-        .read()
-        .await
-        .iter()
-        .any(|c| c.id == id && c.tenant_id == tenant);
-    if !owns_client {
+    // Check and mutate under one lock section; order: api_keys before
+    // api_clients (see module docs).
+    let mut guard = state.api_keys.write().await;
+    let clients = state.api_clients.read().await;
+    if !clients.iter().any(|c| c.id == id && c.tenant_id == tenant) {
         return key_not_found(&kid);
     }
-    let mut guard = state.api_keys.write().await;
-    let key = guard.iter_mut().find(|k| k.id == kid && k.client_id == id);
+    // Same ownership rule as list: under an id shared with another tenant
+    // (legacy or imported data), `client_id` alone does not identify the
+    // owner, so only keys carrying the caller's tenant prefix count. When
+    // another colliding tenant has the same slug the prefix cannot tell them
+    // apart either: refuse with 409 like issue/delete, whatever `kid` is.
+    let collisions = api_gov::cross_tenant_client_id_collisions(&clients);
+    if collisions
+        .get(&id)
+        .is_some_and(|tenants| api_gov::colliding_tenant_slug_is_ambiguous(tenants, tenant))
+    {
+        return client_id_conflict(&id);
+    }
+    // A key that is not the caller's gets the same 404 as a missing key.
+    let key = guard.iter_mut().find(|k| {
+        k.id == kid && k.client_id == id && api_gov::tenant_may_manage_key(&collisions, k, tenant)
+    });
     match key {
         Some(k) => {
             k.status = "revoked".to_string();
