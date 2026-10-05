@@ -142,7 +142,9 @@ do not set either in production.
 ---
 
 The default binary starts the HTTP/SSE server on port `8080` and gRPC on
-`50051`. Start it from a checkout with the provided `config.yaml`:
+`50051`. Prometheus metrics are scraped as `GET /metrics` on that HTTP port
+(not on `api.metrics_port` / 9090, which currently has no listener). Start it
+from a checkout with the provided `config.yaml`:
 
 ```bash
 cargo run --bin wild-agent-os-core
