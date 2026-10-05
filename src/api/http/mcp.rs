@@ -1309,6 +1309,7 @@ mod tests {
             api_usage: Arc::new(crate::api::http::api_gov::ApiUsageState::default()),
             online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
             online_corpus_queue_capacity: 1,
+            invocations: crate::api::http::invocations::InvocationsRuntime::unavailable(),
             shutdown: tokio_util::sync::CancellationToken::new(),
         })
     }

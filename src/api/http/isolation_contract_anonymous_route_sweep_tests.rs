@@ -177,6 +177,10 @@ const MUST_BE_PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/tasks/stream"),
     ("GET", "/api/v1/kb/bases/:id/documents"),
     ("GET", "/api/v1/batch/events"),
+    ("POST", "/v1/invocations"),
+    ("GET", "/v1/invocations"),
+    ("GET", "/v1/invocations/:id"),
+    ("POST", "/v1/invocations/:id/cancel"),
 ];
 
 const ROUTER_SOURCE: &str = include_str!("mod.rs");

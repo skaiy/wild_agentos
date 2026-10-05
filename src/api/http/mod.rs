@@ -35,6 +35,7 @@ pub mod core_ops;
 pub mod corpus_jobs;
 pub mod corpus_watchers;
 pub mod guard;
+pub(crate) mod invocations;
 pub(crate) mod invocations_store;
 pub mod kb;
 pub mod market;
@@ -182,6 +183,8 @@ pub struct AppState {
     /// Configured queue capacity used only for claims-scoped saturation
     /// observability; it does not grant any worker production-write authority.
     pub(crate) online_corpus_queue_capacity: usize,
+    /// `/v1/invocations` store and execution switch (#313).
+    pub(crate) invocations: invocations::InvocationsRuntime,
     /// Process-wide cancellation propagated by the runtime supervisor.
     pub(crate) shutdown: tokio_util::sync::CancellationToken,
 }
@@ -310,6 +313,7 @@ pub fn build_router(
         api_usage: Arc::new(ApiUsageState::default()),
         online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(load_online_corpus_jobs())),
         online_corpus_queue_capacity: online_corpus_watchers.queue_capacity,
+        invocations: invocations::InvocationsRuntime::open_default(),
         shutdown: shutdown.clone(),
     });
     tokio::spawn(run_online_corpus_watcher_scheduler(
@@ -652,6 +656,19 @@ pub fn build_router(
             "/api/v1/public/agents/:id/chat/stream",
             post(public_agent_chat_stream_handler),
         )
+        // ── Invocations (#313): verified JWT claims only, not the OpenAI layer ──
+        .route(
+            "/v1/invocations",
+            get(invocations::list_invocations_handler).post(invocations::create_invocation_handler),
+        )
+        .route(
+            "/v1/invocations/:id",
+            get(invocations::get_invocation_handler),
+        )
+        .route(
+            "/v1/invocations/:id/cancel",
+            post(invocations::cancel_invocation_handler),
+        )
         // ── OpenAI 兼容层（model = agentId，第三方 SDK 可直连）──
         .route("/v1/models", get(openai_list_models_handler))
         .route(
@@ -808,6 +825,7 @@ mod tests {
             api_usage: Arc::new(ApiUsageState::default()),
             online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
             online_corpus_queue_capacity: 10,
+            invocations: crate::api::http::invocations::InvocationsRuntime::unavailable(),
             shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
