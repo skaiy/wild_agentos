@@ -1,6 +1,11 @@
 //! MCP server catalog and authenticated outbound invocation surface.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     extract::{Path, State},
@@ -8,7 +13,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use futures::StreamExt;
+use futures::{future::BoxFuture, StreamExt};
+use ipnet::IpNet;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -218,6 +224,25 @@ fn configured_outbound_mcp_origins() -> Result<Option<HashSet<String>>, &'static
     Ok(Some(origins))
 }
 
+fn configured_outbound_mcp_private_cidrs() -> Result<Vec<IpNet>, &'static str> {
+    let configured = match std::env::var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(_) => return Err("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS is invalid"),
+    };
+    if configured.trim().is_empty() {
+        return Err("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS is invalid");
+    }
+    configured
+        .split(',')
+        .map(|cidr| {
+            cidr.trim()
+                .parse()
+                .map_err(|_| "MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS is invalid")
+        })
+        .collect()
+}
+
 pub(crate) fn validate_strict_mcp_outbound_configuration() -> Result<(), &'static str> {
     let strict_mode = std::env::var("AGENTOS_AUTH_STRICT").as_deref() == Ok("true");
     let legacy_subject_is_set = std::env::var_os("MCP_JWT_SUB").is_some();
@@ -242,6 +267,9 @@ pub(crate) fn validate_strict_mcp_outbound_configuration() -> Result<(), &'stati
         return Err(
             "MCP_OUTBOUND_ALLOWED_ORIGINS must be configured when AGENTOS_AUTH_STRICT=true",
         );
+    }
+    if strict_mode {
+        configured_outbound_mcp_private_cidrs()?;
     }
     Ok(())
 }
@@ -314,6 +342,185 @@ fn validate_outbound_mcp_endpoint(server: &Value) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+pub(crate) trait OutboundMcpResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, std::io::Result<Vec<SocketAddr>>>;
+}
+
+struct SystemOutboundMcpResolver;
+
+impl OutboundMcpResolver for SystemOutboundMcpResolver {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host, port)).await?.collect()) })
+    }
+}
+
+fn blocked_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || a == 169 && b == 254
+                || a == 172 && (16..=31).contains(&b)
+                || a == 192 && (b == 168 || b == 0 && c == 0)
+                || a == 100 && (64..=127).contains(&b)
+                || a == 198 && (18..=19).contains(&b)
+                || a >= 224
+        }
+        IpAddr::V6(ip) => {
+            if ip.is_unspecified() || ip.is_loopback() {
+                return true;
+            }
+            if let Some(v4) = embedded_outbound_ipv4(ip) {
+                return blocked_outbound_ip(IpAddr::V4(v4));
+            }
+            let first = ip.segments()[0];
+            first & 0xffc0 == 0xfe80 || first & 0xfe00 == 0xfc00 || first & 0xff00 == 0xff00
+        }
+    }
+}
+
+/// IPv4 address carried inside an IPv6 address (IPv4-mapped, IPv4-compatible,
+/// or the NAT64 well-known prefix `64:ff9b::/96`). Loopback and unspecified
+/// IPv6 addresses are not treated as embedded IPv4.
+fn embedded_outbound_ipv4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    if let Some(v4) = ip.to_ipv4() {
+        return Some(v4);
+    }
+    let segments = ip.segments();
+    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let [_, _, _, _, _, _, _, _, _, _, _, _, a, b, c, d] = ip.octets();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
+// These targets are never usable destinations, even when the exact origin is
+// in MCP_OUTBOUND_ALLOWED_ORIGINS or the address is inside an explicitly
+// allowed CIDR: link-local (which includes cloud instance metadata such as
+// 169.254.169.254), well-known metadata addresses outside link-local,
+// unspecified, multicast, and broadcast.
+fn never_permitted_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 0
+                || a == 169 && b == 254
+                || (224..240).contains(&a)
+                || ip.is_broadcast()
+                // Alibaba Cloud instance metadata (inside 100.64.0.0/10).
+                || ip == std::net::Ipv4Addr::new(100, 100, 100, 200)
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_unspecified()
+                || first & 0xff00 == 0xff00
+                || first & 0xffc0 == 0xfe80
+                // AWS IPv6 instance metadata (inside fc00::/7).
+                || ip == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                || embedded_outbound_ipv4(ip)
+                    .is_some_and(|v4| never_permitted_outbound_ip(IpAddr::V4(v4)))
+        }
+    }
+}
+
+fn local_development_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 127 || a == 10 || a == 172 && (16..=31).contains(&b) || a == 192 && b == 168
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || embedded_outbound_ipv4(ip)
+                    .is_some_and(|v4| local_development_outbound_ip(IpAddr::V4(v4)))
+                || ip.segments()[0] & 0xfe00 == 0xfc00
+        }
+    }
+}
+
+fn outbound_ip_in_cidr(ip: IpAddr, cidr: &IpNet) -> bool {
+    cidr.contains(&ip)
+        || matches!((ip, cidr), (IpAddr::V6(v6), IpNet::V4(v4)) if embedded_outbound_ipv4(v6).is_some_and(|ip| v4.contains(&ip)))
+}
+
+#[derive(Debug)]
+enum OutboundMcpResolutionError {
+    NotAllowed,
+    Failed,
+}
+
+async fn vetted_outbound_mcp_addresses(
+    endpoint: &str,
+    resolver: &dyn OutboundMcpResolver,
+    private_cidrs: &[IpNet],
+) -> Result<(String, Vec<SocketAddr>), OutboundMcpResolutionError> {
+    // The endpoint has already passed origin validation.
+    let url = reqwest::Url::parse(endpoint).map_err(|_| OutboundMcpResolutionError::Failed)?;
+    let host = url
+        .host_str()
+        .ok_or(OutboundMcpResolutionError::Failed)?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = url
+        .port_or_known_default()
+        .ok_or(OutboundMcpResolutionError::Failed)?;
+    let literal = host.parse::<IpAddr>().ok();
+    let addresses = if let Some(ip) = literal {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        resolver
+            .resolve(&host, port)
+            .await
+            .map_err(|_| OutboundMcpResolutionError::Failed)?
+    };
+    if addresses.is_empty() {
+        return Err(OutboundMcpResolutionError::Failed);
+    }
+    let origins =
+        configured_outbound_mcp_origins().map_err(|_| OutboundMcpResolutionError::NotAllowed)?;
+    // An endpoint whose exact origin an operator listed in
+    // MCP_OUTBOUND_ALLOWED_ORIGINS (IP literal or hostname) may reach private
+    // and loopback addresses, e.g. a sidecar addressed by its container name.
+    // The hostname is still resolved once and the vetted answer is pinned.
+    let origin_listed = origins
+        .as_ref()
+        .is_some_and(|origins| origins.contains(&url.origin().ascii_serialization()));
+    let permits_blocked = |ip: IpAddr| {
+        origin_listed
+            || if literal.is_some() {
+                // Non-strict local development with no origin allowlist.
+                origins.is_none() && local_development_outbound_ip(ip)
+            } else {
+                private_cidrs
+                    .iter()
+                    .any(|cidr| outbound_ip_in_cidr(ip, cidr))
+            }
+    };
+    if addresses.iter().any(|address| {
+        let ip = address.ip();
+        address.port() != port
+            || never_permitted_outbound_ip(ip)
+            || blocked_outbound_ip(ip) && !permits_blocked(ip)
+    }) {
+        return Err(OutboundMcpResolutionError::NotAllowed);
+    }
+    Ok((host, addresses))
 }
 
 fn validate_outbound_timeout(timeout_seconds: Option<u64>) -> Result<(), &'static str> {
@@ -614,6 +821,7 @@ fn outbound_mcp_effective_timeout_ms(
 
 fn outbound_mcp_client(
     server_timeout_seconds: Option<u64>,
+    pinned: Option<(&str, &[SocketAddr])>,
 ) -> Result<(reqwest::Client, usize), InvokeHttpMcpError> {
     let connect_timeout = outbound_mcp_configured_positive_u64(
         "MCP_OUTBOUND_CONNECT_TIMEOUT_MS",
@@ -632,14 +840,17 @@ fn outbound_mcp_client(
         DEFAULT_OUTBOUND_MCP_MAX_RESPONSE_BYTES,
     )
     .map_err(InvokeHttpMcpError::Transport)?;
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(connect_timeout))
         .timeout(Duration::from_millis(timeout))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some((host, addresses)) = pinned {
+        // Proxies could resolve the hostname again, bypassing the pinned answer.
+        builder = builder.no_proxy().resolve_to_addrs(host, addresses);
+    }
+    let client = builder
         .build()
-        .map_err(|error| {
-            InvokeHttpMcpError::Transport(format!("MCP HTTP client setup failed: {error}"))
-        })?;
+        .map_err(|_| InvokeHttpMcpError::Transport("MCP HTTP client setup failed".into()))?;
     Ok((client, max_response_bytes))
 }
 
@@ -650,9 +861,8 @@ async fn read_bounded_response(
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            InvokeHttpMcpError::Transport(format!("MCP SSE response read failed: {error}"))
-        })?;
+        let chunk = chunk
+            .map_err(|_| InvokeHttpMcpError::Transport("MCP SSE response read failed".into()))?;
         if body.len() + chunk.len() > max_response_bytes {
             return Err(InvokeHttpMcpError::Transport(format!(
                 "MCP response exceeded {max_response_bytes} byte limit"
@@ -762,6 +972,7 @@ fn tool_policy_denied_response(
     )
 }
 
+#[cfg(test)]
 async fn invoke_http_mcp(
     endpoint: &str,
     bearer: &str,
@@ -769,7 +980,26 @@ async fn invoke_http_mcp(
     arguments: Value,
     timeout_seconds: Option<u64>,
 ) -> Result<Value, InvokeHttpMcpError> {
-    let (client, max_response_bytes) = outbound_mcp_client(timeout_seconds)?;
+    invoke_http_mcp_pinned(
+        endpoint,
+        bearer,
+        tool_name,
+        arguments,
+        timeout_seconds,
+        None,
+    )
+    .await
+}
+
+async fn invoke_http_mcp_pinned(
+    endpoint: &str,
+    bearer: &str,
+    tool_name: &str,
+    arguments: Value,
+    timeout_seconds: Option<u64>,
+    pinned: Option<(&str, &[SocketAddr])>,
+) -> Result<Value, InvokeHttpMcpError> {
+    let (client, max_response_bytes) = outbound_mcp_client(timeout_seconds, pinned)?;
     let response = client
         .post(endpoint)
         .bearer_auth(bearer)
@@ -790,7 +1020,7 @@ async fn invoke_http_mcp(
             if error.is_timeout() {
                 InvokeHttpMcpError::Transport("MCP HTTP request timed out".to_string())
             } else {
-                InvokeHttpMcpError::Transport(format!("MCP HTTP request failed: {error}"))
+                InvokeHttpMcpError::Transport("MCP HTTP request failed".into())
             }
         })?;
     let status = response.status();
@@ -854,6 +1084,15 @@ pub(crate) async fn invoke_mcp_server_handler(
     identity: UserIdentity,
     Json(request): Json<McpCatalogInvokeRequest>,
 ) -> impl IntoResponse {
+    invoke_mcp_server(state, identity, request, &SystemOutboundMcpResolver).await
+}
+
+async fn invoke_mcp_server(
+    state: Arc<AppState>,
+    identity: UserIdentity,
+    request: McpCatalogInvokeRequest,
+    resolver: &dyn OutboundMcpResolver,
+) -> axum::response::Response {
     // This gate is deliberately before catalog lookup, JWT minting, client
     // construction, and outbound I/O.
     if !identity.has_role("DA") && !identity.has_role(MCP_INVOKE_ROLE) {
@@ -955,6 +1194,48 @@ pub(crate) async fn invoke_mcp_server_handler(
         )
             .into_response();
     }
+    let private_cidrs = match configured_outbound_mcp_private_cidrs() {
+        Ok(cidrs) => cidrs,
+        Err(message) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "mcp_outbound_allowlist_required", "message": message})),
+            )
+                .into_response()
+        }
+    };
+    let endpoint = server["endpoint"].as_str().unwrap_or_default();
+    let (host, addresses) =
+        match vetted_outbound_mcp_addresses(endpoint, resolver, &private_cidrs).await {
+            Ok(vetted) => vetted,
+            Err(OutboundMcpResolutionError::NotAllowed) => {
+                tracing::warn!(
+                    server_id = server
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown"),
+                    "catalog MCP endpoint resolved to a non-allowed address"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "mcp_endpoint_not_allowed",
+                        "message": "catalog MCP endpoint resolved to a non-allowed address"
+                    })),
+                )
+                    .into_response();
+            }
+            Err(OutboundMcpResolutionError::Failed) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "outbound_mcp_call_failed",
+                        "message": "catalog MCP endpoint resolution failed"
+                    })),
+                )
+                    .into_response();
+            }
+        };
     let audience = match outbound_mcp_audience(&server) {
         Ok(audience) => audience,
         Err(error) => {
@@ -975,14 +1256,14 @@ pub(crate) async fn invoke_mcp_server_handler(
                 .into_response()
         }
     };
-    let endpoint = server["endpoint"].as_str().unwrap_or_default();
     let timeout_seconds = server.get("timeout_seconds").and_then(Value::as_u64);
-    match invoke_http_mcp(
+    match invoke_http_mcp_pinned(
         endpoint,
         &bearer,
         &request.tool_name,
         request.arguments,
         timeout_seconds,
+        Some((&host, &addresses)),
     )
     .await
     {
@@ -1014,8 +1295,485 @@ mod tests {
             Arc, Mutex,
         },
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
+
+    struct FlippingResolver {
+        calls: AtomicUsize,
+        first: Result<Vec<SocketAddr>, std::io::ErrorKind>,
+        later: Vec<SocketAddr>,
+    }
+
+    impl FlippingResolver {
+        fn new(first: Result<Vec<SocketAddr>, std::io::ErrorKind>, later: Vec<SocketAddr>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                first,
+                later,
+            }
+        }
+    }
+
+    impl OutboundMcpResolver for FlippingResolver {
+        fn resolve<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+        ) -> BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            let result = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first.clone()
+            } else {
+                Ok(self.later.clone())
+            };
+            Box::pin(async move { result.map_err(std::io::Error::from) })
+        }
+    }
+
+    async fn counted_sidecar(listener: TcpListener) -> Arc<AtomicUsize> {
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let count = accepts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut input = [0u8; 4096];
+                    let _ = stream.read(&mut input).await;
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        accepts
+    }
+
+    fn outbound_test_identity() -> UserIdentity {
+        crate::api::http::iam::claims_identity(crate::api::http::iam::JwtClaims {
+            sub: "test-actor".into(),
+            tenant_id: "test-tenant".into(),
+            project_id: Some("test-project".into()),
+            roles: vec!["DA".into()],
+            exp: 0,
+        })
+        .unwrap()
+    }
+
+    async fn outbound_test_invoke(
+        endpoint: &str,
+        resolver: &dyn OutboundMcpResolver,
+    ) -> (StatusCode, String) {
+        let origin = endpoint_origin(endpoint).unwrap();
+        let state = test_app_state(vec![json!({
+            "id": "server-id", "name": "catalog-server",
+            "endpoint": endpoint, "endpoint_origin": origin,
+            "protocol": "http", "auth": {"kind": "bearer_jwt"},
+            "allowed_tools": ["read_status"],
+            "tenantId": "test-tenant", "projectId": "test-project"
+        })]);
+        let response = invoke_mcp_server(
+            state,
+            outbound_test_identity(),
+            McpCatalogInvokeRequest {
+                server: "server-id".into(),
+                tool_name: "read_status".into(),
+                arguments: json!({}),
+            },
+            resolver,
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    // Hold the global environment lock across the entire invocation and restore
+    // each variable even when the test changes it more than once.
+    fn restore_outbound_test_env(saved: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    fn save_outbound_test_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        [
+            "AGENTOS_AUTH_STRICT",
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            "MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS",
+            "MCP_JWT_SECRET",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect()
+    }
+
+    #[test]
+    fn outbound_ip_ranges_have_explicit_edges() {
+        let cases = [
+            ("0.0.0.0", true),
+            ("0.255.255.255", true),
+            ("1.0.0.0", false),
+            ("10.0.0.0", true),
+            ("10.255.255.255", true),
+            ("11.0.0.0", false),
+            ("100.63.255.255", false),
+            ("100.64.0.1", true),
+            ("100.127.255.255", true),
+            ("100.128.0.0", false),
+            ("126.255.255.255", false),
+            ("127.0.0.0", true),
+            ("127.255.255.255", true),
+            ("128.0.0.0", false),
+            ("169.253.255.255", false),
+            ("169.254.0.0", true),
+            ("169.254.169.254", true),
+            ("169.254.255.255", true),
+            ("169.255.0.0", false),
+            ("172.15.255.255", false),
+            ("172.16.0.0", true),
+            ("172.31.255.255", true),
+            ("172.32.0.0", false),
+            ("192.0.0.0", true),
+            ("192.0.0.255", true),
+            ("192.0.1.0", false),
+            ("192.168.0.0", true),
+            ("192.168.255.255", true),
+            ("192.169.0.0", false),
+            ("198.17.255.255", false),
+            ("198.18.0.0", true),
+            ("198.19.255.255", true),
+            ("198.20.0.0", false),
+            ("223.255.255.255", false),
+            ("224.0.0.0", true),
+            ("239.255.255.255", true),
+            ("240.0.0.0", true),
+            ("255.255.255.255", true),
+            ("::", true),
+            ("::1", true),
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:169.254.169.254", true),
+            ("fe7f::1", false),
+            ("fe80::1", true),
+            ("febf::1", true),
+            ("fec0::1", false),
+            ("fbff::1", false),
+            ("fc00::1", true),
+            ("fdff::1", true),
+            ("fe00::1", false),
+            ("ff00::1", true),
+            ("::ffff:8.8.8.8", false),
+            ("8.8.8.8", false),
+            ("2606:4700::1", false),
+            ("192.0.2.1", false),
+            ("2001:db8::1", false),
+            ("64:ff9b::a9fe:a9fe", true),
+            ("64:ff9b::7f00:1", true),
+            ("64:ff9b::808:808", false),
+        ];
+        for (ip, blocked) in cases {
+            assert_eq!(blocked_outbound_ip(ip.parse().unwrap()), blocked, "{ip}");
+        }
+        for ip in [
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "ff02::1",
+            "::ffff:224.0.0.1",
+            "169.254.0.1",
+            "169.254.169.254",
+            "169.254.255.255",
+            "::ffff:169.254.169.254",
+            "::169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "fe80::1",
+            "febf::1",
+            "fd00:ec2::254",
+            "100.100.100.200",
+        ] {
+            assert!(never_permitted_outbound_ip(ip.parse().unwrap()), "{ip}");
+        }
+        // Private and loopback targets stay reachable through an explicit rule.
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "fc00::1",
+            "fd00:ec2::253",
+        ] {
+            assert!(!never_permitted_outbound_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_invoke_pins_the_first_answer_and_rejects_any_blocked_answer() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = save_outbound_test_env();
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS", "127.0.0.1/32");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let a_accepts = counted_sidecar(a).await;
+        let b = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let b_accepts = counted_sidecar(b).await;
+        let endpoint = format!("http://rebind.mcp.test:{}/mcp", a_addr.port());
+        // The origin is not listed, so only the CIDR opt-in can permit the
+        // private answer.
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let resolver = FlippingResolver::new(Ok(vec![a_addr]), vec![b_addr]);
+        let (status, body) = outbound_test_invoke(&endpoint, &resolver).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(b_accepts.load(Ordering::SeqCst), 0);
+
+        // An absent signing key proves rejection happens before JWT minting.
+        std::env::remove_var("MCP_JWT_SECRET");
+        for answers in [
+            vec![SocketAddr::new(b_addr.ip(), a_addr.port())],
+            vec![a_addr, SocketAddr::new(b_addr.ip(), a_addr.port())],
+        ] {
+            let resolver = FlippingResolver::new(Ok(answers), vec![a_addr]);
+            let (status, body) = outbound_test_invoke(&endpoint, &resolver).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("mcp_endpoint_not_allowed"));
+            assert!(!body.contains("127."));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(a_accepts.load(Ordering::SeqCst), 1);
+            assert_eq!(b_accepts.load(Ordering::SeqCst), 0);
+        }
+        restore_outbound_test_env(saved);
+    }
+
+    #[tokio::test]
+    async fn catalog_invoke_enforces_literal_and_hostname_permissions() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = save_outbound_test_env();
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepts = counted_sidecar(listener).await;
+        let hostname = format!("http://sidecar.mcp.test:{}/mcp", address.port());
+        let literal = format!("http://{address}/mcp");
+        std::env::set_var(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            format!(
+                "{},{}",
+                endpoint_origin(&hostname).unwrap(),
+                endpoint_origin(&literal).unwrap()
+            ),
+        );
+
+        // A hostname whose exact origin is listed may resolve to loopback.
+        let resolver = FlippingResolver::new(Ok(vec![address]), vec![]);
+        let (status, body) = outbound_test_invoke(&hostname, &resolver).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        let (status, body) = outbound_test_invoke(&literal, &resolver).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+
+        // Metadata stays blocked even when its origin is listed and a CIDR
+        // covers it, for hostnames and IP literals alike.
+        let metadata =
+            FlippingResolver::new(Ok(vec!["169.254.169.254:80".parse().unwrap()]), vec![]);
+        std::env::set_var(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            "http://metadata.mcp.test,http://169.254.169.254",
+        );
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS", "169.254.0.0/16");
+        let (status, body) = outbound_test_invoke("http://metadata.mcp.test/mcp", &metadata).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("mcp_endpoint_not_allowed"));
+        assert!(!body.contains("169.254"));
+        assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+        let (status, body) = outbound_test_invoke("http://169.254.169.254/mcp", &metadata).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let (status, body) = outbound_test_invoke("http://169.254.169.254/mcp", &metadata).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+        for blocked_literal in [
+            "http://100.64.0.1/mcp",
+            "http://198.18.0.1/mcp",
+            "http://240.0.0.1/mcp",
+            "http://[fe80::1]/mcp",
+        ] {
+            let (status, body) = outbound_test_invoke(blocked_literal, &metadata).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        restore_outbound_test_env(saved);
+    }
+
+    #[tokio::test]
+    async fn catalog_invoke_permits_private_answers_only_for_listed_hostnames() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = save_outbound_test_env();
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS");
+        std::env::set_var("MCP_JWT_SECRET", "outbound-mcp-test-secret");
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let a_accepts = counted_sidecar(a).await;
+        let b = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let b_accepts = counted_sidecar(b).await;
+        let listed = format!("http://sidecar.mcp.test:{}/mcp", a_addr.port());
+        let unlisted = format!("http://other.mcp.test:{}/mcp", a_addr.port());
+
+        // No origin allowlist and no CIDR: a hostname resolving to loopback is
+        // rejected before any connection or JWT minting.
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let resolver = FlippingResolver::new(Ok(vec![a_addr]), vec![]);
+        let (status, body) = outbound_test_invoke(&listed, &resolver).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("mcp_endpoint_not_allowed"));
+        assert!(!body.contains("127."));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 0);
+
+        // Allowlist set: a hostname whose origin is absent is refused before
+        // DNS resolution.
+        std::env::set_var(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            endpoint_origin(&listed).unwrap(),
+        );
+        let resolver = FlippingResolver::new(Ok(vec![a_addr]), vec![]);
+        let (status, body) = outbound_test_invoke(&unlisted, &resolver).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("mcp_endpoint_not_allowed"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 0);
+
+        // Listed hostname: resolved once and pinned, even if a later lookup
+        // would rebind it elsewhere.
+        let resolver = FlippingResolver::new(
+            Ok(vec![a_addr]),
+            vec![SocketAddr::new(b_addr.ip(), a_addr.port())],
+        );
+        let (status, body) = outbound_test_invoke(&listed, &resolver).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(b_accepts.load(Ordering::SeqCst), 0);
+
+        // Listed hostname with any never-permitted answer is rejected as a
+        // whole, even with a CIDR that covers everything.
+        std::env::set_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS", "0.0.0.0/0,::/0");
+        std::env::remove_var("MCP_JWT_SECRET");
+        let port = a_addr.port();
+        for bad in [
+            "169.254.169.254",
+            "169.254.1.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "fe80::1",
+            "fd00:ec2::254",
+            "100.100.100.200",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ] {
+            let bad = SocketAddr::new(bad.parse().unwrap(), port);
+            for answers in [vec![bad], vec![a_addr, bad]] {
+                let resolver = FlippingResolver::new(Ok(answers), vec![a_addr]);
+                let (status, body) = outbound_test_invoke(&listed, &resolver).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{bad}: {body}");
+                assert!(body.contains("mcp_endpoint_not_allowed"));
+                assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+            }
+        }
+        assert_eq!(a_accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(b_accepts.load(Ordering::SeqCst), 0);
+        restore_outbound_test_env(saved);
+    }
+
+    #[tokio::test]
+    async fn catalog_invoke_fails_closed_for_resolution_and_cidr_configuration() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = save_outbound_test_env();
+        std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS");
+        std::env::set_var(
+            "MCP_OUTBOUND_ALLOWED_ORIGINS",
+            "https://unresolved.mcp.test",
+        );
+        std::env::remove_var("MCP_JWT_SECRET");
+        let endpoint = "https://unresolved.mcp.test/mcp";
+        for first in [Err(std::io::ErrorKind::NotFound), Ok(vec![])] {
+            let resolver = FlippingResolver::new(first, vec![]);
+            let (status, body) = outbound_test_invoke(endpoint, &resolver).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert!(body.contains("outbound_mcp_call_failed"));
+            assert!(!body.contains("127."));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        }
+        for invalid in ["not-a-cidr", "10.0.0.0/8,", ""] {
+            std::env::set_var("MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS", invalid);
+            let resolver = FlippingResolver::new(Ok(vec![]), vec![]);
+            let (status, body) = outbound_test_invoke(endpoint, &resolver).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert!(body.contains("mcp_outbound_allowlist_required"));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+            std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+            assert!(validate_strict_mcp_outbound_configuration().is_err());
+            std::env::remove_var("AGENTOS_AUTH_STRICT");
+        }
+        restore_outbound_test_env(saved);
+    }
+
+    #[tokio::test]
+    async fn pinned_https_request_preserves_hostname() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = save_outbound_test_env();
+        std::env::remove_var("MCP_OUTBOUND_ALLOWED_ORIGINS");
+        let endpoint = "https://pinned.mcp.test/mcp";
+        let resolver = FlippingResolver::new(Ok(vec!["192.0.2.1:443".parse().unwrap()]), vec![]);
+        let (host, addresses) = vetted_outbound_mcp_addresses(endpoint, &resolver, &[])
+            .await
+            .unwrap();
+        let (client, _) = outbound_mcp_client(None, Some((&host, &addresses))).unwrap();
+        let request = client.post(endpoint).build().unwrap();
+        assert_eq!(request.url().host_str(), Some("pinned.mcp.test"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        restore_outbound_test_env(saved);
+    }
 
     #[test]
     fn mcp_server_catalog_is_scoped_to_verified_claims() {

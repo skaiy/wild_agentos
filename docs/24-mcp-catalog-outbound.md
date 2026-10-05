@@ -54,6 +54,7 @@ origins when the deployment needs an explicit network allowlist:
 
 ```sh
 MCP_OUTBOUND_ALLOWED_ORIGINS=https://mcp.example.test,http://127.0.0.1:8080
+MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS=10.20.0.0/16,fd00:1::/64
 MCP_OUTBOUND_CONNECT_TIMEOUT_MS=5000
 MCP_OUTBOUND_TIMEOUT_MS=15000
 MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
@@ -67,6 +68,52 @@ values shown are the secure defaults.
 When `AGENTOS_AUTH_STRICT=true`, `MCP_OUTBOUND_ALLOWED_ORIGINS` is required.
 An unset or empty value prevents startup and catalog register/invoke requests
 also reject it as defense in depth. HTTP redirects are never followed.
+
+Before minting a JWT, each catalog invoke resolves a hostname exactly once,
+rejects the entire answer if any address is not permitted, and pins all vetted
+addresses to the request client. The URL retains its original hostname for
+HTTPS certificate validation and SNI. Catalog outbound requests do not use
+configured HTTP proxies, which could otherwise resolve the hostname again.
+IP-literal endpoints do not require DNS resolution.
+
+By default, loopback, link-local (including metadata), private IPv4 and IPv6,
+unspecified, shared/CGNAT, `192.0.0.0/24`, benchmark, multicast, and reserved
+addresses are blocked, including IPv4-mapped, IPv4-compatible, and NAT64
+(`64:ff9b::/96`) IPv6 forms. Three explicit permission rules apply:
+
+1. **Listed origin.** An endpoint (hostname or IP literal) whose exact origin
+   (scheme, host, and port) appears in `MCP_OUTBOUND_ALLOWED_ORIGINS` may
+   resolve to private, loopback, or other blocked addresses, such as a sidecar
+   addressed by its container hostname. A hostname is still resolved only once;
+   every vetted address is pinned and no proxy is used.
+2. **Local development.** In non-strict local development with the origin
+   allowlist **unset**, an IP-literal endpoint may use loopback or private
+   addresses.
+3. **Optional CIDR opt-in.** A hostname that is not covered by rule 1 may
+   resolve into `MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS` (a comma-separated CIDR
+   list, as shown above), which permits the whole segment. Every resolved
+   address must be permitted.
+
+A hostname that matches none of these rules and resolves to a blocked address
+is rejected. In particular, with the origin allowlist unset and no CIDR
+configured, a hostname resolving to a private or loopback address returns
+`403`.
+
+The following addresses are **never** permitted, even when the origin is listed
+or a configured CIDR covers them: link-local (`169.254.0.0/16` and
+`fe80::/10`, which include the `169.254.169.254` instance metadata address),
+other well-known metadata addresses (`fd00:ec2::254`, `100.100.100.200`),
+unspecified, multicast, and broadcast, in any IPv6-embedded form.
+
+Rule 1 grants access to specific, operator-listed origins instead of whole
+network segments. A deployment whose sidecar origin is already in
+`MCP_OUTBOUND_ALLOWED_ORIGINS` needs no configuration change. The CIDR opt-in
+remains available when a whole segment must be reachable by hostnames that are
+not listed individually; it never acts as a boolean "allow private" switch.
+Malformed CIDRs fail closed with `503 mcp_outbound_allowlist_required` on invoke
+and prevent startup in strict mode. Rejected addresses return
+`403 mcp_endpoint_not_allowed`; failed or empty DNS answers return
+`502 outbound_mcp_call_failed`. Neither response includes resolved addresses.
 
 An entry may also set `timeout_seconds` to a positive value from 1 through 300.
 It applies as that entry's total outbound request timeout, capped by

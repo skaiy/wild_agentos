@@ -35,6 +35,7 @@ pub mod core_ops;
 pub mod corpus_jobs;
 pub mod corpus_watchers;
 pub mod guard;
+pub(crate) mod invocations_store;
 pub mod kb;
 pub mod market;
 pub mod mcp;
