@@ -24,9 +24,8 @@ spec:
           image: 10.0.0.33/wild-agentos/core:latest   # 33 Harbor
           imagePullPolicy: IfNotPresent
           ports:
-            - { name: http, containerPort: 8080 }
+            - { name: http, containerPort: 8080 }  # /metrics is on this port; no separate metrics listener
             - { name: grpc, containerPort: 50051 }
-            - { name: metrics, containerPort: 9090 }
           envFrom:
             - configMapRef: { name: wild-agentos-core-env }
             - secretRef: { name: wild-agentos-core-secret }
@@ -64,6 +63,5 @@ spec:
   selector:
     app: wild-agentos-core
   ports:
-    - { name: http, port: 8080, targetPort: 8080 }
+    - { name: http, port: 8080, targetPort: 8080 }  # scrape GET /metrics on http
     - { name: grpc, port: 50051, targetPort: 50051 }
-    - { name: metrics, port: 9090, targetPort: 9090 }
