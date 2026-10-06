@@ -234,7 +234,9 @@ impl InvocationsRuntime {
         &self.input_refs
     }
 
-    /// Replaces the `input_ref` registry (tests / deployments that register schemes).
+    /// Replaces the `input_ref` registry. Test-only until a deployment hook
+    /// registers schemes (v0.12 ships no built-in resolver).
+    #[cfg(test)]
     pub(crate) fn with_input_refs(mut self, input_refs: InputRefRegistry) -> Self {
         self.input_refs = input_refs;
         self

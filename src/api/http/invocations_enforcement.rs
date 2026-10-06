@@ -203,6 +203,8 @@ impl InputRefRegistry {
         Self::default()
     }
 
+    /// Test-only until a deployment hook registers schemes (v0.12 ships empty).
+    #[cfg(test)]
     pub(crate) fn register(&self, scheme: impl Into<String>, resolver: Arc<dyn InputRefResolver>) {
         self.by_scheme.insert(scheme.into(), resolver);
     }

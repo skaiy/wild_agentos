@@ -349,13 +349,16 @@ impl InvocationDispatcher for InvocationExecutionBridge {
         let token = self.cancellations.register(&invocation.id);
         let store = self.store.clone();
         let cancellations = self.cancellations.clone();
-        let core = self.core.clone();
-        let executor = self.executor.clone();
-        let events = self.events.clone();
         let shutdown = self.shutdown.clone();
-        let gate = self.projection_gate.clone();
         let scheduler = self.scheduler.clone();
-        let input_refs = self.input_refs.clone();
+        let deps = InvocationRunDeps {
+            store: self.store.clone(),
+            core: self.core.clone(),
+            executor: self.executor.clone(),
+            events: self.events.clone(),
+            gate: self.projection_gate.clone(),
+            input_refs: self.input_refs.clone(),
+        };
         let invocation = invocation.clone();
         let id = invocation.id.clone();
         let scope = RunningScope::from_invocation(&invocation);
@@ -374,18 +377,7 @@ impl InvocationDispatcher for InvocationExecutionBridge {
                 });
             }
 
-            let run = admit_and_run(
-                store,
-                core,
-                executor,
-                events,
-                gate,
-                scheduler,
-                input_refs,
-                invocation,
-                token.clone(),
-                scope,
-            );
+            let run = admit_and_run(deps, scheduler, invocation, token.clone(), scope);
             tokio::pin!(run);
             tokio::select! {
                 biased;
@@ -402,19 +394,14 @@ impl InvocationDispatcher for InvocationExecutionBridge {
 
 /// Waits for a running slot (per-scope FIFO by `created_at`), then executes;
 /// releases the slot and wakes waiters when done.
-#[allow(clippy::too_many_arguments)]
 async fn admit_and_run(
-    store: Arc<InvocationStore>,
-    core: Arc<SemanticCore>,
-    executor: Arc<dyn TaskExecutor>,
-    events: Arc<EventBus>,
-    gate: Arc<dyn ProjectionContextGate>,
+    deps: InvocationRunDeps,
     scheduler: Arc<FifoScheduler>,
-    input_refs: InputRefRegistry,
     invocation: Invocation,
     cancellation: CancellationToken,
     scope: RunningScope,
 ) {
+    let store = deps.store.clone();
     loop {
         let claims = match claims_from_invocation(&invocation) {
             Ok(c) => c,
@@ -469,17 +456,7 @@ async fn admit_and_run(
         }
     }
 
-    run_invocation(
-        store,
-        core,
-        executor,
-        events,
-        gate,
-        input_refs,
-        invocation,
-        cancellation,
-    )
-    .await;
+    run_invocation(deps, invocation, cancellation).await;
 
     scheduler.release(&scope).await;
 }
@@ -524,16 +501,31 @@ async fn watch_deadline(
     scheduler.notify().notify_waiters();
 }
 
-async fn run_invocation(
+/// Shared dependencies for one invocation run, bundled so the admit/run
+/// helpers keep small signatures (clippy `too_many_arguments`).
+#[derive(Clone)]
+struct InvocationRunDeps {
     store: Arc<InvocationStore>,
     core: Arc<SemanticCore>,
     executor: Arc<dyn TaskExecutor>,
     events: Arc<EventBus>,
     gate: Arc<dyn ProjectionContextGate>,
     input_refs: InputRefRegistry,
+}
+
+async fn run_invocation(
+    deps: InvocationRunDeps,
     invocation: Invocation,
     cancellation: CancellationToken,
 ) {
+    let InvocationRunDeps {
+        store,
+        core,
+        executor,
+        events,
+        gate,
+        input_refs,
+    } = deps;
     if cancellation.is_cancelled() {
         // Cancel / deadline raced ahead.
         return;
