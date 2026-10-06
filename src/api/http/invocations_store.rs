@@ -1227,11 +1227,13 @@ impl InvocationStore {
     }
 
     /// Oldest `queued` invocation in a tenant/project scope (FIFO by
-    /// `created_at`, then `id`). Used by the running-cap scheduler (#331).
-    pub(crate) async fn oldest_queued_in_scope(
+    /// `created_at`, then `id`), skipping `exclude` (scheduler-admitted ids
+    /// that still look queued in the store). Used by the running-cap scheduler (#331).
+    pub(crate) async fn oldest_queued_in_scope_excluding(
         &self,
         tenant_id: &str,
         project_id: &str,
+        exclude: &std::collections::HashSet<String>,
     ) -> Option<Invocation> {
         let records = self.records.read().await;
         records
@@ -1240,6 +1242,7 @@ impl InvocationStore {
                 record.state == InvocationState::Queued
                     && record.tenant_id == tenant_id
                     && record.project_id == project_id
+                    && !exclude.contains(&record.id)
             })
             .min_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)))
             .cloned()

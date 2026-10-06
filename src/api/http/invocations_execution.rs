@@ -358,6 +358,7 @@ impl InvocationDispatcher for InvocationExecutionBridge {
             events: self.events.clone(),
             gate: self.projection_gate.clone(),
             input_refs: self.input_refs.clone(),
+            scheduler: self.scheduler.clone(),
         };
         let invocation = invocation.clone();
         let id = invocation.id.clone();
@@ -402,12 +403,17 @@ async fn admit_and_run(
     scope: RunningScope,
 ) {
     let store = deps.store.clone();
+    let id = invocation.id.clone();
     loop {
+        // Subscribe before re-checking so a notify between check and wait is not lost.
+        let notified = scheduler.notify().notified();
+        tokio::pin!(notified);
+
         let claims = match claims_from_invocation(&invocation) {
             Ok(c) => c,
             Err(_) => return,
         };
-        let Ok(current) = store.get_for_claims(&claims, &invocation.id).await else {
+        let Ok(current) = store.get_for_claims(&claims, &id).await else {
             return;
         };
         if current.state != InvocationState::Queued {
@@ -434,31 +440,34 @@ async fn admit_and_run(
             return;
         }
 
-        // Per-scope FIFO: only the oldest queued in this scope may acquire.
+        // Per-scope FIFO: oldest *non-admitted* queued may take a slot. Ids that
+        // already hold a slot but are still store-queued are skipped so peers
+        // can admit under per_scope > 1.
+        let admitted = scheduler.admitted_ids().await;
         let oldest = store
-            .oldest_queued_in_scope(&scope.tenant_id, &scope.project_id)
+            .oldest_queued_in_scope_excluding(&scope.tenant_id, &scope.project_id, &admitted)
             .await;
-        if oldest.as_ref().map(|inv| inv.id.as_str()) != Some(invocation.id.as_str()) {
+        if oldest.as_ref().map(|inv| inv.id.as_str()) != Some(id.as_str()) {
             tokio::select! {
-                _ = scheduler.notify().notified() => {}
+                _ = &mut notified => {}
                 _ = cancellation.cancelled() => {}
             }
             continue;
         }
 
-        if scheduler.try_acquire(&scope).await {
+        if scheduler.try_admit(&scope, &id).await {
             break;
         }
 
         tokio::select! {
-            _ = scheduler.notify().notified() => {}
+            _ = &mut notified => {}
             _ = cancellation.cancelled() => {}
         }
     }
 
     run_invocation(deps, invocation, cancellation).await;
 
-    scheduler.release(&scope).await;
+    scheduler.release(&scope, &id).await;
 }
 
 async fn watch_deadline(
@@ -511,6 +520,7 @@ struct InvocationRunDeps {
     events: Arc<EventBus>,
     gate: Arc<dyn ProjectionContextGate>,
     input_refs: InputRefRegistry,
+    scheduler: Arc<FifoScheduler>,
 }
 
 async fn run_invocation(
@@ -525,6 +535,7 @@ async fn run_invocation(
         events,
         gate,
         input_refs,
+        scheduler,
     } = deps;
     if cancellation.is_cancelled() {
         // Cancel / deadline raced ahead.
@@ -610,6 +621,8 @@ async fn run_invocation(
         );
         return;
     }
+    // Store row left `queued`; wake peers that were waiting for a new FIFO head.
+    scheduler.notify().notify_waiters();
 
     // Subscribe before spawning the executor so early events are not missed.
     let mut rx = events.subscribe();

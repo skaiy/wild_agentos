@@ -449,3 +449,39 @@ async fn input_ref_matching_digest_runs() {
     h.release.notify_one();
     wait_state(&h.store, &alice_claims(), &id, InvocationState::Succeeded).await;
 }
+
+/// Same-scope burst under per_scope>1 must admit concurrently (安野 #332 blocker).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fifo_same_scope_burst_runs_under_per_scope_cap() {
+    let h = make_harness(
+        InvocationRunningLimits {
+            global: 8,
+            per_scope: 4,
+        },
+        InputRefRegistry::new(),
+        false,
+    );
+    let auth = alice();
+    let (s1, _) = create_prompt(&h, &auth, json!({"prompt": "a"})).await;
+    let (s2, _) = create_prompt(&h, &auth, json!({"prompt": "b"})).await;
+    let (s3, _) = create_prompt(&h, &auth, json!({"prompt": "c"})).await;
+    assert_eq!(
+        (s1, s2, s3),
+        (
+            StatusCode::ACCEPTED,
+            StatusCode::ACCEPTED,
+            StatusCode::ACCEPTED
+        )
+    );
+    wait_calls(&h.calls, 3).await;
+    assert_eq!(
+        h.scheduler
+            .scope_running_count(&RunningScope {
+                tenant_id: "tenant-a".into(),
+                project_id: "project-a".into(),
+            })
+            .await,
+        3
+    );
+    h.release.notify_waiters();
+}

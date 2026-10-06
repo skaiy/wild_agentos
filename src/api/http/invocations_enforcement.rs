@@ -5,7 +5,7 @@
 //! those fields on the execution path and gates starts behind global +
 //! per-scope **running** caps (FIFO by `created_at` within a scope).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -89,11 +89,16 @@ impl RunningScope {
 
 /// In-memory running slot ledger (admission control; store state is authoritative
 /// for lifecycle, this ledger prevents over-starting before `queued→running`).
+///
+/// `admitted` holds ids that already own a slot but may still be `queued` in the
+/// store until `queued→running` completes — peers must skip them when picking
+/// the FIFO head, or the head blocks the whole scope until it finishes.
 #[derive(Debug)]
 pub(crate) struct FifoRunningSlots {
     limits: InvocationRunningLimits,
     global: usize,
     per_scope: HashMap<RunningScope, usize>,
+    admitted: HashSet<String>,
 }
 
 impl FifoRunningSlots {
@@ -102,6 +107,7 @@ impl FifoRunningSlots {
             limits,
             global: 0,
             per_scope: HashMap::new(),
+            admitted: HashSet::new(),
         }
     }
 
@@ -119,6 +125,10 @@ impl FifoRunningSlots {
         self.per_scope.get(scope).copied().unwrap_or(0)
     }
 
+    pub(crate) fn admitted_ids(&self) -> HashSet<String> {
+        self.admitted.clone()
+    }
+
     /// Acquires one running slot when both global and per-scope caps allow.
     pub(crate) fn try_acquire(&mut self, scope: &RunningScope) -> bool {
         let scope_count = self.scope_running(scope);
@@ -130,7 +140,20 @@ impl FifoRunningSlots {
         true
     }
 
-    pub(crate) fn release(&mut self, scope: &RunningScope) {
+    /// Atomically take a slot and mark `id` admitted (same lock as release).
+    pub(crate) fn try_admit(&mut self, scope: &RunningScope, id: &str) -> bool {
+        if self.admitted.contains(id) {
+            return true;
+        }
+        if !self.try_acquire(scope) {
+            return false;
+        }
+        self.admitted.insert(id.to_string());
+        true
+    }
+
+    pub(crate) fn release(&mut self, scope: &RunningScope, id: &str) {
+        self.admitted.remove(id);
         if self.global > 0 {
             self.global -= 1;
         }
@@ -143,7 +166,7 @@ impl FifoRunningSlots {
     }
 }
 
-/// Shared scheduler state: slots + wakeups when a slot frees.
+/// Shared scheduler state: slots + wakeups when a slot frees or a peer is admitted.
 #[derive(Debug)]
 pub(crate) struct FifoScheduler {
     slots: Mutex<FifoRunningSlots>,
@@ -162,12 +185,23 @@ impl FifoScheduler {
         Self::new(InvocationRunningLimits::from_env())
     }
 
-    pub(crate) async fn try_acquire(&self, scope: &RunningScope) -> bool {
-        self.slots.lock().await.try_acquire(scope)
+    /// Snapshot of ids that hold a slot (may still be store-`queued`).
+    pub(crate) async fn admitted_ids(&self) -> HashSet<String> {
+        self.slots.lock().await.admitted_ids()
     }
 
-    pub(crate) async fn release(&self, scope: &RunningScope) {
-        self.slots.lock().await.release(scope);
+    /// Take a slot + mark admitted under one lock; wakes peers so the next
+    /// FIFO head (excluding admitted) can proceed under `per_scope > 1`.
+    pub(crate) async fn try_admit(&self, scope: &RunningScope, id: &str) -> bool {
+        let ok = self.slots.lock().await.try_admit(scope, id);
+        if ok {
+            self.notify.notify_waiters();
+        }
+        ok
+    }
+
+    pub(crate) async fn release(&self, scope: &RunningScope, id: &str) {
+        self.slots.lock().await.release(scope, id);
         self.notify.notify_waiters();
     }
 
@@ -371,7 +405,7 @@ mod tests {
         assert!(!slots.try_acquire(&a), "per-scope cap");
         assert!(slots.try_acquire(&b), "other scope ok");
         assert!(!slots.try_acquire(&b), "global cap");
-        slots.release(&a);
+        slots.release(&a, "a1");
         assert!(slots.try_acquire(&a), "slot freed");
     }
 
