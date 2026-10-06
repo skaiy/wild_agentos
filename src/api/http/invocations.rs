@@ -21,15 +21,16 @@
 //! while execution is switched off, still replays the original.
 //!
 //! Gaps still tracked elsewhere:
-//! - Real `TaskExecutor` / event-bus drive (#317 follow-up). Create registers
-//!   a [`CancellationToken`] (keyed by invocation id only) and leaves the
-//!   resource `queued`; the SSE route emits a snapshot and closes on a
-//!   terminal state (poll watch). The execution switch defaults to off
-//!   (`AGENTOS_INVOCATION_EXECUTION_ENABLED`), so production create answers
-//!   `503 execution_disabled` and persists nothing. Tests enable the switch
-//!   to exercise create.
-//! - Agent revisions (#317). The agent store has no revisions, so a create
-//!   carrying `agent_revision` is `422 agent_revision_unsupported`.
+//! - Agent revisions / topology registry (#317 follow-up). The agent store has
+//!   no revisions, so a create carrying `agent_revision` is
+//!   `422 agent_revision_unsupported`.
+//! - Concurrency caps (global + per-scope FIFO), deadline/budget/input_ref
+//!   enforcement, and agent_revision pinning: deferred; see the Draft PR.
+//!
+//! Execution switch defaults to off (`AGENTOS_INVOCATION_EXECUTION_ENABLED`).
+//! When on and a [`InvocationDispatcher`] is installed, create hands the
+//! resource to the TaskExecutor bridge; otherwise create registers a cancel
+//! token and leaves the resource `queued` (tests without a bridge).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -139,11 +140,20 @@ impl InvocationsRuntime {
     }
 
     /// Same runtime with `dispatcher` receiving new invocations.
-    // Used by tests now; the execution bridge (#317) installs one in production.
-    #[allow(dead_code)]
     pub(crate) fn with_dispatcher(mut self, dispatcher: Arc<dyn InvocationDispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
         self
+    }
+
+    /// Shared store handle when open (`None` when unavailable).
+    pub(crate) fn store(&self) -> Option<Arc<InvocationStore>> {
+        self.store.clone()
+    }
+
+    /// Whether a production / test dispatcher is installed.
+    #[allow(dead_code)]
+    pub(crate) fn has_dispatcher(&self) -> bool {
+        self.dispatcher.is_some()
     }
 
     /// No store and execution off. Used when the store fails to open and by
@@ -179,7 +189,7 @@ impl InvocationsRuntime {
         let execution_enabled = Self::execution_enabled_from_env();
         if execution_enabled {
             tracing::warn!(
-                "invocation execution enabled via AGENTOS_INVOCATION_EXECUTION_ENABLED; keep off in production until the #317 execution bridge lands"
+                "invocation execution enabled via AGENTOS_INVOCATION_EXECUTION_ENABLED; keep off in production unless the TaskExecutor bridge is intentionally enabled"
             );
         }
         let config = match InvocationStoreConfig::try_from_env() {
@@ -747,15 +757,15 @@ pub(crate) async fn create_invocation_handler(
     };
     match store.create_idempotent_for_claims(claims, new).await {
         Ok(CreateOutcome::Created(invocation)) => {
-            // Stub bridge (#317): register a CancellationToken (by id only)
-            // so cancel can signal it. Real TaskExecutor / state drive is a
-            // follow-up.
-            state
-                .invocations
-                .register_stub_execution(&invocation.id, state.shutdown.clone());
+            // Real bridge (#317) owns the cancel token + state drive when a
+            // dispatcher is installed. Otherwise keep the stub token so cancel
+            // still signals something in tests without an executor.
             if let Some(dispatcher) = &state.invocations.dispatcher {
-                // TODO(#317): the execution bridge is the production dispatcher.
                 dispatcher.dispatch(&invocation);
+            } else {
+                state
+                    .invocations
+                    .register_stub_execution(&invocation.id, state.shutdown.clone());
             }
             let mut response = resource_response(StatusCode::ACCEPTED, &invocation);
             insert_location(&mut response, &invocation);
@@ -943,12 +953,12 @@ pub(crate) async fn cancel_invocation_handler(
     }
 }
 
-/// `GET /v1/invocations/:id/events` — SSE skeleton (#317 / docs/29 §8.1).
+/// `GET /v1/invocations/:id/events` — SSE (#317 / docs/29 §8.1).
 ///
 /// Emits a `state` snapshot (with `snapshot: true` and the resource view),
-/// then watches the store until the invocation is terminal (or shutdown).
-/// On terminal: optional `result` / `error` event, then the stream closes.
-/// Full event-bus forwarding and `Lagged` → `resync` land in a follow-up.
+/// then watches the store (and the event bus when `task_iri` is bound) until
+/// the invocation is terminal (or shutdown). On `Lagged`, emits `resync` so
+/// the client re-GETs. On terminal: optional `result` / `error`, then close.
 pub(crate) async fn events_invocation_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
@@ -968,10 +978,13 @@ pub(crate) async fn events_invocation_handler(
     };
 
     let shutdown = state.shutdown.clone();
+    let event_bus = state.core.events.clone();
     let stream = async_stream::stream! {
         let mut seq: u64 = 0;
         let mut last_revision = initial.revision;
         let mut last_state = initial.state;
+        let mut task_iri = initial.task_iri.clone();
+        let mut rx = event_bus.subscribe();
 
         yield Ok::<Event, Infallible>(sse_state_event(
             &initial,
@@ -992,11 +1005,51 @@ pub(crate) async fn events_invocation_handler(
                 _ = shutdown.cancelled() => {
                     break;
                 }
+                bus = rx.recv() => {
+                    match bus {
+                        Ok(event) => {
+                            let Some(iri) = task_iri.as_deref() else { continue; };
+                            if event.task_iri != iri {
+                                continue;
+                            }
+                            // Progress is not persisted; surface a lightweight hint.
+                            if event.event_type != "TASK_COMPLETED"
+                                && event.event_type != "TASK_FAILED"
+                            {
+                                let data = json!({
+                                    "invocation_id": id,
+                                    "revision": last_revision,
+                                    "at": chrono::Utc::now().to_rfc3339(),
+                                    "message": event.event_type,
+                                });
+                                yield Ok(Event::default()
+                                    .event("progress")
+                                    .id(sse_event_id(last_revision, &mut seq))
+                                    .data(data.to_string()));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let data = json!({
+                                "invocation_id": id,
+                                "revision": last_revision,
+                                "at": chrono::Utc::now().to_rfc3339(),
+                            });
+                            yield Ok(Event::default()
+                                .event("resync")
+                                .id(sse_event_id(last_revision, &mut seq))
+                                .data(data.to_string()));
+                        }
+                    }
+                }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     let current = match store.get_for_claims(&claims, &id).await {
                         Ok(invocation) => invocation,
                         Err(_) => break,
                     };
+                    if current.task_iri.is_some() {
+                        task_iri = current.task_iri.clone();
+                    }
                     if current.revision != last_revision || current.state != last_state {
                         let previous = last_state;
                         last_revision = current.revision;
@@ -1098,3 +1151,7 @@ mod tests;
 #[cfg(test)]
 #[path = "invocations_idempotency_tests.rs"]
 mod idempotency_tests;
+
+#[cfg(test)]
+#[path = "invocations_bridge_tests.rs"]
+mod bridge_tests;

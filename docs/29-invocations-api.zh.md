@@ -211,7 +211,7 @@ queued ──► running ──► succeeded
 - 创建成功（且不是幂等重放）后，服务端用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
 - 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
 - 每次运行都计量，用量随终态迁移写入 `result.usage`。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。
-- 执行受配置开关控制，默认**关闭**。在 [#317](https://github.com/skaiy/wild_agentos/issues/317) 执行桥落地前，生产必须保持关闭（投影按 scope 绑定 #310/#322 已在 main）。
+- 执行受配置开关控制，默认**关闭**（`AGENTOS_INVOCATION_EXECUTION_ENABLED`）。生产仅在明确启用 TaskExecutor 桥时打开。桥运行时强制投影按 scope 绑定（#310/#322）与 VAL-PROJ-CTX fail-closed（缺 claims / 空投影 → `failed` / `projection_context_missing`）。
 - 开关关闭时，新的创建请求返回 `503 execution_disabled`，什么都不落盘（没有资源，也没有幂等记录），因此不会有调用永远停在非终态。开关关闭前已登记的 key 重放仍返回 `200` 和原资源。开关在启动时读取；关闭开关需要重启，重启会把执行中的调用改为 `failed/interrupted`。
 
 ### 8.1 事件流

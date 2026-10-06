@@ -132,6 +132,10 @@ pub(crate) const INTERRUPTED_ERROR_CODE: &str = "interrupted";
 /// Error code for an invocation stopped by its `deadline`. It is also the
 /// only reason that unlocks the `queued → failed` edge.
 pub(crate) const DEADLINE_EXCEEDED_ERROR_CODE: &str = "deadline_exceeded";
+/// Pre-execution fail-closed mark when scoped projection context is missing/empty (#317 H4).
+pub(crate) const PROJECTION_CONTEXT_MISSING_ERROR_CODE: &str = "projection_context_missing";
+/// Task node could not be created before the executor starts (#317).
+pub(crate) const TASK_INIT_FAILED_ERROR_CODE: &str = "task_init_failed";
 /// Actor recorded in audit events written by the store itself.
 pub(crate) const SYSTEM_ACTOR_ID: &str = "system";
 
@@ -319,13 +323,21 @@ impl InvocationState {
         )
     }
 
-    /// [`Self::permits`] plus the conditional `queued → failed` edge, which
-    /// only a deadline expiry (`error.code = "deadline_exceeded"`) may take.
+    /// [`Self::permits`] plus the conditional `queued → failed` edge for
+    /// pre-execution system failures: deadline expiry, missing projection
+    /// context (H4), or task init failure (#317).
     pub(crate) fn permits_with(self, next: Self, error: Option<&InvocationErrorInfo>) -> bool {
         self.permits(next)
             || (self == Self::Queued
                 && next == Self::Failed
-                && error.is_some_and(|e| e.code == DEADLINE_EXCEEDED_ERROR_CODE))
+                && error.is_some_and(|e| {
+                    matches!(
+                        e.code.as_str(),
+                        DEADLINE_EXCEEDED_ERROR_CODE
+                            | PROJECTION_CONTEXT_MISSING_ERROR_CODE
+                            | TASK_INIT_FAILED_ERROR_CODE
+                    )
+                }))
     }
 
     /// The state a cancel request moves to, or `None` when cancel would leave
@@ -421,6 +433,18 @@ pub(crate) struct InvocationToolCallUsage {
     pub transport: Option<String>,
 }
 
+/// Lightly redact secret-shaped substrings from persisted free text.
+pub(crate) fn scrub_secret_shaped_text(input: &str) -> String {
+    let mut out = input.to_string();
+    for needle in ["api_key", "api-key", "secret", "password", "token="] {
+        if out.to_ascii_lowercase().contains(needle) {
+            out = out.replace(needle, "[redacted]");
+            out = out.replace(&needle.to_ascii_uppercase(), "[redacted]");
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct InvocationErrorInfo {
     pub code: String,
@@ -430,7 +454,7 @@ pub(crate) struct InvocationErrorInfo {
 impl InvocationErrorInfo {
     /// Builds a persisted error, truncating the message on a char boundary.
     pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        let mut message = message.into();
+        let mut message = scrub_secret_shaped_text(&message.into());
         if message.len() > MAX_ERROR_MESSAGE_BYTES {
             let mut end = MAX_ERROR_MESSAGE_BYTES;
             while !message.is_char_boundary(end) {
@@ -616,6 +640,8 @@ pub(crate) struct TransitionOutcome {
 pub(crate) struct TransitionPatch {
     pub result: Option<InvocationResult>,
     pub error: Option<InvocationErrorInfo>,
+    /// Server-generated task IRI bound when execution starts (#317).
+    pub task_iri: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1217,8 +1243,8 @@ impl InvocationStore {
     /// Checks, in order and under one write lock: scope (`NotFound`),
     /// same-state repeat (idempotent no-op, `changed = false`),
     /// `expected_revision` (`RevisionConflict`), lifecycle edge
-    /// (`IllegalTransition`; `queued → failed` only with
-    /// `error.code = "deadline_exceeded"`). On success state, revision, timestamps, patch
+    /// (`IllegalTransition`; `queued → failed` only with approved
+    /// pre-execution error codes). On success state, revision, timestamps, patch
     /// and the audit event are persisted in one atomic file replace before
     /// memory is updated. Who may request which transition (for example
     /// cancel only by the creating actor or a DA) is decided by the caller.
@@ -1276,6 +1302,9 @@ impl InvocationStore {
         }
         if let Some(error) = patch.error {
             record.error = Some(InvocationErrorInfo::new(error.code, error.message));
+        }
+        if let Some(task_iri) = patch.task_iri {
+            record.task_iri = Some(task_iri);
         }
         let revision = record.revision;
         record.push_audit(InvocationAuditEvent {

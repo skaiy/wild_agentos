@@ -293,6 +293,27 @@ pub fn build_router(
         }
     }
 
+    let invocations_runtime = {
+        let runtime = invocations::InvocationsRuntime::open_default();
+        match (runtime.store(), task_executor.as_ref()) {
+            (Some(store), Some(executor)) => {
+                let bridge = std::sync::Arc::new(
+                    invocations_execution::InvocationExecutionBridge::with_default_gate(
+                        store,
+                        runtime.cancellations().clone(),
+                        core.clone(),
+                        executor.clone(),
+                        shutdown.clone(),
+                    ),
+                );
+                tracing::info!(
+                    "invocation TaskExecutor bridge installed (still gated by AGENTOS_INVOCATION_EXECUTION_ENABLED)"
+                );
+                runtime.with_dispatcher(bridge)
+            }
+            _ => runtime,
+        }
+    };
     let state = Arc::new(AppState {
         core,
         gateway,
@@ -314,7 +335,7 @@ pub fn build_router(
         api_usage: Arc::new(ApiUsageState::default()),
         online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(load_online_corpus_jobs())),
         online_corpus_queue_capacity: online_corpus_watchers.queue_capacity,
-        invocations: invocations::InvocationsRuntime::open_default(),
+        invocations: invocations_runtime,
         shutdown: shutdown.clone(),
     });
     tokio::spawn(run_online_corpus_watcher_scheduler(
