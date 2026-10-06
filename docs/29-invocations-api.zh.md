@@ -206,9 +206,22 @@ queued ──► running ──► succeeded
 - 每个 tenant/project scope 默认最多 32 个非终态调用（`AGENTOS_INVOCATION_MAX_ACTIVE`，≥ 1）。
 - 超限时创建 → `429 too_many_active`，带 `Retry-After: 5`，什么都不落盘（没有资源，也没有幂等记录）。计数和写入在同一把写锁里完成。
 
+### 7.3 运行中并发（FIFO）
+
+与 §7.2 的「非终态活跃上限」不同：这里只统计已被准入**运行**（占有 running 槽 / 进入 executor 路径）的调用。
+
+- 全局运行中上限：默认 **64**，环境变量 `AGENTOS_INVOCATION_MAX_RUNNING_GLOBAL`（≥ 1）。
+- 每 scope（tenant_id + project_id）运行中上限：默认 **8**，环境变量 `AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE`（≥ 1）。
+- 任一上限触顶时，新创建的调用保持 `queued`，**不**调用 `TaskExecutor`，直到有槽位释放。
+- 运行中调用到达终态（或启动后被取消）时，按该 scope 内 `created_at`（再按 `id`）启动仍为 `queued` 的最老一条——同 scope FIFO。各 scope 不共享 per-scope 配额，只共享全局上限。
+- 仍为 `queued` 的调用若 `deadline` 到期 → `queued → failed`，`error.code = "deadline_exceeded"`（该条件边除 §8 预执行系统码外仅此原因）。运行中到期则取消 executor token，并以 `failed` / `deadline_exceeded` 结束。
+
 ## 8. 执行
 
-- 创建成功（且不是幂等重放）后，服务端用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
+- 创建成功（且不是幂等重放）后，服务端按 §7.3 运行中上限准入（或保持 `queued`），再用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
+- `request.budget` 在执行路径上强制：已计量 usage 超过任一给出的 `max_tokens` / `max_tool_calls` / `max_cost`（micro-USD）时，调用以 `failed` / `budget_exceeded` 结束，并尽量带回 `result.usage`。落到 `succeeded` 仍须完整 usage（VAL-016）。
+- `input_ref` 使用可插拔的 scheme→resolver 注册表。v0.12 **无内置** resolver（创建 → `422 input_ref_unresolvable`）。已注册的 resolver 在执行路径拉取字节；SHA-256 不符 → `failed` / `input_digest_mismatch`。不提供默认外网 resolver。
+- `agent_revision`：在仓库内尚无 agent 定义修订字段前，创建仍返回 `422 agent_revision_unsupported`（不得静默忽略；不假装已 pin）。
 - 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
 - 每次运行都计量，用量随终态迁移写入 `result.usage`。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。
 - 执行受配置开关控制，默认**关闭**（`AGENTOS_INVOCATION_EXECUTION_ENABLED`）。生产仅在明确启用 TaskExecutor 桥时打开。桥运行时强制投影按 scope 绑定（#310/#322）与 VAL-PROJ-CTX fail-closed（缺 claims / 空投影 → `failed` / `projection_context_missing`）。

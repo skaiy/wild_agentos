@@ -21,11 +21,11 @@
 //! while execution is switched off, still replays the original.
 //!
 //! Gaps still tracked elsewhere:
-//! - Agent revisions / topology registry (#317 follow-up). The agent store has
-//!   no revisions, so a create carrying `agent_revision` is
-//!   `422 agent_revision_unsupported`.
-//! - Concurrency caps (global + per-scope FIFO), deadline/budget/input_ref
-//!   enforcement, and agent_revision pinning: deferred; see the Draft PR.
+//! - Agent definition revision registry / topology dispatch (follow-up). The
+//!   agent store has no revisions, so a create carrying `agent_revision` is
+//!   still `422 agent_revision_unsupported` (never silently ignored).
+//! - FIFO running caps, deadline / budget / `input_ref` enforcement: #331
+//!   (`invocations_enforcement` + execution bridge).
 //!
 //! Execution switch defaults to off (`AGENTOS_INVOCATION_EXECUTION_ENABLED`).
 //! When on and a [`InvocationDispatcher`] is installed, create hands the
@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 use sha2::{Digest, Sha256};
 
 use super::iam::UserIdentity;
+use super::invocations_enforcement::InputRefRegistry;
 use super::invocations_execution::InvocationCancellationRegistry;
 use super::invocations_store::{
     invocation_not_found_response, parse_if_match, CreateOutcome, IdempotencyLookup,
@@ -127,6 +128,10 @@ pub(crate) struct InvocationsRuntime {
     /// Called after a successful, non-replayed create. `None` until the
     /// execution bridge (#317) installs one in production.
     dispatcher: Option<Arc<dyn InvocationDispatcher>>,
+    /// Pluggable `input_ref` scheme → resolver registry (#331). Empty by
+    /// default (create still `422 input_ref_unresolvable` until a deployment
+    /// or test registers a scheme).
+    input_refs: InputRefRegistry,
 }
 
 impl InvocationsRuntime {
@@ -136,6 +141,7 @@ impl InvocationsRuntime {
             execution_enabled,
             cancellations: InvocationCancellationRegistry::new(),
             dispatcher: None,
+            input_refs: InputRefRegistry::new(),
         }
     }
 
@@ -221,6 +227,19 @@ impl InvocationsRuntime {
 
     pub(crate) fn cancellations(&self) -> &InvocationCancellationRegistry {
         &self.cancellations
+    }
+
+    /// Shared `input_ref` resolver registry (empty in production v0.12).
+    pub(crate) fn input_refs(&self) -> &InputRefRegistry {
+        &self.input_refs
+    }
+
+    /// Replaces the `input_ref` registry. Test-only until a deployment hook
+    /// registers schemes (v0.12 ships no built-in resolver).
+    #[cfg(test)]
+    pub(crate) fn with_input_refs(mut self, input_refs: InputRefRegistry) -> Self {
+        self.input_refs = input_refs;
+        self
     }
 
     /// Registers a cancel token for a freshly created invocation and holds it
@@ -532,14 +551,8 @@ pub(crate) fn parse_create_request(raw: &[u8]) -> Result<InvocationRequest, ApiE
             "prompt is required unless input or input_ref is set",
         ));
     }
-    if request.input_ref.is_some() {
-        // v0.12.0 registers no input_ref resolver (docs §4.2).
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "input_ref_unresolvable",
-            "no resolver is registered for the input_ref scheme",
-        ));
-    }
+    // Scheme registration is checked at create time against the runtime
+    // registry (#331); parse only validates shape here.
     Ok(request)
 }
 
@@ -662,8 +675,9 @@ async fn resolve_agent(
         ));
     }
     if request.agent_revision.is_some() {
-        // TODO(#317): agent definitions carry no revision yet, so a pin can
-        // neither match nor be checked. Reject rather than ignore it.
+        // Agent definitions still carry no revision field in-tree (#331): a
+        // pin can neither match nor be checked. Reject rather than ignore it
+        // (never invent fake revision pinning).
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "agent_revision_unsupported",
@@ -736,6 +750,18 @@ pub(crate) async fn create_invocation_handler(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
+    if let Some(input_ref) = request.input_ref.as_ref() {
+        let scheme = super::invocations_enforcement::InputRefRegistry::scheme_of(&input_ref.uri);
+        let registered = scheme.is_some_and(|s| state.invocations.input_refs().has_scheme(s));
+        if !registered {
+            return ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "input_ref_unresolvable",
+                "no resolver is registered for the input_ref scheme",
+            )
+            .into_response();
+        }
+    }
     if let Err(error) = resolve_agent(&state, claims, &request).await {
         return error.into_response();
     }
@@ -1155,3 +1181,7 @@ mod idempotency_tests;
 #[cfg(test)]
 #[path = "invocations_bridge_tests.rs"]
 mod bridge_tests;
+
+#[cfg(test)]
+#[path = "invocations_enforcement_tests.rs"]
+mod enforcement_tests;

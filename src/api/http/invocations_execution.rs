@@ -20,10 +20,14 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::invocations::InvocationDispatcher;
+use super::invocations_enforcement::{
+    budget_is_exceeded, deadline_already_due, duration_until_deadline, fetch_and_verify_input_ref,
+    FifoScheduler, InputRefRegistry, RunningScope, BUDGET_EXCEEDED_ERROR_CODE,
+};
 use super::invocations_store::{
     scrub_secret_shaped_text, Invocation, InvocationErrorInfo, InvocationResult, InvocationState,
-    InvocationStore, InvocationUsage, TransitionPatch, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
-    TASK_INIT_FAILED_ERROR_CODE,
+    InvocationStore, InvocationUsage, TransitionPatch, DEADLINE_EXCEEDED_ERROR_CODE,
+    PROJECTION_CONTEXT_MISSING_ERROR_CODE, TASK_INIT_FAILED_ERROR_CODE,
 };
 use super::{TaskExecSpec, TaskExecutor};
 use crate::core::core_types::SemanticCore;
@@ -249,7 +253,8 @@ pub(crate) fn parse_terminal_payload(payload: &str) -> (String, Option<Invocatio
     (scrub_result_summary(&summary), usage)
 }
 
-/// Production dispatcher: init task → projection gate → TaskExecutor → state drive.
+/// Production dispatcher: FIFO running caps → input_ref → init task →
+/// projection gate → TaskExecutor → state drive (#317 / #331).
 pub(crate) struct InvocationExecutionBridge {
     store: Arc<InvocationStore>,
     cancellations: InvocationCancellationRegistry,
@@ -258,9 +263,12 @@ pub(crate) struct InvocationExecutionBridge {
     events: Arc<EventBus>,
     shutdown: CancellationToken,
     projection_gate: Arc<dyn ProjectionContextGate>,
+    scheduler: Arc<FifoScheduler>,
+    input_refs: InputRefRegistry,
 }
 
 impl InvocationExecutionBridge {
+    #[allow(dead_code)]
     pub(crate) fn new(
         store: Arc<InvocationStore>,
         cancellations: InvocationCancellationRegistry,
@@ -268,6 +276,29 @@ impl InvocationExecutionBridge {
         executor: Arc<dyn TaskExecutor>,
         shutdown: CancellationToken,
         projection_gate: Arc<dyn ProjectionContextGate>,
+    ) -> Self {
+        Self::new_with_enforcement(
+            store,
+            cancellations,
+            core,
+            executor,
+            shutdown,
+            projection_gate,
+            Arc::new(FifoScheduler::with_defaults()),
+            InputRefRegistry::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_enforcement(
+        store: Arc<InvocationStore>,
+        cancellations: InvocationCancellationRegistry,
+        core: Arc<SemanticCore>,
+        executor: Arc<dyn TaskExecutor>,
+        shutdown: CancellationToken,
+        projection_gate: Arc<dyn ProjectionContextGate>,
+        scheduler: Arc<FifoScheduler>,
+        input_refs: InputRefRegistry,
     ) -> Self {
         let events = core.events.clone();
         Self {
@@ -278,10 +309,13 @@ impl InvocationExecutionBridge {
             events,
             shutdown,
             projection_gate,
+            scheduler,
+            input_refs,
         }
     }
 
     /// Convenience constructor with the default scoped projection gate.
+    #[allow(dead_code)]
     pub(crate) fn with_default_gate(
         store: Arc<InvocationStore>,
         cancellations: InvocationCancellationRegistry,
@@ -298,6 +332,16 @@ impl InvocationExecutionBridge {
             Arc::new(ScopedProjectionGate),
         )
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn scheduler(&self) -> Arc<FifoScheduler> {
+        self.scheduler.clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn input_refs(&self) -> &InputRefRegistry {
+        &self.input_refs
+    }
 }
 
 impl InvocationDispatcher for InvocationExecutionBridge {
@@ -305,24 +349,36 @@ impl InvocationDispatcher for InvocationExecutionBridge {
         let token = self.cancellations.register(&invocation.id);
         let store = self.store.clone();
         let cancellations = self.cancellations.clone();
-        let core = self.core.clone();
-        let executor = self.executor.clone();
-        let events = self.events.clone();
         let shutdown = self.shutdown.clone();
-        let gate = self.projection_gate.clone();
+        let scheduler = self.scheduler.clone();
+        let deps = InvocationRunDeps {
+            store: self.store.clone(),
+            core: self.core.clone(),
+            executor: self.executor.clone(),
+            events: self.events.clone(),
+            gate: self.projection_gate.clone(),
+            input_refs: self.input_refs.clone(),
+            scheduler: self.scheduler.clone(),
+        };
         let invocation = invocation.clone();
         let id = invocation.id.clone();
+        let scope = RunningScope::from_invocation(&invocation);
 
         tokio::spawn(async move {
-            let run = run_invocation(
-                store,
-                core,
-                executor,
-                events,
-                gate,
-                invocation,
-                token.clone(),
-            );
+            // Deadline while queued/running: cancel token; run path maps to
+            // failed/deadline_exceeded (not user-cancelled).
+            if invocation.request.deadline.is_some() {
+                let store_dl = store.clone();
+                let inv_dl = invocation.clone();
+                let token_dl = token.clone();
+                let shutdown_dl = shutdown.clone();
+                let scheduler_dl = scheduler.clone();
+                tokio::spawn(async move {
+                    watch_deadline(store_dl, inv_dl, token_dl, shutdown_dl, scheduler_dl).await;
+                });
+            }
+
+            let run = admit_and_run(deps, scheduler, invocation, token.clone(), scope);
             tokio::pin!(run);
             tokio::select! {
                 biased;
@@ -337,18 +393,164 @@ impl InvocationDispatcher for InvocationExecutionBridge {
     }
 }
 
-async fn run_invocation(
+/// Waits for a running slot (per-scope FIFO by `created_at`), then executes;
+/// releases the slot and wakes waiters when done.
+async fn admit_and_run(
+    deps: InvocationRunDeps,
+    scheduler: Arc<FifoScheduler>,
+    invocation: Invocation,
+    cancellation: CancellationToken,
+    scope: RunningScope,
+) {
+    let store = deps.store.clone();
+    let id = invocation.id.clone();
+    loop {
+        // Subscribe before re-checking so a notify between check and wait is not lost.
+        let notified = scheduler.notify().notified();
+        tokio::pin!(notified);
+
+        let claims = match claims_from_invocation(&invocation) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let Ok(current) = store.get_for_claims(&claims, &id).await else {
+            return;
+        };
+        if current.state != InvocationState::Queued {
+            return;
+        }
+
+        if cancellation.is_cancelled() {
+            // Deadline watcher writes failed; user cancel route writes cancelled.
+            // Only backstop a due deadline that left us still queued.
+            if invocation
+                .request
+                .deadline
+                .as_deref()
+                .is_some_and(deadline_already_due)
+            {
+                let _ = fail_pre_execution(
+                    &store,
+                    &invocation,
+                    DEADLINE_EXCEEDED_ERROR_CODE,
+                    "deadline exceeded while queued",
+                )
+                .await;
+            }
+            return;
+        }
+
+        // Per-scope FIFO: oldest *non-admitted* queued may take a slot. Ids that
+        // already hold a slot but are still store-queued are skipped so peers
+        // can admit under per_scope > 1.
+        let admitted = scheduler.admitted_ids().await;
+        let oldest = store
+            .oldest_queued_in_scope_excluding(&scope.tenant_id, &scope.project_id, &admitted)
+            .await;
+        if oldest.as_ref().map(|inv| inv.id.as_str()) != Some(id.as_str()) {
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = cancellation.cancelled() => {}
+            }
+            continue;
+        }
+
+        if scheduler.try_admit(&scope, &id).await {
+            break;
+        }
+
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = cancellation.cancelled() => {}
+        }
+    }
+
+    run_invocation(deps, invocation, cancellation).await;
+
+    scheduler.release(&scope, &id).await;
+}
+
+async fn watch_deadline(
+    store: Arc<InvocationStore>,
+    invocation: Invocation,
+    token: CancellationToken,
+    shutdown: CancellationToken,
+    scheduler: Arc<FifoScheduler>,
+) {
+    let Some(raw) = invocation.request.deadline.clone() else {
+        return;
+    };
+    let wait = duration_until_deadline(&raw).unwrap_or(std::time::Duration::ZERO);
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => {}
+        _ = shutdown.cancelled() => return,
+        _ = token.cancelled() => return,
+    }
+
+    let Ok(claims) = claims_from_invocation(&invocation) else {
+        return;
+    };
+    let Ok(current) = store.get_for_claims(&claims, &invocation.id).await else {
+        return;
+    };
+    if current.state.is_terminal() {
+        return;
+    }
+
+    // Signal the executor / admit loop first, then persist failed.
+    token.cancel();
+    let _ = fail_pre_execution(
+        &store,
+        &invocation,
+        DEADLINE_EXCEEDED_ERROR_CODE,
+        "deadline exceeded",
+    )
+    .await;
+    // Wake FIFO waiters (a queued peer may now be eligible; this id is terminal).
+    scheduler.notify().notify_waiters();
+}
+
+/// Shared dependencies for one invocation run, bundled so the admit/run
+/// helpers keep small signatures (clippy `too_many_arguments`).
+#[derive(Clone)]
+struct InvocationRunDeps {
     store: Arc<InvocationStore>,
     core: Arc<SemanticCore>,
     executor: Arc<dyn TaskExecutor>,
     events: Arc<EventBus>,
     gate: Arc<dyn ProjectionContextGate>,
+    input_refs: InputRefRegistry,
+    scheduler: Arc<FifoScheduler>,
+}
+
+async fn run_invocation(
+    deps: InvocationRunDeps,
     invocation: Invocation,
     cancellation: CancellationToken,
 ) {
+    let InvocationRunDeps {
+        store,
+        core,
+        executor,
+        events,
+        gate,
+        input_refs,
+        scheduler,
+    } = deps;
     if cancellation.is_cancelled() {
-        // Cancel raced ahead (queued → cancelled already by the cancel route).
+        // Cancel / deadline raced ahead.
         return;
+    }
+
+    // Resolve input_ref before task init (digest mismatch → queued→failed).
+    if let Some(input_ref) = invocation.request.input_ref.as_ref() {
+        match fetch_and_verify_input_ref(&input_refs, &input_ref.uri, &input_ref.sha256).await {
+            Ok(_bytes) => {}
+            Err((code, message)) => {
+                let _ = fail_pre_execution(&store, &invocation, code, &message).await;
+                return;
+            }
+        }
     }
 
     let claims = match claims_from_invocation(&invocation) {
@@ -419,6 +621,8 @@ async fn run_invocation(
         );
         return;
     }
+    // Store row left `queued`; wake peers that were waiting for a new FIFO head.
+    scheduler.notify().notify_waiters();
 
     // Subscribe before spawning the executor so early events are not missed.
     let mut rx = events.subscribe();
@@ -486,6 +690,19 @@ async fn run_invocation(
                             None,
                         )
                         .await;
+                        return;
+                    }
+                }
+                // Deadline watcher may already have written failed/deadline_exceeded.
+                if let Ok(current) = store.get_for_claims(&claims, &invocation.id).await {
+                    if current.state.is_terminal() {
+                        return;
+                    }
+                    if current
+                        .error
+                        .as_ref()
+                        .is_some_and(|e| e.code == DEADLINE_EXCEEDED_ERROR_CODE)
+                    {
                         return;
                     }
                 }
@@ -579,17 +796,35 @@ async fn run_invocation(
         return;
     };
 
-    apply_terminal_event(&store, &claims, &invocation.id, &event).await;
+    apply_terminal_event(&store, &claims, &invocation, &event).await;
 }
 
 async fn apply_terminal_event(
     store: &InvocationStore,
     claims: &IsolationClaims,
-    id: &str,
+    invocation: &Invocation,
     event: &crate::core::event_bus::Event,
 ) {
+    let id = invocation.id.as_str();
     let (summary, usage) = parse_terminal_payload(&event.payload);
     if event.event_type == "TASK_COMPLETED" {
+        // Budget gate before VAL-016 succeeded write (#331).
+        if let (Some(budget), Some(usage_ref)) =
+            (invocation.request.budget.as_ref(), usage.as_ref())
+        {
+            if budget_is_exceeded(budget, usage_ref) {
+                let _ = fail_running(
+                    store,
+                    claims,
+                    id,
+                    BUDGET_EXCEEDED_ERROR_CODE,
+                    "request.budget limit exceeded",
+                    usage.clone(),
+                )
+                .await;
+                return;
+            }
+        }
         let result = InvocationResult {
             summary,
             artifacts: vec![],

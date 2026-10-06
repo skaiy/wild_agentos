@@ -313,11 +313,44 @@ queued ──► running ──► succeeded
   nothing is persisted (no resource, no idempotency record). The count and the
   insert happen under one write lock.
 
+### 7.3 Running concurrency (FIFO)
+
+Distinct from the active (non-terminal) create cap in §7.2: these limits count
+only invocations that have been admitted to **run** (held a running slot /
+entered the executor path).
+
+- Global max running: default **64**, env
+  `AGENTOS_INVOCATION_MAX_RUNNING_GLOBAL` (≥ 1).
+- Per-scope (tenant_id + project_id) max running: default **8**, env
+  `AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE` (≥ 1).
+- Over either limit, a newly created invocation stays `queued` and does **not**
+  call `TaskExecutor` until a slot frees.
+- When a running invocation reaches a terminal state (or is cancelled after
+  starting), the server starts the oldest still-`queued` invocation in that
+  scope by `created_at` (then `id`) — FIFO within the scope. Scopes do not
+  share the per-scope quota; they share only the global cap.
+- `deadline` on a still-queued invocation: on expiry → `queued → failed` with
+  `error.code = "deadline_exceeded"` (the only conditional edge for that
+  transition besides the pre-execution system codes in §8). A due deadline
+  while running cancels the executor token and ends `failed` /
+  `deadline_exceeded`.
+
 ## 8. Execution
 
-- After a successful (non-replayed) create, the server creates a task with the
+- After a successful (non-replayed) create, the server admits the invocation
+  under §7.3 running caps (or leaves it `queued`), then creates a task with the
   caller's claims and runs it through the existing `TaskExecutor`. Execution is
   detached from the HTTP connection.
+- `request.budget` is enforced on the execution path: when metered usage exceeds
+  any present `max_tokens` / `max_tool_calls` / `max_cost` (micro-USD) limit, the
+  invocation ends `failed` with `error.code = "budget_exceeded"` and best-effort
+  `result.usage`. A `succeeded` write still requires complete usage (VAL-016).
+- `input_ref` uses a pluggable scheme→resolver registry. v0.12 ships **no**
+  built-in resolver (create → `422 input_ref_unresolvable`). A registered
+  resolver fetches bytes on the execution path; SHA-256 mismatch → `failed` /
+  `input_digest_mismatch`. There is no default outbound/network resolver.
+- `agent_revision`: until agent definition revisions exist in-tree, create still
+  returns `422 agent_revision_unsupported` (never silently ignored; no fake pin).
 - Task events drive state transitions. A lagging SSE subscriber receives a
   `resync` event and should re-read the resource; the persisted state is
   authoritative.

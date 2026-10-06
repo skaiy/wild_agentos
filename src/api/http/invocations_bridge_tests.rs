@@ -15,6 +15,7 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::api::http::control_plane_route_auth_tests::{test_state_with_invocations, EnvGuard};
+use crate::api::http::invocations_enforcement::{FifoScheduler, InputRefRegistry};
 use crate::api::http::invocations_execution::{
     claims_from_invocation, projection_context_is_nonempty, InvocationExecutionBridge,
     ProjectionContextGate, ScopedProjectionGate, PROJECTION_GATE_FRAME,
@@ -146,8 +147,10 @@ fn make_bridge_harness(mode: MockMode, gate: Arc<dyn ProjectionContextGate>) -> 
         dir.path(),
         InvocationsRuntime::new(Some(store.clone()), true),
     );
-    let runtime = InvocationsRuntime::new(Some(store.clone()), true);
-    let bridge = Arc::new(InvocationExecutionBridge::new(
+    let input_refs = InputRefRegistry::new();
+    let runtime =
+        InvocationsRuntime::new(Some(store.clone()), true).with_input_refs(input_refs.clone());
+    let bridge = Arc::new(InvocationExecutionBridge::new_with_enforcement(
         store.clone(),
         runtime.cancellations().clone(),
         bootstrap.core.clone(),
@@ -159,6 +162,8 @@ fn make_bridge_harness(mode: MockMode, gate: Arc<dyn ProjectionContextGate>) -> 
         }),
         bootstrap.shutdown.clone(),
         gate,
+        Arc::new(FifoScheduler::with_defaults()),
+        input_refs,
     ));
     let runtime = runtime.with_dispatcher(bridge);
 
