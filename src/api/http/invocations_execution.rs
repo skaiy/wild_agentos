@@ -398,36 +398,23 @@ impl InvocationDispatcher for InvocationExecutionBridge {
 
 /// Releases a scheduler admission if its owning task returns or unwinds.
 ///
-/// `FifoScheduler::release` is async, so `Drop` schedules it on the current
-/// Tokio runtime. The guard is only created within the dispatch task, where a
-/// runtime is available; if runtime teardown is already in progress, no
-/// surviving waiters can use the in-memory scheduler.
+/// Release is synchronous and idempotent (`FifoScheduler::release_now`), so
+/// it happens inline in `Drop` — including during runtime teardown or task
+/// abort — with no spawned task that could be dropped before it runs.
 struct AdmittedSlot {
     scheduler: Arc<FifoScheduler>,
-    scope: RunningScope,
     id: String,
 }
 
 impl AdmittedSlot {
-    fn new(scheduler: Arc<FifoScheduler>, scope: RunningScope, id: String) -> Self {
-        Self {
-            scheduler,
-            scope,
-            id,
-        }
+    fn new(scheduler: Arc<FifoScheduler>, id: String) -> Self {
+        Self { scheduler, id }
     }
 }
 
 impl Drop for AdmittedSlot {
     fn drop(&mut self) {
-        let scheduler = self.scheduler.clone();
-        let scope = self.scope.clone();
-        let id = self.id.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            drop(handle.spawn(async move {
-                scheduler.release(&scope, &id).await;
-            }));
-        }
+        self.scheduler.release_now(&self.id);
     }
 }
 
@@ -504,7 +491,7 @@ async fn admit_and_run(
         }
     }
 
-    let _admitted_slot = AdmittedSlot::new(scheduler, scope, id);
+    let _admitted_slot = AdmittedSlot::new(scheduler, id);
     run_invocation(deps, invocation, cancellation).await;
 }
 
