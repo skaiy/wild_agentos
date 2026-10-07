@@ -388,8 +388,46 @@ impl InvocationDispatcher for InvocationExecutionBridge {
                 }
                 _ = &mut run => {}
             }
+            // Wake the detached deadline watcher as soon as this invocation is
+            // terminal, rather than leaving it asleep until its deadline.
+            token.cancel();
             cancellations.remove(&id);
         });
+    }
+}
+
+/// Releases a scheduler admission if its owning task returns or unwinds.
+///
+/// `FifoScheduler::release` is async, so `Drop` schedules it on the current
+/// Tokio runtime. The guard is only created within the dispatch task, where a
+/// runtime is available; if runtime teardown is already in progress, no
+/// surviving waiters can use the in-memory scheduler.
+struct AdmittedSlot {
+    scheduler: Arc<FifoScheduler>,
+    scope: RunningScope,
+    id: String,
+}
+
+impl AdmittedSlot {
+    fn new(scheduler: Arc<FifoScheduler>, scope: RunningScope, id: String) -> Self {
+        Self {
+            scheduler,
+            scope,
+            id,
+        }
+    }
+}
+
+impl Drop for AdmittedSlot {
+    fn drop(&mut self) {
+        let scheduler = self.scheduler.clone();
+        let scope = self.scope.clone();
+        let id = self.id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn(async move {
+                scheduler.release(&scope, &id).await;
+            }));
+        }
     }
 }
 
@@ -408,6 +446,7 @@ async fn admit_and_run(
         // Subscribe before re-checking so a notify between check and wait is not lost.
         let notified = scheduler.notify().notified();
         tokio::pin!(notified);
+        notified.as_mut().enable();
 
         let claims = match claims_from_invocation(&invocation) {
             Ok(c) => c,
@@ -465,9 +504,8 @@ async fn admit_and_run(
         }
     }
 
+    let _admitted_slot = AdmittedSlot::new(scheduler, scope, id);
     run_invocation(deps, invocation, cancellation).await;
-
-    scheduler.release(&scope, &id).await;
 }
 
 async fn watch_deadline(

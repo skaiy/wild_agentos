@@ -306,7 +306,10 @@ pub(crate) async fn fetch_and_verify_input_ref(
 /// evidence of exceeding).
 pub(crate) fn budget_is_exceeded(budget: &InvocationBudget, usage: &InvocationUsage) -> bool {
     if let Some(max_tokens) = budget.max_tokens {
-        let used = usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0);
+        let used = usage
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(usage.output_tokens.unwrap_or(0));
         if (usage.input_tokens.is_some() || usage.output_tokens.is_some()) && used > max_tokens {
             return true;
         }
@@ -463,6 +466,21 @@ mod tests {
                 transport: None,
             },
         ]);
+        assert!(budget_is_exceeded(&budget, &usage));
+    }
+
+    #[test]
+    fn budget_token_sum_saturates() {
+        let budget = InvocationBudget {
+            max_tokens: Some(u64::MAX - 1),
+            ..Default::default()
+        };
+        let usage = InvocationUsage {
+            input_tokens: Some(u64::MAX),
+            output_tokens: Some(1),
+            ..Default::default()
+        };
+
         assert!(budget_is_exceeded(&budget, &usage));
     }
 
