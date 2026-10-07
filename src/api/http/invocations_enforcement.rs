@@ -6,13 +6,13 @@
 //! per-scope **running** caps (FIFO by `created_at` within a scope).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
 use super::invocations_store::{Invocation, InvocationBudget, InvocationUsage};
 
@@ -98,7 +98,9 @@ pub(crate) struct FifoRunningSlots {
     limits: InvocationRunningLimits,
     global: usize,
     per_scope: HashMap<RunningScope, usize>,
-    admitted: HashSet<String>,
+    /// id → scope it was admitted under. Release is keyed on this map, so a
+    /// repeated or unknown release is a no-op and can never free a peer's slot.
+    admitted: HashMap<String, RunningScope>,
 }
 
 impl FifoRunningSlots {
@@ -107,7 +109,7 @@ impl FifoRunningSlots {
             limits,
             global: 0,
             per_scope: HashMap::new(),
-            admitted: HashSet::new(),
+            admitted: HashMap::new(),
         }
     }
 
@@ -126,11 +128,13 @@ impl FifoRunningSlots {
     }
 
     pub(crate) fn admitted_ids(&self) -> HashSet<String> {
-        self.admitted.clone()
+        self.admitted.keys().cloned().collect()
     }
 
     /// Acquires one running slot when both global and per-scope caps allow.
-    pub(crate) fn try_acquire(&mut self, scope: &RunningScope) -> bool {
+    /// Private: every slot must be owned by an admitted id so release can be
+    /// matched one-to-one.
+    fn try_acquire(&mut self, scope: &RunningScope) -> bool {
         let scope_count = self.scope_running(scope);
         if self.global >= self.limits.global || scope_count >= self.limits.per_scope {
             return false;
@@ -142,33 +146,40 @@ impl FifoRunningSlots {
 
     /// Atomically take a slot and mark `id` admitted (same lock as release).
     pub(crate) fn try_admit(&mut self, scope: &RunningScope, id: &str) -> bool {
-        if self.admitted.contains(id) {
+        if self.admitted.contains_key(id) {
             return true;
         }
         if !self.try_acquire(scope) {
             return false;
         }
-        self.admitted.insert(id.to_string());
+        self.admitted.insert(id.to_string(), scope.clone());
         true
     }
 
-    pub(crate) fn release(&mut self, scope: &RunningScope, id: &str) {
-        self.admitted.remove(id);
-        if self.global > 0 {
-            self.global -= 1;
-        }
-        if let Some(count) = self.per_scope.get_mut(scope) {
+    /// Frees the slot owned by `id`. Idempotent: returns `false` (and changes
+    /// nothing) when `id` holds no slot, e.g. on a second release. The scope
+    /// decremented is the one recorded at admission, not a caller argument.
+    pub(crate) fn release(&mut self, id: &str) -> bool {
+        let Some(scope) = self.admitted.remove(id) else {
+            return false;
+        };
+        self.global = self.global.saturating_sub(1);
+        if let Some(count) = self.per_scope.get_mut(&scope) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                self.per_scope.remove(scope);
+                self.per_scope.remove(&scope);
             }
         }
+        true
     }
 }
 
 /// Shared scheduler state: slots + wakeups when a slot frees or a peer is admitted.
 #[derive(Debug)]
 pub(crate) struct FifoScheduler {
+    /// `std` mutex: critical sections are short and never await, which lets
+    /// `release_now` run synchronously from `Drop` (no spawned task that a
+    /// runtime teardown could drop, leaving the slot stuck).
     slots: Mutex<FifoRunningSlots>,
     notify: Notify,
 }
@@ -187,22 +198,33 @@ impl FifoScheduler {
 
     /// Snapshot of ids that hold a slot (may still be store-`queued`).
     pub(crate) async fn admitted_ids(&self) -> HashSet<String> {
-        self.slots.lock().await.admitted_ids()
+        self.lock_slots().admitted_ids()
     }
 
     /// Take a slot + mark admitted under one lock; wakes peers so the next
     /// FIFO head (excluding admitted) can proceed under `per_scope > 1`.
     pub(crate) async fn try_admit(&self, scope: &RunningScope, id: &str) -> bool {
-        let ok = self.slots.lock().await.try_admit(scope, id);
+        let ok = self.lock_slots().try_admit(scope, id);
         if ok {
             self.notify.notify_waiters();
         }
         ok
     }
 
-    pub(crate) async fn release(&self, scope: &RunningScope, id: &str) {
-        self.slots.lock().await.release(scope, id);
-        self.notify.notify_waiters();
+    /// Synchronous, idempotent release; safe to call from `Drop`. Wakes
+    /// waiters only when a slot was actually freed.
+    pub(crate) fn release_now(&self, id: &str) -> bool {
+        let freed = self.lock_slots().release(id);
+        if freed {
+            self.notify.notify_waiters();
+        }
+        freed
+    }
+
+    /// Poison-tolerant lock: the ledger holds plain counters, so a panic in
+    /// another holder cannot leave it logically torn.
+    fn lock_slots(&self) -> MutexGuard<'_, FifoRunningSlots> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn notify(&self) -> &Notify {
@@ -211,13 +233,13 @@ impl FifoScheduler {
 
     #[allow(dead_code)]
     pub(crate) async fn snapshot(&self) -> (usize, InvocationRunningLimits) {
-        let slots = self.slots.lock().await;
+        let slots = self.lock_slots();
         (slots.global_running(), slots.limits())
     }
 
     #[cfg(test)]
     pub(crate) async fn scope_running_count(&self, scope: &RunningScope) -> usize {
-        self.slots.lock().await.scope_running(scope)
+        self.lock_slots().scope_running(scope)
     }
 }
 
@@ -404,12 +426,57 @@ mod tests {
             tenant_id: "t1".into(),
             project_id: "p2".into(),
         };
-        assert!(slots.try_acquire(&a));
-        assert!(!slots.try_acquire(&a), "per-scope cap");
-        assert!(slots.try_acquire(&b), "other scope ok");
-        assert!(!slots.try_acquire(&b), "global cap");
-        slots.release(&a, "a1");
-        assert!(slots.try_acquire(&a), "slot freed");
+        assert!(slots.try_admit(&a, "a1"));
+        assert!(!slots.try_admit(&a, "a2"), "per-scope cap");
+        assert!(slots.try_admit(&b, "b1"), "other scope ok");
+        assert!(!slots.try_admit(&b, "b2"), "global cap");
+        assert!(slots.release("a1"));
+        assert!(slots.try_admit(&a, "a2"), "slot freed");
+    }
+
+    #[test]
+    fn fifo_release_is_idempotent_and_owner_keyed() {
+        let mut slots = FifoRunningSlots::new(InvocationRunningLimits {
+            global: 2,
+            per_scope: 2,
+        });
+        let a = RunningScope {
+            tenant_id: "t1".into(),
+            project_id: "p1".into(),
+        };
+        assert!(slots.try_admit(&a, "a1"));
+        assert!(slots.try_admit(&a, "a2"));
+        assert!(
+            slots.try_admit(&a, "a1"),
+            "re-admit of holder takes no slot"
+        );
+        assert_eq!(slots.global_running(), 2);
+        assert!(slots.release("a1"));
+        assert!(!slots.release("a1"), "double release is a no-op");
+        assert!(!slots.release("never-admitted"), "unknown id is a no-op");
+        assert_eq!(slots.global_running(), 1, "peer a2 keeps its slot");
+        assert_eq!(slots.scope_running(&a), 1);
+        assert!(slots.admitted_ids().contains("a2"));
+        assert!(slots.release("a2"));
+        assert_eq!(slots.global_running(), 0);
+        assert_eq!(slots.scope_running(&a), 0);
+    }
+
+    #[test]
+    fn scheduler_release_now_is_sync_and_idempotent() {
+        // No Tokio runtime here: release must not depend on one.
+        let scheduler = FifoScheduler::new(InvocationRunningLimits {
+            global: 1,
+            per_scope: 1,
+        });
+        let a = RunningScope {
+            tenant_id: "t1".into(),
+            project_id: "p1".into(),
+        };
+        assert!(scheduler.lock_slots().try_admit(&a, "a1"));
+        assert!(scheduler.release_now("a1"));
+        assert!(!scheduler.release_now("a1"));
+        assert_eq!(scheduler.lock_slots().global_running(), 0);
     }
 
     #[tokio::test]
