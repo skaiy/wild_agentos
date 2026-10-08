@@ -1007,11 +1007,11 @@ mod tests {
             .block_on(hm.execute(HookPoint::SkillBefore, &mut ctx));
 
         assert!(
-            ctx.data.get("file_unchanged").is_none(),
+            !ctx.data.contains_key("file_unchanged"),
             "Stale file should NOT have file_unchanged flag"
         );
         assert!(
-            ctx.data.get("stale_warning").is_some(),
+            ctx.data.contains_key("stale_warning"),
             "Stale file SHOULD have stale_warning"
         );
     }

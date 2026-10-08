@@ -4,3 +4,15 @@ target/
 data/
 logs/
 *.log
+
+# 密钥与凭据文件绝不进入构建上下文（任意层级）/ never send secrets into the build context (any depth)
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.jks
+**/id_rsa*
+**/id_ed25519*

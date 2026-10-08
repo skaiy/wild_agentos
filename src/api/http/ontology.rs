@@ -3147,6 +3147,9 @@ fn build_action_effects(
 // ontology CRUD 集成测试（原与 skill_manifest_tests 混放，随 skills 拆分迁出后独立）
 // ──────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#[allow(clippy::await_holding_lock)]
 mod ontology_crud_tests {
     use super::*;
     use crate::core::core_types::{CoreConfig, SemanticCore};

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Multipart, State},
+    extract::{FromRequest, Multipart, Request, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -225,6 +225,20 @@ pub(crate) struct ModelTestRequest {
     modality: String,
 }
 
+/// Parse a JSON request body after authorization (#312).
+///
+/// Same rejections as the `Json` extractor (422 for a schema error, 400 for a
+/// syntax error, 415 for a wrong content type), but only reached once the
+/// handler's gate has passed. Callers that fail the gate never see them.
+pub(crate) async fn parse_json_body<T: serde::de::DeserializeOwned>(
+    request: Request,
+) -> Result<T, Response> {
+    Json::<T>::from_request(request, &())
+        .await
+        .map(|Json(value)| value)
+        .map_err(IntoResponse::into_response)
+}
+
 /// 32x32 纯白 PNG(base64),vision 连通性测试的最小图片载荷。
 /// 注:部分 VL 模型(如 Qwen3-VL)要求图片每边 > 28px,且校验 PNG 完整性,故用合法 32x32 而非 1x1。
 const TEST_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NMQ0AAAwDoPo33arYsQQMkB6LQCAQCAQCgUAg+BIMi1X0ptsIcT0AAAAASUVORK5CYII=";
@@ -232,13 +246,16 @@ const TEST_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAA
 /// POST /api/v1/models/test — provider/resource 连通性测试。
 /// Body: { provider_id?, resource_id, modality? }。返回 { ok, http_status, latency_ms, dimension? }。
 /// 绝不回显 api_key;错误信息不含 Authorization。
-pub(crate) async fn test_model_handler(
-    identity: UserIdentity,
-    Json(req): Json<ModelTestRequest>,
-) -> Response {
+pub(crate) async fn test_model_handler(identity: UserIdentity, request: Request) -> Response {
     if let Err(error) = identity.require_control_plane_da("model operations") {
         return error.into_response();
     }
+    // #312: parse the body only after the gate, so schema errors (422/400/415)
+    // reach authorized callers only.
+    let req: ModelTestRequest = match parse_json_body(request).await {
+        Ok(req) => req,
+        Err(rejection) => return rejection,
+    };
     let m = crate::config::settings::Settings::load_models();
     let resource = m
         .resources
@@ -400,13 +417,16 @@ fn explicit_api_key_required() -> Response {
 
 /// POST /api/v1/providers/models — 拉取 provider 的 /v1/models 型号列表（自动加载）。
 /// 返回 { ok, http_status, models:[{id, owned_by}] }。绝不回显 api_key；错误仅取网络层原因。
-pub(crate) async fn provider_models_handler(
-    identity: UserIdentity,
-    Json(req): Json<ProviderModelsRequest>,
-) -> Response {
+pub(crate) async fn provider_models_handler(identity: UserIdentity, request: Request) -> Response {
     if let Err(error) = identity.require_control_plane_da("model operations") {
         return error.into_response();
     }
+    // #312: parse the body only after the gate, so schema errors (422/400/415)
+    // reach authorized callers only.
+    let req: ProviderModelsRequest = match parse_json_body(request).await {
+        Ok(req) => req,
+        Err(rejection) => return rejection,
+    };
     // 端点/密钥解析：内联优先，缺省按 provider_id 回填持久化值。
     // #299: 已保存的 api_key 只回填给它保存时的同一端点（归一化后精确比较）；
     // 内联 base_url 与已保存端点不同时拒绝（400），绝不把已保存密钥发往调用方指定的地址。
@@ -498,11 +518,17 @@ pub(crate) struct EmbeddingActivateRequest {
 pub(crate) async fn activate_embedding_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Json(req): Json<EmbeddingActivateRequest>,
+    request: Request,
 ) -> Response {
     if let Err(error) = identity.require_platform_admin("model operations") {
         return error.into_response();
     }
+    // #312: parse the body only after the gate, so schema errors (422/400/415)
+    // reach authorized callers only.
+    let req: EmbeddingActivateRequest = match parse_json_body(request).await {
+        Ok(req) => req,
+        Err(rejection) => return rejection,
+    };
     let m = crate::config::settings::Settings::load_models();
     let resource = match m.resources.iter().find(|r| r.id == req.resource_id) {
         Some(r) => r.clone(),
