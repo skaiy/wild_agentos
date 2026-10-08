@@ -29,7 +29,8 @@ services:
     volumes:
       - core-data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      # 运行镜像无 shell/curl：用二进制自带的 healthcheck 子命令(只请求本机 /health)
+      test: ["CMD", "/usr/local/bin/wild-agent-os-core", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

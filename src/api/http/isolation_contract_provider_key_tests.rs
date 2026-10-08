@@ -2,6 +2,10 @@
 //! saved with. Caller-supplied endpoints never receive it, on any route that
 //! can fall back to a saved key.
 
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#![allow(clippy::await_holding_lock)]
+
 use std::{
     path::Path,
     sync::{Arc, Mutex},

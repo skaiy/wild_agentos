@@ -13,6 +13,7 @@ use crate::jsonld::{generate_iri, validate_jsonld_node, JsonLdContext, JsonLdNod
 use crate::memory::l1_session::L1Session;
 use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
+use crate::tools::tool_executor::MicroToolOwner;
 use crate::CoreError;
 
 use super::{
@@ -740,18 +741,22 @@ impl super::AgentRunner {
 
         let restriction_guard = self.begin_tool_restriction_run(&ctx.task_iri);
         let run_id = restriction_guard.run_id().to_string();
+        // #311: generated result readers belong to this run and agent only.
+        let micro_owner = crate::tools::tool_executor::MicroToolOwner::new(
+            ctx.isolation_claims.as_ref(),
+            &run_id,
+            &agent.agent_id,
+        );
         let mut activated_tools = self.tool_executor.read().activated_tools();
         if let Some(allowed) = self.run_tool_restriction(&run_id) {
             activated_tools.restrict_tools(&agent.agent_id, allowed);
         }
-        let tools = self
-            .tool_executor
-            .read()
-            .tool_definitions_for_turn_with_policy(
-                &agent.role.to_string(),
-                &agent.agent_id,
-                &activated_tools,
-            );
+        let tools = self.tool_executor.read().tool_definitions_for_run(
+            &agent.role.to_string(),
+            &agent.agent_id,
+            &activated_tools,
+            Some(&micro_owner),
+        );
 
         info!(
             "AgentRunner streaming started: role={}, model={}, tools={}",
@@ -792,14 +797,12 @@ impl super::AgentRunner {
             if let Some(allowed) = self.run_tool_restriction(&run_id) {
                 activated_tools.restrict_tools(&agent.agent_id, allowed);
             }
-            let current_tools = self
-                .tool_executor
-                .read()
-                .tool_definitions_for_turn_with_policy(
-                    &agent.role.to_string(),
-                    &agent.agent_id,
-                    &activated_tools,
-                );
+            let current_tools = self.tool_executor.read().tool_definitions_for_run(
+                &agent.role.to_string(),
+                &agent.agent_id,
+                &activated_tools,
+                Some(&micro_owner),
+            );
             let advertised_tools: Vec<String> = current_tools
                 .iter()
                 .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
@@ -980,6 +983,7 @@ impl super::AgentRunner {
                                     &advertised_tools,
                                     ctx.isolation_claims.clone(),
                                     activated_tools.policy(),
+                                    Some(&micro_owner),
                                 )
                                 .await
                             {
@@ -1008,8 +1012,15 @@ impl super::AgentRunner {
                                 }
                             }
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
-                            let mut result_str =
-                                self.route_tool_result(&raw_result_str, name, &c.id).await;
+                            let mut result_str = self
+                                .route_tool_result(
+                                    &raw_result_str,
+                                    name,
+                                    &c.id,
+                                    &micro_owner,
+                                    ctx.isolation_claims.as_ref(),
+                                )
+                                .await;
 
                             // SkillAfter hook
                             let guard_aborted = {
@@ -1099,11 +1110,18 @@ impl super::AgentRunner {
                                     compressor.compress_tool_messages(&mut running_messages);
                                 }
                             }
-                            self.compress_tool_results_with_microtools(&mut running_messages);
+                            self.compress_tool_results_with_microtools(
+                                &mut running_messages,
+                                &micro_owner,
+                            );
 
                             // Cross-turn aging: compress old tool results by staleness
                             if let Some(ref aging) = self.tool_result_aging {
-                                aging.age_tool_results(&mut running_messages, &self.tool_executor);
+                                aging.age_tool_results(
+                                    &mut running_messages,
+                                    &self.tool_executor,
+                                    Some(&micro_owner),
+                                );
                             }
 
                             running_messages.push(ChatMessage {
@@ -1315,68 +1333,103 @@ impl super::AgentRunner {
         )
     }
 
-    /// Store micro-tool data to both memory and L0 persistent storage
-    fn store_micro_tool_data_persistent(&self, storage_key: &str, data: serde_json::Value) {
-        self.tool_executor
-            .write()
-            .store_micro_tool_data(storage_key, data.clone());
-        // L0 persistence for cross-session availability
-        if let Ok(data_str) = serde_json::to_string(&data) {
-            let _ = self.l0_store.store(storage_key, &data_str);
+    /// Store a full tool result and register its reader for `owner` only (#311).
+    ///
+    /// Full results stay in the executor's owner-scoped memory store and are
+    /// removed when the run ends (or by TTL/cap). They are not copied to L0:
+    /// L0 has generic by-IRI readers that do not check ownership.
+    fn store_owned_result(
+        &self,
+        owner: &MicroToolOwner,
+        call_id: &str,
+        tool_name: &str,
+        data: serde_json::Value,
+        readers: &[(String, Vec<String>, usize)],
+    ) {
+        use crate::tools::tool_executor::MicroToolContext;
+
+        let storage_key = owner.storage_key(call_id);
+        let exe = self.tool_executor.read();
+        exe.store_micro_tool_data(owner, &storage_key, data);
+        for (reader_name, entity_types, preview_size) in readers {
+            exe.register_micro_tool(
+                reader_name,
+                MicroToolContext {
+                    call_id: call_id.to_string(),
+                    storage_key: storage_key.clone(),
+                    tool_name: tool_name.to_string(),
+                    entity_types: entity_types.clone(),
+                    preview_size: *preview_size,
+                    owner: owner.clone(),
+                },
+            );
         }
     }
 
+    /// Notify workspace_monitor that a file was read via read_full_result.
+    fn mark_routed_file_read(&self, tool_name: &str, result_str: &str) {
+        if tool_name != "file_read" {
+            return;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(result_str) {
+            if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
+                self.tool_executor.write().mark_file_external_read(path);
+            }
+        }
+    }
+
+    /// Route one tool result. `owner` scopes any stored result and generated
+    /// reader to this run, agent and verified tenant/project (#311); `claims`
+    /// are the run's verified claims, required for graphify.
     pub(super) async fn route_tool_result(
         &self,
         result_str: &str,
         tool_name: &str,
         call_id: &str,
+        owner: &MicroToolOwner,
+        claims: Option<&crate::isolation::IsolationClaims>,
     ) -> String {
         use crate::tools::result_router::graphify::GraphifyEngine;
         use crate::tools::result_router::micro_tools::MicroToolGenerator;
         use crate::tools::result_router::router::ResultRouter;
         use crate::tools::result_router::summary;
         use crate::tools::result_router::RouteDecision;
-        use crate::tools::tool_executor::MicroToolContext;
 
         let settings = crate::config::settings::ToolResultRouterSettings::default();
         let router = ResultRouter::new(&settings);
 
-        let decision = router.route(result_str, tool_name, call_id);
+        let mut decision = router.route(result_str, tool_name, call_id);
+        // Model-visible reference; the storage key carries the owner.
         let iri = format!("iri://tool-result/{}", call_id);
+
+        // #311: graphify only into the graph minted from verified claims.
+        // Without claims there is no graphify; fall back to truncation.
+        if matches!(decision, RouteDecision::Graphify { .. }) && claims.is_none() {
+            decision = RouteDecision::Truncate {
+                max_chars: settings.threshold_large,
+            };
+        }
 
         match decision {
             RouteDecision::PassThrough => {
                 // Small result: pass through but attach IRI metadata
                 // Pre-register micro-tool for results exceeding prepare_threshold, in preparation for reference compression
                 if result_str.len() > settings.prepare_threshold {
-                    self.store_micro_tool_data_persistent(
-                        &iri,
+                    self.store_owned_result(
+                        owner,
+                        call_id,
+                        tool_name,
                         serde_json::json!({
                             "content": result_str,
                             "tool_name": tool_name,
                         }),
+                        &[(
+                            format!("read_full_result_{}", call_id),
+                            vec![],
+                            settings.preview_size,
+                        )],
                     );
-                    let read_tool_name = format!("read_full_result_{}", call_id);
-                    let ctx = MicroToolContext {
-                        call_id: call_id.to_string(),
-                        storage_key: iri.clone(),
-                        tool_name: tool_name.to_string(),
-                        entity_types: vec![],
-                        preview_size: settings.preview_size,
-                    };
-                    {
-                        let mut exe = self.tool_executor.write();
-                        exe.register_micro_tool(&read_tool_name, ctx);
-                        // Notify workspace_monitor that the file was read via read_full_result
-                        if tool_name == "file_read" {
-                            if let Ok(val) = serde_json::from_str::<Value>(result_str) {
-                                if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
-                                    exe.mark_file_external_read(path);
-                                }
-                            }
-                        }
-                    }
+                    self.mark_routed_file_read(tool_name, result_str);
                 }
                 format!("{}\nIRI: {}", result_str, iri)
             }
@@ -1387,34 +1440,21 @@ impl super::AgentRunner {
                 } else {
                     summary::smart_truncate(result_str, max_chars)
                 };
-                // Persist full result to memory + L0
-                self.store_micro_tool_data_persistent(
-                    &iri,
+                self.store_owned_result(
+                    owner,
+                    call_id,
+                    tool_name,
                     serde_json::json!({
                         "content": result_str,
                         "tool_name": tool_name,
                     }),
+                    &[(
+                        format!("read_full_result_{}", call_id),
+                        vec![],
+                        settings.preview_size,
+                    )],
                 );
-                let read_tool_name = format!("read_full_result_{}", call_id);
-                let ctx = MicroToolContext {
-                    call_id: call_id.to_string(),
-                    storage_key: iri.clone(),
-                    tool_name: tool_name.to_string(),
-                    entity_types: vec![],
-                    preview_size: settings.preview_size,
-                };
-                {
-                    let mut exe = self.tool_executor.write();
-                    exe.register_micro_tool(&read_tool_name, ctx);
-                    // Notify workspace_monitor that the file was read via read_full_result
-                    if tool_name == "file_read" {
-                        if let Ok(val) = serde_json::from_str::<Value>(result_str) {
-                            if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
-                                exe.mark_file_external_read(path);
-                            }
-                        }
-                    }
-                }
+                self.mark_routed_file_read(tool_name, result_str);
                 summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
             }
 
@@ -1424,9 +1464,8 @@ impl super::AgentRunner {
             } => {
                 let parsed: Option<serde_json::Value> =
                     serde_json::from_str(result_str.trim()).ok();
-                match parsed {
-                    Some(json_val) => {
-                        self.store_micro_tool_data_persistent(&iri, json_val.clone());
+                match (parsed, claims) {
+                    (Some(json_val), Some(claims)) => {
                         let engine_result = match &self.unified_graph_store {
                             Some(store) => GraphifyEngine::with_shared_store(
                                 store.clone(),
@@ -1436,7 +1475,8 @@ impl super::AgentRunner {
                         };
                         match engine_result {
                             Ok(mut engine) => {
-                                let graphify_result = engine.graphify_json(
+                                let graphify_result = engine.graphify_json_for_claims(
+                                    claims,
                                     &json_val,
                                     &g_call_id,
                                     settings.max_graph_entities,
@@ -1457,18 +1497,13 @@ impl super::AgentRunner {
                                     &g_call_id,
                                     settings.max_micro_tools,
                                 );
-                                for mt in &micro_tools {
-                                    let ctx = MicroToolContext {
-                                        call_id: g_call_id.clone(),
-                                        storage_key: iri.clone(),
-                                        tool_name: tool_name.to_string(),
-                                        entity_types: vec![],
-                                        preview_size: settings.preview_size,
-                                    };
-                                    self.tool_executor
-                                        .write()
-                                        .register_micro_tool(&mt.name, ctx);
-                                }
+                                let readers: Vec<(String, Vec<String>, usize)> = micro_tools
+                                    .iter()
+                                    .map(|mt| (mt.name.clone(), vec![], settings.preview_size))
+                                    .collect();
+                                self.store_owned_result(
+                                    owner, &g_call_id, tool_name, json_val, &readers,
+                                );
                                 info!(
                                     "[ResultRouter] Graphified: {} entities, {} relations, {} micro-tools, graph={}",
                                     graphify_result.entity_count, graphify_result.relation_count,
@@ -1494,7 +1529,7 @@ impl super::AgentRunner {
                             }
                         }
                     }
-                    None => {
+                    _ => {
                         let text_summary = summary::generate_text_summary(
                             result_str,
                             tool_name,
@@ -1514,25 +1549,17 @@ impl super::AgentRunner {
                 call_id: s_call_id,
                 preview_size,
             } => {
-                self.store_micro_tool_data_persistent(
-                    &iri,
+                let read_tool_name = format!("read_full_result_{}", s_call_id);
+                self.store_owned_result(
+                    owner,
+                    &s_call_id,
+                    tool_name,
                     serde_json::json!({
                         "content": result_str,
                         "tool_name": tool_name,
                     }),
+                    &[(read_tool_name.clone(), vec![], preview_size)],
                 );
-
-                let read_tool_name = format!("read_full_result_{}", s_call_id);
-                let ctx = MicroToolContext {
-                    call_id: s_call_id.to_string(),
-                    storage_key: iri.clone(),
-                    tool_name: tool_name.to_string(),
-                    entity_types: vec![],
-                    preview_size,
-                };
-                self.tool_executor
-                    .write()
-                    .register_micro_tool(&read_tool_name, ctx);
 
                 let preview = summary::generate_text_summary(result_str, tool_name, preview_size);
                 info!(
@@ -1546,7 +1573,11 @@ impl super::AgentRunner {
 
     /// Reference compression: for tool messages exceeding the threshold, replace with a lightweight reference if a corresponding micro-tool exists.
     /// Call after ToolResultCompressor::compress_tool_messages.
-    pub(super) fn compress_tool_results_with_microtools(&self, messages: &mut [ChatMessage]) {
+    pub(super) fn compress_tool_results_with_microtools(
+        &self,
+        messages: &mut [ChatMessage],
+        owner: &MicroToolOwner,
+    ) {
         let threshold = self
             .tool_result_compressor
             .as_ref()
@@ -1566,11 +1597,11 @@ impl super::AgentRunner {
                 _ => continue,
             };
             let micro_tool_name = format!("read_full_result_{}", call_id);
+            // #311: only this run's own reader counts.
             let has_micro_tool = self
                 .tool_executor
                 .read()
-                .try_get_handler(&micro_tool_name)
-                .is_some();
+                .has_micro_reader(owner, &micro_tool_name);
             if has_micro_tool {
                 let iri = format!("iri://tool-result/{}", call_id);
                 let original_size = msg.content.as_text().len();

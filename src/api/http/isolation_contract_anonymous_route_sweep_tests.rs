@@ -7,6 +7,10 @@
 //! and `INCONCLUSIVE` (extractor rejects before auth) are temporary, disjoint
 //! lists that may only shrink; an entry whose status changes fails the sweep.
 
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#![allow(clippy::await_holding_lock)]
+
 use std::time::Duration;
 
 use axum::{
@@ -237,7 +241,7 @@ fn router_source_violations(source: &str) -> Vec<String> {
     if chain.contains("_service(") {
         violations.push("build_router uses a *_service(...) call".to_string());
     }
-    if after.trim_start().chars().next() != Some('}') {
+    if !after.trim_start().starts_with('}') {
         violations.push(".with_state(state) is not the last call in build_router".to_string());
     }
     violations

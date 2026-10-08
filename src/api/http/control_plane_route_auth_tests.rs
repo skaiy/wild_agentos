@@ -1,5 +1,9 @@
 //! Route-level authorization coverage for the #241 control-plane claim gates.
 
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#![allow(clippy::await_holding_lock)]
+
 use std::{
     ffi::OsString,
     sync::{atomic::AtomicUsize, Arc},

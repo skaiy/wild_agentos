@@ -623,6 +623,9 @@ pub(crate) async fn hot_reload_embedding(
 }
 
 #[cfg(test)]
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
