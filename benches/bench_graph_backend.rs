@@ -34,6 +34,9 @@ fn build_petgraph_backend(node_count: usize) -> PetgraphBackend {
     PetgraphBackend::new(store)
 }
 
+// Fixture setup writes the unscoped bench graph directly: the claims-scoped API would
+// mint a tenant graph name that the backend under test does not query.
+#[allow(deprecated)]
 fn build_sparql_backend(node_count: usize) -> SparqlBackend {
     let kg = KnowledgeGraphStore::new().unwrap();
     let graph = "http://bench/graph";
