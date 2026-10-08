@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod data_paths;
+pub mod healthcheck;
 pub mod jsonld;
 pub mod logging;
 pub mod metrics;
