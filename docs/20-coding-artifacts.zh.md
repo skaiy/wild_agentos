@@ -38,7 +38,8 @@ graph 内的条目；`?kind=<kind>` 只返回该 kind，未知 kind 返回 `400`
 
 `input_snapshot` 是调用方的不可变输入，例如之后某次 invocation 的大输入。内容必须是合法的
 UTF-8 JSON（不带 BOM），嵌套不超过 127 层，以保证之后总能解析成标准 JSON 值；否则上传返回 `400` 且不落盘；大小上限、明文密钥拦截与 claims 作用域
-与其他 kind 相同。
+与其他 kind 相同。任一层对象出现重复键（按解码转义后的键比较）时返回 `400`，固定 code 为
+`input_snapshot_duplicate_key`，不回显该键；原因是不同 JSON 解析器对重复键取哪个值并不一致。
 
 ```json
 {

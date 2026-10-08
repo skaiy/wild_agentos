@@ -134,18 +134,112 @@ fn contains_plaintext_secret(bytes: &[u8]) -> bool {
 /// or a caller.
 pub(crate) const INPUT_SNAPSHOT_MAX_DEPTH: usize = 127;
 
+/// Stable code for an `input_snapshot` that repeats an object key; the key is
+/// never echoed.
+const INPUT_SNAPSHOT_DUPLICATE_KEY_CODE: &str = "input_snapshot_duplicate_key";
+
+/// Why an `input_snapshot` body was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotJsonError {
+    /// Not UTF-8 JSON, or nested deeper than [`INPUT_SNAPSHOT_MAX_DEPTH`].
+    Invalid,
+    /// Some object repeats a key. Parsers disagree on which value wins, so a
+    /// value hidden behind the "losing" duplicate could escape the scan.
+    DuplicateKey,
+}
+
 /// Parses `bytes` as UTF-8 JSON nested at most [`INPUT_SNAPSHOT_MAX_DEPTH`]
-/// levels into a `serde_json::Value`; `None` when it is not. Parsing into
-/// `Value` (not `IgnoredAny`, which skips string contents and is not
-/// depth-limited) validates every string; the explicit depth pre-scan keeps
-/// the limit independent of `serde_json` defaults and rejects deep input
-/// cheaply.
-fn parse_snapshot_json(bytes: &[u8]) -> Option<Value> {
-    let text = std::str::from_utf8(bytes).ok()?;
+/// levels into a `serde_json::Value`, refusing duplicate object keys at any
+/// depth. Parsing into a value (not `IgnoredAny`, which skips string contents
+/// and is not depth-limited) validates every string; the explicit depth
+/// pre-scan keeps the limit independent of `serde_json` defaults and rejects
+/// deep input cheaply.
+fn parse_snapshot_json(bytes: &[u8]) -> Result<Value, SnapshotJsonError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| SnapshotJsonError::Invalid)?;
     if json_nesting_exceeds(text.as_bytes(), INPUT_SNAPSHOT_MAX_DEPTH) {
-        return None;
+        return Err(SnapshotJsonError::Invalid);
     }
-    serde_json::from_str::<Value>(text).ok()
+    serde_json::from_str::<UniqueKeyValue>(text)
+        .map(|UniqueKeyValue(value)| value)
+        .map_err(|error| {
+            // The visitor accepts every JSON type, so its only data error is
+            // the duplicate-key one; syntax/EOF errors mean invalid JSON.
+            if error.is_data() {
+                SnapshotJsonError::DuplicateKey
+            } else {
+                SnapshotJsonError::Invalid
+            }
+        })
+}
+
+/// A `serde_json::Value` whose objects must not repeat a key.
+struct UniqueKeyValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueKeyValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_any(UniqueKeyVisitor)
+            .map(UniqueKeyValue)
+    }
+}
+
+struct UniqueKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeyVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(UniqueKeyValue(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut members = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if members.contains_key(&key) {
+                // Never echo the key: it may itself be sensitive.
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            let UniqueKeyValue(member) = map.next_value()?;
+            members.insert(key, member);
+        }
+        Ok(Value::Object(members))
+    }
 }
 
 /// Secret scan over a parsed JSON snapshot. The raw-byte scan cannot see
@@ -416,12 +510,25 @@ pub(crate) async fn upload_artifact_handler(
             .into_response();
     }
     if request.kind == ArtifactKind::InputSnapshot {
-        let Some(snapshot) = parse_snapshot_json(&bytes) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "input_snapshot content must be valid UTF-8 JSON" })),
-            )
-                .into_response();
+        let snapshot = match parse_snapshot_json(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(SnapshotJsonError::Invalid) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "input_snapshot content must be valid UTF-8 JSON" })),
+                )
+                    .into_response();
+            }
+            Err(SnapshotJsonError::DuplicateKey) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "input_snapshot objects must not repeat a key",
+                        "code": INPUT_SNAPSHOT_DUPLICATE_KEY_CODE,
+                    })),
+                )
+                    .into_response();
+            }
         };
         if snapshot_contains_plaintext_secret(&snapshot) {
             return plaintext_secret_rejection();

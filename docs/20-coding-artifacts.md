@@ -44,6 +44,9 @@ of a later invocation. Its content must be valid UTF-8 JSON (no byte-order
 mark) nested at most 127 levels deep, so that it always parses into a
 standard JSON value later; otherwise upload returns `400` and stores nothing; size limit,
 plaintext-secret guard, and claims scoping are the same as for other kinds.
+An object that repeats a key (at any depth, after decoding escapes) is
+rejected with `400` and the fixed code `input_snapshot_duplicate_key`, because
+JSON parsers disagree on which duplicate wins; the key is not echoed.
 
 ```json
 {
