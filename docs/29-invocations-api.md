@@ -351,14 +351,27 @@ entered the executor path).
 
 - Global max running: default **64**, env
   `AGENTOS_INVOCATION_MAX_RUNNING_GLOBAL` (≥ 1).
+- Per-tenant (tenant_id, summed over all of the tenant's projects) max
+  running: default **16**, env `AGENTOS_INVOCATION_MAX_RUNNING_PER_TENANT`
+  (≥ 1). This stops one tenant from filling the global cap by spreading
+  invocations over many projects.
 - Per-scope (tenant_id + project_id) max running: default **8**, env
-  `AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE` (≥ 1).
-- Over either limit, a newly created invocation stays `queued` and does **not**
-  call `TaskExecutor` until a slot frees.
+  `AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE` (≥ 1). The number that can run at
+  once in one scope is `min(per-scope, per-tenant, global)`.
+- A value that is not a positive integer (`0`, negative, non-numeric) falls
+  back to the default.
+- Over any limit, a newly created invocation stays `queued` and does **not**
+  call `TaskExecutor` until a slot frees. No new error code is returned; the
+  HTTP contract is unchanged.
 - When a running invocation reaches a terminal state (or is cancelled after
   starting), the server starts the oldest still-`queued` invocation in that
   scope by `created_at` (then `id`) — FIFO within the scope. Scopes do not
-  share the per-scope quota; they share only the global cap.
+  share the per-scope quota; scopes of one tenant share the per-tenant cap;
+  all scopes share the global cap. There is no ordering across scopes: when a
+  slot frees, the heads of the waiting scopes compete for it.
+- All of these limits are counted in process memory and apply to one process
+  only. In a multi-instance deployment each instance counts on its own; the
+  limits are not shared across instances.
 - `deadline` on a still-queued invocation: on expiry → `queued → failed` with
   `error.code = "deadline_exceeded"` (the only conditional edge for that
   transition besides the pre-execution system codes in §8). A due deadline
