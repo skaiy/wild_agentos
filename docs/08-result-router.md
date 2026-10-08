@@ -160,6 +160,38 @@ sequenceDiagram
     end
 ```
 
+### Micro-tool scope and lifetime (#311)
+
+The `ToolExecutor` is shared by every run, agent and tenant in the process, so
+generated readers (`read_full_result_{call_id}`, `query_{type}`,
+`get_entity_details`, `expand_relation`) and the full results they serve are
+owned, not global:
+
+- **Owner.** Each stored result and each reader belongs to a
+  `MicroToolOwner { tenant_id, project_id, run_id, agent_id }`. Tenant and
+  project come from the run's verified isolation claims (empty when the run has
+  none); `run_id` comes from the run guard; `agent_id` is the running agent.
+  None of these come from model output.
+- **Storage key.** `iri://tool-result/{tenant}/{project}/{run_id}/{agent_id}/{call_id}`,
+  every segment percent-escaped. The model still sees the short reference
+  `iri://tool-result/{call_id}`; provider-supplied call ids may repeat across
+  runs and tenants without colliding.
+- **Visibility.** Readers are not added to the shared tool table. A run's turn
+  schema lists only its own readers (newest 5), and a reader resolves only
+  inside a guarded call made by the same owner. Any other caller, including the
+  same run with a different agent, gets exactly the response for a tool that
+  never existed.
+- **Graphify.** Only with verified claims, into the graph minted from those
+  claims (`graphify_json_for_claims`). Without claims there is no graphify; the
+  result is truncated and gets a `read_full_result_{call_id}` reader instead.
+- **Lifetime.** Full results are kept in memory only, not copied to L0. When the
+  run ends, its readers and results are removed. A TTL (default 1 hour,
+  `AGENTOS_MICRO_TOOL_TTL_SECS`) and a total cap (1024 readers and 1024 results,
+  oldest evicted first) bound memory regardless of run count.
+- Older builds wrote full results to L0 under `iri://tool-result/{call_id}`.
+  Nothing reads those entries any more; they can be left to age out or removed
+  by operators.
+
 ## UTF-8 Safe Handling
 
 All truncation operations ensure that slices end on a character boundary:
