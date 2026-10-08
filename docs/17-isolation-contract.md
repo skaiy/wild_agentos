@@ -402,6 +402,13 @@ keeps the startup L0 store, which `L0Store::new` opened read-only; writes throug
 that historical shared database fail closed. The historical
 `./data/l0_store/l0.redb` database has not been migrated.
 
+On a fresh install there is no historical `l0.redb` under `memory.l0.path`.
+Startup then uses an empty, in-memory, read-only legacy view and creates no
+file at that path; unclaimed writes still fail closed and tenant writes still
+go through `open_for_claims`. An existing `l0.redb` that cannot be opened
+(zero bytes or corrupt) stops startup with an error that names the file and how
+to recover; the file is never overwritten.
+
 ## Graph interface
 
 Wild AgentOS graph queries remain **SPARQL 1.1** queries against Oxigraph.
