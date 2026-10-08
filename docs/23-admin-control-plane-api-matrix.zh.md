@@ -120,6 +120,15 @@ key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 
 和 `embedding` 段是类型化的，只接受文档列出的小写字段名；其他字段（包括大小写
 不同的写法）返回 `422`，不保存也不生效。
 
+每次加载（启动或热切换）只读取一次 `config_override.json`，密钥检查用的就是这一次
+读取的结果，因此检查的端点就是加载后配置实际使用的端点。在这两段类型化之前写入的
+override 可能仍有其他写法：只要 `gateway` 或 `embedding` 下有任何非小写的键，或者
+同一段出现了两种写法（`embedding` 与 `Embedding`，或 `embedding.oneapi`），这一段
+就一律不使用部署密钥（无论它指向哪个端点），并输出一条告警，只写段名（不含密钥、
+不含路径）。文件不会被自动改写。把这一段改成小写后，部署密钥即恢复。
+`gateway.model_mapping` 下的模型名不受此限制。embedding 热切换逐个串行执行。
+文件采用原子替换：先写一个仅属主可读写（`0600`）的新文件，再重命名覆盖旧文件。
+
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、
 [隔离矩阵](17-isolation-matrix.zh.md)、
 [知识摄取](16-knowledge-ingest-import-graph.zh.md)和

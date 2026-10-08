@@ -151,6 +151,19 @@ are the same field. The `gateway` and `embedding` sections of
 names; any other field, including a differently cased spelling, returns `422`
 and nothing is saved or applied.
 
+Each load (startup or hot reload) reads `config_override.json` once, and the
+key check uses that same read, so the endpoint it checks is the endpoint the
+loaded configuration uses. An override written before these sections were
+typed may still hold other spellings. If any key under `gateway` or `embedding`
+is not lowercase, or the section appears under two spellings (`embedding` and
+`Embedding`, or `embedding.oneapi`), the deployment key for that section is
+always dropped, whatever endpoint the section names, and a warning names the
+section (no key, no path). The file is not rewritten. Rewrite the section in
+lowercase to restore the deployment key. Model names under
+`gateway.model_mapping` are not affected. Embedding hot reloads run one at a
+time. The file is replaced atomically: a new owner-only (`0600`) file is
+written and renamed over the old one.
+
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and
 [Ontology Knowledge Engineering Pipeline](21-ontology-knowledge-engineering-pipeline.md)
