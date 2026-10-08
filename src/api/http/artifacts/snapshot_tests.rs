@@ -347,9 +347,13 @@ fn escaped_secret_probes() -> Vec<(&'static str, String)> {
 async fn snapshot_secret_scan_sees_through_json_escapes_without_persisting() {
     let fx = Fixture::new();
     let tenant = claims("tenant-a");
-    for (name, probe) in escaped_secret_probes() {
+    // Only the probe index is reported on failure, never the probe value.
+    for (index, (_label, probe)) in escaped_secret_probes().into_iter().enumerate() {
         // The raw-byte scan alone misses every probe; only decoding finds it.
-        assert!(!contains_plaintext_secret(probe.as_bytes()));
+        assert!(
+            !contains_plaintext_secret(probe.as_bytes()),
+            "probe #{index}"
+        );
         let (status, body) = upload(
             &fx,
             &tenant,
@@ -358,7 +362,7 @@ async fn snapshot_secret_scan_sees_through_json_escapes_without_persisting() {
             probe.as_bytes(),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "must block probe #{index}");
         assert_eq!(
             body,
             json!({
