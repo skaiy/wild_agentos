@@ -771,6 +771,16 @@ fn cased_embedding_endpoint_patches(base: &str) -> Vec<Value> {
     ]
 }
 
+/// Cased spellings in the other embedding sub-tables (ollama, fallback).
+fn cased_embedding_other_patches(base: &str) -> Vec<Value> {
+    vec![
+        json!({ "embedding": { "Ollama": { "base_url": base } } }),
+        json!({ "embedding": { "ollama": { "Base_Url": base } } }),
+        json!({ "embedding": { "Fallback": { "dimension": 8 } } }),
+        json!({ "embedding": { "fallback": { "DIMENSION": 8 } } }),
+    ]
+}
+
 /// #303 review (BLOCKER on #352): `PUT /api/v1/config` must reject a cased
 /// spelling of the embedding endpoint with 422 before anything is saved or
 /// hot-reloaded, so the deployment embedding key never reaches that endpoint.
@@ -786,7 +796,11 @@ async fn isolation_contract_put_config_rejects_cased_embedding_endpoint_keys() {
     let (attacker, hits) = counting_upstream().await;
     let router = app(test_state(dir.path()));
 
-    for patch in cased_embedding_endpoint_patches(&attacker) {
+    let mut patches = cased_embedding_endpoint_patches(&attacker);
+    patches.extend(cased_embedding_other_patches(&attacker));
+    for patch in patches {
+        let before =
+            std::fs::read_to_string(dir.path().join("config_override.json")).unwrap_or_default();
         let (status, text) = send(
             &router,
             Method::PUT,
@@ -800,6 +814,7 @@ async fn isolation_contract_put_config_rejects_cased_embedding_endpoint_keys() {
         let saved =
             std::fs::read_to_string(dir.path().join("config_override.json")).unwrap_or_default();
         assert!(!saved.contains(&attacker), "{patch} was persisted: {saved}");
+        assert_eq!(saved, before, "{patch} changed the override file");
     }
     // Give any spawned reload/reindex a chance to run before counting.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

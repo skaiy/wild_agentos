@@ -178,7 +178,14 @@ fn gateway_key_would_follow_new_base_url(
 
 /// 将网关配置持久化到运行期覆盖文件，重启后由 Settings::load() 生效。
 /// Gateway API keys are runtime-only and never written to this file.
+///
+/// Read-modify-write is serialized within the process, and the file is
+/// replaced atomically (owner-only temporary file in the same directory, then
+/// rename), so a concurrent `Settings` load never sees a half-written file.
 pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
+    let _serialized = CONFIG_OVERRIDE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = config_override_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -310,7 +317,59 @@ pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
     }
 
     let content = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(&path, content)
+    write_file_atomically(&path, content.as_bytes())
+}
+
+/// Serializes `save_config_override` read-modify-write cycles in this process.
+static CONFIG_OVERRIDE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Write `bytes` to a new owner-only (0600 on Unix) temporary file next to
+/// `path`, flush it, and rename it over `path`. Readers see either the old or
+/// the new file, never a partial one. The result keeps the 0600 mode.
+fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config_override.json".to_string());
+    let temp = dir.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        // Best effort: persist the rename itself.
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = std::fs::File::open(dir) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// 递归深合并 src 到 dst（对象逐键合并，其余类型直接覆盖）。
@@ -679,12 +738,20 @@ pub(crate) fn hot_reload_models(state: &Arc<AppState>) {
     );
 }
 
+/// Serializes [`hot_reload_embedding`].
+static EMBEDDING_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Embedding 配置热切换：按最新持久化配置重建 embedding 服务，原子换入新维度向量库，
 /// 并后台重建所有向量 KB 索引（从原文台账重嵌入）。免进程重启即时生效。
 /// 返回 (old_dim, new_dim, dim_changed, reindex_queued)。
+///
+/// Reloads are serialized (one at a time per process), and each reload reads
+/// the configuration (and `config_override.json`) exactly once: the endpoint
+/// and the key it uses come from that single read (#303 review).
 pub(crate) async fn hot_reload_embedding(
     state: &Arc<AppState>,
 ) -> Result<(usize, usize, bool, usize), String> {
+    let _serialized = EMBEDDING_RELOAD_LOCK.lock().await;
     let settings = crate::config::settings::Settings::load().unwrap_or_default();
     let embedding = settings.embedding.clone();
     let timeout = settings.agents.embedding_timeout_secs;
@@ -746,6 +813,78 @@ mod tests {
             model_mapping: std::collections::HashMap::new(),
         })
         .unwrap()
+    }
+
+    /// #303 re-review nit: the override is replaced atomically by an
+    /// owner-only file, and concurrent saves neither lose updates nor expose
+    /// a half-written file to readers.
+    #[test]
+    fn save_config_override_is_atomic_owner_only_and_serialized() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = super::super::control_plane_route_auth_tests::EnvGuard::set(&[(
+            "AGENTOS_DATA_DIR",
+            dir.path().to_string_lossy().into_owned(),
+        )]);
+        let path = dir.path().join("config_override.json");
+        std::fs::write(&path, r#"{"gateway":{"default_model":"old"}}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let text = std::fs::read_to_string(&path).expect("override always present");
+                    serde_json::from_str::<Value>(&text)
+                        .unwrap_or_else(|e| panic!("partial override read ({e}): {text:?}"));
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    for round in 0..25 {
+                        let patch = json!({ "gateway": { format!("t{i}"): round } });
+                        save_config_override(&patch).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["gateway"]["default_model"], "old");
+        for i in 0..8 {
+            assert_eq!(
+                saved["gateway"][format!("t{i}")],
+                24,
+                "lost update for t{i}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "override mode {mode:o}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config_override.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
     }
 
     #[tokio::test]
