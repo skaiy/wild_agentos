@@ -976,7 +976,7 @@ impl HttpTaskExecutor {
             gateway,
             skills: Arc::new(SkillRegistry::new()),
             blackboard,
-            l0_root: std::path::PathBuf::from(&settings.memory.l0.path),
+            tenant_l0: Arc::new(TenantL0Registry::new(&settings.memory.l0.path)),
             memory_manager,
             templates: Arc::new(
                 TemplateEngine::new(std::path::Path::new("src/templates/templates"))

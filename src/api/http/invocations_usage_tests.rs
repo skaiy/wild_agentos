@@ -271,6 +271,14 @@ fn bob() -> String {
     token("bob", "tenant-b", Some("project-b"), &[])
 }
 
+fn carol() -> String {
+    token("carol", "tenant-a", Some("project-c"), &[])
+}
+
+fn carol_claims() -> IsolationClaims {
+    IsolationClaims::from_verified("tenant-a", "project-c", "carol").unwrap()
+}
+
 fn alice_claims() -> IsolationClaims {
     IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap()
 }
@@ -488,8 +496,9 @@ async fn production_budget_limits_fail_with_actual_usage() {
     }
 }
 
-/// Two runs at the same time (different tenants) each report only their own
-/// calls: together they account for exactly the calls the stub served.
+/// Three runs at the same time (two projects of one tenant, plus another
+/// tenant) each report only their own calls: together they account for
+/// exactly the calls the stub served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_concurrent_runs_do_not_mix_usage() {
     let h = usage_harness(
@@ -504,12 +513,14 @@ async fn production_concurrent_runs_do_not_mix_usage() {
     .await;
     let a = create(&h, &alice(), prompt_body()).await;
     let b = create(&h, &bob(), prompt_body()).await;
-    let (claims_a, claims_b) = (alice_claims(), bob_claims());
-    let (inv_a, inv_b) = tokio::join!(
+    let c = create(&h, &carol(), prompt_body()).await;
+    let (claims_a, claims_b, claims_c) = (alice_claims(), bob_claims(), carol_claims());
+    let (inv_a, inv_b, inv_c) = tokio::join!(
         wait_terminal(&h, &a, &claims_a),
-        wait_terminal(&h, &b, &claims_b)
+        wait_terminal(&h, &b, &claims_b),
+        wait_terminal(&h, &c, &claims_c)
     );
-    for inv in [&inv_a, &inv_b] {
+    for inv in [&inv_a, &inv_b, &inv_c] {
         assert_eq!(
             inv.state,
             InvocationState::Succeeded,
@@ -517,16 +528,16 @@ async fn production_concurrent_runs_do_not_mix_usage() {
             inv.error
         );
     }
-    let (ua, ub) = (usage_of(&inv_a), usage_of(&inv_b));
+    let usages = [usage_of(&inv_a), usage_of(&inv_b), usage_of(&inv_c)];
     let total = h.stats.total();
-    assert!(ua.input_tokens.unwrap() > 0 && ub.input_tokens.unwrap() > 0);
+    assert!(usages.iter().all(|u| u.input_tokens.unwrap() > 0));
     assert_eq!(
-        ua.input_tokens.unwrap() + ub.input_tokens.unwrap(),
+        usages.iter().map(|u| u.input_tokens.unwrap()).sum::<u64>(),
         total * PROMPT_TOKENS,
         "per-run counts must add up to exactly the calls served"
     );
     assert_eq!(
-        ua.cost.unwrap() + ub.cost.unwrap(),
+        usages.iter().map(|u| u.cost.unwrap()).sum::<u64>(),
         total * CALL_COST_MICRO_USD
     );
 }
