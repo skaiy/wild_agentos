@@ -126,7 +126,8 @@ override 可能仍有其他写法：只要 `gateway` 或 `embedding` 下有任�
 同一段出现了两种写法（`embedding` 与 `Embedding`，或 `embedding.oneapi`），这一段
 就一律不使用部署密钥（无论它指向哪个端点），并输出一条告警，只写段名（不含密钥、
 不含路径）。文件不会被自动改写。把这一段改成小写后，部署密钥即恢复。
-`gateway.model_mapping` 下的模型名不受此限制。embedding 热切换逐个串行执行。
+`gateway.model_mapping` 下的模型名不受此限制。embedding 热切换逐个串行执行，
+每次把旧向量库移到各自独立的 `vector_store.bak-<时间戳>-<序号>` 目录。
 文件采用原子替换：先写一个仅属主可读写（`0600`）的新文件，再重命名覆盖旧文件。
 
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、

@@ -161,8 +161,10 @@ always dropped, whatever endpoint the section names, and a warning names the
 section (no key, no path). The file is not rewritten. Rewrite the section in
 lowercase to restore the deployment key. Model names under
 `gateway.model_mapping` are not affected. Embedding hot reloads run one at a
-time. The file is replaced atomically: a new owner-only (`0600`) file is
-written and renamed over the old one.
+time, and each moves the previous vector store to its own
+`vector_store.bak-<timestamp>-<n>` directory. The file is replaced
+atomically: a new owner-only (`0600`) file is written and renamed over the old
+one.
 
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and

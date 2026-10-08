@@ -741,6 +741,42 @@ pub(crate) fn hot_reload_models(state: &Arc<AppState>) {
 /// Serializes [`hot_reload_embedding`].
 static EMBEDDING_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Test probe: the largest number of [`hot_reload_embedding`] bodies seen
+/// running at the same time (must stay 1).
+#[cfg(test)]
+pub(crate) mod embedding_reload_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct Entered;
+
+    pub(crate) fn enter() -> Entered {
+        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+        Entered
+    }
+
+    impl Drop for Entered {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Unique name for the rotated vector store directory. Serialized reloads can
+/// run within the same second, so the timestamp alone is not enough.
+fn vector_store_backup_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "vector_store.bak-{}-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S%9f"),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Embedding 配置热切换：按最新持久化配置重建 embedding 服务，原子换入新维度向量库，
 /// 并后台重建所有向量 KB 索引（从原文台账重嵌入）。免进程重启即时生效。
 /// 返回 (old_dim, new_dim, dim_changed, reindex_queued)。
@@ -752,6 +788,10 @@ pub(crate) async fn hot_reload_embedding(
     state: &Arc<AppState>,
 ) -> Result<(usize, usize, bool, usize), String> {
     let _serialized = EMBEDDING_RELOAD_LOCK.lock().await;
+    #[cfg(test)]
+    let _probe = embedding_reload_probe::enter();
+    #[cfg(test)]
+    tokio::task::yield_now().await;
     let settings = crate::config::settings::Settings::load().unwrap_or_default();
     let embedding = settings.embedding.clone();
     let timeout = settings.agents.embedding_timeout_secs;
@@ -764,10 +804,7 @@ pub(crate) async fn hot_reload_embedding(
     // 任何 embedding 变更都需换库重建（旧向量来自旧模型，语义不可混用；维度变更更是结构不兼容）。
     // 用全新目录打开，旧库整体移为 .bak-<ts> 便于回滚，同时避免与仍被引用的旧句柄争用同一文件。
     if vdir.exists() {
-        let bak = data_dir().join(format!(
-            "vector_store.bak-{}",
-            chrono::Utc::now().format("%Y%m%d%H%M%S")
-        ));
+        let bak = data_dir().join(vector_store_backup_name());
         std::fs::rename(&vdir, &bak).map_err(|e| format!("轮换旧向量目录失败: {e}"))?;
         tracing::info!("embedding 热切换：旧向量库已移至 {}", bak.display());
     }

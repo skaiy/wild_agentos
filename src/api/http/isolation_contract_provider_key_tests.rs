@@ -882,3 +882,58 @@ fn isolation_contract_cased_override_embedding_endpoint_drops_deployment_key() {
         assert_eq!(live.oneapi.api_key, "", "{patch}");
     }
 }
+
+/// #303 re-review: concurrent embedding hot reloads (two PUTs touching
+/// `embedding` at once) are serialized. Each reload reads the configuration
+/// once, rotates the previous vector store to its own backup directory and
+/// swaps in a new one; no two reload bodies ever run at the same time, and
+/// back-to-back reloads within the same second do not collide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn isolation_contract_concurrent_embedding_hot_reloads_are_serialized() {
+    use std::sync::atomic::Ordering;
+
+    use super::config::{embedding_reload_probe, hot_reload_embedding};
+
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    std::fs::write(
+        dir.path().join("config_override.json"),
+        json!({ "embedding": { "enabled": false, "fallback": { "dimension": 8 } } }).to_string(),
+    )
+    .unwrap();
+    let state = test_state(dir.path());
+    embedding_reload_probe::MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+
+    const RELOADS: usize = 8;
+    let tasks: Vec<_> = (0..RELOADS)
+        .map(|_| {
+            let state = state.clone();
+            tokio::spawn(async move { hot_reload_embedding(&state).await })
+        })
+        .collect();
+    for task in tasks {
+        let (_, new_dim, _, _) = task.await.unwrap().expect("hot reload failed");
+        assert_eq!(new_dim, 8);
+    }
+
+    assert_eq!(
+        embedding_reload_probe::MAX_IN_FLIGHT.load(Ordering::SeqCst),
+        1,
+        "embedding hot reloads overlapped"
+    );
+    assert_eq!(state.vector_store.load_full().unwrap().dimension(), 8);
+    let mut stores = 0;
+    let mut backups = 0;
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if name == "vector_store" {
+            stores += 1;
+        } else if name.starts_with("vector_store.bak-") {
+            backups += 1;
+        }
+    }
+    assert_eq!(stores, 1);
+    // The first reload had no previous store to rotate.
+    assert_eq!(backups, RELOADS - 1);
+}
