@@ -58,5 +58,25 @@ UTF-8 JSON（不带 BOM），嵌套不超过 127 层，以保证之后总能解�
 ## 重放与安全
 
 `task_iri` 把 patch、轨迹或脚本与 checkpoint/task 执行关联。复现脚本必须从环境变量
-或 secret manager 获得凭据。上传会拒绝可识别的明文私钥和常见 access-token 形式；
-元数据不会返回 secret。此 API 不读取或迁移历史 blob 对象。
+或 secret manager 获得凭据；元数据不会返回 secret。此 API 不读取或迁移历史 blob 对象。
+
+### 明文密钥拦截
+
+内容中嵌入了凭据**值**时，上传返回 `400`，响应体固定为 `{"error": "plaintext secrets are
+forbidden in coding artifacts", "code": "artifact_plaintext_secret"}`。不回显命中的文本，也不回显
+命中的规则，且不落盘。规则按真实凭据格式匹配，不是裸子串匹配，大小写与真实格式一致。技能流水线的
+文件扫描用的是同一个检测模块（`utils::secret_scan`）：命中私钥则门禁失败，命中其他格式只告警。
+
+| 规则 | 匹配 |
+| --- | --- |
+| `private_key` | `-----BEGIN [A-Z ]*PRIVATE KEY-----` 或 `… PRIVATE KEY BLOCK-----`（证书、公钥不拦） |
+| `aws_access_key_id` | `AKIA` + 16 个 `[0-9A-Z]` |
+| `aws_secret_access_key` | `aws_secret_access_key`（不分大小写），可选引号，`:`/`=`，再跟 40 位 `[A-Za-z0-9/+=]` 值 |
+| `github_classic_pat` | `ghp_` + 36 个 `[A-Za-z0-9]` |
+| `github_fine_grained_pat` | `github_pat_` + 82 个 `[A-Za-z0-9_]` |
+| `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + 至少 10 个 `[A-Za-z0-9-]` |
+| `sk_api_key` | 前面不是 `[A-Za-z0-9_-]` 的 `sk-`，后跟至少 20 个 `[A-Za-z0-9_-]`（覆盖 `sk-proj-…`、`sk-ant-…`、`sk-<slug>-<hex>`） |
+
+`task-`、`risk-`、`disk-`、`ask-`、`Slovakia` 等普通文本不会命中；按名字引用凭据
+（`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`、`TOKEN="$TOKEN_FROM_ENV"`）是允许的。
+

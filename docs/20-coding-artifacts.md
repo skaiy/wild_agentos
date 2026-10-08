@@ -67,6 +67,31 @@ creator, time, and blob key. Client data never selects either storage target.
 
 `task_iri` links the patch, transcript, or script to its checkpoint/task
 execution. Reproduction scripts must obtain credentials from environment
-variables or a secret manager. Upload rejects recognizable plaintext private
-keys and common access-token forms; secrets are never returned in metadata.
+variables or a secret manager; secrets are never returned in metadata.
 Historical blob objects are neither read nor migrated by this API.
+
+### Plaintext-secret guard
+
+Upload rejects content that embeds a credential *value* with `400` and a fixed
+body `{"error": "plaintext secrets are forbidden in coding artifacts", "code":
+"artifact_plaintext_secret"}`; neither the matched text nor the rule is echoed,
+and nothing is stored. Rules match real credential formats, not bare
+substrings, and are case-sensitive like the issued format. The same detector
+(`utils::secret_scan`) drives the skill pipeline's file scan, where private
+keys fail the gate and other formats warn.
+
+| Rule | Matches |
+| --- | --- |
+| `private_key` | `-----BEGIN [A-Z ]*PRIVATE KEY-----` or `… PRIVATE KEY BLOCK-----` (certificates and public keys pass) |
+| `aws_access_key_id` | `AKIA` + 16 `[0-9A-Z]` |
+| `aws_secret_access_key` | `aws_secret_access_key` (any case), optional quote, `:`/`=`, then a 40-character `[A-Za-z0-9/+=]` value |
+| `github_classic_pat` | `ghp_` + 36 `[A-Za-z0-9]` |
+| `github_fine_grained_pat` | `github_pat_` + 82 `[A-Za-z0-9_]` |
+| `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + at least 10 `[A-Za-z0-9-]` |
+| `sk_api_key` | `sk-` not preceded by `[A-Za-z0-9_-]`, + at least 20 `[A-Za-z0-9_-]` (covers `sk-proj-…`, `sk-ant-…`, `sk-<slug>-<hex>`) |
+
+Ordinary words such as `task-`, `risk-`, `disk-`, `ask-` or `Slovakia` never
+match, and referencing a credential by name
+(`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`, `TOKEN="$TOKEN_FROM_ENV"`)
+is allowed.
+

@@ -401,6 +401,8 @@ pub(crate) struct ToolRestrictionRunGuard {
     active_runs: Arc<dashmap::DashMap<String, HashSet<String>>>,
     task_iri: String,
     run_id: String,
+    /// Generated result readers and stored results to drop with the run (#311).
+    micro_tools: crate::tools::tool_executor::MicroToolStoreHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +428,7 @@ impl Drop for ToolRestrictionRunGuard {
             active.remove(&self.run_id);
             active.is_empty()
         });
+        self.micro_tools.remove_run(&self.run_id);
     }
 }
 
@@ -616,6 +619,7 @@ impl AgentRunner {
             active_runs: self.active_tool_runs.clone(),
             task_iri: task_iri.to_string(),
             run_id,
+            micro_tools: self.tool_executor.read().micro_tool_store(),
         }
     }
 
