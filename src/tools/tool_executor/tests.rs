@@ -765,6 +765,7 @@ mod tests {
                     &["bash".to_string()],
                     None,
                     executor.activated_tools().policy(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -823,6 +824,7 @@ mod tests {
                     &["bash".to_string()],
                     None,
                     executor.activated_tools().policy(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -873,6 +875,7 @@ mod tests {
                         advertised,
                         None,
                         executor.activated_tools().policy(),
+                        None,
                     )
                     .await
                     .unwrap();
@@ -973,51 +976,49 @@ mod tests {
     #[test]
     fn old_micro_reader_is_rejected_when_next_turn_does_not_advertise_it() {
         rt().block_on(async {
-            let mut executor = ToolExecutor::new();
+            let executor = ToolExecutor::new();
             let micro_name = "read_full_result_turn_one";
-            executor.store_micro_tool_data(
-                "iri://tool-result/turn-one",
+            let owner = test_owner("tenant-a", "run-1", "agent:test");
+            register_reader(
+                &executor,
+                &owner,
+                micro_name,
+                "turn-one",
                 json!({"content": "turn one data"}),
             );
-            executor.register_micro_tool(
-                micro_name,
-                MicroToolContext {
-                    call_id: "turn-one".to_string(),
-                    storage_key: "iri://tool-result/turn-one".to_string(),
-                    tool_name: "file_read".to_string(),
-                    entity_types: vec![],
-                    preview_size: 100,
-                },
-            );
 
-            let first_turn = vec![micro_name.to_string()];
-            let first_result = executor
-                .execute_with_security_context(
-                    micro_name,
-                    json!({}),
-                    security_context(),
-                    &first_turn,
-                    executor.activated_tools().policy(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(first_result["content"], "turn one data");
+            TOOL_MICRO_OWNER
+                .scope(Some(owner), async {
+                    let first_turn = vec![micro_name.to_string()];
+                    let first_result = executor
+                        .execute_with_security_context(
+                            micro_name,
+                            json!({}),
+                            security_context(),
+                            &first_turn,
+                            executor.activated_tools().policy(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(first_result["content"], "turn one data");
 
-            let next_turn = vec!["file_read".to_string()];
-            let rejected = executor
-                .execute_with_security_context(
-                    micro_name,
-                    json!({}),
-                    security_context(),
-                    &next_turn,
-                    executor.activated_tools().policy(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                rejected["error"],
-                format!("Tool not advertised for this turn: {}", micro_name)
-            );
+                    let next_turn = vec!["file_read".to_string()];
+                    let rejected = executor
+                        .execute_with_security_context(
+                            micro_name,
+                            json!({}),
+                            security_context(),
+                            &next_turn,
+                            executor.activated_tools().policy(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        rejected["error"],
+                        format!("Tool not advertised for this turn: {}", micro_name)
+                    );
+                })
+                .await;
         });
     }
 
@@ -1413,6 +1414,38 @@ mod tests {
         assert!(out.contains("[output truncated"));
     }
 
+    fn test_owner(tenant: &str, run: &str, agent: &str) -> MicroToolOwner {
+        MicroToolOwner {
+            tenant_id: tenant.to_string(),
+            project_id: "project".to_string(),
+            run_id: run.to_string(),
+            agent_id: agent.to_string(),
+        }
+    }
+
+    /// Store `data` and register `reader` for `owner`, as the router does.
+    fn register_reader(
+        executor: &ToolExecutor,
+        owner: &MicroToolOwner,
+        reader: &str,
+        call_id: &str,
+        data: Value,
+    ) {
+        let storage_key = owner.storage_key(call_id);
+        executor.store_micro_tool_data(owner, &storage_key, data);
+        executor.register_micro_tool(
+            reader,
+            MicroToolContext {
+                call_id: call_id.to_string(),
+                storage_key,
+                tool_name: "file_read".to_string(),
+                entity_types: vec![],
+                preview_size: 100,
+                owner: owner.clone(),
+            },
+        );
+    }
+
     fn check_context() -> SecurityContext {
         SecurityContext::new("agent:check", "CA").with_task("iri://tasks/security-test")
     }
@@ -1425,16 +1458,6 @@ mod tests {
                 Ok(json!({"written": true}))
             })
         })
-    }
-
-    fn micro_context(call_id: &str) -> MicroToolContext {
-        MicroToolContext {
-            call_id: call_id.to_string(),
-            storage_key: format!("iri://tool-result/{call_id}"),
-            tool_name: "file_read".to_string(),
-            entity_types: vec![],
-            preview_size: 100,
-        }
     }
 
     /// #270-2: an external tool whose name merely starts with `query_` is not
@@ -1452,12 +1475,18 @@ mod tests {
                 marker_tool(hit.clone()),
                 &[],
             );
-            executor.store_micro_tool_data("iri://tool-result/c1", json!({"content": "row"}));
-            executor.register_micro_tool("read_full_result_c1", micro_context("c1"));
+            let owner = test_owner("tenant-a", "run-1", "agent:check");
+            register_reader(
+                &executor,
+                &owner,
+                "read_full_result_c1",
+                "c1",
+                json!({"content": "row"}),
+            );
 
             let activated = executor.activated_tools();
             let names: Vec<String> = executor
-                .tool_definitions_for_turn("Check", &activated)
+                .tool_definitions_for_run("Check", "", &activated, Some(&owner))
                 .iter()
                 .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
                 .collect();
@@ -1482,15 +1511,18 @@ mod tests {
             assert_eq!(hit.load(std::sync::atomic::Ordering::SeqCst), 0);
 
             let allowed = executor
-                .execute_with_security_context(
+                .execute_guarded(
                     "read_full_result_c1",
                     json!({}),
                     check_context(),
                     &advertised,
+                    None,
                     activated.policy(),
+                    Some(&owner),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .value;
             assert_eq!(allowed["content"], "row");
         });
     }
@@ -1502,8 +1534,14 @@ mod tests {
         rt().block_on(async {
             let mut executor = ToolExecutor::new();
             executor.set_tool_group_manager(ToolGroupManager::new(None));
-            executor.store_micro_tool_data("iri://tool-result/c2", json!({"content": "row"}));
-            executor.register_micro_tool("query_person", micro_context("c2"));
+            let owner = test_owner("tenant-a", "run-1", "agent:check");
+            register_reader(
+                &executor,
+                &owner,
+                "query_person",
+                "c2",
+                json!({"content": "row"}),
+            );
             let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             executor.register(
                 "query_person",
@@ -1585,5 +1623,317 @@ mod tests {
             assert_eq!(denied["error"], "Tool not allowed for role");
             assert_eq!(hit.load(std::sync::atomic::Ordering::SeqCst), 1);
         });
+    }
+
+    // ── #311: generated result readers are owned by run/agent/tenant ──
+
+    /// Calls `name` the way the runner does, as `owner`, and returns the
+    /// serialized outcome so responses can be compared byte for byte.
+    async fn call_reader_as(
+        executor: &ToolExecutor,
+        owner: &MicroToolOwner,
+        name: &str,
+        input: Value,
+    ) -> String {
+        let advertised = vec![name.to_string()];
+        let outcome = executor
+            .execute_guarded(
+                name,
+                input,
+                security_context(),
+                &advertised,
+                None,
+                executor.activated_tools().policy(),
+                Some(owner),
+            )
+            .await
+            .map(|outcome| outcome.value)
+            .map_err(|error| error.to_string());
+        serde_json::to_string(&outcome.map_err(Value::String)).unwrap()
+    }
+
+    /// What any caller gets for `name` when no reader was ever registered.
+    async fn never_registered_response(owner: &MicroToolOwner, name: &str) -> String {
+        call_reader_as(&ToolExecutor::new(), owner, name, json!({})).await
+    }
+
+    fn canary(label: &str) -> Value {
+        json!({"content": format!("CANARY-{label}-line-1\nCANARY-{label}-line-2")})
+    }
+
+    #[test]
+    fn isolation_contract_micro_reader_is_absent_for_another_run() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let run_a = test_owner("tenant-a", "run-a", "agent:test");
+            let run_b = test_owner("tenant-a", "run-b", "agent:test");
+            register_reader(&executor, &run_a, "read_full_result_c1", "c1", canary("A"));
+
+            let own = call_reader_as(&executor, &run_a, "read_full_result_c1", json!({})).await;
+            assert!(own.contains("CANARY-A"), "{own}");
+
+            let other = call_reader_as(&executor, &run_b, "read_full_result_c1", json!({})).await;
+            assert!(!other.contains("CANARY-A"), "{other}");
+            assert_eq!(
+                other,
+                never_registered_response(&run_b, "read_full_result_c1").await
+            );
+            // Outside any runtime owner scope the reader does not exist either.
+            assert!(executor.try_get_handler("read_full_result_c1").is_none());
+        });
+    }
+
+    #[test]
+    fn isolation_contract_micro_reader_is_absent_for_another_agent_in_same_run() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let agent_a = test_owner("tenant-a", "run-1", "agent:a");
+            let agent_b = test_owner("tenant-a", "run-1", "agent:b");
+            register_reader(
+                &executor,
+                &agent_a,
+                "read_full_result_c1",
+                "c1",
+                canary("A"),
+            );
+
+            let other = call_reader_as(&executor, &agent_b, "read_full_result_c1", json!({})).await;
+            assert!(!other.contains("CANARY-A"), "{other}");
+            assert_eq!(
+                other,
+                never_registered_response(&agent_b, "read_full_result_c1").await
+            );
+        });
+    }
+
+    #[test]
+    fn isolation_contract_micro_reader_same_call_id_across_tenants_stays_separate() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            // Provider-supplied call ids are not secret and can repeat.
+            let tenant_a = test_owner("tenant-a", "run-1", "agent:test");
+            let tenant_b = test_owner("tenant-b", "run-1", "agent:test");
+            assert_ne!(
+                tenant_a.storage_key("call_1"),
+                tenant_b.storage_key("call_1")
+            );
+            register_reader(
+                &executor,
+                &tenant_a,
+                "read_full_result_call_1",
+                "call_1",
+                canary("A"),
+            );
+
+            let probe =
+                call_reader_as(&executor, &tenant_b, "read_full_result_call_1", json!({})).await;
+            assert!(!probe.contains("CANARY-A"), "{probe}");
+            assert_eq!(
+                probe,
+                never_registered_response(&tenant_b, "read_full_result_call_1").await
+            );
+
+            register_reader(
+                &executor,
+                &tenant_b,
+                "read_full_result_call_1",
+                "call_1",
+                canary("B"),
+            );
+            let a =
+                call_reader_as(&executor, &tenant_a, "read_full_result_call_1", json!({})).await;
+            let b =
+                call_reader_as(&executor, &tenant_b, "read_full_result_call_1", json!({})).await;
+            assert!(a.contains("CANARY-A") && !a.contains("CANARY-B"), "{a}");
+            assert!(b.contains("CANARY-B") && !b.contains("CANARY-A"), "{b}");
+        });
+    }
+
+    #[test]
+    fn isolation_contract_graphify_reader_names_do_not_cross_runs() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let run_a = test_owner("tenant-a", "run-a", "agent:test");
+            let run_b = test_owner("tenant-a", "run-b", "agent:test");
+            // Graphify readers carry no call id: both runs get `query_person`.
+            let rows = |label: &str| {
+                json!({"content": json!([{"id": format!("{label}-1"), "type": "person", "name": format!("CANARY-{label}")}]).to_string()})
+            };
+            // Same provider call id on both sides, too.
+            register_reader(&executor, &run_a, "query_person", "g1", rows("A"));
+            register_reader(&executor, &run_b, "query_person", "g1", rows("B"));
+
+            let a = call_reader_as(&executor, &run_a, "query_person", json!({})).await;
+            let b = call_reader_as(&executor, &run_b, "query_person", json!({})).await;
+            assert!(a.contains("CANARY-A") && !a.contains("CANARY-B"), "{a}");
+            assert!(b.contains("CANARY-B") && !b.contains("CANARY-A"), "{b}");
+        });
+    }
+
+    #[test]
+    fn isolation_contract_later_registration_with_same_call_id_does_not_overwrite() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let run_a = test_owner("tenant-a", "run-a", "agent:test");
+            let run_b = test_owner("tenant-a", "run-b", "agent:test");
+            register_reader(
+                &executor,
+                &run_a,
+                "read_full_result_dup",
+                "dup",
+                canary("A"),
+            );
+            register_reader(
+                &executor,
+                &run_b,
+                "read_full_result_dup",
+                "dup",
+                canary("B"),
+            );
+
+            let a = call_reader_as(&executor, &run_a, "read_full_result_dup", json!({})).await;
+            assert!(a.contains("CANARY-A") && !a.contains("CANARY-B"), "{a}");
+        });
+    }
+
+    #[test]
+    fn isolation_contract_turn_schema_lists_only_own_readers() {
+        let executor = ToolExecutor::new();
+        let run_a = test_owner("tenant-a", "run-a", "agent:test");
+        let run_b = test_owner("tenant-a", "run-b", "agent:test");
+        register_reader(&executor, &run_a, "read_full_result_a1", "a1", canary("A"));
+        let names = |owner: Option<&MicroToolOwner>| -> Vec<String> {
+            executor
+                .tool_definitions_for_run("DA", "agent:test", &executor.activated_tools(), owner)
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        assert!(names(Some(&run_a)).contains(&"read_full_result_a1".to_string()));
+        assert!(!names(Some(&run_b)).contains(&"read_full_result_a1".to_string()));
+        assert!(!names(None).contains(&"read_full_result_a1".to_string()));
+        assert!(!executor
+            .registered_tool_names()
+            .contains(&"read_full_result_a1".to_string()));
+    }
+
+    #[test]
+    fn micro_reader_owner_reads_full_result_with_paging() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let owner = test_owner("tenant-a", "run-1", "agent:test");
+            let content: Vec<String> = (0..10).map(|i| format!("line-{i}")).collect();
+            register_reader(
+                &executor,
+                &owner,
+                "read_full_result_page",
+                "page",
+                json!({"content": content.join("\n")}),
+            );
+            let out = call_reader_as(
+                &executor,
+                &owner,
+                "read_full_result_page",
+                json!({"offset": 2, "limit": 3}),
+            )
+            .await;
+            let out: Value = serde_json::from_str(&out).unwrap();
+            let ok = &out["Ok"];
+            assert_eq!(ok["content"], "line-2\nline-3\nline-4");
+            assert_eq!(ok["total_lines"], 10);
+            assert_eq!(ok["offset"], 2);
+            assert_eq!(ok["returned"], 3);
+            assert_eq!(ok["call_id"], "page");
+        });
+    }
+
+    #[test]
+    fn isolation_contract_run_end_removes_readers_and_results() {
+        let executor = ToolExecutor::new();
+        let run_a = test_owner("tenant-a", "run-a", "agent:test");
+        let run_b = test_owner("tenant-a", "run-b", "agent:test");
+        register_reader(&executor, &run_a, "read_full_result_a1", "a1", canary("A"));
+        register_reader(&executor, &run_a, "query_person", "a1", canary("A"));
+        register_reader(&executor, &run_b, "read_full_result_b1", "b1", canary("B"));
+        let store = executor.micro_tool_store();
+        assert_eq!(store.counts(), (3, 2));
+
+        store.remove_run("run-a");
+        assert_eq!(store.counts(), (1, 1));
+        assert!(!executor.has_micro_reader(&run_a, "read_full_result_a1"));
+        assert!(executor.has_micro_reader(&run_b, "read_full_result_b1"));
+        store.remove_run("run-b");
+        assert_eq!(store.counts(), (0, 0));
+    }
+
+    #[test]
+    fn isolation_contract_expired_readers_are_gone_and_pruned() {
+        let executor = ToolExecutor::new();
+        let owner = test_owner("tenant-a", "run-a", "agent:test");
+        register_reader(
+            &executor,
+            &owner,
+            "read_full_result_old",
+            "old",
+            canary("A"),
+        );
+        executor
+            .micro_tools
+            .0
+            .write()
+            .advance_clock_for_test(micro_store::DEFAULT_MICRO_TOOL_TTL * 2);
+        assert!(!executor.has_micro_reader(&owner, "read_full_result_old"));
+
+        // The next write prunes expired entries.
+        register_reader(
+            &executor,
+            &owner,
+            "read_full_result_new",
+            "new",
+            canary("B"),
+        );
+        assert_eq!(executor.micro_tool_store().counts(), (1, 1));
+        assert!(executor.has_micro_reader(&owner, "read_full_result_new"));
+    }
+
+    #[test]
+    fn isolation_contract_micro_store_is_bounded_across_runs() {
+        let executor = ToolExecutor::new();
+        for run in 0..(micro_store::MAX_MICRO_TOOL_ENTRIES + 500) {
+            let owner = test_owner("tenant-a", &format!("run-{run}"), "agent:test");
+            register_reader(&executor, &owner, "read_full_result_c1", "c1", canary("X"));
+            register_reader(&executor, &owner, "query_person", "c1", canary("X"));
+        }
+        let (readers, data) = executor.micro_tool_store().counts();
+        assert!(readers <= micro_store::MAX_MICRO_TOOL_ENTRIES, "{readers}");
+        assert!(data <= micro_store::MAX_MICRO_TOOL_ENTRIES, "{data}");
+        // Newest entries survive eviction.
+        let newest = test_owner(
+            "tenant-a",
+            &format!("run-{}", micro_store::MAX_MICRO_TOOL_ENTRIES + 499),
+            "agent:test",
+        );
+        assert!(executor.has_micro_reader(&newest, "query_person"));
+    }
+
+    #[test]
+    fn isolation_contract_storage_key_segments_cannot_collide() {
+        let a = MicroToolOwner {
+            tenant_id: "t/a".to_string(),
+            project_id: "p".to_string(),
+            run_id: "r".to_string(),
+            agent_id: "g".to_string(),
+        };
+        let b = MicroToolOwner {
+            tenant_id: "t".to_string(),
+            project_id: "a/p".to_string(),
+            run_id: "r".to_string(),
+            agent_id: "g".to_string(),
+        };
+        assert_ne!(a.storage_key("c"), b.storage_key("c"));
+        assert_eq!(
+            a.storage_key("c"),
+            "iri://tool-result/t%2Fa/p/r/g/c".to_string()
+        );
     }
 }
