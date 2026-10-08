@@ -221,29 +221,46 @@ pub(crate) fn claims_from_invocation(invocation: &Invocation) -> Result<Isolatio
 
 /// Prompt text used for `init_task_with_claims` / `TaskExecSpec`.
 ///
-/// Resolved `input_ref` content stands in for inline `input` (the two are
-/// mutually exclusive): a non-empty `prompt` wins, otherwise the content,
-/// decoded as UTF-8 (invalid sequences replaced), is the prompt.
+/// Resolved `input_ref` text (UTF-8, digest-checked by the kernel) is never
+/// dropped: it follows a non-empty `prompt` as an `<input_ref …>` block, or
+/// is the whole prompt (still wrapped) when there is no prompt. Without
+/// `input_ref`, a non-empty `prompt` wins, then inline `input`.
 pub(crate) fn prompt_from_invocation(
     invocation: &Invocation,
-    input_ref_bytes: Option<&[u8]>,
+    input_ref_text: Option<&str>,
 ) -> String {
-    if let Some(prompt) = invocation
+    let prompt = invocation
         .request
         .prompt
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+        .filter(|s| !s.is_empty());
+    // Resolved input_ref content always reaches the task: appended after the
+    // prompt as a delimited block, or alone when there is no prompt.
+    if let (Some(text), Some(input_ref)) = (input_ref_text, invocation.request.input_ref.as_ref()) {
+        let block = input_ref_block(&input_ref.uri, &input_ref.sha256, text);
+        return match prompt {
+            Some(prompt) => format!("{prompt}\n\n{block}"),
+            None => block,
+        };
+    }
+    if let Some(prompt) = prompt {
         return prompt.to_string();
     }
     if let Some(input) = invocation.request.input.as_ref() {
         return input.to_string();
     }
-    if let Some(bytes) = input_ref_bytes {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
     String::new()
+}
+
+/// `<input_ref uri="…" sha256="…">\n{text}\n</input_ref>`; `"`, `<`, `>` in
+/// the uri are percent-encoded so the attribute stays well-formed.
+pub(crate) fn input_ref_block(uri: &str, sha256: &str, text: &str) -> String {
+    let uri = uri
+        .replace('"', "%22")
+        .replace('<', "%3C")
+        .replace('>', "%3E");
+    format!("<input_ref uri=\"{uri}\" sha256=\"{sha256}\">\n{text}\n</input_ref>")
 }
 
 /// Parses usage (+ summary) out of a TASK_* event payload.
@@ -592,14 +609,31 @@ async fn run_invocation(
         }
     };
 
-    // Resolve input_ref with the caller's claims before task init (any
-    // failure / digest mismatch → queued→failed with a fixed message).
-    let mut input_ref_bytes = None;
+    // Resolve input_ref with the caller's claims before task init, under the
+    // kernel timeout capped by the invocation deadline (any failure / digest
+    // mismatch / non-UTF-8 → queued→failed with a fixed message). Cancel or
+    // the deadline watcher abandons the fetch; they write the state.
+    let mut input_ref_text = None;
     if let Some(input_ref) = invocation.request.input_ref.as_ref() {
-        match fetch_and_verify_input_ref(&input_refs, &claims, &input_ref.uri, &input_ref.sha256)
-            .await
-        {
-            Ok(bytes) => input_ref_bytes = Some(bytes),
+        let invocation_deadline = invocation
+            .request
+            .deadline
+            .as_deref()
+            .and_then(duration_until_deadline)
+            .map(|left| std::time::Instant::now() + left);
+        let fetched = tokio::select! {
+            fetched = fetch_and_verify_input_ref(
+                &input_refs,
+                &claims,
+                &invocation.id,
+                &input_ref.uri,
+                &input_ref.sha256,
+                invocation_deadline,
+            ) => fetched,
+            _ = cancellation.cancelled() => return,
+        };
+        match fetched {
+            Ok(text) => input_ref_text = Some(text),
             Err((code, message)) => {
                 let _ = fail_pre_execution(&store, &invocation, code, message).await;
                 return;
@@ -607,7 +641,7 @@ async fn run_invocation(
         }
     }
 
-    let prompt = prompt_from_invocation(&invocation, input_ref_bytes.as_deref());
+    let prompt = prompt_from_invocation(&invocation, input_ref_text.as_deref());
     let task_iri = match core
         .init_task_with_claims(&prompt, None, None, None, None, &claims)
         .await

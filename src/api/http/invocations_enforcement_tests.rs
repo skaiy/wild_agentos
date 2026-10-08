@@ -35,11 +35,14 @@ struct HoldExecutor {
     release: Arc<tokio::sync::Notify>,
     events: Arc<crate::core::event_bus::EventBus>,
     over_budget: bool,
+    /// Prompt of every execution, in order.
+    prompts: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait]
 impl TaskExecutor for HoldExecutor {
     async fn execute(&self, spec: TaskExecSpec) {
+        self.prompts.lock().unwrap().push(spec.prompt.clone());
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.release.notified().await;
         let usage = if self.over_budget {
@@ -72,6 +75,8 @@ struct MemResolver {
     body: Vec<u8>,
     /// `(tenant, project, actor)` of every call.
     seen: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// Invocation id of every call.
+    ids: std::sync::Mutex<Vec<String>>,
 }
 
 impl MemResolver {
@@ -79,6 +84,7 @@ impl MemResolver {
         Arc::new(Self {
             body: body.to_vec(),
             seen: std::sync::Mutex::new(Vec::new()),
+            ids: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
@@ -91,7 +97,25 @@ impl InputRefResolver for MemResolver {
             request.claims.project_id().to_string(),
             request.claims.actor_id().to_string(),
         ));
+        self.ids
+            .lock()
+            .unwrap()
+            .push(request.invocation_id.to_string());
         Ok(self.body.clone())
+    }
+}
+
+/// Accepts only `bound://<caller project>/…` at create.
+struct ProjectBoundResolver;
+
+#[async_trait]
+impl InputRefResolver for ProjectBoundResolver {
+    fn validate(&self, uri: &str, claims: &IsolationClaims) -> Result<(), InputRefError> {
+        crate::api::http::invocations_input_ref::check_project_segment(uri, claims)
+    }
+
+    async fn resolve(&self, _request: InputRefRequest<'_>) -> Result<Vec<u8>, InputRefError> {
+        Ok(b"bound".to_vec())
     }
 }
 
@@ -123,6 +147,7 @@ struct EnforcementHarness {
     calls: Arc<AtomicUsize>,
     release: Arc<tokio::sync::Notify>,
     scheduler: Arc<FifoScheduler>,
+    prompts: Arc<std::sync::Mutex<Vec<String>>>,
     _dir: tempfile::TempDir,
     _env: EnvGuard,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -145,6 +170,7 @@ fn make_harness(
     let calls = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(tokio::sync::Notify::new());
     let scheduler = Arc::new(FifoScheduler::new(limits));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let bootstrap = test_state_with_invocations(
         dir.path(),
@@ -161,6 +187,7 @@ fn make_harness(
             release: release.clone(),
             events: bootstrap.core.events.clone(),
             over_budget,
+            prompts: prompts.clone(),
         }),
         bootstrap.shutdown.clone(),
         Arc::new(AlwaysOkGate),
@@ -200,6 +227,7 @@ fn make_harness(
         calls,
         release,
         scheduler,
+        prompts,
         _dir: dir,
         _env: env_guard,
         _lock: lock,
@@ -525,6 +553,7 @@ async fn input_ref_valid_shape_without_resolver_is_422_not_400() {
         Arc::new(oxigraph::store::Store::new().unwrap()),
         None,
         false,
+        &InputRefRegistry::new(),
     );
     let other_scheme = InputRefRegistry::new();
     other_scheme
@@ -603,6 +632,20 @@ async fn input_ref_matching_digest_runs() {
     wait_calls(&h.calls, 1).await;
     h.release.notify_one();
     wait_state(&h.store, &alice_claims(), &id, InvocationState::Succeeded).await;
+    // The fetched content reached the executor next to the prompt.
+    let prompts = h.prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].starts_with("go\n\n<input_ref "),
+        "{}",
+        prompts[0]
+    );
+    assert!(
+        prompts[0].contains("\nok-bytes\n</input_ref>"),
+        "{}",
+        prompts[0]
+    );
+    assert_eq!(resolver.ids.lock().unwrap().as_slice(), &[id.clone()]);
     // The resolver was called with the creator's verified claims.
     assert_eq!(
         resolver.seen.lock().unwrap().as_slice(),
@@ -612,6 +655,81 @@ async fn input_ref_matching_digest_runs() {
             "alice".to_string()
         )]
     );
+}
+
+/// Only `input_ref`, no prompt: the content alone becomes the prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_ref_without_prompt_feeds_the_content() {
+    let payload = "the whole document";
+    let registry = InputRefRegistry::new();
+    registry
+        .register_scheme("mem", MemResolver::new(payload.as_bytes()))
+        .unwrap();
+    let h = make_harness(InvocationRunningLimits::default(), registry, false);
+    let (status, resp) = create_prompt(
+        &h,
+        &alice(),
+        json!({"input_ref": {"uri": "mem://doc", "sha256": sha256_hex(payload.as_bytes())}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    let id = resp["id"].as_str().unwrap().to_string();
+    wait_calls(&h.calls, 1).await;
+    h.release.notify_one();
+    wait_state(&h.store, &alice_claims(), &id, InvocationState::Succeeded).await;
+    let prompts = h.prompts.lock().unwrap().clone();
+    assert!(
+        prompts[0].starts_with("<input_ref uri=\"mem://doc\""),
+        "{}",
+        prompts[0]
+    );
+    assert!(prompts[0].contains(payload));
+}
+
+/// A resolver's `validate` binds the URI's project segment at create:
+/// another project → `422 input_ref_scope_mismatch`, nothing persisted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_ref_scope_mismatch_is_rejected_at_create() {
+    let registry = InputRefRegistry::new();
+    registry
+        .register_scheme("bound", Arc::new(ProjectBoundResolver))
+        .unwrap();
+    let h = make_harness(InvocationRunningLimits::default(), registry, false);
+    let sha = sha256_hex(b"bound");
+    let (status, body) = create_prompt(
+        &h,
+        &alice(),
+        json!({"input_ref": {"uri": "bound://project-b/doc@r1", "sha256": sha}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "input_ref_scope_mismatch");
+    assert!(!body.to_string().contains("project-b"), "{body}");
+    let (status, body) = create_prompt(
+        &h,
+        &alice(),
+        json!({"input_ref": {"uri": "bound:///doc@r1", "sha256": sha}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "input_ref_unresolvable");
+    assert!(h
+        .store
+        .list_for_claims(&alice_claims(), None)
+        .await
+        .is_empty());
+
+    let (status, resp) = create_prompt(
+        &h,
+        &alice(),
+        json!({"input_ref": {"uri": "bound://project-a/doc@r1", "sha256": sha}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    let id = resp["id"].as_str().unwrap().to_string();
+    wait_calls(&h.calls, 1).await;
+    h.release.notify_one();
+    wait_state(&h.store, &alice_claims(), &id, InvocationState::Succeeded).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -297,13 +297,19 @@ pub fn build_router(
 
     let blob_store = crate::blob::open_blob_store();
     let invocations_runtime = {
+        // Compiled-in resolvers only: config switches the built-in on,
+        // embedders register in code beforehand; both tables freeze here.
+        let env = |key: &str| std::env::var(key).ok();
+        let embedders = invocations_input_ref::deployment_input_ref_registry();
         let input_refs = invocations_input_ref::startup_input_ref_registry(
             kg_store.clone(),
             blob_store.clone(),
-            invocations_input_ref::artifact_resolver_enabled_from_vars(|key| {
-                std::env::var(key).ok()
-            }),
-        );
+            invocations_input_ref::artifact_resolver_enabled_from_vars(env),
+            embedders,
+        )
+        .with_timeout(invocations_input_ref::input_ref_timeout_from_vars(env));
+        input_refs.freeze();
+        embedders.freeze();
         let runtime = invocations::InvocationsRuntime::open_default().with_input_refs(input_refs);
         match (runtime.store(), task_executor.as_ref()) {
             (Some(store), Some(executor)) => {

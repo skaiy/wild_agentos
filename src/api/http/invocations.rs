@@ -56,6 +56,9 @@ use sha2::{Digest, Sha256};
 use super::iam::UserIdentity;
 use super::invocations_enforcement::InputRefRegistry;
 use super::invocations_execution::InvocationCancellationRegistry;
+use super::invocations_input_ref::{
+    InputRefError, INPUT_REF_SCOPE_MISMATCH_ERROR_CODE, INPUT_REF_UNRESOLVABLE_ERROR_CODE,
+};
 use super::invocations_store::{
     invocation_not_found_response, parse_if_match, CreateOutcome, IdempotencyLookup,
     IdempotencyRegistration, Invocation, InvocationBudget, InvocationConfigError,
@@ -458,6 +461,27 @@ fn parse_deadline(value: &Value) -> Result<String, ApiError> {
     Ok(text.to_string())
 }
 
+/// Create-time `input_ref` rejection (fixed messages, nothing echoed).
+fn input_ref_create_error(error: InputRefError) -> ApiError {
+    match error {
+        InputRefError::NoResolver => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INPUT_REF_UNRESOLVABLE_ERROR_CODE,
+            "no resolver is registered for the input_ref uri",
+        ),
+        InputRefError::ScopeMismatch => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INPUT_REF_SCOPE_MISMATCH_ERROR_CODE,
+            "input_ref uri is outside the caller's project",
+        ),
+        _ => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INPUT_REF_UNRESOLVABLE_ERROR_CODE,
+            "the input_ref uri is not accepted by its resolver",
+        ),
+    }
+}
+
 /// Validates a create body into the stored request. Pure: no I/O, no store.
 /// Errors are `400` / `413` / `422`; the order is scope fields, unknown
 /// fields, per-field rules, then cross-field rules.
@@ -751,18 +775,14 @@ pub(crate) async fn create_invocation_handler(
         Err(error) => return error.into_response(),
     };
     if let Some(input_ref) = request.input_ref.as_ref() {
-        // Fail closed: no matching resolver (prefix or scheme) → 422.
-        if !state
+        // Fail closed: no matching resolver (prefix or scheme), or the
+        // resolver's I/O-free validate rejects the uri for these claims → 422.
+        if let Err(error) = state
             .invocations
             .input_refs()
-            .has_resolver_for(&input_ref.uri)
+            .validate(&input_ref.uri, claims)
         {
-            return ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "input_ref_unresolvable",
-                "no resolver is registered for the input_ref uri",
-            )
-            .into_response();
+            return input_ref_create_error(error).into_response();
         }
     }
     if let Err(error) = resolve_agent(&state, claims, &request).await {
