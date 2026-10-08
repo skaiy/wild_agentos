@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -370,7 +370,7 @@ pub(crate) async fn config_handler(
 pub(crate) async fn update_config_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Json(request): Json<ConfigUpdateRequest>,
+    body: Request,
 ) -> impl IntoResponse {
     if let Some(error) = require_verified_jwt(&identity, "update") {
         return error;
@@ -379,6 +379,11 @@ pub(crate) async fn update_config_handler(
     if let Err(error) = identity.require_platform_admin("configuration updates") {
         return error.into_response();
     }
+    // #312: the body is parsed only after both gates.
+    let request: ConfigUpdateRequest = match super::models::parse_json_body(body).await {
+        Ok(request) => request,
+        Err(rejection) => return rejection,
+    };
     let patch = request.into_patch();
 
     if let Err(error) = save_config_override(&patch) {
