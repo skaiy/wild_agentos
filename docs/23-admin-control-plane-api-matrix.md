@@ -139,9 +139,17 @@ gateway key, and at startup a deployment key (`config.yaml` or
 the key, when the override's `gateway.base_url` is a different endpoint than
 the deployment's and `AGENT_OS_GATEWAY_BASE_URL` is not set. Only a key stored
 in the override itself is used with the override's endpoint. The same rule
-applies to `embedding.oneapi.base_url` and `AGENT_OS_EMBEDDING_ONEAPI_API_KEY`.
+applies to `embedding.oneapi.base_url` and `AGENT_OS_EMBEDDING_ONEAPI_API_KEY`,
+both after a restart and when an embedding change is hot-reloaded.
 To move the gateway durably, set `AGENT_OS_GATEWAY_BASE_URL` together with
 `AGENT_OS_GATEWAY_API_KEY` in the deployment.
+
+The configuration loader treats key names case-insensitively, so this check
+reads the override the same way: `BASE_URL`, `OneApi.Base_Url` and `base_url`
+are the same field. The `gateway` and `embedding` sections of
+`PUT /api/v1/config` are typed and accept only the documented lowercase field
+names; any other field, including a differently cased spelling, returns `422`
+and nothing is saved or applied.
 
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and

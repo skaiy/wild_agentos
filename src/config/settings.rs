@@ -156,11 +156,6 @@ const ENDPOINT_KEY_BINDINGS: &[(&str, &str, &str, &str)] = &[
 
 const ENDPOINT_KEY_BINDING_ORIGIN: &str = "endpoint key binding (config_override.json)";
 
-fn json_at<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    path.split('.')
-        .try_fold(root, |value, segment| value.get(segment))
-}
-
 fn non_blank(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -172,18 +167,27 @@ fn non_blank(value: Option<&str>) -> Option<&str> {
 /// deployment key is dropped instead of being sent to the new endpoint after a
 /// restart. Only a key stored in the override itself is used with the
 /// override's endpoint. Keys are never logged.
+///
+/// The override is read through `config` itself, exactly as the merged
+/// configuration sees it: `config` lowercases key paths while merging, so
+/// `BASE_URL`, `OneApi.Base_Url` and `base_url` all name the same field and
+/// none of them can move the endpoint past this check (#303 review).
 fn bind_deployment_keys_to_their_endpoints(
     mut builder: ConfigBuilder<DefaultState>,
     yaml_name: &str,
     override_path: &Path,
     env: &[(String, String)],
 ) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
-    let Some(overrides) = std::fs::read_to_string(override_path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-    else {
+    if !override_path.exists() {
         return Ok(builder);
-    };
+    }
+    // Same source definition as `config_builder_with_sources`, so a file the
+    // main build can read is read identically here (and a malformed one fails
+    // both builds the same way).
+    let overrides = Config::builder()
+        .add_source(config::File::from(override_path.to_path_buf()).required(false))
+        .build()?;
+    let override_string = |path: &str| overrides.get_string(path).ok();
     let env_value = |name: &str| {
         env.iter()
             .find(|(candidate, _)| candidate == name)
@@ -196,9 +200,8 @@ fn bind_deployment_keys_to_their_endpoints(
         if env_value(base_env).is_some() {
             continue;
         }
-        let Some(override_base) =
-            non_blank(json_at(&overrides, base_path).and_then(|v| v.as_str()))
-        else {
+        let override_base = override_string(base_path);
+        let Some(override_base) = non_blank(override_base.as_deref()) else {
             continue;
         };
         if deployment.is_none() {
@@ -216,7 +219,8 @@ fn bind_deployment_keys_to_their_endpoints(
         if !deployment_base.is_empty() && deployment_base == normalize_api_base(override_base) {
             continue;
         }
-        let override_key = non_blank(json_at(&overrides, key_path).and_then(|v| v.as_str()));
+        let override_key = override_string(key_path);
+        let override_key = non_blank(override_key.as_deref());
         let deployment_key_present = non_blank(env_value(key_env)).is_some()
             || non_blank(yaml.get_string(key_path).ok().as_deref()).is_some();
         let key = match override_key {

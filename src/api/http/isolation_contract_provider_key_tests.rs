@@ -743,3 +743,127 @@ fn isolation_contract_saved_embedding_key_is_dropped_when_endpoint_changes() {
         json!(CALLER_KEY)
     );
 }
+
+/// Mock upstream that counts every request it receives, on any path.
+async fn counting_upstream() -> (String, Arc<Mutex<usize>>) {
+    let hits: Arc<Mutex<usize>> = Arc::default();
+    let counter = hits.clone();
+    let mock = Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            *counter.lock().unwrap() += 1;
+            Json(json!({ "data": [{ "embedding": [0.0] }] }))
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    (format!("http://{address}/v1"), hits)
+}
+
+/// Differently cased spellings of `embedding.oneapi.base_url`. The
+/// configuration loader lowercases keys, so each of these would move the
+/// endpoint if it reached `config_override.json`.
+fn cased_embedding_endpoint_patches(base: &str) -> Vec<Value> {
+    vec![
+        json!({ "embedding": { "provider": "oneapi", "oneapi": { "BASE_URL": base } } }),
+        json!({ "embedding": { "provider": "oneapi", "OneApi": { "Base_Url": base } } }),
+    ]
+}
+
+/// #303 review (BLOCKER on #352): `PUT /api/v1/config` must reject a cased
+/// spelling of the embedding endpoint with 422 before anything is saved or
+/// hot-reloaded, so the deployment embedding key never reaches that endpoint.
+#[tokio::test]
+async fn isolation_contract_put_config_rejects_cased_embedding_endpoint_keys() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let _key = EnvGuard::set(&[(
+        "AGENT_OS_EMBEDDING_ONEAPI_API_KEY",
+        "test-only-env-emb-key".into(),
+    )]);
+    let (attacker, hits) = counting_upstream().await;
+    let router = app(test_state(dir.path()));
+
+    for patch in cased_embedding_endpoint_patches(&attacker) {
+        let (status, text) = send(
+            &router,
+            Method::PUT,
+            "/api/v1/config",
+            patch.clone(),
+            Some(&admin_token()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{patch}: {text}");
+        assert!(!text.contains("test-only-env-emb-key"));
+        let saved =
+            std::fs::read_to_string(dir.path().join("config_override.json")).unwrap_or_default();
+        assert!(!saved.contains(&attacker), "{patch} was persisted: {saved}");
+    }
+    // Give any spawned reload/reindex a chance to run before counting.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(*hits.lock().unwrap(), 0, "attacker endpoint was contacted");
+
+    // The canonical spelling the Admin UI sends is still accepted.
+    let (status, text) = send(
+        &router,
+        Method::PUT,
+        "/api/v1/config",
+        json!({ "embedding": {
+            "enabled": false, "provider": "fallback", "active_dimension": 128,
+            "ollama": { "base_url": "http://localhost:11434", "model": "m", "dimension": 768 },
+            "oneapi": { "base_url": "", "model": "m", "dimension": 1536, "api_key_configured": true },
+            "fallback": { "dimension": 128 }
+        } }),
+        Some(&admin_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {text}");
+    let saved = read_override(dir.path());
+    assert!(!saved.contains("active_dimension") && !saved.contains("api_key_configured"));
+}
+
+/// #303 review (BLOCKER on #352): an override that already holds a cased
+/// spelling (e.g. written before the PUT schema was typed) must not pair the
+/// deployment embedding key with that endpoint, after a restart or on the
+/// hot reload path (`Settings::load_embedding` / `Settings::load`).
+#[test]
+fn isolation_contract_cased_override_embedding_endpoint_drops_deployment_key() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let _key = EnvGuard::set(&[(
+        "AGENT_OS_EMBEDDING_ONEAPI_API_KEY",
+        "test-only-env-emb-key".into(),
+    )]);
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        "embedding:\n  oneapi:\n    base_url: https://deploy-emb.invalid/v1\n    api_key: test-only-yaml-emb-key\n",
+    )
+    .unwrap();
+    let attacker = "https://attacker.invalid/v1";
+    for patch in cased_embedding_endpoint_patches(attacker) {
+        std::fs::write(dir.path().join("config_override.json"), patch.to_string()).unwrap();
+        for env in [
+            &[][..],
+            &[("AGENT_OS_EMBEDDING_ONEAPI_API_KEY", "test-only-env-emb-key")][..],
+        ] {
+            let config = reload_after_restart(dir.path(), env);
+            assert_eq!(
+                config.get_string("embedding.oneapi.base_url").unwrap(),
+                attacker,
+                "{patch}"
+            );
+            assert_eq!(
+                config.get_string("embedding.oneapi.api_key").unwrap(),
+                "",
+                "{patch}: deployment key followed the override endpoint"
+            );
+        }
+        // Hot reload reads the process configuration the same way.
+        let live = crate::config::settings::Settings::load_embedding();
+        assert_eq!(live.oneapi.base_url, attacker, "{patch}");
+        assert_eq!(live.oneapi.api_key, "", "{patch}");
+    }
+}

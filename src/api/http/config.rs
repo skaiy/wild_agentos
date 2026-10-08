@@ -23,17 +23,19 @@ use super::{data_dir, AppState};
 
 /// Validated request schema for the configuration write surface.
 ///
-/// The settings document remains extensible for the non-gateway sections, but
-/// gateway is typed because it controls the credentials used by the shared LLM
-/// gateway.  This prevents a typo or arbitrary top-level JSON from silently
-/// becoming persistent configuration.
+/// The settings document remains extensible for the models/admin sections, but
+/// gateway and embedding are typed because they pair an endpoint with a
+/// credential.  Unknown fields, including differently cased spellings such as
+/// `BASE_URL` or `OneApi`, are rejected (422) instead of being persisted: the
+/// configuration loader lowercases keys, so such a spelling would otherwise
+/// slip past the endpoint/key checks below (#303 review).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigUpdateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     gateway: Option<GatewayConfigPatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding: Option<Value>,
+    embedding: Option<EmbeddingConfigPatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     models: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +67,62 @@ struct GatewayConfigPatch {
     /// UI-only state, ignored when persisting or applying the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_configured: Option<bool>,
+}
+
+/// Typed `embedding` section of `PUT /api/v1/config` (#303 review). Mirrors
+/// `EmbeddingSettings`; only the exact lowercase field names are accepted.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddingConfigPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ollama: Option<OllamaEmbeddingPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oneapi: Option<OneApiEmbeddingPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback: Option<FallbackEmbeddingPatch>,
+    /// UI-only state echoed back by older clients; never persisted or applied.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    active_dimension: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaEmbeddingPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimension: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OneApiEmbeddingPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimension: Option<usize>,
+    /// UI-only state, never persisted or applied.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    api_key_configured: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FallbackEmbeddingPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimension: Option<usize>,
 }
 
 impl ConfigUpdateRequest {

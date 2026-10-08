@@ -110,9 +110,15 @@ key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 
 `gateway.base_url` 与部署配置的端点不同，且未设置 `AGENT_OS_GATEWAY_BASE_URL`，
 就丢弃来自部署（`config.yaml` 或 `AGENT_OS_GATEWAY_API_KEY`）的密钥并输出告警
 （告警不含密钥）。只有 override 自带的密钥才会用于 override 的端点。
-`embedding.oneapi.base_url` 与 `AGENT_OS_EMBEDDING_ONEAPI_API_KEY` 适用同一规则。
+`embedding.oneapi.base_url` 与 `AGENT_OS_EMBEDDING_ONEAPI_API_KEY` 适用同一规则，
+重启后和 embedding 变更热切换时都成立。
 如需持久地更换网关端点，请在部署中同时设置 `AGENT_OS_GATEWAY_BASE_URL` 和
 `AGENT_OS_GATEWAY_API_KEY`。
+
+配置加载器不区分键名大小写，这项检查也按同样方式读取 override：`BASE_URL`、
+`OneApi.Base_Url` 和 `base_url` 是同一个字段。`PUT /api/v1/config` 的 `gateway`
+和 `embedding` 段是类型化的，只接受文档列出的小写字段名；其他字段（包括大小写
+不同的写法）返回 `422`，不保存也不生效。
 
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、
 [隔离矩阵](17-isolation-matrix.zh.md)、
