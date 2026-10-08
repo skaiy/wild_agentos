@@ -1524,7 +1524,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let claims = IsolationClaims::from_verified(
                         "acme",
-                        &format!("project-{}", i % 4),
+                        format!("project-{}", i % 4),
                         "actor",
                     )
                     .unwrap();
