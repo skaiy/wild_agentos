@@ -237,14 +237,15 @@ pub(crate) async fn skill_manifest_handler(
     }
 }
 
-/// POST /api/v1/skills — 注册新技能（G7：仅 DA 角色可用）
+/// POST /api/v1/skills — 注册新技能（#302：仅平台管理员；技能注册表全进程共享）
 pub(crate) async fn register_skill_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Json(skill): Json<SkillMeta>,
 ) -> impl IntoResponse {
-    // G7：严格模式下要求 DA 角色
-    if let Err(e) = identity.require_role("DA") {
+    // #302: the SkillRegistry and the persisted user skills are process-global
+    // (no tenant/project scope), so writes need a platform administrator.
+    if let Err(e) = identity.require_platform_admin("skill registry writes") {
         return e.into_response();
     }
     if skill.skill_iri.is_empty() {
@@ -308,14 +309,15 @@ pub(crate) async fn register_skill_handler(
         .into_response()
 }
 
-/// DELETE /api/v1/skills?iri=... — 删除应用级技能（G7：仅 DA 角色）。
+/// DELETE /api/v1/skills?iri=... — 删除应用级技能（#302：仅平台管理员）。
 /// 系统级内置技能（iri://）只读，拒绝删除。
 pub(crate) async fn delete_skill_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Query(q): Query<SkillManifestQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
+    // #302: process-global skill registry; platform administrator only.
+    if let Err(e) = identity.require_platform_admin("skill registry writes") {
         return e.into_response();
     }
     if q.iri.is_empty() {
@@ -538,13 +540,14 @@ pub(crate) fn iri_from_git_url(url: &str) -> String {
 }
 
 /// POST /api/v1/skills/import-git — 从 Git 仓库导入技能。
-/// 需要 DA 角色。
+/// #302：需要平台管理员（技能注册表全进程共享）。
 pub(crate) async fn import_git_skill_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Json(req): Json<GitImportRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
+    // #302: process-global skill registry; platform administrator only.
+    if let Err(e) = identity.require_platform_admin("skill registry writes") {
         return e.into_response();
     }
     let git_source = match validate_git_clone_source(&req.repo_url, &req.r#ref) {
@@ -870,13 +873,14 @@ pub(crate) struct PipelineRerunRequest {
     skill_iri: String,
 }
 
-/// POST /api/v1/skills/pipeline-rerun — 对已注册的应用级技能重跑准入流水线（G7：仅 DA 角色）。
+/// POST /api/v1/skills/pipeline-rerun — 对已注册的应用级技能重跑准入流水线（#302：仅平台管理员）。
 pub(crate) async fn pipeline_rerun_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Json(req): Json<PipelineRerunRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
+    // #302: process-global skill registry; platform administrator only.
+    if let Err(e) = identity.require_platform_admin("skill registry writes") {
         return e.into_response();
     }
     if req.skill_iri.trim().is_empty() {
@@ -953,7 +957,6 @@ mod tests {
         routing::{get, post},
         Router,
     };
-    use base64::Engine;
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -1314,9 +1317,10 @@ version: \"2.0.0\"\n\
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    /// POST /api/v1/skills/import-git 无 JWT → 403（严格模式）
+    /// POST /api/v1/skills/import-git 无 JWT → 401（严格模式；#302 起需平台管理员，
+    /// 无 verified claims 时先返回 401，原为 403）
     #[tokio::test]
-    async fn test_import_git_403_no_role() {
+    async fn test_import_git_401_no_jwt() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("importgit_403_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1340,7 +1344,7 @@ version: \"2.0.0\"\n\
             .unwrap();
 
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         std::env::remove_var("AGENTOS_AUTH_STRICT");
@@ -1376,9 +1380,22 @@ version: \"2.0.0\"\n\
             .uri("/api/v1/skills/import-git")
             .header("content-type", "application/json")
             .header("x-identity", identity)
-            .body(axum::body::Body::from(body))
+            .body(axum::body::Body::from(body.clone()))
             .unwrap();
 
+        // #302: the unverified dev X-Identity DA no longer reaches the handler.
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // A verified platform administrator reaches input validation → 400.
+        let _auth = platform_admin_env();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/skills/import-git")
+            .header("content-type", "application/json")
+            .header("authorization", platform_admin_bearer())
+            .body(axum::body::Body::from(body))
+            .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
@@ -1391,14 +1408,35 @@ version: \"2.0.0\"\n\
 
     // ── 技能准入流水线集成测试 ─────────────────────────────────────────────────
 
-    use base64::engine::general_purpose::STANDARD as B64;
+    const TEST_JWT_SECRET: &str = "test-hs256-secret-at-least-32-bytes-long";
 
-    /// 构造带 DA 角色的 dev-only X-Identity 头值。
-    fn da_identity(user: &str) -> String {
-        B64.encode(
-            serde_json::json!({"user_id": user, "tenant_id": "t-test", "roles": ["DA"]})
-                .to_string(),
+    /// #302: skill registry writes need a platform administrator.
+    fn platform_admin_env() -> super::super::control_plane_route_auth_tests::EnvGuard {
+        super::super::control_plane_route_auth_tests::EnvGuard::set(&[
+            ("AGENTOS_AUTH_MODE", "hs256".into()),
+            ("AGENTOS_JWT_SECRET", TEST_JWT_SECRET.into()),
+            (
+                super::super::iam::PLATFORM_ADMIN_TENANT_ENV,
+                "platform".into(),
+            ),
+        ])
+    }
+
+    /// `Bearer` value for a verified platform-administrator JWT.
+    fn platform_admin_bearer() -> String {
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: "platform-admin".into(),
+                tenant_id: "platform".into(),
+                project_id: Some("ops".into()),
+                roles: vec![super::super::iam::PLATFORM_ADMIN_ROLE.into()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
         )
+        .unwrap();
+        format!("Bearer {token}")
     }
 
     /// POST 一个 JSON body 到 router，返回 (状态码, 解析后的 body)。
@@ -1413,7 +1451,11 @@ version: \"2.0.0\"\n\
             .uri(uri)
             .header("content-type", "application/json");
         if let Some(id) = ident {
-            b = b.header("x-identity", id);
+            b = if id.starts_with("Bearer ") {
+                b.header("authorization", id)
+            } else {
+                b.header("x-identity", id)
+            };
         }
         let req = b.body(axum::body::Body::from(body.to_string())).unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
@@ -1457,7 +1499,8 @@ version: \"2.0.0\"\n\
             )
             .with_state(state);
 
-        let ident = da_identity("admin");
+        let _auth = platform_admin_env();
+        let ident = platform_admin_bearer();
         let skill = serde_json::json!({
             "skill_iri": "skill://test/ok", "name": "合法技能", "description": "有效",
             "version": "1.0.0", "category": "test", "security_level": "standard",
@@ -1504,7 +1547,8 @@ version: \"2.0.0\"\n\
             )
             .with_state(state.clone());
 
-        let ident = da_identity("admin");
+        let _auth = platform_admin_env();
+        let ident = platform_admin_bearer();
         // type 必须是字符串/数组；此处为数字 → JSON Schema 编译失败 → Lint 阶段 Failed。
         let skill = serde_json::json!({
             "skill_iri": "skill://test/bad", "name": "非法技能", "description": "无效",
@@ -1560,7 +1604,8 @@ version: \"2.0.0\"\n\
             )
             .with_state(state);
 
-        let ident = da_identity("admin");
+        let _auth = platform_admin_env();
+        let ident = platform_admin_bearer();
         let skill = serde_json::json!({
             "skill_iri": "skill://test/rerun", "name": "可重跑技能", "description": "有效",
             "version": "1.0.0", "category": "test", "security_level": "standard",
@@ -1611,7 +1656,8 @@ version: \"2.0.0\"\n\
             )
             .with_state(state);
 
-        let ident = da_identity("admin");
+        let _auth = platform_admin_env();
+        let ident = platform_admin_bearer();
         let (st, _) = post_json(
             &router,
             "/api/v1/skills/pipeline-rerun",
