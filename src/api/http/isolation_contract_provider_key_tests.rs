@@ -937,3 +937,67 @@ async fn isolation_contract_concurrent_embedding_hot_reloads_are_serialized() {
     // The first reload had no previous store to rotate.
     assert_eq!(backups, RELOADS - 1);
 }
+
+/// #303 re-review: a failed `PUT /api/v1/config` save answers 500 with a
+/// fixed message and the I/O error kind only. The underlying error (the
+/// temporary file error names the absolute data directory and the temporary
+/// file) is logged on the server, never returned.
+#[cfg(unix)]
+#[tokio::test]
+async fn isolation_contract_config_persist_failure_does_not_leak_paths() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let router = app(test_state(dir.path()));
+
+    // A data directory the server cannot write to.
+    let read_only = dir.path().join("read-only-data");
+    std::fs::create_dir(&read_only).unwrap();
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestoreMode(&read_only);
+    if std::fs::write(read_only.join("probe"), b"").is_ok() {
+        // Privileged user: permissions are not enforced, nothing to observe.
+        eprintln!("skipping: running with permission override");
+        return;
+    }
+    let _data_dir =
+        EnvGuard::set(&[("AGENTOS_DATA_DIR", read_only.to_string_lossy().into_owned())]);
+
+    let (status, text) = send(
+        &router,
+        Method::PUT,
+        "/api/v1/config",
+        json!({ "gateway": { "default_model": "persist-failure-model" } }),
+        Some(&admin_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["persisted"], json!(false));
+    assert_eq!(
+        body["message"],
+        json!(format!(
+            "配置持久化失败：{}",
+            std::io::ErrorKind::PermissionDenied
+        ))
+    );
+    for leaked in [
+        read_only.to_string_lossy().as_ref(),
+        dir.path().to_string_lossy().as_ref(),
+        "read-only-data",
+        "config_override",
+        ".tmp",
+        "os error",
+    ] {
+        assert!(!text.contains(leaked), "500 body leaks {leaked:?}: {text}");
+    }
+    assert!(!read_only.join("config_override.json").exists());
+}

@@ -335,7 +335,11 @@ pub(crate) async fn save_config_override_off_runtime(patch: &Value) -> std::io::
     let patch = patch.clone();
     tokio::task::spawn_blocking(move || save_config_override(&patch))
         .await
-        .map_err(|error| std::io::Error::other(format!("config override writer: {error}")))?
+        .map_err(|error| {
+            // A panic message may contain paths: log it, return fixed text.
+            tracing::error!("config override writer task failed: {error}");
+            std::io::Error::other("config override writer failed")
+        })?
 }
 
 /// Serializes `save_config_override` read-modify-write cycles in this process.
@@ -554,11 +558,15 @@ pub(crate) async fn update_config_handler(
     }
 
     if let Err(error) = save_config_override_off_runtime(&patch).await {
+        // The full error (it may name the data directory and the temporary
+        // file) goes to the server log only; the response carries the error
+        // kind (#303 re-review).
+        tracing::error!("persisting config_override.json failed: {error}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
                 "status": "error",
-                "message": format!("配置持久化失败：{error}"),
+                "message": format!("配置持久化失败：{}", error.kind()),
                 "persisted": false,
             })),
         )
