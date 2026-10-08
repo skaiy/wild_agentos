@@ -32,22 +32,21 @@ graph 内的条目；`GET /api/v1/artifacts/{id}/download` 也先执行同一验
 
 ### 明文密钥拦截
 
-内容中嵌入了凭据**值**时，上传返回 `400` 和 `matched_rules`（只有规则名，从不回显命中的文本），
-且不落盘。规则按真实凭据格式匹配，而不是裸子串：token 前缀必须位于 ASCII 单词边界
-（输入开头，或 `[A-Za-z0-9_]` 以外的字符之后），后面必须跟足够长度的 token 字符，
-大小写与真实格式一致。
+内容中嵌入了凭据**值**时，上传返回 `400`，响应体固定为 `{"error": "plaintext secrets are
+forbidden in coding artifacts", "code": "artifact_plaintext_secret"}`。不回显命中的文本，也不回显
+命中的规则，且不落盘。规则按真实凭据格式匹配，不是裸子串匹配，大小写与真实格式一致。技能流水线的
+文件扫描用的是同一个检测模块（`utils::secret_scan`）：命中私钥则门禁失败，命中其他格式只告警。
 
 | 规则 | 匹配 |
 | --- | --- |
-| `pem_armor_header` | 任意 `-----BEGIN <大写标签>-----` 行 |
-| `pem_private_key_marker` | `PRIVATE KEY-----` / `PRIVATE KEY BLOCK-----` |
-| `aws_secret_access_key` | `aws_secret_access_key`、`aws-secret-access-key` 或 `SecretAccessKey`（不分大小写），可选引号，`:`/`=`，再跟 40 个 `[A-Za-z0-9/+=]` |
-| `aws_access_key_id` | `AKIA`/`ASIA` + 16 个 `[0-9A-Z]`，两侧都有边界 |
-| `github_fine_grained_pat` | `github_pat_` + 至少 22 个 `[A-Za-z0-9_]` |
-| `github_token` | `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_` + 至少 36 个 `[A-Za-z0-9]` |
-| `slack_token` | `xoxa-`/`xoxb-`/`xoxp-`/`xoxo-`/`xoxs-`/`xoxr-` + 至少 10 个 `[A-Za-z0-9-]` |
-| `sk_api_key` | `sk-` + 至少 20 个 `[A-Za-z0-9_-]`（覆盖 `sk-proj-…`、`sk-ant-…`） |
+| `private_key` | `-----BEGIN [A-Z ]*PRIVATE KEY-----` 或 `… PRIVATE KEY BLOCK-----`（证书、公钥不拦） |
+| `aws_access_key_id` | `AKIA` + 16 个 `[0-9A-Z]` |
+| `aws_secret_access_key` | `aws_secret_access_key`（不分大小写），可选引号，`:`/`=`，再跟 40 位 `[A-Za-z0-9/+=]` 值 |
+| `github_classic_pat` | `ghp_` + 36 个 `[A-Za-z0-9]` |
+| `github_fine_grained_pat` | `github_pat_` + 82 个 `[A-Za-z0-9_]` |
+| `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + 至少 10 个 `[A-Za-z0-9-]` |
+| `sk_api_key` | 前面不是 `[A-Za-z0-9_-]` 的 `sk-`，后跟至少 20 个 `[A-Za-z0-9_-]`（覆盖 `sk-proj-…`、`sk-ant-…`、`sk-<slug>-<hex>`） |
 
-`task-`、`risk-`、`disk-`、`ask-` 等普通词不会命中；按名字引用凭据
+`task-`、`risk-`、`disk-`、`ask-`、`Slovakia` 等普通文本不会命中；按名字引用凭据
 （`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`、`TOKEN="$TOKEN_FROM_ENV"`）是允许的。
 

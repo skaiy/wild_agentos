@@ -35,25 +35,26 @@ Historical blob objects are neither read nor migrated by this API.
 
 ### Plaintext-secret guard
 
-Upload rejects content that embeds a credential *value* with `400` and
-`matched_rules` (rule names only, never the matched text); nothing is stored.
-Rules match real credential formats, not bare substrings: token prefixes must
-start at an ASCII word boundary (start of input or a character outside
-`[A-Za-z0-9_]`), must be followed by enough token characters, and are
-case-sensitive like the real format.
+Upload rejects content that embeds a credential *value* with `400` and a fixed
+body `{"error": "plaintext secrets are forbidden in coding artifacts", "code":
+"artifact_plaintext_secret"}`; neither the matched text nor the rule is echoed,
+and nothing is stored. Rules match real credential formats, not bare
+substrings, and are case-sensitive like the issued format. The same detector
+(`utils::secret_scan`) drives the skill pipeline's file scan, where private
+keys fail the gate and other formats warn.
 
 | Rule | Matches |
 | --- | --- |
-| `pem_armor_header` | any `-----BEGIN <UPPERCASE LABEL>-----` line |
-| `pem_private_key_marker` | `PRIVATE KEY-----` / `PRIVATE KEY BLOCK-----` |
-| `aws_secret_access_key` | `aws_secret_access_key`, `aws-secret-access-key` or `SecretAccessKey` (any case), optional quote, `:`/`=`, then 40 `[A-Za-z0-9/+=]` |
-| `aws_access_key_id` | `AKIA`/`ASIA` + 16 `[0-9A-Z]`, bounded on both sides |
-| `github_fine_grained_pat` | `github_pat_` + at least 22 `[A-Za-z0-9_]` |
-| `github_token` | `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_` + at least 36 `[A-Za-z0-9]` |
-| `slack_token` | `xoxa-`/`xoxb-`/`xoxp-`/`xoxo-`/`xoxs-`/`xoxr-` + at least 10 `[A-Za-z0-9-]` |
-| `sk_api_key` | `sk-` + at least 20 `[A-Za-z0-9_-]` (covers `sk-proj-…`, `sk-ant-…`) |
+| `private_key` | `-----BEGIN [A-Z ]*PRIVATE KEY-----` or `… PRIVATE KEY BLOCK-----` (certificates and public keys pass) |
+| `aws_access_key_id` | `AKIA` + 16 `[0-9A-Z]` |
+| `aws_secret_access_key` | `aws_secret_access_key` (any case), optional quote, `:`/`=`, then a 40-character `[A-Za-z0-9/+=]` value |
+| `github_classic_pat` | `ghp_` + 36 `[A-Za-z0-9]` |
+| `github_fine_grained_pat` | `github_pat_` + 82 `[A-Za-z0-9_]` |
+| `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + at least 10 `[A-Za-z0-9-]` |
+| `sk_api_key` | `sk-` not preceded by `[A-Za-z0-9_-]`, + at least 20 `[A-Za-z0-9_-]` (covers `sk-proj-…`, `sk-ant-…`, `sk-<slug>-<hex>`) |
 
-Ordinary words such as `task-`, `risk-`, `disk-` or `ask-` never match, and
-referencing a credential by name (`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`,
-`TOKEN="$TOKEN_FROM_ENV"`) is allowed.
+Ordinary words such as `task-`, `risk-`, `disk-`, `ask-` or `Slovakia` never
+match, and referencing a credential by name
+(`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`, `TOKEN="$TOKEN_FROM_ENV"`)
+is allowed.
 

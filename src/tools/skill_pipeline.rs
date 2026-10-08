@@ -370,26 +370,12 @@ impl PipelineContext {
 /// 系统内建/受支持的角色集合（校验用，未知角色仅告警不阻断）。
 const KNOWN_ROLES: &[&str] = &["PA", "DA", "CA", "AA", "SA", "USER"];
 
-/// 敏感模式：命中即视为高危泄露（阻断）。仅匹配「明确的密钥文本头」。
-const SECRET_HARD_PATTERNS: &[&str] = &[
-    "-----BEGIN RSA PRIVATE KEY-----",
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
-    "-----BEGIN PRIVATE KEY-----",
-    "-----BEGIN EC PRIVATE KEY-----",
-    "-----BEGIN PGP PRIVATE KEY BLOCK-----",
-];
+// 凭据检测与 artifact 上传共用 `crate::utils::secret_scan`（按真实格式匹配）：
+// PEM 私钥 → 阻断；其他凭据格式（AWS / GitHub / Slack / sk- key）→ 告警。
 
-/// 敏感模式：命中仅告警（可能为示例/占位）。
-const SECRET_SOFT_PATTERNS: &[&str] = &[
-    "AKIA", // AWS Access Key ID 前缀
-    "aws_secret_access_key",
-    "api_key=",
-    "apikey=",
-    "password=",
-    "secret_key=",
-    "xoxb-", // Slack bot token
-    "ghp_",  // GitHub personal access token
-];
+/// 额外的赋值提示：命中仅告警（可能为示例/占位），不区分大小写。
+/// 都带 `=`，不会像裸前缀那样命中普通单词。
+const SECRET_ASSIGNMENT_HINTS: &[&str] = &["api_key=", "apikey=", "password=", "secret_key="];
 
 /// 单文件扫描上限（字节），避免大文件拖慢流水线。
 const MAX_SCAN_FILE_BYTES: u64 = 512 * 1024;
@@ -661,23 +647,29 @@ fn scan_secrets(root: &Path) -> (Vec<(String, usize)>, Vec<(String, usize)>, usi
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
-            let hard_hits = SECRET_HARD_PATTERNS
-                .iter()
-                .filter(|p| content.contains(**p))
-                .count();
+            let (hard_hits, soft_hits) = classify_secret_hits(&content);
             if hard_hits > 0 {
                 hard.push((rel.clone(), hard_hits));
             }
-            let soft_hits = SECRET_SOFT_PATTERNS
-                .iter()
-                .filter(|p| content.to_lowercase().contains(&p.to_lowercase()))
-                .count();
             if soft_hits > 0 {
                 soft.push((rel, soft_hits));
             }
         }
     }
     (hard, soft, scanned)
+}
+
+/// 返回 (硬命中数, 软命中数)。只计数，不返回命中文本。
+fn classify_secret_hits(content: &str) -> (usize, usize) {
+    use crate::utils::secret_scan;
+    let hard = usize::from(secret_scan::contains_private_key(content));
+    let lower = content.to_lowercase();
+    let soft = secret_scan::credential_token_hits(content)
+        + SECRET_ASSIGNMENT_HINTS
+            .iter()
+            .filter(|hint| lower.contains(**hint))
+            .count();
+    (hard, soft)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1196,5 +1188,29 @@ mod tests {
             .stages
             .iter()
             .any(|stage| { stage.stage == "rule_review" && stage.status == StageStatus::Failed }));
+    }
+
+    #[test]
+    fn secret_scan_uses_real_formats_shared_with_artifact_uploads() {
+        // Old case-insensitive substring rules warned on `akia` in Slovakia.
+        assert_eq!(
+            classify_secret_hits("Shipping to Slovakia; ghp_ prefix"),
+            (0, 0)
+        );
+        let key = ["-----", "BEGIN EC ", "PRIVATE KEY-----"].concat();
+        assert_eq!(classify_secret_hits(&key), (1, 0));
+        let token = ["T=", "gh", "p_", &"FAKE".repeat(9)].concat();
+        assert_eq!(classify_secret_hits(&token), (0, 1));
+        assert_eq!(classify_secret_hits("PASSWORD=changeme"), (0, 1));
+
+        let dir = std::env::temp_dir().join(format!("skill-scan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "Slovakia task-risk-disk-ask-").unwrap();
+        std::fs::write(dir.join("id_ec"), &key).unwrap();
+        let (hard, soft, scanned) = scan_secrets(&dir);
+        assert_eq!(scanned, 2);
+        assert_eq!(hard, vec![("id_ec".to_string(), 1)]);
+        assert!(soft.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -94,8 +94,17 @@ fn valid_task_iri(task_iri: &str) -> bool {
         && !task_iri.bytes().any(|byte| byte.is_ascii_control())
 }
 
-mod secret_guard;
-use secret_guard::matching_secret_rules;
+/// Stable machine-readable code for a secret-guard rejection. The matched
+/// text and rule are never echoed.
+const ARTIFACT_SECRET_ERROR_CODE: &str = "artifact_plaintext_secret";
+
+/// Blocks recognizable credential values before they can be persisted; see
+/// [`crate::utils::secret_scan`] for the shared real-format rules. Replay
+/// inputs must reference credentials through environment variables or a
+/// secret manager, never embed their values.
+fn contains_plaintext_secret(bytes: &[u8]) -> bool {
+    crate::utils::secret_scan::contains_plaintext_secret(&String::from_utf8_lossy(bytes))
+}
 
 fn require_claims(identity: &UserIdentity) -> Result<&IsolationClaims, (StatusCode, Json<Value>)> {
     identity.isolation_claims().ok_or_else(|| {
@@ -219,16 +228,12 @@ pub(crate) async fn upload_artifact_handler(
         )
             .into_response();
     }
-    // Replay inputs must reference credentials through environment variables
-    // or a secret manager, never embed their values. Only rule names (never the
-    // matched value) are returned so callers can locate the offending field.
-    let matched_rules = matching_secret_rules(&bytes);
-    if !matched_rules.is_empty() {
+    if contains_plaintext_secret(&bytes) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "plaintext secrets are forbidden in coding artifacts",
-                "matched_rules": matched_rules,
+                "code": ARTIFACT_SECRET_ERROR_CODE,
             })),
         )
             .into_response();
@@ -367,7 +372,6 @@ pub(crate) async fn download_artifact_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::secret_guard::contains_plaintext_secret;
     use super::*;
     use crate::{
         api::http::{api_gov::ApiUsageState, SharedVectorStore},
@@ -381,7 +385,8 @@ mod tests {
     #[test]
     fn artifact_kinds_and_secret_guard_are_explicit() {
         assert_eq!(ArtifactKind::Patch.extension(), "patch");
-        let token = ["export TOKEN=gh", "p_", &"aSecretValue".repeat(3)].concat();
+        // Real shape, obviously fake value.
+        let token = format!("export TOKEN=ghp_{}", "FAKE".repeat(9));
         assert!(contains_plaintext_secret(token.as_bytes()));
         assert!(!contains_plaintext_secret(
             b"export TOKEN=\"$TOKEN_FROM_ENV\""
@@ -522,13 +527,16 @@ mod tests {
         let (status, body) = upload(&state, &claims, ordinary).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
 
-        let token = ["{\"key\":\"s", "k-", &"Ab3dE5gH7j".repeat(5), "\"}"].concat();
+        let token = ["{\"key\":\"s", "k-proj-", &"FAKE".repeat(12), "\"}"].concat();
         let (status, body) = upload(&state, &claims, token.as_bytes()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["matched_rules"], json!(["sk_api_key"]));
-        assert!(
-            !body.to_string().contains("Ab3dE5gH7j"),
-            "value must not echo"
+        assert_eq!(
+            body,
+            json!({
+                "error": "plaintext secrets are forbidden in coding artifacts",
+                "code": ARTIFACT_SECRET_ERROR_CODE,
+            }),
+            "fixed error, no rule name or matched text"
         );
 
         // Only the ordinary upload was persisted.
