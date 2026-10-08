@@ -307,7 +307,8 @@ pub fn build_router(
             invocations_input_ref::artifact_resolver_enabled_from_vars(env),
             embedders,
         )
-        .with_timeout(invocations_input_ref::input_ref_timeout_from_vars(env));
+        .with_timeout(invocations_input_ref::input_ref_timeout_from_vars(env))
+        .with_max_bytes(invocations_input_ref::input_ref_max_bytes_from_vars(env));
         input_refs.freeze();
         embedders.freeze();
         let runtime = invocations::InvocationsRuntime::open_default().with_input_refs(input_refs);

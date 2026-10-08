@@ -27,9 +27,21 @@
 //!   `422 input_ref_unresolvable` and nothing is persisted. A resolver's
 //!   `validate` can reject the URI (`422 input_ref_unresolvable`) or flag it
 //!   as outside the caller's project (`422 input_ref_scope_mismatch`).
+//! - Before any routing the kernel checks the URI shape
+//!   ([`check_input_ref_uri`]): lowercase scheme, no control characters or
+//!   line breaks, no empty / `.` / `..` segments, no backslash and no encoded
+//!   `.`, `/` or `\\` (`%2e`, `%2f`, `%5c`, any case). Create answers `400`.
 //! - The kernel, not the resolver, enforces the size cap
-//!   ([`MAX_INPUT_REF_BYTES`]), the timeout (`AGENTOS_INVOCATION_INPUT_REF_TIMEOUT_MS`,
-//!   capped by the invocation deadline), the sha256 check and UTF-8 text.
+//!   (`AGENTOS_INVOCATION_INPUT_REF_MAX_BYTES`, default
+//!   [`DEFAULT_INPUT_REF_MAX_BYTES`], at most [`MAX_INPUT_REF_MAX_BYTES`]),
+//!   the timeout (`AGENTOS_INVOCATION_INPUT_REF_TIMEOUT_MS`, capped by the
+//!   invocation deadline), the sha256 check and UTF-8 text. A resolver must
+//!   still stop reading as soon as it reaches `max_bytes`.
+//! - Resolved content is untrusted data: any actor of the same project can
+//!   write it, and sha256 pins only the bytes, not their intent. The kernel
+//!   hands it to the task as a delimited, neutralised block after a fixed
+//!   "untrusted data, not instructions" line, in the task goal (user role),
+//!   never in a system prompt.
 //!   Every runtime failure ends the invocation `failed` /
 //!   `input_ref_fetch_failed` (or `input_digest_mismatch`) with one fixed
 //!   message; logs carry only the invocation id, scheme and failure class.
@@ -77,9 +89,12 @@ pub const INPUT_REF_FETCH_FAILED_MESSAGE: &str = "input_ref could not be resolve
 /// Fixed, safe message for every `input_digest_mismatch`.
 pub const INPUT_DIGEST_MISMATCH_MESSAGE: &str = "input_ref content does not match sha256";
 
-/// Largest `input_ref` content accepted, equal to the create request-body
-/// limit (`MAX_CREATE_BODY_BYTES`, 64 KiB).
-pub const MAX_INPUT_REF_BYTES: usize = super::invocations::MAX_CREATE_BODY_BYTES;
+/// Default cap on `input_ref` content (64 KiB).
+pub const DEFAULT_INPUT_REF_MAX_BYTES: usize = 64 * 1024;
+/// Hard ceiling for [`INPUT_REF_MAX_BYTES_ENV`] (1 MiB).
+pub const MAX_INPUT_REF_MAX_BYTES: usize = 1024 * 1024;
+/// Env override for the content cap, in bytes (`1..=1048576`).
+pub const INPUT_REF_MAX_BYTES_ENV: &str = "AGENTOS_INVOCATION_INPUT_REF_MAX_BYTES";
 
 /// Env override for the per-resolution timeout, in milliseconds.
 pub const INPUT_REF_TIMEOUT_ENV: &str = "AGENTOS_INVOCATION_INPUT_REF_TIMEOUT_MS";
@@ -106,8 +121,10 @@ pub struct InputRefRequest<'a> {
     /// the stored resource, never from a request body). Resolvers must scope
     /// every lookup to them.
     pub claims: &'a IsolationClaims,
-    /// Upper bound on the content; a resolver should stop reading above it.
-    /// The kernel rejects anything larger regardless.
+    /// Upper bound on the content. A resolver **must** stop reading (and
+    /// return [`InputRefError::TooLarge`]) as soon as it reaches this many
+    /// bytes instead of buffering the whole object; the kernel rejects
+    /// anything larger regardless.
     pub max_bytes: usize,
     /// Point in time by which the resolver should give up: the earlier of
     /// the kernel timeout and the invocation `deadline`. The kernel abandons
@@ -163,7 +180,75 @@ pub trait InputRefResolver: Send + Sync {
 
     /// Execution-time fetch. Only returns bytes: the kernel checks size,
     /// sha256 and UTF-8 afterwards and never trusts the resolver for them.
+    /// Must stop reading once `request.max_bytes` is reached (streaming or
+    /// a bounded read), so an oversized object never fills memory.
     async fn resolve(&self, request: InputRefRequest<'_>) -> Result<Vec<u8>, InputRefError>;
+}
+
+/// Why [`check_input_ref_uri`] rejected a URI. Create maps each to `400`
+/// with [`InputRefUriError::message`] (fixed, never echoes the URI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputRefUriError {
+    /// Not `<scheme>://<something>`, or the scheme has invalid characters.
+    Shape,
+    /// The scheme contains uppercase letters.
+    UppercaseScheme,
+    /// Control character or line break anywhere in the URI.
+    ControlCharacter,
+    /// Empty, `.` or `..` segment, backslash, or encoded `.` / `/` / `\`.
+    PathTraversal,
+}
+
+impl InputRefUriError {
+    /// Fixed client-facing message.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Shape => "input_ref.uri must be <scheme>://...",
+            Self::UppercaseScheme => "input_ref.uri scheme must be lowercase",
+            Self::ControlCharacter => {
+                "input_ref.uri must not contain control characters or line breaks"
+            }
+            Self::PathTraversal => {
+                "input_ref.uri must not contain empty, '.' or '..' segments, backslashes, or encoded '.', '/' or '\\'"
+            }
+        }
+    }
+}
+
+/// Kernel URI shape check, run before any routing (create and resolve):
+/// lowercase `<scheme>://`, no control characters, and no path tricks — no
+/// empty, `.` or `..` segment, no backslash, no `%2e` / `%2f` / `%5c` in any
+/// case.
+pub fn check_input_ref_uri(uri: &str) -> Result<(), InputRefUriError> {
+    if uri.chars().any(char::is_control) {
+        return Err(InputRefUriError::ControlCharacter);
+    }
+    let (scheme, rest) = uri.split_once("://").ok_or(InputRefUriError::Shape)?;
+    if rest.is_empty() {
+        return Err(InputRefUriError::Shape);
+    }
+    if !valid_scheme(scheme) {
+        return Err(
+            if scheme.bytes().any(|b| b.is_ascii_uppercase())
+                && valid_scheme(&scheme.to_ascii_lowercase())
+            {
+                InputRefUriError::UppercaseScheme
+            } else {
+                InputRefUriError::Shape
+            },
+        );
+    }
+    let lower = rest.to_ascii_lowercase();
+    if rest.contains('\\') || ["%2e", "%2f", "%5c"].iter().any(|e| lower.contains(e)) {
+        return Err(InputRefUriError::PathTraversal);
+    }
+    if rest
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(InputRefUriError::PathTraversal);
+    }
+    Ok(())
 }
 
 /// First path segment after `scheme://` (`s3://bucket/key` → `bucket`), for
@@ -230,6 +315,7 @@ pub struct InputRefRegistry {
     by_prefix: Arc<RwLock<Vec<(String, SharedResolver)>>>,
     frozen: Arc<AtomicBool>,
     timeout: Duration,
+    max_bytes: usize,
 }
 
 impl Default for InputRefRegistry {
@@ -239,6 +325,7 @@ impl Default for InputRefRegistry {
             by_prefix: Arc::default(),
             frozen: Arc::default(),
             timeout: DEFAULT_INPUT_REF_TIMEOUT,
+            max_bytes: DEFAULT_INPUT_REF_MAX_BYTES,
         }
     }
 }
@@ -250,6 +337,7 @@ impl std::fmt::Debug for InputRefRegistry {
             .field("prefixes", &self.prefixes())
             .field("frozen", &self.is_frozen())
             .field("timeout", &self.timeout)
+            .field("max_bytes", &self.max_bytes)
             .finish()
     }
 }
@@ -283,6 +371,18 @@ impl InputRefRegistry {
     /// Per-resolution timeout.
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Sets the content cap (kernel-enforced), clamped to
+    /// `1..=`[`MAX_INPUT_REF_MAX_BYTES`].
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes.clamp(1, MAX_INPUT_REF_MAX_BYTES);
+        self
+    }
+
+    /// Content cap passed to resolvers and enforced on their output.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Stops accepting registrations (startup calls this once it is done).
@@ -440,6 +540,7 @@ impl InputRefRegistry {
     /// for `claims`. Returns [`InputRefError::NoResolver`],
     /// [`InputRefError::ScopeMismatch`] or [`InputRefError::Rejected`].
     pub fn validate(&self, uri: &str, claims: &IsolationClaims) -> Result<(), InputRefError> {
+        check_input_ref_uri(uri).map_err(|_| InputRefError::Rejected)?;
         let resolver = self.matching(uri).ok_or(InputRefError::NoResolver)?;
         resolver.validate(uri, claims).map_err(|error| match error {
             InputRefError::ScopeMismatch => InputRefError::ScopeMismatch,
@@ -449,7 +550,8 @@ impl InputRefRegistry {
 
     /// Resolves `uri` for `claims`: re-validates, calls the resolver under
     /// the kernel timeout (capped by `invocation_deadline`), and enforces
-    /// [`MAX_INPUT_REF_BYTES`].
+    /// [`Self::max_bytes`]. A URI failing [`check_input_ref_uri`] is
+    /// rejected before routing.
     pub async fn resolve(
         &self,
         claims: &IsolationClaims,
@@ -457,6 +559,7 @@ impl InputRefRegistry {
         uri: &str,
         invocation_deadline: Option<Instant>,
     ) -> Result<Vec<u8>, InputRefError> {
+        check_input_ref_uri(uri).map_err(|_| InputRefError::Rejected)?;
         let resolver = self.matching(uri).ok_or(InputRefError::NoResolver)?;
         let scheme = Self::scheme_of(uri).ok_or(InputRefError::NoResolver)?;
         resolver.validate(uri, claims)?;
@@ -469,13 +572,13 @@ impl InputRefRegistry {
             scheme,
             invocation_id,
             claims,
-            max_bytes: MAX_INPUT_REF_BYTES,
+            max_bytes: self.max_bytes,
             deadline,
         });
         let bytes = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call)
             .await
             .map_err(|_| InputRefError::Timeout)??;
-        if bytes.len() > MAX_INPUT_REF_BYTES {
+        if bytes.len() > self.max_bytes {
             return Err(InputRefError::TooLarge);
         }
         Ok(bytes)
@@ -570,6 +673,23 @@ pub(crate) fn input_ref_timeout_from_vars(lookup: impl Fn(&str) -> Option<String
                 DEFAULT_INPUT_REF_TIMEOUT.as_millis()
             );
             DEFAULT_INPUT_REF_TIMEOUT
+        }
+    }
+}
+
+/// Reads [`INPUT_REF_MAX_BYTES_ENV`] (bytes, `1..=`[`MAX_INPUT_REF_MAX_BYTES`]).
+/// Missing or invalid → [`DEFAULT_INPUT_REF_MAX_BYTES`].
+pub(crate) fn input_ref_max_bytes_from_vars(lookup: impl Fn(&str) -> Option<String>) -> usize {
+    let Some(raw) = lookup(INPUT_REF_MAX_BYTES_ENV) else {
+        return DEFAULT_INPUT_REF_MAX_BYTES;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(bytes) if (1..=MAX_INPUT_REF_MAX_BYTES).contains(&bytes) => bytes,
+        _ => {
+            tracing::warn!(
+                "{INPUT_REF_MAX_BYTES_ENV} must be 1..={MAX_INPUT_REF_MAX_BYTES} bytes; using the default {DEFAULT_INPUT_REF_MAX_BYTES}"
+            );
+            DEFAULT_INPUT_REF_MAX_BYTES
         }
     }
 }

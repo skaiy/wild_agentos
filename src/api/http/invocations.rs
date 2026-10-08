@@ -386,16 +386,6 @@ fn bounded_id(value: &Value, field: &str) -> Result<String, ApiError> {
     Ok(text.to_string())
 }
 
-fn has_uri_scheme(uri: &str) -> bool {
-    let Some((scheme, rest)) = uri.split_once("://") else {
-        return false;
-    };
-    let mut chars = scheme.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        && !rest.is_empty()
-}
-
 fn parse_input_ref(value: &Value) -> Result<InvocationInputRef, ApiError> {
     let Some(object) = value.as_object() else {
         return Err(invalid_request("input_ref must be an object"));
@@ -408,8 +398,11 @@ fn parse_input_ref(value: &Value) -> Result<InvocationInputRef, ApiError> {
     let (Some(uri), Some(sha256)) = (uri, sha256) else {
         return Err(invalid_request("input_ref requires uri and sha256 strings"));
     };
-    if !has_uri_scheme(uri) {
-        return Err(invalid_request("input_ref.uri must be <scheme>://..."));
+    // Kernel shape check before any resolver routing: lowercase scheme, no
+    // control characters / line breaks, no dot / empty segments, backslash
+    // or encoded dot / slash / backslash (#347 review).
+    if let Err(error) = super::invocations_input_ref::check_input_ref_uri(uri) {
+        return Err(invalid_request(error.message()));
     }
     if sha256.len() != 64
         || !sha256
