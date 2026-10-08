@@ -543,4 +543,20 @@ mod tests {
         assert_eq!(load_metadata(&state, &claims, None).unwrap().len(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    /// Handler-level regression: these payloads were rejected on `main`,
+    /// accepted by the first real-format guard, and must be rejected again.
+    #[tokio::test]
+    async fn upload_rejects_review_regression_payloads_without_persisting() {
+        let root = std::env::temp_dir().join(format!("artifact-test-{}", uuid::Uuid::new_v4()));
+        let state = test_state(root.clone());
+        let claims = IsolationClaims::from_verified("tenant-a", "project", "actor-a").unwrap();
+        for (_, sample) in crate::utils::secret_scan::tests::review_regression_samples() {
+            let (status, body) = upload(&state, &claims, sample.as_bytes()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "must block: {sample}");
+            assert_eq!(body["code"], ARTIFACT_SECRET_ERROR_CODE);
+        }
+        assert!(load_metadata(&state, &claims, None).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

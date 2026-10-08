@@ -25,6 +25,87 @@ fn ordinary_samples() -> Vec<String> {
         cat(&["-----", "BEGIN CERTIFICATE-----\nMIIB", &fake(60)]),
         "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}".to_string(),
         "export TOKEN=\"$TOKEN_FROM_ENV\"; client-sk-integration-handler-v2".to_string(),
+        // Escaped newlines/tabs and percent-encoding next to ordinary words.
+        r#"{"log": "line1\nask-user-for-confirmation-before-continuing\ttask-risk-review-pipeline%20disk-cleanup-schedule-weekly"}"#
+            .to_string(),
+    ]
+}
+
+/// Leaks found in review of the first real-format version: `main` rejected
+/// them, that version let them through. Each must stay rejected.
+pub(crate) fn review_regression_samples() -> Vec<(&'static str, String)> {
+    let sk = cat(&["s", "k-proj-", &fake(48)]);
+    let aws = fake(40);
+    vec![
+        // `\n` / `\t` / `\r` escapes in JSON or log text.
+        ("sk_api_key", cat(&[r#"{"content":"key:\n"#, &sk, "\"}"])),
+        ("sk_api_key", cat(&[r"\t", &sk])),
+        ("sk_api_key", cat(&[r"line\r", &sk])),
+        // Percent-encoded separators.
+        ("sk_api_key", cat(&["Authorization: Bearer%20", &sk])),
+        ("sk_api_key", cat(&["?key%3D", &sk])),
+        ("sk_api_key", cat(&["?key%3d", &sk])),
+        // JSON nested in a JSON string (escaped quotes).
+        (
+            "aws_secret_access_key",
+            cat(&[r#"{\"aws_secret_"#, r#"access_key\": \""#, &aws, r#"\"}"#]),
+        ),
+        // PHP / Ruby hash syntax.
+        (
+            "aws_secret_access_key",
+            cat(&["'aws_secret_", "access_key' => '", &aws, "'"]),
+        ),
+    ]
+}
+
+/// Must-block samples that pin rule details a weaker rule would miss. Each
+/// comment names the weakening it guards against; see the PR for the
+/// mutation runs.
+fn rule_detail_samples() -> Vec<(&'static str, String)> {
+    let aws = fake(40);
+    vec![
+        // PEM without an algorithm prefix (PKCS#8), and a digit in the label.
+        (
+            "private_key",
+            cat(&["-----", "BEGIN ", "PRIVATE KEY-----\n", &fake(64)]),
+        ),
+        (
+            "private_key",
+            cat(&["-----", "BEGIN ED25519 ", "PRIVATE KEY-----"]),
+        ),
+        // Slack: every accepted type, not only `xoxb-`.
+        ("slack_token", cat(&["xo", "xp-", &fake(24)])),
+        ("slack_token", cat(&["xo", "xa-", &fake(24)])),
+        ("slack_token", cat(&["xo", "xr-", &fake(24)])),
+        ("slack_token", cat(&["xo", "xs-", &fake(24)])),
+        // Slack: length threshold stays at 10.
+        ("slack_token", cat(&["xo", "xb-", &fake(12)])),
+        // sk: length threshold stays at 20 (also 32-hex compatible keys).
+        ("sk_api_key", cat(&[" s", "k-", &fake(24)])),
+        (
+            "sk_api_key",
+            cat(&["=s", "k-", "0123456789abcdef0123456789abcdef"]),
+        ),
+        // sk: key at the very start of the text.
+        ("sk_api_key", cat(&["s", "k-", &fake(48)])),
+        // AWS: `:` separator, double and single quotes.
+        (
+            "aws_secret_access_key",
+            cat(&["aws_secret_", "access_key: ", &aws]),
+        ),
+        (
+            "aws_secret_access_key",
+            cat(&["{\"aws_secret_", "access_key\": \"", &aws, "\"}"]),
+        ),
+        (
+            "aws_secret_access_key",
+            cat(&["aws_secret_", "access_key='", &aws, "'"]),
+        ),
+        // AWS: name is case-insensitive.
+        (
+            "aws_secret_access_key",
+            cat(&["AWS_SECRET_", "ACCESS_KEY=", &aws]),
+        ),
     ]
 }
 
@@ -92,9 +173,23 @@ fn every_real_shape_is_caught_by_exactly_its_rule() {
     assert_eq!(covered, all, "every rule needs a positive sample");
     for (name, sample) in real_samples() {
         assert!(contains_plaintext_secret(&sample), "must block: {name}");
-        // Exactly-one-rule doubles as a mutation check: deleting or weakening
-        // any rule lets its sample through, because no other rule matches it.
+        // No other rule matches the sample, so deleting this rule turns the
+        // test red. (Weakening is covered by `rule_detail_samples`.)
         assert_eq!(matched_rules(&sample), vec![name], "sample for {name}");
+    }
+}
+
+#[test]
+fn review_regressions_stay_rejected() {
+    for (name, sample) in review_regression_samples() {
+        assert_eq!(matched_rules(&sample), vec![name], "must block: {sample}");
+    }
+}
+
+#[test]
+fn rule_details_are_pinned() {
+    for (name, sample) in rule_detail_samples() {
+        assert_eq!(matched_rules(&sample), vec![name], "must block: {sample}");
     }
 }
 

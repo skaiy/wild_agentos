@@ -16,18 +16,21 @@ use regex::RegexSet;
 
 /// `(name, pattern)`; index order is the [`RegexSet`] match index.
 const RULES: &[(&str, &str)] = &[
-    // PEM private-key armor only; certificates and public keys pass.
+    // PEM private-key armor only (PKCS#8 `BEGIN PRIVATE KEY`, RSA, EC,
+    // OPENSSH, ED25519, PGP, ...); certificates and public keys pass.
     (
         "private_key",
-        r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----",
     ),
     // AWS access key id.
     ("aws_access_key_id", r"AKIA[0-9A-Z]{16}"),
-    // AWS secret access key assigned to its well-known name. The name alone,
-    // or a reference such as `=${AWS_SECRET_ACCESS_KEY}`, does not match.
+    // AWS secret access key assigned to its well-known name with `=`, `:` or
+    // `=>`, optionally quoted, including JSON-in-JSON escaped quotes
+    // (`\"key\": \"…\"`). The name alone, or a reference such as
+    // `=${AWS_SECRET_ACCESS_KEY}`, does not match.
     (
         "aws_secret_access_key",
-        r#"(?i:aws_secret_access_key)["']?\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}"#,
+        r#"(?i:aws_secret_access_key)\\?["']?\s*(?:=>|[:=])\s*\\?["']?[A-Za-z0-9/+=]{40}"#,
     ),
     // GitHub classic personal access token.
     ("github_classic_pat", r"ghp_[A-Za-z0-9]{36}"),
@@ -37,11 +40,13 @@ const RULES: &[(&str, &str)] = &[
     ("slack_token", r"xox[baprs]-[A-Za-z0-9-]{10,}"),
     // `sk-` API keys, including `sk-proj-…`, `sk-ant-…` and `sk-<slug>-<hex>`.
     // The `regex` crate has no look-behind, so the left boundary is a
-    // non-capturing group: `sk-` inside `task-` / `risk-` / `disk-` / `ask-`
-    // (or after `_` / `-`) is not a key prefix.
+    // non-capturing group: start of text, a non-token character, an escaped
+    // `\n` / `\r` / `\t` (JSON or log text), or a percent-encoded byte
+    // (`%20`, `%3D`). `sk-` inside `task-` / `risk-` / `disk-` / `ask-` (or
+    // after `_` / `-`) is not a key prefix.
     (
         "sk_api_key",
-        r"(?:^|[^A-Za-z0-9_-])sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}",
+        r"(?:^|[^A-Za-z0-9_-]|\\[nrt]|%[0-9A-Fa-f]{2})sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}",
     ),
 ];
 
@@ -53,8 +58,9 @@ static SECRET_SET: Lazy<RegexSet> = Lazy::new(|| {
         .expect("secret scan patterns must compile")
 });
 
-/// Names of all rules that match `text`. Never return matched text itself.
-pub fn matched_rules(text: &str) -> Vec<&'static str> {
+/// Names of all rules that match `text`; diagnostics for tests only.
+#[cfg(test)]
+pub(crate) fn matched_rules(text: &str) -> Vec<&'static str> {
     SECRET_SET
         .matches(text)
         .into_iter()
@@ -83,4 +89,4 @@ pub fn credential_token_hits(text: &str) -> usize {
 
 #[cfg(test)]
 #[path = "secret_scan_tests.rs"]
-mod tests;
+pub(crate) mod tests;
