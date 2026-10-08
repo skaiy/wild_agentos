@@ -30,6 +30,7 @@ cargo test --workspace isolation_contract --verbose
 | 开发 `X-Identity` | `X-Identity` 只能模拟开发身份，绝不创建 `IsolationClaims`；严格认证拒绝它。 | `api::http::iam::tests::isolation_contract_x_identity_never_creates_isolation_claims` |
 | 工具调用额度门 | `AGENTOS_TENANT_TOOL_CALL_CAP` 未设置时不要求 claims；设置有效 cap 后，没有 verified claims 的计量调用被拒绝。 | `spend::tests::isolation_contract_spend_gate_allows_missing_claims_when_cap_is_unset`; `spend::tests::isolation_contract_spend_gate_requires_claims_when_cap_is_configured` |
 | Invocations API（`/v1/invocations`） | 匿名/未校验调用方在全部 5 条路由上得到 `401 verified_isolation_claims_required`（STRICT 开/关相同）。跨租户、跨项目与未知 id 的 get/cancel/events 返回逐字节一致的 `404 not_found`（状态码、头、体），且不回显外租户 metadata。 | `api::http::invocations::tests::invocations_routes_reject_unverified_callers_with_401`；`api::http::invocations::tests::events_cross_scope_is_byte_identical_404` （同模块另有 get/cancel 孪生用例）；契约索引 `api::http::isolation_contract_invocations_tests`（#318） |
+| 原仅 DA 的写路由（#302） | 全进程共享的注册表（Prompt 创建/激活/灰度/删除；技能注册/删除/import-git/pipeline-rerun）要求 `require_platform_admin`：租户 `DA` 得到 `403 platform_admin_required`，没有已验证 claims 的调用方（包括非严格模式的 `X-Identity` 旁路）得到 `401`。按租户隔离的写操作（市场 publish/install/rollback/upgrade、MCP 技能暴露的新增/删除、KB 重建索引）要求 `require_control_plane_da`（已验证 JWT、显式 project、`DA`）；暴露记录的 tenant 取自已验证 claims。其他租户的 KB、暴露记录或私有包，与不存在时返回同样的 `404`。 | `api::http::isolation_contract_da_write_routes_tests` |
 
 ## 历史数据需要离线迁移
 
