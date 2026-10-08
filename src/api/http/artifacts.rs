@@ -1,4 +1,4 @@
-//! Claims-scoped, replayable coding artifacts.
+//! Claims-scoped, replayable coding artifacts and immutable input snapshots.
 //!
 //! Artifact bytes live below the tenant-minted blob prefix.  Their JSON index is
 //! stored as an RDF literal in the claims-minted graph, so neither request data
@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -37,6 +37,9 @@ pub enum ArtifactKind {
     Patch,
     RunTranscript,
     ReproduceScript,
+    /// Immutable UTF-8 JSON input uploaded before an invocation exists, for
+    /// example to be referenced through `input_ref`.
+    InputSnapshot,
 }
 
 impl ArtifactKind {
@@ -45,6 +48,7 @@ impl ArtifactKind {
             Self::Patch => "text/x-diff; charset=utf-8",
             Self::RunTranscript => "text/plain; charset=utf-8",
             Self::ReproduceScript => "text/x-shellscript; charset=utf-8",
+            Self::InputSnapshot => "application/json",
         }
     }
 
@@ -53,15 +57,30 @@ impl ArtifactKind {
             Self::Patch => "patch",
             Self::RunTranscript => "log",
             Self::ReproduceScript => "sh",
+            Self::InputSnapshot => "json",
         }
+    }
+
+    /// Replay kinds describe one execution and must name it. Input snapshots
+    /// are uploaded before any task exists, so their link is optional.
+    fn requires_task_iri(self) -> bool {
+        !matches!(self, Self::InputSnapshot)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        serde_json::from_value(Value::String(value.to_string())).ok()
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ArtifactUploadRequest {
     pub kind: ArtifactKind,
-    /// IRI of the task/checkpoint execution this artifact can replay.
-    pub task_iri: String,
+    /// IRI of the task/checkpoint execution this artifact can replay. Required
+    /// for replay kinds, optional for `input_snapshot`. It is only shape-checked
+    /// and stored: it is not resolved, authorized against, or queried, so a
+    /// caller may supply its own business IRI/URN.
+    #[serde(default)]
+    pub task_iri: Option<String>,
     /// Standard base64-encoded artifact bytes. This avoids storing request
     /// credentials in a multipart side channel and is bounded by the route.
     pub content_base64: String,
@@ -71,7 +90,10 @@ pub struct ArtifactUploadRequest {
 pub struct ArtifactMetadata {
     pub id: String,
     pub kind: ArtifactKind,
-    pub task_iri: String,
+    /// `null` when an `input_snapshot` was uploaded without a task link.
+    /// Records written before this field became optional still deserialize.
+    #[serde(default)]
+    pub task_iri: Option<String>,
     pub blob_key: String,
     pub content_type: String,
     pub size_bytes: usize,
@@ -211,12 +233,22 @@ pub(crate) async fn upload_artifact_handler(
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
-    if !valid_task_iri(&request.task_iri) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "task_iri must be a non-empty control-character-free IRI" })),
-        )
-            .into_response();
+    match request.task_iri.as_deref() {
+        Some(task_iri) if !valid_task_iri(task_iri) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "task_iri must be a non-empty control-character-free IRI" })),
+            )
+                .into_response();
+        }
+        None if request.kind.requires_task_iri() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "task_iri is required for this artifact kind" })),
+            )
+                .into_response();
+        }
+        _ => {}
     }
     let bytes = match STANDARD.decode(&request.content_base64) {
         Ok(bytes) => bytes,
@@ -232,6 +264,22 @@ pub(crate) async fn upload_artifact_handler(
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(json!({ "error": "artifact content must be between 1 byte and 5 MiB" })),
+        )
+            .into_response();
+    }
+    if request.kind == ArtifactKind::InputSnapshot
+        // `IgnoredAny` skips string contents without UTF-8 validation, so the
+        // encoding is checked explicitly before parsing.
+        && std::str::from_utf8(&bytes)
+            .map_err(|_| ())
+            .and_then(|text| {
+                serde_json::from_str::<serde::de::IgnoredAny>(text).map_err(|_| ())
+            })
+            .is_err()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "input_snapshot content must be valid UTF-8 JSON" })),
         )
             .into_response();
     }
@@ -290,21 +338,44 @@ pub(crate) async fn upload_artifact_handler(
         .into_response()
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ListArtifactsQuery {
+    /// Optional exact kind filter, e.g. `?kind=input_snapshot`.
+    kind: Option<String>,
+}
+
 /// GET /api/v1/artifacts — list metadata in only the caller's claims graph.
 pub(crate) async fn list_artifacts_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
+    Query(query): Query<ListArtifactsQuery>,
 ) -> Response {
     let claims = match require_claims(&identity) {
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
+    let kind = match query.kind.as_deref().map(ArtifactKind::parse) {
+        None => None,
+        Some(Some(kind)) => Some(kind),
+        Some(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "unknown artifact kind" })),
+            )
+                .into_response()
+        }
+    };
     match load_metadata(&state, claims, None) {
-        Ok(artifacts) => (
-            StatusCode::OK,
-            Json(json!({ "count": artifacts.len(), "artifacts": artifacts })),
-        )
-            .into_response(),
+        Ok(mut artifacts) => {
+            if let Some(kind) = kind {
+                artifacts.retain(|artifact| artifact.kind == kind);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({ "count": artifacts.len(), "artifacts": artifacts })),
+            )
+                .into_response()
+        }
         Err(response) => response.into_response(),
     }
 }
@@ -375,6 +446,9 @@ pub(crate) async fn download_artifact_handler(
 }
 
 #[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -402,7 +476,7 @@ mod tests {
         assert!(!valid_task_iri("iri://task/\ninvalid"));
     }
 
-    fn test_state(root: std::path::PathBuf) -> Arc<AppState> {
+    pub(super) fn test_state(root: std::path::PathBuf) -> Arc<AppState> {
         let gateway = UnifiedGateway::new(&GatewaySettings {
             base_url: "http://localhost".to_string(),
             api_key: String::new(),
@@ -459,7 +533,7 @@ mod tests {
         let metadata = ArtifactMetadata {
             id: id.clone(),
             kind: ArtifactKind::Patch,
-            task_iri: "iri://task/94".to_string(),
+            task_iri: Some("iri://task/94".to_string()),
             blob_key: artifact_key(&id, ArtifactKind::Patch),
             content_type: ArtifactKind::Patch.content_type().to_string(),
             size_bytes: 12,
