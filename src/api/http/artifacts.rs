@@ -94,23 +94,16 @@ fn valid_task_iri(task_iri: &str) -> bool {
         && !task_iri.bytes().any(|byte| byte.is_ascii_control())
 }
 
-/// Blocks recognizable credential material before it can be persisted. This is
-/// intentionally conservative: replay inputs must reference secrets through
-/// environment variables or a secret manager, never embed their values.
+/// Stable machine-readable code for a secret-guard rejection. The matched
+/// text and rule are never echoed.
+const ARTIFACT_SECRET_ERROR_CODE: &str = "artifact_plaintext_secret";
+
+/// Blocks recognizable credential values before they can be persisted; see
+/// [`crate::utils::secret_scan`] for the shared real-format rules. Replay
+/// inputs must reference credentials through environment variables or a
+/// secret manager, never embed their values.
 fn contains_plaintext_secret(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    [
-        "-----begin ",
-        "private key-----",
-        "aws_secret_access_key",
-        "github_pat_",
-        "ghp_",
-        "xoxb-",
-        "xoxp-",
-        "sk-",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+    crate::utils::secret_scan::contains_plaintext_secret(&String::from_utf8_lossy(bytes))
 }
 
 fn require_claims(identity: &UserIdentity) -> Result<&IsolationClaims, (StatusCode, Json<Value>)> {
@@ -311,7 +304,10 @@ pub(crate) async fn upload_artifact_handler(
     if contains_plaintext_secret(&bytes) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "plaintext secrets are forbidden in coding artifacts" })),
+            Json(json!({
+                "error": "plaintext secrets are forbidden in coding artifacts",
+                "code": ARTIFACT_SECRET_ERROR_CODE,
+            })),
         )
             .into_response();
     }
@@ -462,7 +458,9 @@ mod tests {
     #[test]
     fn artifact_kinds_and_secret_guard_are_explicit() {
         assert_eq!(ArtifactKind::Patch.extension(), "patch");
-        assert!(contains_plaintext_secret(b"export TOKEN=ghp_aSecretValue"));
+        // Real shape, obviously fake value.
+        let token = format!("export TOKEN=ghp_{}", "FAKE".repeat(9));
+        assert!(contains_plaintext_secret(token.as_bytes()));
         assert!(!contains_plaintext_secret(
             b"export TOKEN=\"$TOKEN_FROM_ENV\""
         ));
@@ -565,5 +563,73 @@ mod tests {
     #[test]
     fn artifacts_reject_missing_verified_claims() {
         assert!(require_claims(&UserIdentity::anonymous()).is_err());
+    }
+
+    async fn upload(
+        state: &Arc<AppState>,
+        claims: &IsolationClaims,
+        content: &[u8],
+    ) -> (StatusCode, Value) {
+        let identity =
+            crate::api::http::iam::test_identity_from_verified_claims(claims.clone(), vec![]);
+        let response = upload_artifact_handler(
+            State(state.clone()),
+            identity,
+            Json(ArtifactUploadRequest {
+                kind: ArtifactKind::RunTranscript,
+                task_iri: "iri://task/secret-guard".to_string(),
+                content_base64: STANDARD.encode(content),
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_ordinary_words_and_rejects_real_tokens_without_persisting() {
+        let root = std::env::temp_dir().join(format!("artifact-test-{}", uuid::Uuid::new_v4()));
+        let state = test_state(root.clone());
+        let claims = IsolationClaims::from_verified("tenant-a", "project", "actor-a").unwrap();
+
+        let ordinary =
+            br#"{"task-id":"task-1","risk-level":"low","disk-free":"9G","ask-user":true}"#;
+        let (status, body) = upload(&state, &claims, ordinary).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let token = ["{\"key\":\"s", "k-proj-", &"FAKE".repeat(12), "\"}"].concat();
+        let (status, body) = upload(&state, &claims, token.as_bytes()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({
+                "error": "plaintext secrets are forbidden in coding artifacts",
+                "code": ARTIFACT_SECRET_ERROR_CODE,
+            }),
+            "fixed error, no rule name or matched text"
+        );
+
+        // Only the ordinary upload was persisted.
+        assert_eq!(load_metadata(&state, &claims, None).unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Handler-level regression: these payloads were rejected on `main`,
+    /// accepted by the first real-format guard, and must be rejected again.
+    #[tokio::test]
+    async fn upload_rejects_review_regression_payloads_without_persisting() {
+        let root = std::env::temp_dir().join(format!("artifact-test-{}", uuid::Uuid::new_v4()));
+        let state = test_state(root.clone());
+        let claims = IsolationClaims::from_verified("tenant-a", "project", "actor-a").unwrap();
+        for (_, sample) in crate::utils::secret_scan::tests::review_regression_samples() {
+            let (status, body) = upload(&state, &claims, sample.as_bytes()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "must block: {sample}");
+            assert_eq!(body["code"], ARTIFACT_SECRET_ERROR_CODE);
+        }
+        assert!(load_metadata(&state, &claims, None).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
