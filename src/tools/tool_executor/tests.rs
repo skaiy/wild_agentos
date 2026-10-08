@@ -5,6 +5,9 @@ use crate::tools::builtin::hooks::HookRunner;
 use crate::tools::builtin::permissions::{PermissionMode, PermissionPolicy};
 
 #[cfg(test)]
+// Nested `tests` module inside `tests.rs` keeps existing test paths stable and avoids
+// re-indenting the whole file; no other module shares this name.
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
     use crate::tools::tool_executor::tool_description_lint::{

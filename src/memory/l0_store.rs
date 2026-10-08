@@ -92,6 +92,81 @@ const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entrie
 const TAG_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tag_index");
 const NAMED_GRAPH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("named_graph");
 
+/// Process-wide registry of writable tenant L0 handles.
+///
+/// redb takes an exclusive lock on its file, so a second `Database::create`
+/// on the same `l0.redb` in this process fails with "Database already open".
+/// Every run of one tenant therefore has to share a single open handle; this
+/// registry hands out that shared handle instead of opening the file per run.
+///
+/// - Paths are minted only from verified claims ([`tenant_path`]), so the
+///   registry cannot be used to reach another tenant's directory. Projects of
+///   one tenant share the tenant's L0, exactly as with
+///   [`L0Store::open_for_claims`].
+/// - The first open of a tenant path happens under the registry lock, so two
+///   concurrent first runs cannot race to open the file twice.
+/// - [`Self::release_idle`] closes handles no run is using any more. It drops
+///   them while still holding the registry lock, so the redb file lock is
+///   released before any later run can try to reopen it.
+/// - The lock is per process: two Core processes still cannot share one L0
+///   root.
+pub struct TenantL0Registry {
+    l0_root: PathBuf,
+    handles: std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<L0Store>>>,
+}
+
+impl TenantL0Registry {
+    pub fn new(l0_root: impl Into<PathBuf>) -> Self {
+        Self {
+            l0_root: l0_root.into(),
+            handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn l0_root(&self) -> &Path {
+        &self.l0_root
+    }
+
+    /// The shared writable L0 handle for the tenant in `claims`, opened on
+    /// first use.
+    pub fn get_or_open(&self, claims: &IsolationClaims) -> Result<Arc<L0Store>, CoreError> {
+        let path = tenant_path(&self.l0_root, claims)?;
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handle) = handles.get(&path) {
+            return Ok(handle.clone());
+        }
+        info!("Initializing tenant-scoped L0 Store: {}", path.display());
+        let handle = Arc::new(L0Store::open_writable(&path)?);
+        handles.insert(path, handle.clone());
+        Ok(handle)
+    }
+
+    /// Close every handle that only the registry still holds. Returns how many
+    /// were closed.
+    pub fn release_idle(&self) -> usize {
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = handles.len();
+        // `strong_count == 1` means no run holds a clone; new clones are only
+        // handed out under this lock, so the count cannot grow concurrently.
+        handles.retain(|_, handle| Arc::strong_count(handle) > 1);
+        before - handles.len()
+    }
+
+    /// Number of tenant handles currently open.
+    pub fn open_handles(&self) -> usize {
+        self.handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 fn tenant_path(l0_root: &Path, claims: &IsolationClaims) -> Result<PathBuf, CoreError> {
     let minted_path = claims.l0_path().map_err(|e| CoreError::PermissionDenied {
         agent: "l0_store".to_string(),
@@ -1434,6 +1509,90 @@ impl MemoryCompressor {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// #355: every run of one tenant (any project) must get the same open
+    /// handle; opening `l0.redb` again in-process fails on redb's file lock.
+    #[test]
+    fn tenant_registry_shares_one_handle_per_tenant_across_runs_and_projects() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(TenantL0Registry::new(dir.path()));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let claims = IsolationClaims::from_verified(
+                        "acme",
+                        format!("project-{}", i % 4),
+                        "actor",
+                    )
+                    .unwrap();
+                    barrier.wait();
+                    registry.get_or_open(&claims)
+                })
+            })
+            .collect();
+        let stores: Vec<Arc<L0Store>> = handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap()
+                    .expect("same-tenant open must not hit the redb lock")
+            })
+            .collect();
+        assert!(stores.iter().all(|s| Arc::ptr_eq(s, &stores[0])));
+        assert_eq!(registry.open_handles(), 1);
+
+        // The shared handle is writable and the writes are visible to all runs.
+        let entry = L0Entry {
+            iri: "iri://acme/shared".to_string(),
+            content: "{}".to_string(),
+            importance: 0.5,
+            access_count: 0,
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            tags: Vec::new(),
+            metadata: serde_json::Map::new(),
+            mesi_state: MesiState::Shared,
+            content_hash: String::new(),
+            named_graph: None,
+            jsonld_context: None,
+            jsonld_types: Vec::new(),
+            hyperspace_point_id: None,
+        };
+        stores[3].store_entry(&entry).unwrap();
+        assert!(stores[11].retrieve("iri://acme/shared").unwrap().is_some());
+
+        let other = IsolationClaims::from_verified("other", "project-0", "actor").unwrap();
+        let other_store = registry.get_or_open(&other).unwrap();
+        assert!(!Arc::ptr_eq(&other_store, &stores[0]));
+        assert!(other_store.retrieve("iri://acme/shared").unwrap().is_none());
+        assert_eq!(registry.open_handles(), 2);
+    }
+
+    #[test]
+    fn tenant_registry_releases_only_idle_handles_and_unlocks_the_file() {
+        let dir = tempdir().unwrap();
+        let registry = TenantL0Registry::new(dir.path());
+        let acme = IsolationClaims::from_verified("acme", "p", "actor").unwrap();
+        let other = IsolationClaims::from_verified("other", "p", "actor").unwrap();
+
+        let in_use = registry.get_or_open(&acme).unwrap();
+        drop(registry.get_or_open(&other).unwrap());
+
+        assert_eq!(registry.release_idle(), 1, "only the unused handle closes");
+        assert_eq!(registry.open_handles(), 1);
+        assert!(Arc::ptr_eq(&in_use, &registry.get_or_open(&acme).unwrap()));
+
+        // The released tenant's file lock is gone: it can be opened again.
+        drop(L0Store::open_for_claims(dir.path(), &other).unwrap());
+
+        drop(in_use);
+        assert_eq!(registry.release_idle(), 1);
+        assert_eq!(registry.open_handles(), 0);
+        drop(L0Store::open_for_claims(dir.path(), &acme).unwrap());
+    }
 
     fn test_store(dir: &tempfile::TempDir) -> L0Store {
         let claims =
