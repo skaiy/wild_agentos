@@ -248,12 +248,12 @@ fn snapshot_depth_limit_matches_value_parsing() {
     // Accepted iff a later `serde_json::Value` parse succeeds.
     for depth in [1, 64, INPUT_SNAPSHOT_MAX_DEPTH] {
         let bytes = nested_array(depth);
-        assert!(is_valid_snapshot_json(&bytes), "depth {depth}");
+        assert!(parse_snapshot_json(&bytes).is_some(), "depth {depth}");
         assert!(serde_json::from_slice::<Value>(&bytes).is_ok());
     }
     for depth in [INPUT_SNAPSHOT_MAX_DEPTH + 1, 10_000] {
         let bytes = nested_array(depth);
-        assert!(!is_valid_snapshot_json(&bytes), "depth {depth}");
+        assert!(parse_snapshot_json(&bytes).is_none(), "depth {depth}");
         assert!(serde_json::from_slice::<Value>(&bytes).is_err());
     }
     let deep_object = format!(
@@ -261,11 +261,11 @@ fn snapshot_depth_limit_matches_value_parsing() {
         "{\"a\":".repeat(INPUT_SNAPSHOT_MAX_DEPTH + 1),
         "}".repeat(INPUT_SNAPSHOT_MAX_DEPTH + 1)
     );
-    assert!(!is_valid_snapshot_json(deep_object.as_bytes()));
+    assert!(parse_snapshot_json(deep_object.as_bytes()).is_none());
     // Brackets inside strings (including after escaped quotes) do not count.
     let in_strings = format!("[\"{}\", \"\\\"{}\"]", "[".repeat(500), "{".repeat(500));
     assert!(!json_nesting_exceeds(in_strings.as_bytes(), 1));
-    assert!(is_valid_snapshot_json(in_strings.as_bytes()));
+    assert!(parse_snapshot_json(in_strings.as_bytes()).is_some());
 }
 
 #[tokio::test]
@@ -296,4 +296,109 @@ async fn overly_deep_snapshot_is_rejected_unpersisted() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let (_, listed) = list(&fx, &tenant, None).await;
     assert_eq!(listed["count"], 1);
+}
+
+/// JSON-escaped credentials (review probes for #378). Values are obviously
+/// fake and assembled at runtime so no complete credential-shaped literal is
+/// in the source; each payload only matches after JSON decoding.
+fn escaped_secret_probes() -> Vec<(&'static str, String)> {
+    let fake = |n: usize| "FAKE".repeat(n);
+    vec![
+        (
+            "unicode-escaped s",
+            format!(r#"{{"input":"\u0073k-proj-{}"}}"#, fake(6)),
+        ),
+        (
+            "ensure_ascii fullwidth colon",
+            format!(r#"{{"note":"API Key\uff1ask-proj-{}"}}"#, fake(6)),
+        ),
+        (
+            "ideographic space",
+            format!(r#"{{"note":"\u3000sk-{}"}}"#, fake(6)),
+        ),
+        (
+            "backspace escape",
+            format!(r#"{{"note":"\bsk-{}"}}"#, fake(6)),
+        ),
+        (
+            "unicode-escaped p",
+            format!(r#"{{"token":"gh\u0070_{}"}}"#, fake(9)),
+        ),
+        (
+            "unicode-escaped A",
+            format!(r#"{{"id":"AKIA\u0041{}FAK"}}"#, fake(3)),
+        ),
+        (
+            "escaped slash, member",
+            format!(r#"{{"aws_secret_access_key":"{}\/{}"}}"#, fake(5), fake(5)),
+        ),
+        (
+            "escaped slash, in string",
+            format!(
+                r#"{{"env":["aws_secret_access_key={}\/{}"]}}"#,
+                fake(5),
+                fake(5)
+            ),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn snapshot_secret_scan_sees_through_json_escapes_without_persisting() {
+    let fx = Fixture::new();
+    let tenant = claims("tenant-a");
+    for (name, probe) in escaped_secret_probes() {
+        // The raw-byte scan alone misses every probe; only decoding finds it.
+        assert!(!contains_plaintext_secret(probe.as_bytes()), "{name}");
+        let (status, body) = upload(
+            &fx,
+            &tenant,
+            ArtifactKind::InputSnapshot,
+            None,
+            probe.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "must block: {name}");
+        assert_eq!(
+            body,
+            json!({
+                "error": "plaintext secrets are forbidden in coding artifacts",
+                "code": ARTIFACT_SECRET_ERROR_CODE,
+            }),
+            "{name}: fixed error, nothing echoed"
+        );
+    }
+    let (_, listed) = list(&fx, &tenant, None).await;
+    assert_eq!(listed["count"], 0);
+    assert_eq!(walk_files(&fx.root.join("blobs")), 0, "nothing written");
+
+    // Escaped ordinary text (`task-…`) is still accepted.
+    let benign = format!(r#"{{"id":"ta\u0073k-{}"}}"#, "FAKE".repeat(6));
+    let (status, body) = upload(
+        &fx,
+        &tenant,
+        ArtifactKind::InputSnapshot,
+        None,
+        benign.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+fn walk_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk_files(&path)
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
