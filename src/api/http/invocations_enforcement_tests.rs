@@ -235,6 +235,7 @@ async fn fifo_over_cap_stays_queued_then_starts_in_order() {
     let h = make_harness(
         InvocationRunningLimits {
             global: 8,
+            per_tenant: 8,
             per_scope: 1,
         },
         InputRefRegistry::new(),
@@ -269,6 +270,7 @@ async fn fifo_scopes_do_not_share_per_scope_quota() {
     let h = make_harness(
         InvocationRunningLimits {
             global: 8,
+            per_tenant: 8,
             per_scope: 1,
         },
         InputRefRegistry::new(),
@@ -307,10 +309,66 @@ async fn fifo_scopes_do_not_share_per_scope_quota() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_tenant_cap_queues_other_projects_of_same_tenant() {
+    let h = make_harness(
+        InvocationRunningLimits {
+            global: 8,
+            per_tenant: 1,
+            per_scope: 4,
+        },
+        InputRefRegistry::new(),
+        false,
+    );
+
+    let (s1, b1) = create_prompt(&h, &alice(), json!({"prompt": "a"})).await;
+    assert_eq!(s1, StatusCode::ACCEPTED, "{b1}");
+    let id1 = b1["id"].as_str().unwrap().to_string();
+    wait_calls(&h.calls, 1).await;
+
+    // Same tenant, different project: blocked by the per-tenant cap, stays
+    // queued with no new error code (HTTP contract unchanged).
+    let alice_p2 = token("alice", "tenant-a", Some("project-b"), &[]);
+    let alice_p2_claims = IsolationClaims::from_verified("tenant-a", "project-b", "alice").unwrap();
+    let (s2, b2) = create_prompt(&h, &alice_p2, json!({"prompt": "a2"})).await;
+    assert_eq!(s2, StatusCode::ACCEPTED, "{b2}");
+    let id2 = b2["id"].as_str().unwrap().to_string();
+
+    // Another tenant still starts.
+    let bob = token("bob", "tenant-b", Some("project-b"), &[]);
+    let (s3, b3) = create_prompt(&h, &bob, json!({"prompt": "b"})).await;
+    assert_eq!(s3, StatusCode::ACCEPTED, "{b3}");
+    wait_calls(&h.calls, 2).await;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let inv2 = h
+        .store
+        .get_for_claims(&alice_p2_claims, &id2)
+        .await
+        .unwrap();
+    assert_eq!(inv2.state, InvocationState::Queued);
+    assert_eq!(h.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(h.scheduler.tenant_running_count("tenant-a").await, 1);
+    assert_eq!(h.scheduler.tenant_running_count("tenant-b").await, 1);
+
+    // Finishing one tenant-a run lets the queued project-b invocation start.
+    // `notify_waiters` releases both held runs; the queued one then starts.
+    h.release.notify_waiters();
+    wait_state(&h.store, &alice_claims(), &id1, InvocationState::Succeeded).await;
+    wait_calls(&h.calls, 3).await;
+    wait_state(&h.store, &alice_p2_claims, &id2, InvocationState::Running).await;
+    assert_eq!(h.scheduler.tenant_running_count("tenant-a").await, 1);
+
+    // `notify_one` keeps a permit if the executor has not parked yet.
+    h.release.notify_one();
+    wait_state(&h.store, &alice_p2_claims, &id2, InvocationState::Succeeded).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deadline_while_queued_fails_with_deadline_exceeded() {
     let h = make_harness(
         InvocationRunningLimits {
             global: 8,
+            per_tenant: 8,
             per_scope: 1,
         },
         InputRefRegistry::new(),
@@ -456,6 +514,7 @@ async fn fifo_same_scope_burst_runs_under_per_scope_cap() {
     let h = make_harness(
         InvocationRunningLimits {
             global: 8,
+            per_tenant: 8,
             per_scope: 4,
         },
         InputRefRegistry::new(),

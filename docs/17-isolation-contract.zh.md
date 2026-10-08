@@ -269,6 +269,11 @@ legacy unscoped Agent 不再隐式共享。新 user Agent 创建时写入 verifi
 `L0Store::new` read-only 打开的 startup L0 store；写历史共享数据库会 fail closed。
 `./data/l0_store/l0.redb` 尚未迁移。
 
+全新安装时 `memory.l0.path` 下没有历史 `l0.redb`。此时启动使用一个空的、内存中的
+read-only legacy 视图，不在该路径创建任何文件；无 claims 的写入仍 fail closed，tenant
+写入仍只经 `open_for_claims`。已存在但无法打开的 `l0.redb`（零字节或损坏）会让启动失败，
+错误信息给出文件路径和处理办法；该文件不会被覆盖。
+
 Coding 制品的上传、列出与下载同样要求 JWT-verified claims。制品字节使用 mint 的
 `{tenant}/artifacts/` blob 前缀；用于重放的元数据写入 mint 的 claims graph。每个
 patch、运行轨迹或复现脚本以 task IRI 关联 checkpoint 执行。参见
