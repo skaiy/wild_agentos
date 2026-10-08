@@ -326,3 +326,127 @@ async fn completed_run_flushes_into_its_tenant_l0_not_the_read_only_shared_l0() 
     );
     assert_eq!(harness.legacy_l0.count().unwrap(), 0);
 }
+
+/// Concurrent runs of one tenant (same and different projects) share the
+/// tenant's L0 handle: every run completes and every run's completion flush
+/// lands in that tenant L0, with no redb lock failure on open or on flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_runs_of_one_tenant_all_complete_and_flush_into_the_shared_tenant_l0() {
+    // Every LLM reply is delayed so all runs hold the tenant L0 at once.
+    let harness = production_harness(Duration::from_millis(400)).await;
+    let tenant_project_1 = claims("tenant-a", "project-1");
+    let tenant_project_2 = claims("tenant-a", "project-2");
+    let runs: Vec<(String, IsolationClaims)> =
+        [&tenant_project_1, &tenant_project_1, &tenant_project_2]
+            .into_iter()
+            .map(|claims| {
+                (
+                    format!("iri://task/{}", uuid::Uuid::new_v4()),
+                    claims.clone(),
+                )
+            })
+            .collect();
+
+    // A dirty node per run, as PDCA leaves it before completion.
+    let config = CoreConfig::default();
+    let seeds: Vec<String> = runs
+        .iter()
+        .map(|(task_iri, _)| format!("{task_iri}/seed"))
+        .collect();
+    for seed in &seeds {
+        harness
+            .blackboard
+            .write_node(seed, r#"{"v":1}"#, &config)
+            .unwrap();
+        harness
+            .blackboard
+            .write_node(seed, r#"{"v":2}"#, &config)
+            .unwrap();
+    }
+
+    let mut rx = harness.event_bus.subscribe();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let mut joins = Vec::new();
+    for (task_iri, claims) in runs.clone() {
+        let executor = harness.executor.clone();
+        let in_flight = in_flight.clone();
+        let max_in_flight = max_in_flight.clone();
+        joins.push(tokio::spawn(async move {
+            let now = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            max_in_flight.fetch_max(now, AtomicOrdering::SeqCst);
+            executor.execute(spec(&task_iri, &claims)).await;
+            in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+        }));
+    }
+    for join in joins {
+        join.await.unwrap();
+    }
+
+    assert!(
+        max_in_flight.load(AtomicOrdering::SeqCst) > 1,
+        "runs must overlap"
+    );
+    let mut all = Vec::new();
+    {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => all.push(event),
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    let lock_errors: Vec<String> = all
+        .iter()
+        .filter(|e| {
+            e.payload.contains("L0InitializationError")
+                || e.payload.contains("already open")
+                || e.payload.contains("Cannot acquire lock")
+                || e.payload.contains("cannot write L0 data")
+        })
+        .map(|e| format!("{} {}: {}", e.task_iri, e.event_type, e.payload))
+        .collect();
+    assert!(
+        lock_errors.is_empty(),
+        "same-tenant concurrent runs must not fight over the L0 lock: {lock_errors:#?}"
+    );
+    for (task_iri, _) in &runs {
+        let events: Vec<Event> = all
+            .iter()
+            .filter(|e| &e.task_iri == task_iri)
+            .cloned()
+            .collect();
+        let terminal = terminal_events(&events);
+        assert!(
+            terminal.iter().any(|l| l.starts_with("TASK_COMPLETED"))
+                && !terminal.iter().any(|l| l.starts_with("TASK_FAILED")),
+            "every run must complete: {task_iri} {terminal:?}"
+        );
+    }
+    assert!(harness.llm.requests.load(AtomicOrdering::SeqCst) >= runs.len());
+
+    // Every run's completion flush succeeded: no run left its node dirty in
+    // L2 (completion may also release it), and the node is in the tenant L0
+    // the runs shared.
+    for seed in &seeds {
+        assert!(
+            harness
+                .blackboard
+                .read_node(seed)
+                .unwrap()
+                .is_none_or(|node| !node.dirty),
+            "completion flush must not leave the node dirty: {seed}"
+        );
+    }
+    assert_eq!(harness.executor.tenant_l0.open_handles(), 0);
+    let tenant_l0 = L0Store::open_for_claims(&harness.l0_root, &tenant_project_1).unwrap();
+    for seed in &seeds {
+        assert!(
+            tenant_l0.retrieve(seed).unwrap().is_some(),
+            "each run's dirty node must be flushed into the shared tenant L0: {seed}"
+        );
+    }
+    assert_eq!(harness.legacy_l0.count().unwrap(), 0);
+}
