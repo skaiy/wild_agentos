@@ -236,7 +236,8 @@ pub(crate) async fn publish_package_handler(
         Ok(claims) => claims,
         Err(response) => return response,
     };
-    if let Err(error) = identity.require_role("DA") {
+    // #302: tenant/project-scoped write; explicit verified scope + DA.
+    if let Err(error) = identity.require_control_plane_da("market package writes") {
         return error.into_response();
     }
     if request.name.trim().is_empty() || !valid_semver(&request.version) {
@@ -351,26 +352,20 @@ fn select_visible_package(
     version: &str,
     claims: &crate::isolation::IsolationClaims,
 ) -> Result<MarketPackage, axum::response::Response> {
+    // #302: a version that exists but is not visible to the caller is
+    // answered exactly like a missing one, so other tenants' private packages
+    // cannot be enumerated.
     load_packages()
         .into_iter()
-        .find(|package| package.name == name && package.version == version)
+        .find(|package| {
+            package.name == name && package.version == version && is_visible_to(package, claims)
+        })
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "package version not found"})),
             )
                 .into_response()
-        })
-        .and_then(|package| {
-            if is_visible_to(&package, claims) {
-                Ok(package)
-            } else {
-                Err((
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": "package is not visible to this tenant/project"})),
-                )
-                    .into_response())
-            }
         })
 }
 
@@ -385,7 +380,8 @@ pub(crate) async fn install_package_handler(
         Ok(c) => c,
         Err(r) => return r,
     };
-    if let Err(error) = identity.require_role("DA") {
+    // #302: tenant/project-scoped write; explicit verified scope + DA.
+    if let Err(error) = identity.require_control_plane_da("market package writes") {
         return error.into_response();
     }
     let package = match select_visible_package(&name, &request.version, claims) {
@@ -446,7 +442,8 @@ pub(crate) async fn rollback_package_handler(
         Ok(claims) => claims,
         Err(response) => return response,
     };
-    if let Err(error) = identity.require_role("DA") {
+    // #302: tenant/project-scoped write; explicit verified scope + DA.
+    if let Err(error) = identity.require_control_plane_da("market package writes") {
         return error.into_response();
     }
     let mut installations = load_installations();
@@ -502,7 +499,8 @@ pub(crate) async fn upgrade_package_handler(
         Ok(claims) => claims,
         Err(response) => return response,
     };
-    if let Err(error) = identity.require_role("DA") {
+    // #302: tenant/project-scoped write; explicit verified scope + DA.
+    if let Err(error) = identity.require_control_plane_da("market package writes") {
         return error.into_response();
     }
     let package = match select_visible_package(&name, &request.version, claims) {
