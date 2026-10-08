@@ -20,7 +20,7 @@ Admin 页面，不是内核路径。“所需 claims”只陈述当前内核行�
 | Runs | `#/runs` | `GET /api/v1/tasks` | 已验证的 tenant/project `IsolationClaims`；只列出调用方持久化作用域内的任务。 | **已有** |
 | Runs — 任务详情 | `#/runs` | `GET /api/v1/tasks/:task_iri`、`GET /api/v1/tasks/:task_iri/status`、`GET /api/v1/tasks/:task_iri/details`、`GET /api/v1/tasks/trends` | 已验证的 tenant/project `IsolationClaims`；详情读取要求与 Runs 列表相同的持久化任务作用域，trends 仅聚合该作用域。 | **已有** |
 | Agents | `#/agents` | `GET, POST /api/v1/agents`；`PUT, DELETE /api/v1/agents/:id`；`POST /api/v1/agents/:id/chat` | 已验证的 tenant/project `IsolationClaims`；用户 Agent 仅在调用方持久化作用域内列出和变更。无作用域的平台目录仍为共享运行期元数据。 | **已有** |
-| Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`；`GET /api/v1/skills/manifest`；`POST /api/v1/skills/import-git`；`GET /api/v1/skills/pipeline-runs`；`POST /api/v1/skills/pipeline-rerun` | Skill 变更要求 `DA`；读取没有统一的 `IsolationClaims` 门禁。 | **已有** |
+| Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`；`GET /api/v1/skills/manifest`；`POST /api/v1/skills/import-git`；`GET /api/v1/skills/pipeline-runs`；`POST /api/v1/skills/pipeline-rerun` | Skill 变更（`POST`/`DELETE /api/v1/skills`、`import-git`、`pipeline-rerun`）会改动全进程共享的技能注册表，要求 `require_platform_admin`（#302）；租户 `DA` 得到 `403 platform_admin_required`。读取没有统一的 `IsolationClaims` 门禁。 | **已有** |
 | KB · Ontology | `#/kb-ontology` | `GET, POST /api/v1/kb/bases`；`GET, POST /api/v1/kb/categories`；`GET, POST /api/v1/knowledge-packs`；`GET /api/v1/ontology/types`；`GET /api/v1/ontology/health` | KB 图/向量摄取、目录 CRUD 和本体写入使用已验证的 tenant/project `IsolationClaims`；缺失 claims 会 fail closed。 | **已有** |
 | Isolation | `#/isolation` | 没有 create-tenant HTTP 路径。本地只读诊断：`scripts/isolation-diagnose --data-root <path>` | JWT 验证 mint tenant/project claims。诊断 CLI 不需 JWT，仍可作为只读本地导入/盘点辅助；它不是 HTTP endpoint。 | **已有** — 没有 Admin 建租户表单 |
 | Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`；`PUT, DELETE /api/v1/api-clients/:id`；`POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`；`GET /api/v1/api-audit`；`GET, PUT /api/v1/config`；`POST /api/v1/models/test`；`POST /api/v1/providers/models`；`POST /api/v1/embedding/activate` | API client、key、audit 要求 verified explicit claims 加 `DA`，按已验证 tenant 隔离；跨租户变更与不存在的记录返回相同 404。`PUT /api/v1/config`（所有配置段）和 `POST /api/v1/embedding/activate` 要求 `require_platform_admin`：经验证的 JWT 带明确非空 tenant/project、精确的 `PLATFORM_ADMIN` 角色，tenant 与非 `default` 的 `AGENTOS_PLATFORM_ADMIN_TENANT` 一致（未配置时 fail closed）；无需 `DA`。`GET /api/v1/config` 要求经验证的 JWT，并满足 `require_control_plane_da`（verified explicit tenant/project + DA）或 `require_platform_admin` 之一；响应去掉疑似密钥字段（字段名先转小写并去掉 `_`/`-` 再匹配，如 `api_key`、`accessToken`、`client_secret`、`private_key`、`authorization`、`credentials`），凭据仅以 `*_configured` 布尔值表示。Admin 配置页需要包含 tenant 和 project 的 DA token，或平台管理员 token；`POST /api/v1/models/test` 和 `POST /api/v1/providers/models` 同样要求 `require_platform_admin`（#303），并经过 provider 出站守卫（#267），见下文“Provider 探测与网关密钥”。 | **已接线** |
@@ -53,6 +53,20 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
 
 隔离诊断无需 token 是刻意设计：它是本地、只读的文件系统工具，
 既不创建 tenant，也不授予 HTTP 访问。
+
+### 矩阵之外的写路由（#302）
+
+下列内核写路由在上表中没有单独的 Admin 屏行，但遵循同样的两道门：
+
+- **全进程共享 → `require_platform_admin`。** `POST /api/v1/prompts`、
+  `POST /api/v1/prompts/:id/activate`、`PUT /api/v1/prompts/:id/canary`、
+  `DELETE /api/v1/prompts/:id`（所有租户共用一个 Prompt 注册表和一个生效版本）。
+  Prompt 读取不变。
+- **按租户隔离 → `require_control_plane_da`**（已验证 JWT、显式 tenant 和 project、`DA`）：
+  `POST /api/v1/market/packages` 及 `.../:name/{install,rollback,upgrade}`；
+  `POST, DELETE /api/v1/mcp/skill-exposures`（所属 tenant 取自已验证 claims，不取自
+  `X-Identity`）；`POST /api/v1/kb/bases/:id/reindex`。
+- 其他租户的知识库、技能暴露记录或市场私有包，与不存在时返回同样的 `404`。
 
 ### API client id 冲突与恢复
 
