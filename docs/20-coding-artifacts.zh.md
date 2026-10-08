@@ -37,7 +37,7 @@ graph 内的条目；`?kind=<kind>` 只返回该 kind，未知 kind 返回 `400`
 ## 输入快照
 
 `input_snapshot` 是调用方的不可变输入，例如之后某次 invocation 的大输入。内容必须是合法的
-UTF-8 JSON（不带 BOM），否则上传返回 `400` 且不落盘；大小上限、明文密钥拦截与 claims 作用域
+UTF-8 JSON（不带 BOM），嵌套不超过 127 层，以保证之后总能解析成标准 JSON 值；否则上传返回 `400` 且不落盘；大小上限、明文密钥拦截与 claims 作用域
 与其他 kind 相同。
 
 ```json

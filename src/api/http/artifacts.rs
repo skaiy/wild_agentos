@@ -135,6 +135,52 @@ fn contains_plaintext_secret(bytes: &[u8]) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+/// Deepest accepted `input_snapshot` nesting (arrays/objects). This is what
+/// `serde_json`'s default recursion limit (128) admits, so every accepted
+/// snapshot can later be parsed into a `serde_json::Value` by the platform
+/// or a caller.
+pub(crate) const INPUT_SNAPSHOT_MAX_DEPTH: usize = 127;
+
+/// Whether `bytes` is UTF-8 JSON nested at most [`INPUT_SNAPSHOT_MAX_DEPTH`]
+/// levels that parses into a `serde_json::Value`. Parsing into `Value` (not
+/// `IgnoredAny`, which skips string contents and is not depth-limited)
+/// validates every string; the explicit depth pre-scan keeps the limit
+/// independent of `serde_json` defaults and rejects deep input cheaply.
+fn is_valid_snapshot_json(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(|text| {
+        !json_nesting_exceeds(text.as_bytes(), INPUT_SNAPSHOT_MAX_DEPTH)
+            && serde_json::from_str::<Value>(text).is_ok()
+    })
+}
+
+/// True when array/object nesting outside string literals exceeds `max`.
+fn json_nesting_exceeds(bytes: &[u8], max: usize) -> bool {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > max {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 fn require_claims(identity: &UserIdentity) -> Result<&IsolationClaims, (StatusCode, Json<Value>)> {
     identity.isolation_claims().ok_or_else(|| {
         (
@@ -267,16 +313,7 @@ pub(crate) async fn upload_artifact_handler(
         )
             .into_response();
     }
-    if request.kind == ArtifactKind::InputSnapshot
-        // `IgnoredAny` skips string contents without UTF-8 validation, so the
-        // encoding is checked explicitly before parsing.
-        && std::str::from_utf8(&bytes)
-            .map_err(|_| ())
-            .and_then(|text| {
-                serde_json::from_str::<serde::de::IgnoredAny>(text).map_err(|_| ())
-            })
-            .is_err()
-    {
+    if request.kind == ArtifactKind::InputSnapshot && !is_valid_snapshot_json(&bytes) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "input_snapshot content must be valid UTF-8 JSON" })),

@@ -41,7 +41,8 @@ when it was omitted.
 
 An `input_snapshot` is an immutable caller input, for example the large input
 of a later invocation. Its content must be valid UTF-8 JSON (no byte-order
-mark), otherwise upload returns `400` and stores nothing; size limit,
+mark) nested at most 127 levels deep, so that it always parses into a
+standard JSON value later; otherwise upload returns `400` and stores nothing; size limit,
 plaintext-secret guard, and claims scoping are the same as for other kinds.
 
 ```json

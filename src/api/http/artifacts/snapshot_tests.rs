@@ -238,3 +238,62 @@ async fn list_filters_by_kind_within_claims_only() {
         assert_eq!(body["error"], "unknown artifact kind");
     }
 }
+
+fn nested_array(depth: usize) -> Vec<u8> {
+    format!("{}{}", "[".repeat(depth), "]".repeat(depth)).into_bytes()
+}
+
+#[test]
+fn snapshot_depth_limit_matches_value_parsing() {
+    // Accepted iff a later `serde_json::Value` parse succeeds.
+    for depth in [1, 64, INPUT_SNAPSHOT_MAX_DEPTH] {
+        let bytes = nested_array(depth);
+        assert!(is_valid_snapshot_json(&bytes), "depth {depth}");
+        assert!(serde_json::from_slice::<Value>(&bytes).is_ok());
+    }
+    for depth in [INPUT_SNAPSHOT_MAX_DEPTH + 1, 10_000] {
+        let bytes = nested_array(depth);
+        assert!(!is_valid_snapshot_json(&bytes), "depth {depth}");
+        assert!(serde_json::from_slice::<Value>(&bytes).is_err());
+    }
+    let deep_object = format!(
+        "{}1{}",
+        "{\"a\":".repeat(INPUT_SNAPSHOT_MAX_DEPTH + 1),
+        "}".repeat(INPUT_SNAPSHOT_MAX_DEPTH + 1)
+    );
+    assert!(!is_valid_snapshot_json(deep_object.as_bytes()));
+    // Brackets inside strings (including after escaped quotes) do not count.
+    let in_strings = format!("[\"{}\", \"\\\"{}\"]", "[".repeat(500), "{".repeat(500));
+    assert!(!json_nesting_exceeds(in_strings.as_bytes(), 1));
+    assert!(is_valid_snapshot_json(in_strings.as_bytes()));
+}
+
+#[tokio::test]
+async fn overly_deep_snapshot_is_rejected_unpersisted() {
+    let fx = Fixture::new();
+    let tenant = claims("tenant-a");
+    let (status, body) = upload(
+        &fx,
+        &tenant,
+        ArtifactKind::InputSnapshot,
+        None,
+        &nested_array(INPUT_SNAPSHOT_MAX_DEPTH + 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        "input_snapshot content must be valid UTF-8 JSON"
+    );
+    let (status, body) = upload(
+        &fx,
+        &tenant,
+        ArtifactKind::InputSnapshot,
+        None,
+        &nested_array(INPUT_SNAPSHOT_MAX_DEPTH),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (_, listed) = list(&fx, &tenant, None).await;
+    assert_eq!(listed["count"], 1);
+}
