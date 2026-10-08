@@ -79,6 +79,10 @@ and nothing is stored. Rules match real credential formats, not bare
 substrings, and are case-sensitive like the issued format. The same detector
 (`utils::secret_scan`) drives the skill pipeline's file scan, where private
 keys fail the gate and other formats warn.
+For `input_snapshot`, the same rules also run on the parsed JSON: every
+decoded string value and object key, and `key=value` for string members, so a
+credential hidden behind JSON escapes (`\u0073k-…`, `\/`, an escaped separator)
+is rejected the same way. The raw-byte scan still applies to every kind.
 
 | Rule | Matches |
 | --- | --- |

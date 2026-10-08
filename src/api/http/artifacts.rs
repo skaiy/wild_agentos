@@ -134,16 +134,52 @@ fn contains_plaintext_secret(bytes: &[u8]) -> bool {
 /// or a caller.
 pub(crate) const INPUT_SNAPSHOT_MAX_DEPTH: usize = 127;
 
-/// Whether `bytes` is UTF-8 JSON nested at most [`INPUT_SNAPSHOT_MAX_DEPTH`]
-/// levels that parses into a `serde_json::Value`. Parsing into `Value` (not
-/// `IgnoredAny`, which skips string contents and is not depth-limited)
-/// validates every string; the explicit depth pre-scan keeps the limit
-/// independent of `serde_json` defaults and rejects deep input cheaply.
-fn is_valid_snapshot_json(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| {
-        !json_nesting_exceeds(text.as_bytes(), INPUT_SNAPSHOT_MAX_DEPTH)
-            && serde_json::from_str::<Value>(text).is_ok()
-    })
+/// Parses `bytes` as UTF-8 JSON nested at most [`INPUT_SNAPSHOT_MAX_DEPTH`]
+/// levels into a `serde_json::Value`; `None` when it is not. Parsing into
+/// `Value` (not `IgnoredAny`, which skips string contents and is not
+/// depth-limited) validates every string; the explicit depth pre-scan keeps
+/// the limit independent of `serde_json` defaults and rejects deep input
+/// cheaply.
+fn parse_snapshot_json(bytes: &[u8]) -> Option<Value> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if json_nesting_exceeds(text.as_bytes(), INPUT_SNAPSHOT_MAX_DEPTH) {
+        return None;
+    }
+    serde_json::from_str::<Value>(text).ok()
+}
+
+/// Secret scan over a parsed JSON snapshot. The raw-byte scan cannot see
+/// credentials hidden behind JSON escapes (`\u0073k-…`, `gh\u0070_…`, `\/`,
+/// or an escaped separator before `sk-`), so every decoded string and object
+/// key is scanned, plus `key=value` for string members so a credential
+/// assigned to its well-known name is still recognized. Recursion is bounded
+/// because [`parse_snapshot_json`] caps nesting at
+/// [`INPUT_SNAPSHOT_MAX_DEPTH`].
+fn snapshot_contains_plaintext_secret(value: &Value) -> bool {
+    use crate::utils::secret_scan::contains_plaintext_secret as scan;
+    match value {
+        Value::String(text) => scan(text),
+        Value::Array(items) => items.iter().any(snapshot_contains_plaintext_secret),
+        Value::Object(members) => members.iter().any(|(key, member)| {
+            scan(key)
+                || match member {
+                    Value::String(text) => scan(text) || scan(&format!("{key}={text}")),
+                    other => snapshot_contains_plaintext_secret(other),
+                }
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn plaintext_secret_rejection() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "plaintext secrets are forbidden in coding artifacts",
+            "code": ARTIFACT_SECRET_ERROR_CODE,
+        })),
+    )
+        .into_response()
 }
 
 /// True when array/object nesting outside string literals exceeds `max`.
@@ -379,22 +415,20 @@ pub(crate) async fn upload_artifact_handler(
         )
             .into_response();
     }
-    if request.kind == ArtifactKind::InputSnapshot && !is_valid_snapshot_json(&bytes) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "input_snapshot content must be valid UTF-8 JSON" })),
-        )
-            .into_response();
+    if request.kind == ArtifactKind::InputSnapshot {
+        let Some(snapshot) = parse_snapshot_json(&bytes) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "input_snapshot content must be valid UTF-8 JSON" })),
+            )
+                .into_response();
+        };
+        if snapshot_contains_plaintext_secret(&snapshot) {
+            return plaintext_secret_rejection();
+        }
     }
     if contains_plaintext_secret(&bytes) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "plaintext secrets are forbidden in coding artifacts",
-                "code": ARTIFACT_SECRET_ERROR_CODE,
-            })),
-        )
-            .into_response();
+        return plaintext_secret_rejection();
     }
     let blob = match &state.blob_store {
         Some(blob) => blob.clone(),
