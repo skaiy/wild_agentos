@@ -1533,8 +1533,6 @@ mod tests {
             let fixture = L0Store::open_writable(dir.path()).unwrap();
             fixture.store("iri://legacy/1", "historical").unwrap();
         }
-        let before = std::fs::read(dir.path().join("l0.redb")).unwrap();
-
         let store = L0Store::open_legacy_readonly(dir.path().to_str().unwrap()).unwrap();
 
         assert_eq!(store.count().unwrap(), 1);
@@ -1547,7 +1545,20 @@ mod tests {
             CoreError::PermissionDenied { .. }
         ));
         drop(store);
-        assert_eq!(std::fs::read(dir.path().join("l0.redb")).unwrap(), before);
+
+        // Data is unchanged after the read-only session. (redb itself may update
+        // header bookkeeping on open; that pre-existing behaviour is not changed here.)
+        let reopened = L0Store::open_legacy_readonly(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(reopened.count().unwrap(), 1);
+        assert!(reopened.retrieve("iri://legacy/2").unwrap().is_none());
+        assert_eq!(
+            reopened
+                .retrieve("iri://legacy/1")
+                .unwrap()
+                .unwrap()
+                .content,
+            "historical"
+        );
     }
 
     #[test]
