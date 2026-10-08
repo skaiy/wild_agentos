@@ -24,14 +24,59 @@ pub(crate) fn load_user_agents() -> Vec<Value> {
     }
 }
 
-/// 将用户态 Agent 持久化到磁盘（pretty JSON）。
+/// 将用户态 Agent 持久化到磁盘（pretty JSON），原子替换。
 pub(crate) fn save_user_agents(agents: &[Value]) -> std::io::Result<()> {
-    let path = agents_store_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let content = serde_json::to_vec_pretty(agents).map_err(std::io::Error::other)?;
+    write_file_atomically(&agents_store_path(), &content)
+}
+
+/// Replaces `path` with `bytes` so a reader (or the next startup) sees either
+/// the old file or the new one, never a torn mix.
+///
+/// The bytes go to a uniquely named temporary file in the same directory
+/// (so the rename stays on one filesystem and concurrent writers never share
+/// a temporary path), are `fsync`ed, then renamed over `path`; on Unix the
+/// directory is `fsync`ed too so the rename itself survives a crash. On any
+/// error the temporary file is removed and `path` is left untouched.
+fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent.to_path_buf(),
+        None => std::path::PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agents.json");
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(&parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    sync_directory(&parent)
+}
+
+#[cfg(unix)]
+fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Persists the agent list after a mutation. A failed write is logged rather
+/// than surfaced so the HTTP contract of the CRUD routes stays unchanged; the
+/// previous file on disk is intact because the write is atomic.
+fn persist_user_agents(agents: &[Value]) {
+    if let Err(error) = save_user_agents(agents) {
+        tracing::error!(error = %error, "failed to persist user agents");
     }
-    let content = serde_json::to_string_pretty(agents).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(&path, content)
 }
 
 /// 从旧 knowledge_graph 值中解析知识库 uuid（形如 .../kb/{uuid}）。
@@ -235,7 +280,7 @@ pub(crate) async fn create_agent_handler(
     let id = agent["id"].as_str().unwrap_or("").to_string();
     let mut guard = state.user_agents.write().await;
     guard.push(agent.clone());
-    let _ = save_user_agents(&guard);
+    persist_user_agents(&guard);
     (
         StatusCode::CREATED,
         Json(json!({ "id": id, "status": "created", "agent": agent })),
@@ -277,7 +322,7 @@ pub(crate) async fn update_agent_handler(
                 obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
             }
             let updated = agent.clone();
-            let _ = save_user_agents(&guard);
+            persist_user_agents(&guard);
             (
                 StatusCode::OK,
                 Json(json!({ "status": "updated", "agent": updated })),
@@ -318,7 +363,7 @@ pub(crate) async fn delete_agent_handler(
         )
             .into_response();
     }
-    let _ = save_user_agents(&guard);
+    persist_user_agents(&guard);
     (
         StatusCode::OK,
         Json(json!({ "status": "deleted", "id": id })),
@@ -532,6 +577,58 @@ mod tests {
 
         restore_env("AGENTOS_AUTH_MODE", previous_auth_mode);
         restore_env("AGENTOS_JWT_SECRET", previous_jwt_secret);
+        restore_env("AGENTOS_DATA_DIR", previous_data_dir);
+    }
+
+    fn leftover_temporaries(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn atomic_write_replaces_file_and_leaves_no_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("agents.json");
+
+        write_file_atomically(&path, b"[1]").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[1]");
+
+        write_file_atomically(&path, b"[1,2]").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[1,2]");
+        assert!(leftover_temporaries(path.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn atomic_write_failure_keeps_target_and_cleans_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory at the target path makes the final rename fail.
+        let path = dir.path().join("agents.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"original").unwrap();
+
+        assert!(write_file_atomically(&path, b"[]").is_err());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"original");
+        assert!(leftover_temporaries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn save_user_agents_round_trips_through_atomic_write() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+
+        let agents = vec![json!({"id": "agent-a", "name": "Agent A"})];
+        save_user_agents(&agents).unwrap();
+        assert_eq!(load_user_agents(), agents);
+        save_user_agents(&[]).unwrap();
+        assert!(load_user_agents().is_empty());
+        assert!(leftover_temporaries(dir.path()).is_empty());
+
         restore_env("AGENTOS_DATA_DIR", previous_data_dir);
     }
 

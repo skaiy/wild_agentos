@@ -49,6 +49,8 @@ jobs:
       run: cargo clippy --workspace -- -D warnings
     - name: Build
       run: cargo build --workspace --verbose
+    - name: Fresh-install smoke (bundled config.yaml, empty data dirs)
+      run: ./scripts/smoke_fresh_install.sh target/debug/wild-agent-os-core
     - name: Run tool description lint
       run: cargo test --lib tool_description_lint --verbose
     - name: Run isolation contract golden suite

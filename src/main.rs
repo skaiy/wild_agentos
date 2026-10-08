@@ -33,6 +33,14 @@ async fn wait_for_shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Container health probe (no shell/curl in the runtime image). Handled
+    // before any configuration or secret is read.
+    if std::env::args().nth(1).as_deref()
+        == Some(wild_agent_os_core::utils::healthcheck::HEALTHCHECK_ARG)
+    {
+        std::process::exit(wild_agent_os_core::utils::healthcheck::run().await);
+    }
+
     if let Err(error) = wild_agent_os_core::api::http::iam::validate_startup_auth_configuration() {
         eprintln!("Authentication configuration error: {}", error);
         std::process::exit(1);

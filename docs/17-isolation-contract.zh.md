@@ -264,10 +264,18 @@ legacy unscoped Agent 不再隐式共享。新 user Agent 创建时写入 verifi
 直接返回。Public API-key chat 没有 tenant/project claims，完全不做 tenant RAG。
 
 `L0Store::open_for_claims` 只在给定 L0 root 下创建和写入 `l0_path()` mint 的 tenant
-目录（`/data/l0/{tenant}`）。生产 HTTP task execution 有 JWT-verified claims 时调用
-`open_for_claims`，PDCA persistence 使用该 tenant directory。无 claims 时保留由
+目录（`/data/l0/{tenant}`）。生产 HTTP task execution 有 JWT-verified claims 时从进程级
+`TenantL0Registry` 取得该 tenant directory 的句柄，PDCA persistence 使用该 tenant
+directory。redb 对 `l0.redb` 加独占锁，因此同一 tenant 的所有并发 run（不论属于哪个
+project）共用同一个已打开句柄，而不是各自再打开文件；没有 run 再使用时由 registry 关闭
+句柄。该锁是进程级的：两个 Core 进程不得共用同一个 L0 root。无 claims 时保留由
 `L0Store::new` read-only 打开的 startup L0 store；写历史共享数据库会 fail closed。
 `./data/l0_store/l0.redb` 尚未迁移。
+
+全新安装时 `memory.l0.path` 下没有历史 `l0.redb`。此时启动使用一个空的、内存中的
+read-only legacy 视图，不在该路径创建任何文件；无 claims 的写入仍 fail closed，tenant
+写入仍只经 `open_for_claims`。已存在但无法打开的 `l0.redb`（零字节或损坏）会让启动失败，
+错误信息给出文件路径和处理办法；该文件不会被覆盖。
 
 Coding 制品的上传、列出与下载同样要求 JWT-verified claims。制品字节使用 mint 的
 `{tenant}/artifacts/` blob 前缀；用于重放的元数据写入 mint 的 claims graph。每个

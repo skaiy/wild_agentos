@@ -2,40 +2,44 @@
 //!
 //! Create already parses `deadline` / `budget` / `input_ref` / `agent_revision`
 //! and rejects unsupported pins / unregistered schemes. This module enforces
-//! those fields on the execution path and gates starts behind global +
-//! per-scope **running** caps (FIFO by `created_at` within a scope).
+//! those fields on the execution path and gates starts behind global,
+//! per-tenant and per-scope **running** caps (FIFO by `created_at` within a
+//! scope). All caps are in-memory and apply to this process only.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use super::invocations_store::{Invocation, InvocationBudget, InvocationUsage};
 
 /// Hit request.budget.max_* during / after a run.
 pub(crate) const BUDGET_EXCEEDED_ERROR_CODE: &str = "budget_exceeded";
-/// `input_ref` bytes do not match the pinned sha256.
-pub(crate) const INPUT_DIGEST_MISMATCH_ERROR_CODE: &str = "input_digest_mismatch";
-/// Resolver returned an error / empty fetch before the digest check.
-pub(crate) const INPUT_REF_FETCH_FAILED_ERROR_CODE: &str = "input_ref_fetch_failed";
 
 /// Default global max **running** invocations (env override below).
 pub(crate) const DEFAULT_MAX_RUNNING_GLOBAL: usize = 64;
+/// Default per-tenant max **running** invocations, summed over all of the
+/// tenant's projects (a quarter of the default global cap).
+pub(crate) const DEFAULT_MAX_RUNNING_PER_TENANT: usize = 16;
 /// Default per-scope (tenant+project) max **running** invocations.
 pub(crate) const DEFAULT_MAX_RUNNING_PER_SCOPE: usize = 8;
 /// Env: global running cap (≥ 1).
 pub(crate) const MAX_RUNNING_GLOBAL_ENV: &str = "AGENTOS_INVOCATION_MAX_RUNNING_GLOBAL";
+/// Env: per-tenant running cap (≥ 1).
+pub(crate) const MAX_RUNNING_PER_TENANT_ENV: &str = "AGENTOS_INVOCATION_MAX_RUNNING_PER_TENANT";
 /// Env: per-scope running cap (≥ 1).
 pub(crate) const MAX_RUNNING_PER_SCOPE_ENV: &str = "AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE";
 
 /// Running-concurrency limits (distinct from `MAX_ACTIVE` non-terminal create cap).
+///
+/// A start needs room under all three caps. `per_tenant` stops one tenant from
+/// filling the global cap by spreading invocations over many projects; the
+/// effective cap for one scope is `min(per_scope, per_tenant, global)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvocationRunningLimits {
     pub global: usize,
+    pub per_tenant: usize,
     pub per_scope: usize,
 }
 
@@ -43,6 +47,7 @@ impl Default for InvocationRunningLimits {
     fn default() -> Self {
         Self {
             global: DEFAULT_MAX_RUNNING_GLOBAL,
+            per_tenant: DEFAULT_MAX_RUNNING_PER_TENANT,
             per_scope: DEFAULT_MAX_RUNNING_PER_SCOPE,
         }
     }
@@ -63,6 +68,9 @@ impl InvocationRunningLimits {
         let mut limits = Self::default();
         if let Some(v) = positive(MAX_RUNNING_GLOBAL_ENV) {
             limits.global = v;
+        }
+        if let Some(v) = positive(MAX_RUNNING_PER_TENANT_ENV) {
+            limits.per_tenant = v;
         }
         if let Some(v) = positive(MAX_RUNNING_PER_SCOPE_ENV) {
             limits.per_scope = v;
@@ -97,6 +105,8 @@ impl RunningScope {
 pub(crate) struct FifoRunningSlots {
     limits: InvocationRunningLimits,
     global: usize,
+    /// tenant_id → running count across all of that tenant's scopes.
+    per_tenant: HashMap<String, usize>,
     per_scope: HashMap<RunningScope, usize>,
     /// id → scope it was admitted under. Release is keyed on this map, so a
     /// repeated or unknown release is a no-op and can never free a peer's slot.
@@ -108,6 +118,7 @@ impl FifoRunningSlots {
         Self {
             limits,
             global: 0,
+            per_tenant: HashMap::new(),
             per_scope: HashMap::new(),
             admitted: HashMap::new(),
         }
@@ -127,19 +138,26 @@ impl FifoRunningSlots {
         self.per_scope.get(scope).copied().unwrap_or(0)
     }
 
+    pub(crate) fn tenant_running(&self, tenant_id: &str) -> usize {
+        self.per_tenant.get(tenant_id).copied().unwrap_or(0)
+    }
+
     pub(crate) fn admitted_ids(&self) -> HashSet<String> {
         self.admitted.keys().cloned().collect()
     }
 
-    /// Acquires one running slot when both global and per-scope caps allow.
-    /// Private: every slot must be owned by an admitted id so release can be
-    /// matched one-to-one.
+    /// Acquires one running slot when the global, per-tenant and per-scope
+    /// caps all allow. Private: every slot must be owned by an admitted id so
+    /// release can be matched one-to-one.
     fn try_acquire(&mut self, scope: &RunningScope) -> bool {
-        let scope_count = self.scope_running(scope);
-        if self.global >= self.limits.global || scope_count >= self.limits.per_scope {
+        if self.global >= self.limits.global
+            || self.tenant_running(&scope.tenant_id) >= self.limits.per_tenant
+            || self.scope_running(scope) >= self.limits.per_scope
+        {
             return false;
         }
         self.global = self.global.saturating_add(1);
+        *self.per_tenant.entry(scope.tenant_id.clone()).or_insert(0) += 1;
         *self.per_scope.entry(scope.clone()).or_insert(0) += 1;
         true
     }
@@ -164,6 +182,12 @@ impl FifoRunningSlots {
             return false;
         };
         self.global = self.global.saturating_sub(1);
+        if let Some(count) = self.per_tenant.get_mut(&scope.tenant_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_tenant.remove(&scope.tenant_id);
+            }
+        }
         if let Some(count) = self.per_scope.get_mut(&scope) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -241,85 +265,18 @@ impl FifoScheduler {
     pub(crate) async fn scope_running_count(&self, scope: &RunningScope) -> usize {
         self.lock_slots().scope_running(scope)
     }
-}
 
-/// Pluggable `input_ref` scheme → resolver registry. v0.12 ships empty.
-#[async_trait]
-pub(crate) trait InputRefResolver: Send + Sync {
-    async fn resolve(&self, uri: &str) -> Result<Vec<u8>, String>;
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct InputRefRegistry {
-    by_scheme: Arc<DashMap<String, Arc<dyn InputRefResolver>>>,
-}
-
-impl InputRefRegistry {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Test-only until a deployment hook registers schemes (v0.12 ships empty).
     #[cfg(test)]
-    pub(crate) fn register(&self, scheme: impl Into<String>, resolver: Arc<dyn InputRefResolver>) {
-        self.by_scheme.insert(scheme.into(), resolver);
-    }
-
-    pub(crate) fn has_scheme(&self, scheme: &str) -> bool {
-        self.by_scheme.contains_key(scheme)
-    }
-
-    /// Extracts the scheme from `uri` (`scheme://…`). `None` if malformed.
-    pub(crate) fn scheme_of(uri: &str) -> Option<&str> {
-        let (scheme, rest) = uri.split_once("://")?;
-        if scheme.is_empty() || rest.is_empty() {
-            return None;
-        }
-        Some(scheme)
-    }
-
-    pub(crate) async fn resolve(&self, uri: &str) -> Result<Vec<u8>, String> {
-        let scheme =
-            Self::scheme_of(uri).ok_or_else(|| "input_ref.uri missing scheme".to_string())?;
-        let resolver = self
-            .by_scheme
-            .get(scheme)
-            .ok_or_else(|| format!("no resolver for scheme {scheme}"))?
-            .clone();
-        resolver.resolve(uri).await
+    pub(crate) async fn tenant_running_count(&self, tenant_id: &str) -> usize {
+        self.lock_slots().tenant_running(tenant_id)
     }
 }
 
-/// Lowercase hex SHA-256 of `bytes`.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
-/// Fetches `input_ref` and checks the pinned digest.
-/// Returns `Ok(bytes)` on match; typed error codes otherwise.
-pub(crate) async fn fetch_and_verify_input_ref(
-    registry: &InputRefRegistry,
-    uri: &str,
-    expected_sha256: &str,
-) -> Result<Vec<u8>, (&'static str, String)> {
-    let bytes = registry
-        .resolve(uri)
-        .await
-        .map_err(|message| (INPUT_REF_FETCH_FAILED_ERROR_CODE, message))?;
-    let actual = sha256_hex(&bytes);
-    if actual != expected_sha256 {
-        return Err((
-            INPUT_DIGEST_MISMATCH_ERROR_CODE,
-            format!("input_ref digest mismatch: expected {expected_sha256}, got {actual}"),
-        ));
-    }
-    Ok(bytes)
-}
+// `input_ref` resolution lives in `invocations_input_ref` (extension point +
+// built-in artifact resolver); re-exported for the execution bridge.
+pub(crate) use super::invocations_input_ref::{fetch_and_verify_input_ref, InputRefRegistry};
+#[cfg(test)]
+pub(crate) use super::invocations_input_ref::{sha256_hex, InputRefRequest, InputRefResolver};
 
 /// Whether reported `usage` violates any present budget member.
 /// `max_tokens` counts `input_tokens + output_tokens` when both are known;
@@ -390,32 +347,100 @@ mod tests {
     use super::*;
     use crate::api::http::invocations_store::InvocationToolCallUsage;
 
-    struct MemoryResolver {
-        body: Vec<u8>,
-    }
-
-    #[async_trait]
-    impl InputRefResolver for MemoryResolver {
-        async fn resolve(&self, _uri: &str) -> Result<Vec<u8>, String> {
-            Ok(self.body.clone())
-        }
-    }
-
     #[test]
     fn running_limits_from_vars() {
         let limits = InvocationRunningLimits::from_vars(|key| match key {
             MAX_RUNNING_GLOBAL_ENV => Some("3".into()),
+            MAX_RUNNING_PER_TENANT_ENV => Some(" 5 ".into()),
             MAX_RUNNING_PER_SCOPE_ENV => Some("2".into()),
             _ => None,
         });
         assert_eq!(limits.global, 3);
+        assert_eq!(limits.per_tenant, 5);
         assert_eq!(limits.per_scope, 2);
+    }
+
+    #[test]
+    fn running_limits_default_and_invalid_per_tenant() {
+        let defaults = InvocationRunningLimits::from_vars(|_| None);
+        assert_eq!(defaults, InvocationRunningLimits::default());
+        assert_eq!(defaults.per_tenant, DEFAULT_MAX_RUNNING_PER_TENANT);
+        assert_eq!(DEFAULT_MAX_RUNNING_PER_TENANT, 16);
+        for raw in ["0", "-1", "abc", ""] {
+            let limits = InvocationRunningLimits::from_vars(|key| {
+                (key == MAX_RUNNING_PER_TENANT_ENV).then(|| raw.to_string())
+            });
+            assert_eq!(
+                limits.per_tenant, DEFAULT_MAX_RUNNING_PER_TENANT,
+                "{raw:?} falls back to the default"
+            );
+        }
+    }
+
+    fn scope(tenant: &str, project: &str) -> RunningScope {
+        RunningScope {
+            tenant_id: tenant.into(),
+            project_id: project.into(),
+        }
+    }
+
+    #[test]
+    fn per_tenant_cap_spans_projects_and_leaves_other_tenants_alone() {
+        let mut slots = FifoRunningSlots::new(InvocationRunningLimits {
+            global: 10,
+            per_tenant: 2,
+            per_scope: 2,
+        });
+        let a1 = scope("t1", "p1");
+        let a2 = scope("t1", "p2");
+        let a3 = scope("t1", "p3");
+        let b1 = scope("t2", "p1");
+        assert!(slots.try_admit(&a1, "a1"));
+        assert!(slots.try_admit(&a2, "a2"));
+        assert!(
+            !slots.try_admit(&a3, "a3"),
+            "third project of t1 is blocked by the per-tenant cap"
+        );
+        assert!(!slots.admitted_ids().contains("a3"));
+        assert_eq!(slots.tenant_running("t1"), 2);
+        assert!(slots.try_admit(&b1, "b1"), "another tenant is unaffected");
+        assert!(slots.try_admit(&b1, "b2"));
+        assert_eq!(slots.tenant_running("t2"), 2);
+        assert_eq!(slots.global_running(), 4);
+
+        assert!(slots.release("a1"));
+        assert!(!slots.release("a1"), "double release frees nothing");
+        assert_eq!(slots.tenant_running("t1"), 1);
+        assert!(slots.try_admit(&a3, "a3"), "freed tenant slot is reusable");
+        assert_eq!(slots.tenant_running("t1"), 2);
+
+        for id in ["a2", "a3", "b1", "b2"] {
+            assert!(slots.release(id));
+        }
+        assert_eq!(slots.global_running(), 0);
+        assert_eq!(slots.tenant_running("t1"), 0);
+        assert_eq!(slots.tenant_running("t2"), 0);
+        assert!(slots.per_tenant.is_empty(), "zero counts are dropped");
+    }
+
+    #[test]
+    fn effective_scope_cap_is_min_of_scope_and_tenant() {
+        let mut slots = FifoRunningSlots::new(InvocationRunningLimits {
+            global: 10,
+            per_tenant: 1,
+            per_scope: 4,
+        });
+        let a = scope("t1", "p1");
+        assert!(slots.try_admit(&a, "a1"));
+        assert!(!slots.try_admit(&a, "a2"), "per_tenant < per_scope wins");
+        assert_eq!(slots.scope_running(&a), 1);
     }
 
     #[test]
     fn fifo_slots_respect_global_and_scope() {
         let mut slots = FifoRunningSlots::new(InvocationRunningLimits {
             global: 2,
+            per_tenant: 2,
             per_scope: 1,
         });
         let a = RunningScope {
@@ -438,6 +463,7 @@ mod tests {
     fn fifo_release_is_idempotent_and_owner_keyed() {
         let mut slots = FifoRunningSlots::new(InvocationRunningLimits {
             global: 2,
+            per_tenant: 2,
             per_scope: 2,
         });
         let a = RunningScope {
@@ -467,6 +493,7 @@ mod tests {
         // No Tokio runtime here: release must not depend on one.
         let scheduler = FifoScheduler::new(InvocationRunningLimits {
             global: 1,
+            per_tenant: 1,
             per_scope: 1,
         });
         let a = RunningScope {
@@ -477,27 +504,6 @@ mod tests {
         assert!(scheduler.release_now("a1"));
         assert!(!scheduler.release_now("a1"));
         assert_eq!(scheduler.lock_slots().global_running(), 0);
-    }
-
-    #[tokio::test]
-    async fn input_ref_digest_match_and_mismatch() {
-        let body = b"hello-input-ref";
-        let registry = InputRefRegistry::new();
-        registry.register(
-            "mem",
-            Arc::new(MemoryResolver {
-                body: body.to_vec(),
-            }),
-        );
-        let digest = sha256_hex(body);
-        let ok = fetch_and_verify_input_ref(&registry, "mem://x", &digest)
-            .await
-            .unwrap();
-        assert_eq!(ok, body);
-        let err = fetch_and_verify_input_ref(&registry, "mem://x", &("0".repeat(64)))
-            .await
-            .unwrap_err();
-        assert_eq!(err.0, INPUT_DIGEST_MISMATCH_ERROR_CODE);
     }
 
     #[test]
@@ -549,12 +555,5 @@ mod tests {
         };
 
         assert!(budget_is_exceeded(&budget, &usage));
-    }
-
-    #[test]
-    fn scheme_of_uri() {
-        assert_eq!(InputRefRegistry::scheme_of("mem://a/b"), Some("mem"));
-        assert_eq!(InputRefRegistry::scheme_of("no-scheme"), None);
-        assert_eq!(InputRefRegistry::scheme_of("://missing"), None);
     }
 }

@@ -56,8 +56,10 @@ fn test_router_large_text_summarize() {
 
 #[test]
 fn test_router_disabled_fallback() {
-    let mut settings = ToolResultRouterSettings::default();
-    settings.enabled = false;
+    let settings = ToolResultRouterSettings {
+        enabled: false,
+        ..Default::default()
+    };
     let router = ResultRouter::new(&settings);
     let result = "x".repeat(10000);
     let decision = router.route(&result, "test_tool", "call_5");

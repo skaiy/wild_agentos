@@ -7,6 +7,10 @@
 //! and `INCONCLUSIVE` (extractor rejects before auth) are temporary, disjoint
 //! lists that may only shrink; an entry whose status changes fails the sweep.
 
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#![allow(clippy::await_holding_lock)]
+
 use std::time::Duration;
 
 use axum::{
@@ -53,19 +57,9 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
         "issue: TBD-P2-ontology-types",
     ),
     ("GET", "/metrics", "issue: #324"),
-    // Prompt routes are tracked by #302 and deliberately untouched here.
+    // Prompt reads stay open for now; #302 gated the prompt writes only.
     ("GET", "/api/v1/prompts", "issue: #302"),
     ("GET", "/api/v1/prompts/resolve", "issue: #302"),
-    (
-        "DELETE",
-        "/api/v1/prompts/:id",
-        "issue: #302 (403, not 401)",
-    ),
-    (
-        "POST",
-        "/api/v1/prompts/:id/activate",
-        "issue: #302 (403, not 401)",
-    ),
 ];
 
 /// TEMPORARY: routes whose anonymous probe is rejected by a request extractor
@@ -83,7 +77,6 @@ const INCONCLUSIVE: &[(&str, &str)] = &[
     ("POST", "/api/v1/api-clients"),
     ("POST", "/api/v1/artifacts"),
     ("POST", "/api/v1/batch/agents/:name/control"),
-    ("POST", "/api/v1/embedding/activate"),
     ("POST", "/api/v1/events"),
     ("POST", "/api/v1/images/upload"),
     ("POST", "/api/v1/kb/bases"),
@@ -238,7 +231,7 @@ fn router_source_violations(source: &str) -> Vec<String> {
     if chain.contains("_service(") {
         violations.push("build_router uses a *_service(...) call".to_string());
     }
-    if after.trim_start().chars().next() != Some('}') {
+    if !after.trim_start().starts_with('}') {
         violations.push(".with_state(state) is not the last call in build_router".to_string());
     }
     violations

@@ -552,6 +552,9 @@ fn arr_field(v: &Value, key: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#[allow(clippy::await_holding_lock)]
 pub(crate) mod tests {
     use axum::{
         extract::FromRequestParts,

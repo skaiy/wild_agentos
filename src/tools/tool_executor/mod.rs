@@ -101,7 +101,11 @@ fn strip_denied_by(value: &mut Value) {
 }
 
 mod builtins;
+mod micro_store;
 pub(crate) mod tool_description_lint;
+
+use micro_store::{read_stored_result, reader_description, reader_parameters};
+pub use micro_store::{MicroToolOwner, MicroToolStoreHandle};
 
 #[cfg(test)]
 mod tests;
@@ -131,6 +135,19 @@ tokio::task_local! {
 tokio::task_local! {
     /// Caller-owned run policy used by tool discovery during one invocation.
     static TOOL_RUN_POLICY: Option<ToolPolicy>;
+}
+
+tokio::task_local! {
+    /// Run/agent/tenant that owns the generated result readers this call may
+    /// use (#311). Set only by the runtime around a guarded call.
+    static TOOL_MICRO_OWNER: Option<MicroToolOwner>;
+}
+
+fn current_micro_owner() -> Option<MicroToolOwner> {
+    TOOL_MICRO_OWNER
+        .try_with(|owner| owner.clone())
+        .ok()
+        .flatten()
 }
 
 pub(super) fn require_isolation_claims() -> Result<IsolationClaims, String> {
@@ -224,6 +241,9 @@ pub struct MicroToolContext {
     pub tool_name: String,
     pub entity_types: Vec<String>,
     pub preview_size: usize,
+    /// Run/agent/tenant that may use this reader (#311).
+    #[serde(default)]
+    pub owner: MicroToolOwner,
 }
 
 /// Unified tool executor with built-in tools
@@ -238,8 +258,8 @@ pub struct ToolExecutor {
     kg_store: Arc<std::sync::RwLock<KnowledgeGraphStore>>,
     projection_engine:
         Arc<parking_lot::RwLock<Option<Arc<crate::memory::l3_projection::ProjectionEngine>>>>,
-    micro_tool_contexts: Arc<parking_lot::RwLock<HashMap<String, MicroToolContext>>>,
-    micro_tool_data: Arc<parking_lot::RwLock<HashMap<String, serde_json::Value>>>,
+    /// Generated result readers and their stored results, keyed by owner (#311).
+    micro_tools: MicroToolStoreHandle,
     syscall_gate: Option<crate::core::syscall_gate::SyscallGate>,
     permission_policy: Option<PermissionPolicy>,
     hook_runner: Option<HookRunner>,
@@ -342,8 +362,7 @@ impl ToolExecutor {
             registering_builtins: false,
             kg_store,
             projection_engine: Arc::new(parking_lot::RwLock::new(None)),
-            micro_tool_contexts: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            micro_tool_data: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            micro_tools: MicroToolStoreHandle::default(),
             syscall_gate: None,
             permission_policy: None,
             hook_runner: None,
@@ -1213,7 +1232,7 @@ impl ToolExecutor {
         handler: ToolFn,
         allowed_roles: &[&str],
     ) {
-        self.micro_tool_contexts.write().remove(name);
+        self.micro_tools.0.write().remove_readers_named(name);
         self.register_handler(name, description, parameters, handler, allowed_roles);
     }
 
@@ -1284,11 +1303,14 @@ impl ToolExecutor {
         MICRO_TOOL_PREFIXES.iter().any(|p| name.starts_with(p))
     }
 
-    /// True only for result readers created by `register_micro_tool`, never
-    /// for an external tool that merely shares a micro-tool name prefix.
+    /// True only for result readers created by `register_micro_tool` for the
+    /// current call's owner, never for an external tool that merely shares a
+    /// micro-tool name prefix, and never for another run's reader (#311).
     fn is_internal_micro_tool(&self, name: &str) -> bool {
         ToolPolicy::has_internal_micro_tool_prefix(name)
-            && self.micro_tool_contexts.read().contains_key(name)
+            && !self.tools.contains_key(name)
+            && current_micro_owner()
+                .is_some_and(|owner| self.micro_tools.0.read().has_reader(&owner, name))
     }
 
     /// Run-local policy decision, with the prefix read-only rule applied only
@@ -1305,153 +1327,51 @@ impl ToolExecutor {
                 && policy.is_internal_micro_tool_executable(role, agent_id, name))
     }
 
-    /// Register micro-tool (dynamically generated tool for querying large tool results)
-    pub fn register_micro_tool(&mut self, tool_name: &str, context: MicroToolContext) {
-        let contexts = Arc::clone(&self.micro_tool_contexts);
-        let data = Arc::clone(&self.micro_tool_data);
-        let tool_name_owned = tool_name.to_string();
-
-        contexts
+    /// Register a generated result reader for `context.owner` (#311).
+    ///
+    /// The reader is not added to the shared tool table: only the owning run
+    /// and agent can see it (see [`Self::tool_definitions_for_run`]) or call
+    /// it (via [`Self::execute_guarded`] with the same owner).
+    pub fn register_micro_tool(&self, tool_name: &str, context: MicroToolContext) {
+        self.micro_tools
+            .0
             .write()
-            .insert(tool_name.to_string(), context.clone());
-
-        let description = if tool_name.starts_with("read_full_result_") {
-            format!("Read full tool result. call_id: {}", context.call_id)
-        } else if tool_name.starts_with("query_") {
-            format!(
-                "Query entity types: {:?}. call_id: {}",
-                context.entity_types, context.call_id
-            )
-        } else if tool_name.starts_with("get_entity_details_") {
-            format!("Get entity details. call_id: {}", context.call_id)
-        } else {
-            format!("Micro-tool: {}", tool_name)
-        };
-
-        let params = json!({
-            "type": "object",
-            "properties": {
-                "offset": {"type": "integer", "description": "Starting offset"},
-                "limit": {"type": "integer", "description": "Max results to return"}
-            }
-        });
-
-        self.register_handler(
-            tool_name,
-            &description,
-            params,
-            Arc::new(move |input: Value| {
-                let contexts = contexts.clone();
-                let tool_name_owned = tool_name_owned.clone();
-                let data = data.clone();
-                Box::pin(async move {
-                    let offset = input["offset"].as_u64().unwrap_or(0) as usize;
-                    let limit = input["limit"].as_u64().unwrap_or(100) as usize;
-
-                    let ctx_guard = contexts.read();
-                    let ctx = ctx_guard.get(&tool_name_owned).ok_or_else(|| {
-                        format!("Micro-tool context not found: {}", tool_name_owned)
-                    })?;
-
-                    let data_guard = data.read();
-                    let stored_data = data_guard
-                        .get(&ctx.storage_key)
-                        .ok_or_else(|| format!("Micro-tool data not found: {}", ctx.storage_key))?;
-
-                    if tool_name_owned.starts_with("read_full_result_") {
-                        if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                            let lines: Vec<&str> = content.lines().collect();
-                            let selected: Vec<String> = lines
-                                .iter()
-                                .skip(offset)
-                                .take(limit)
-                                .map(|l| l.to_string())
-                                .collect();
-                            return Ok(json!({
-                                "content": selected.join("\n"),
-                                "total_lines": lines.len(),
-                                "offset": offset,
-                                "returned": selected.len(),
-                                "call_id": ctx.call_id,
-                            }));
-                        }
-                    } else if tool_name_owned.starts_with("query_") {
-                        if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                            let query_type = input["entity_type"].as_str().unwrap_or("");
-                            let keyword = input["keyword"].as_str().unwrap_or("");
-
-                            let mut results = Vec::new();
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-                                if let Some(arr) = parsed.as_array() {
-                                    for item in arr.iter().skip(offset).take(limit) {
-                                        let type_match = query_type.is_empty()
-                                            || item
-                                                .get("type")
-                                                .and_then(|v| v.as_str())
-                                                .map(|t| t.contains(query_type))
-                                                .unwrap_or(false);
-                                        let keyword_match = keyword.is_empty()
-                                            || item
-                                                .to_string()
-                                                .to_lowercase()
-                                                .contains(&keyword.to_lowercase());
-                                        if type_match && keyword_match {
-                                            results.push(item.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            return Ok(json!({
-                                "results": results,
-                                "count": results.len(),
-                                "call_id": ctx.call_id,
-                            }));
-                        }
-                    } else if tool_name_owned.starts_with("get_entity_details_") {
-                        let entity_id = input["entity_id"].as_str().unwrap_or("");
-                        if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-                                if let Some(arr) = parsed.as_array() {
-                                    for item in arr {
-                                        if item.get("id").and_then(|v| v.as_str())
-                                            == Some(entity_id)
-                                        {
-                                            return Ok(json!({
-                                                "entity": item,
-                                                "call_id": ctx.call_id,
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        return Ok(json!({
-                            "error": "Entity not found",
-                            "entity_id": entity_id,
-                            "call_id": ctx.call_id,
-                        }));
-                    }
-
-                    Ok(json!({
-                        "data": stored_data,
-                        "call_id": ctx.call_id,
-                    }))
-                })
-            }),
-            &[],
-        );
+            .register_reader(tool_name, context);
     }
 
-    /// Store micro-tool data
-    pub fn store_micro_tool_data(&self, storage_key: &str, data: serde_json::Value) {
-        self.micro_tool_data
+    /// Store the full result a reader serves, owned by `owner`.
+    pub fn store_micro_tool_data(
+        &self,
+        owner: &MicroToolOwner,
+        storage_key: &str,
+        data: serde_json::Value,
+    ) {
+        self.micro_tools
+            .0
             .write()
-            .insert(storage_key.to_string(), data);
+            .store_data(owner, storage_key, data);
     }
 
-    /// Get list of registered micro-tools
-    pub fn get_micro_tool_names(&self) -> Vec<String> {
-        self.micro_tool_contexts.read().keys().cloned().collect()
+    /// Whether `owner` has a live reader called `tool_name`.
+    pub fn has_micro_reader(&self, owner: &MicroToolOwner, tool_name: &str) -> bool {
+        !self.tools.contains_key(tool_name)
+            && self.micro_tools.0.read().has_reader(owner, tool_name)
+    }
+
+    /// Names of `owner`'s live readers, oldest first.
+    pub fn micro_tool_names_for(&self, owner: &MicroToolOwner) -> Vec<String> {
+        self.micro_tools
+            .0
+            .read()
+            .readers_for(owner)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Handle used by the run guard to drop a finished run's readers.
+    pub fn micro_tool_store(&self) -> MicroToolStoreHandle {
+        self.micro_tools.clone()
     }
 
     pub async fn execute(&self, name: &str, input: Value) -> Result<Value, ToolExecutionError> {
@@ -1660,15 +1580,52 @@ impl ToolExecutor {
         claims: Option<IsolationClaims>,
         policy: &ToolPolicy,
     ) -> Result<Value, ToolExecutionError> {
-        self.execute_guarded(name, input, context, advertised_tools, claims, policy)
-            .await
-            .map(|outcome| outcome.value)
+        // Keeps the runtime-set reader owner (#311) of an enclosing call, if any.
+        let micro_owner = current_micro_owner();
+        self.execute_guarded(
+            name,
+            input,
+            context,
+            advertised_tools,
+            claims,
+            policy,
+            micro_owner.as_ref(),
+        )
+        .await
+        .map(|outcome| outcome.value)
     }
 
     /// Same gates as `execute_with_security_context_and_claims_and_policy`,
     /// but also reports which executor gate (if any) refused the call. The
     /// runner forwards `policy_denied_by` to SkillAfter hooks out of band.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_guarded(
+        &self,
+        name: &str,
+        input: Value,
+        context: SecurityContext,
+        advertised_tools: &[String],
+        claims: Option<IsolationClaims>,
+        policy: &ToolPolicy,
+        micro_owner: Option<&MicroToolOwner>,
+    ) -> Result<ToolOutcome, ToolExecutionError> {
+        // #311: generated readers resolve only for the caller's own run/agent.
+        TOOL_MICRO_OWNER
+            .scope(
+                micro_owner.cloned(),
+                self.execute_guarded_in_owner_scope(
+                    name,
+                    input,
+                    context,
+                    advertised_tools,
+                    claims,
+                    policy,
+                ),
+            )
+            .await
+    }
+
+    async fn execute_guarded_in_owner_scope(
         &self,
         name: &str,
         input: Value,
@@ -1774,65 +1731,24 @@ impl ToolExecutor {
         self.tools.get(name).cloned()
     }
 
-    /// Get tool handler with micro-tool fallback.
-    /// When normal lookup fails, dynamically build a handler from micro-tool data storage,
-    /// preventing LLM from exhausting turns due to registry/handler inconsistency.
+    /// Get tool handler, including the current owner's generated readers.
+    ///
+    /// A reader resolves only inside a guarded call whose owner registered it
+    /// (#311). Anything else, including another run's reader, is `None` and
+    /// therefore the same `NotFound` as a tool that never existed.
     pub fn try_get_handler(&self, name: &str) -> Option<ToolFn> {
-        // 1. Try registered handler first
         if let Some(handler) = self.tools.get(name) {
             return Some(handler.clone());
         }
-        // 2. Fallback: build dynamic handler from stored data for read_full_result_* micro-tools
-        if name.starts_with("read_full_result_") {
-            return self.make_micro_tool_fallback_handler(name);
+        if !Self::is_micro_tool_name(name) {
+            return None;
         }
-        None
-    }
-
-    /// Build a dynamic fallback handler for micro-tools (reads from micro_tool_data / micro_tool_contexts)
-    fn make_micro_tool_fallback_handler(&self, name: &str) -> Option<ToolFn> {
-        let ctx_guard = self.micro_tool_contexts.read();
-        let ctx = ctx_guard.get(name)?.clone();
-        let storage_key = ctx.storage_key.clone();
-        let call_id = ctx.call_id.clone();
-        drop(ctx_guard);
-
-        let data_guard = self.micro_tool_data.read();
-        let stored_data = data_guard.get(&storage_key)?.clone();
-        drop(data_guard);
-
+        let owner = current_micro_owner()?;
+        let (context, stored) = self.micro_tools.0.read().lookup(&owner, name)?;
+        let tool_name = name.to_string();
         Some(Arc::new(move |input: Value| {
-            let _storage_key = storage_key.clone();
-            let call_id = call_id.clone();
-            let stored_data = stored_data.clone();
-
-            Box::pin(async move {
-                let offset = input["offset"].as_u64().unwrap_or(0) as usize;
-                let limit = input["limit"].as_u64().unwrap_or(100) as usize;
-
-                if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let selected: Vec<String> = lines
-                        .iter()
-                        .skip(offset)
-                        .take(limit)
-                        .map(|l| l.to_string())
-                        .collect();
-                    return Ok(serde_json::json!({
-                        "content": selected.join("
-                    "),
-                        "total_lines": lines.len(),
-                        "offset": offset,
-                        "returned": selected.len(),
-                        "call_id": call_id,
-                    }));
-                }
-
-                Ok(serde_json::json!({
-                    "data": stored_data,
-                    "call_id": call_id,
-                }))
-            })
+            let value = read_stored_result(&tool_name, &context, &stored, &input);
+            Box::pin(async move { Ok(value) })
         }))
     }
 
@@ -1994,6 +1910,44 @@ impl ToolExecutor {
             tool_names
         );
 
+        result
+    }
+
+    /// One turn's schema for a run: [`Self::tool_definitions_for_turn_with_policy`]
+    /// plus the generated readers that `owner` registered (#311), newest
+    /// [`MAX_MICRO_TOOL_DESCRIPTIONS`] only, at the tail.
+    pub fn tool_definitions_for_run(
+        &self,
+        role: &str,
+        agent_id: &str,
+        activated: &ActivatedTools,
+        owner: Option<&MicroToolOwner>,
+    ) -> Vec<Value> {
+        let mut result = self.tool_definitions_for_turn_with_policy(role, agent_id, activated);
+        let Some(owner) = owner else {
+            return result;
+        };
+        let agent_role = role.parse::<AgentRole>().unwrap_or(AgentRole::Act);
+        let policy = activated.policy();
+        let readers = self.micro_tools.0.read().readers_for(owner);
+        let skip = readers.len().saturating_sub(MAX_MICRO_TOOL_DESCRIPTIONS);
+        for (name, context) in readers.into_iter().skip(skip) {
+            if self.tools.contains_key(&name)
+                || !ToolPolicy::has_internal_micro_tool_prefix(&name)
+                || !(policy.is_executable(&agent_role, agent_id, &name)
+                    || policy.is_internal_micro_tool_executable(&agent_role, agent_id, &name))
+            {
+                continue;
+            }
+            result.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": reader_description(&name, &context),
+                    "parameters": reader_parameters(),
+                }
+            }));
+        }
         result
     }
 
