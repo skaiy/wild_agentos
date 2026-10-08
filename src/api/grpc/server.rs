@@ -20,7 +20,7 @@ use crate::core::execution_event::ExecutionState;
 use crate::core::sa::SupervisorAgent;
 use crate::gateway::unified_gateway::UnifiedGateway;
 use crate::memory::consistency_engine::ConsistencyEngine;
-use crate::memory::l0_store::L0Store;
+use crate::memory::l0_store::{L0Store, TenantL0Registry};
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::memory_bus::MemoryBus;
@@ -46,6 +46,8 @@ pub struct AgentOSService {
     settings: Settings,
     gateway: Arc<UnifiedGateway>,
     l0: Arc<L0Store>,
+    /// Shared writable tenant L0 handles for HTTP runs (one per tenant path).
+    tenant_l0: Arc<TenantL0Registry>,
     blackboard: Arc<Blackboard>,
     projection: Arc<ProjectionEngine>,
     memory_manager: Arc<tokio::sync::Mutex<MemoryManager>>,
@@ -301,10 +303,15 @@ impl AgentOSService {
         // 向量库：与 HTTP 路由共用同一实例，避免对同一目录打开两个 HyperspaceStore 句柄。
         let vector_store = crate::api::http::open_vector_store(&settings.embedding);
 
+        // redb locks its file exclusively, so all runs of one tenant must
+        // share one open handle; the registry owns those handles.
+        let tenant_l0 = Arc::new(TenantL0Registry::new(&settings.memory.l0.path));
+
         let s = Self {
             settings,
             gateway,
             l0,
+            tenant_l0,
             blackboard: blackboard.clone(),
             projection,
             memory_manager,
@@ -366,7 +373,7 @@ impl AgentOSService {
                 gateway: self.gateway.clone(),
                 skills: self.skills.clone(),
                 blackboard: self.blackboard.clone(),
-                l0_root: std::path::PathBuf::from(&self.settings.memory.l0.path),
+                tenant_l0: self.tenant_l0.clone(),
                 memory_manager: self.memory_manager.clone(),
                 templates: self.templates.clone(),
                 scheduler: self.scheduler.clone(),
@@ -746,8 +753,9 @@ pub struct HttpTaskExecutor {
     gateway: Arc<UnifiedGateway>,
     skills: Arc<SkillRegistry>,
     blackboard: Arc<Blackboard>,
-    /// Root under which `open_for_claims` mints a tenant directory on demand.
-    l0_root: std::path::PathBuf,
+    /// Shared tenant L0 handles; a run reuses the handle of its tenant
+    /// instead of opening (and exclusively locking) `l0.redb` again.
+    tenant_l0: Arc<TenantL0Registry>,
     memory_manager: Arc<tokio::sync::Mutex<MemoryManager>>,
     templates: Arc<TemplateEngine>,
     scheduler: Arc<MemoryScheduler>,
@@ -761,8 +769,8 @@ pub struct HttpTaskExecutor {
 #[async_trait::async_trait]
 impl crate::api::http::TaskExecutor for HttpTaskExecutor {
     async fn execute(&self, spec: crate::api::http::TaskExecSpec) {
-        let l0 = match L0Store::open_for_claims(&self.l0_root, &spec.isolation_claims) {
-            Ok(l0) => Arc::new(l0),
+        let l0 = match self.tenant_l0.get_or_open(&spec.isolation_claims) {
+            Ok(l0) => l0,
             Err(error) => {
                 let emitter = ExecutionEventEmitter::with_options(
                     &spec.task_iri,
@@ -914,6 +922,11 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                     .await;
             }
         }
+
+        // Release this run's clone of the tenant handle, then close tenant
+        // handles no other run is still using.
+        drop(sa);
+        self.tenant_l0.release_idle();
     }
 }
 
@@ -1701,3 +1714,7 @@ fn clean_content(text: &str) -> String {
         cleaned
     }
 }
+
+#[cfg(test)]
+#[path = "executor_l0_concurrency_tests.rs"]
+mod executor_l0_concurrency_tests;

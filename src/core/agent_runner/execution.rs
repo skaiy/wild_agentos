@@ -943,18 +943,22 @@ Output the summary report directly, not in JSON format."#,
 
         let restriction_guard = self.begin_tool_restriction_run(&ctx.task_iri);
         let run_id = restriction_guard.run_id().to_string();
+        // #311: generated result readers belong to this run and agent only.
+        let micro_owner = crate::tools::tool_executor::MicroToolOwner::new(
+            ctx.isolation_claims.as_ref(),
+            &run_id,
+            &agent.agent_id,
+        );
         let mut activated_tools = self.tool_executor.read().activated_tools();
         if let Some(allowed) = self.run_tool_restriction(&run_id) {
             activated_tools.restrict_tools(&agent.agent_id, allowed);
         }
-        let tools = self
-            .tool_executor
-            .read()
-            .tool_definitions_for_turn_with_policy(
-                &agent.role.to_string(),
-                &agent.agent_id,
-                &activated_tools,
-            );
+        let tools = self.tool_executor.read().tool_definitions_for_run(
+            &agent.role.to_string(),
+            &agent.agent_id,
+            &activated_tools,
+            Some(&micro_owner),
+        );
 
         info!(
             "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}",
@@ -1449,14 +1453,12 @@ Output the summary report directly, not in JSON format."#,
             if let Some(allowed) = self.run_tool_restriction(&run_id) {
                 activated_tools.restrict_tools(&agent.agent_id, allowed);
             }
-            let current_tools = self
-                .tool_executor
-                .read()
-                .tool_definitions_for_turn_with_policy(
-                    &agent.role.to_string(),
-                    &agent.agent_id,
-                    &activated_tools,
-                );
+            let current_tools = self.tool_executor.read().tool_definitions_for_run(
+                &agent.role.to_string(),
+                &agent.agent_id,
+                &activated_tools,
+                Some(&micro_owner),
+            );
             let advertised_tools: Vec<String> = current_tools
                 .iter()
                 .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
@@ -2126,6 +2128,7 @@ Output the summary report directly, not in JSON format."#,
                                     &advertised_tools,
                                     ctx.isolation_claims.clone(),
                                     activated_tools.policy(),
+                                    Some(&micro_owner),
                                 )
                                 .await
                             {
@@ -2161,8 +2164,15 @@ Output the summary report directly, not in JSON format."#,
                             );
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
-                            let mut result_str =
-                                self.route_tool_result(&raw_result_str, name, &c.id).await;
+                            let mut result_str = self
+                                .route_tool_result(
+                                    &raw_result_str,
+                                    name,
+                                    &c.id,
+                                    &micro_owner,
+                                    ctx.isolation_claims.as_ref(),
+                                )
+                                .await;
 
                             debug!(
                                 "  [tool] {} result: {} bytes (raw: {} bytes)",
@@ -2205,11 +2215,15 @@ Output the summary report directly, not in JSON format."#,
                                     compressor.compress_tool_messages(&mut messages);
                                 }
                             }
-                            self.compress_tool_results_with_microtools(&mut messages);
+                            self.compress_tool_results_with_microtools(&mut messages, &micro_owner);
 
                             // Cross-turn aging: compress old tool results by staleness
                             if let Some(ref aging) = self.tool_result_aging {
-                                aging.age_tool_results(&mut messages, &self.tool_executor);
+                                aging.age_tool_results(
+                                    &mut messages,
+                                    &self.tool_executor,
+                                    Some(&micro_owner),
+                                );
                             }
 
                             if let Some(err) = result.get("error") {
