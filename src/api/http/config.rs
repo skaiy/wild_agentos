@@ -833,7 +833,24 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // #312: tightened. A caller that is not a platform admin is refused
+        // before the body is parsed, so it no longer learns the schema (was 422).
+        assert_eq!(unknown_field.status(), StatusCode::FORBIDDEN);
+        assert!(!tmp.join("config_override.json").exists());
+        // The strict schema still applies to an authorized caller.
+        let admin_unknown_field = router
+            .clone()
+            .oneshot(put_config(
+                Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
+                json!({"gateway": {"base_url": "https://blocked.example"}, "unexpected": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            admin_unknown_field.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(!tmp.join("config_override.json").exists());
         let non_da = router
             .clone()
             .oneshot(put_config(
