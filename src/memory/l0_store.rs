@@ -143,12 +143,59 @@ impl L0Store {
     /// Opens an existing historical shared L0 database without permitting
     /// writes. This explicit API is also used to verify the fail-closed
     /// compatibility path in tests.
+    ///
+    /// - `l0.redb` absent (fresh install): starts with an empty, in-memory,
+    ///   read-only legacy view. Nothing is created on disk at the legacy path.
+    /// - `l0.redb` present: opened exactly as before; writes still fail closed.
+    /// - `l0.redb` present but unreadable (zero bytes, corrupt): returns an
+    ///   error that says what to do, and never overwrites the file.
     pub fn open_legacy_readonly(path: &str) -> Result<Self, CoreError> {
         let db_path = Path::new(path).join("l0.redb");
+        // `symlink_metadata` so that a dangling symlink is reported as an
+        // unreadable file rather than silently treated as "no history".
+        match std::fs::symlink_metadata(&db_path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    "No legacy shared L0 database at {}; starting with an empty read-only legacy view (tenant writes use per-tenant directories)",
+                    db_path.display()
+                );
+                return Self::empty_legacy_readonly(path);
+            }
+            Err(e) => {
+                return Err(CoreError::StorageError {
+                    message: format!(
+                        "Failed to open legacy read-only database at {}: cannot inspect the file: {}",
+                        db_path.display(),
+                        e
+                    ),
+                });
+            }
+        }
+
         let db = Database::open(&db_path).map_err(|e| CoreError::StorageError {
-            message: format!("Failed to open legacy read-only database: {}", e),
+            message: format!(
+                "Failed to open legacy read-only database at {}: {}. The file exists but is not a \
+                 readable L0 database (for example it is empty or corrupt); it was left unmodified. \
+                 Restore it from a backup, or move it out of the L0 directory to start without \
+                 legacy history.",
+                db_path.display(),
+                e
+            ),
         })?;
 
+        Self::from_database(db, path.to_owned(), false)
+    }
+
+    /// Empty legacy view for a fresh install: an in-memory redb database with
+    /// the L0 tables created, wrapped read-only so writes still fail closed.
+    fn empty_legacy_readonly(path: &str) -> Result<Self, CoreError> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to create empty legacy L0 view: {}", e),
+            })?;
+        Self::create_tables(&db)?;
         Self::from_database(db, path.to_owned(), false)
     }
 
@@ -184,27 +231,7 @@ impl L0Store {
     fn from_database(db: Database, path: String, writable: bool) -> Result<Self, CoreError> {
         // Ensure tables exist by opening them in a write transaction
         if writable {
-            let write_txn = db.begin_write().map_err(|e| CoreError::StorageError {
-                message: format!("Failed to begin write transaction: {}", e),
-            })?;
-            write_txn
-                .open_table(ENTRIES_TABLE)
-                .map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to open entries table: {}", e),
-                })?;
-            write_txn
-                .open_table(TAG_INDEX_TABLE)
-                .map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to open tag index table: {}", e),
-                })?;
-            write_txn
-                .open_table(NAMED_GRAPH_TABLE)
-                .map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to open named graph table: {}", e),
-                })?;
-            write_txn.commit().map_err(|e| CoreError::StorageError {
-                message: format!("Failed to commit transaction: {}", e),
-            })?;
+            Self::create_tables(&db)?;
         }
 
         let entry_count = {
@@ -231,6 +258,30 @@ impl L0Store {
             },
             entry_count,
             iri_registry: None,
+        })
+    }
+
+    fn create_tables(db: &Database) -> Result<(), CoreError> {
+        let write_txn = db.begin_write().map_err(|e| CoreError::StorageError {
+            message: format!("Failed to begin write transaction: {}", e),
+        })?;
+        write_txn
+            .open_table(ENTRIES_TABLE)
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to open entries table: {}", e),
+            })?;
+        write_txn
+            .open_table(TAG_INDEX_TABLE)
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to open tag index table: {}", e),
+            })?;
+        write_txn
+            .open_table(NAMED_GRAPH_TABLE)
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to open named graph table: {}", e),
+            })?;
+        write_txn.commit().map_err(|e| CoreError::StorageError {
+            message: format!("Failed to commit transaction: {}", e),
         })
     }
 
@@ -1452,6 +1503,100 @@ mod tests {
         let error = store.store("iri://test/1", "unclaimed").unwrap_err();
 
         assert!(matches!(error, CoreError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn legacy_l0_missing_starts_empty_without_creating_files() {
+        let dir = tempdir().unwrap();
+        // Both an empty L0 directory and a not-yet-created one are "no history".
+        for root in [dir.path().to_path_buf(), dir.path().join("not-created")] {
+            let store = L0Store::open_legacy_readonly(root.to_str().unwrap()).unwrap();
+
+            assert_eq!(store.count().unwrap(), 0);
+            assert!(store.retrieve("iri://test/1").unwrap().is_none());
+            assert!(store.search("anything", 10).unwrap().is_empty());
+            assert!(store.list_named_graphs().unwrap().is_empty());
+            assert!(matches!(
+                store.store("iri://test/1", "unclaimed").unwrap_err(),
+                CoreError::PermissionDenied { .. }
+            ));
+            assert!(!root.join("l0.redb").exists());
+        }
+        assert!(!dir.path().join("not-created").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn legacy_l0_existing_database_reads_as_before() {
+        let dir = tempdir().unwrap();
+        {
+            let fixture = L0Store::open_writable(dir.path()).unwrap();
+            fixture.store("iri://legacy/1", "historical").unwrap();
+        }
+        let before = std::fs::read(dir.path().join("l0.redb")).unwrap();
+
+        let store = L0Store::open_legacy_readonly(dir.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(
+            store.retrieve("iri://legacy/1").unwrap().unwrap().content,
+            "historical"
+        );
+        assert!(matches!(
+            store.store("iri://legacy/2", "unclaimed").unwrap_err(),
+            CoreError::PermissionDenied { .. }
+        ));
+        drop(store);
+        assert_eq!(std::fs::read(dir.path().join("l0.redb")).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_l0_unreadable_file_fails_with_guidance_and_is_not_overwritten() {
+        for contents in [&b""[..], &b"not a redb database, just junk bytes"[..]] {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join("l0.redb");
+            std::fs::write(&db_path, contents).unwrap();
+
+            let error = match L0Store::open_legacy_readonly(dir.path().to_str().unwrap()) {
+                Ok(_) => panic!("unreadable legacy L0 file must not open"),
+                Err(error) => error.to_string(),
+            };
+
+            assert!(
+                error.contains("Failed to open legacy read-only database"),
+                "{error}"
+            );
+            assert!(error.contains("left unmodified"), "{error}");
+            assert!(error.contains("Restore it from a backup"), "{error}");
+            assert_eq!(std::fs::read(&db_path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn isolation_contract_l0_fresh_install_keeps_unclaimed_writes_closed_and_tenants_separate() {
+        let dir = tempdir().unwrap();
+        let legacy = L0Store::open_legacy_readonly(dir.path().to_str().unwrap()).unwrap();
+        assert!(matches!(
+            legacy.store("iri://shared/1", "unclaimed").unwrap_err(),
+            CoreError::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            legacy
+                .update_mesi_state("iri://shared/1", MesiState::Modified)
+                .unwrap_err(),
+            CoreError::PermissionDenied { .. }
+        ));
+        assert!(!dir.path().join("l0.redb").exists());
+
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project", "actor").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project", "actor").unwrap();
+        let store_a = L0Store::open_for_claims(dir.path(), &tenant_a).unwrap();
+        store_a.store("iri://task/1", "tenant-a-only").unwrap();
+        let store_b = L0Store::open_for_claims(dir.path(), &tenant_b).unwrap();
+
+        assert!(store_b.retrieve("iri://task/1").unwrap().is_none());
+        assert!(legacy.retrieve("iri://task/1").unwrap().is_none());
+        assert!(!dir.path().join("l0.redb").exists());
     }
 
     #[test]
