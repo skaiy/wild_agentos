@@ -74,7 +74,7 @@ scope and server fields → `400 field_not_allowed` (§3).
 | `prompt` / `input` / `input_ref` | At least one must be present | `400 invalid_request` |
 | `agent_revision` | Must equal the current revision of `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Until agent definition revisions exist ([#317](https://github.com/skaiy/wild_agentos/issues/317)): any value → `422 agent_revision_unsupported`. After #317: mismatch → `409 agent_revision_mismatch`. Floating word or missing `agent_id` → `400 invalid_request` |
 | `input` | Any JSON value, ≤ 8192 bytes as compact JSON | Over limit → `413 payload_too_large` |
-| `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…`; `sha256` is 64 lowercase hex; a registered resolver must match the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` without `<scheme>://` → `400 invalid_request`; no matching resolver → `422 input_ref_unresolvable` |
+| `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…`; `sha256` is 64 lowercase hex; a registered resolver must match and accept the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` without `<scheme>://` → `400 invalid_request`; no matching resolver, or the resolver rejects the `uri` → `422 input_ref_unresolvable`; `uri` names another project → `422 input_ref_scope_mismatch` |
 | `budget.*` | Positive integers (≥ 1); `max_cost` is micro-USD; unknown members rejected | `400 invalid_request` |
 | `deadline` | RFC 3339 with offset, later than server time at create | `400 invalid_request` |
 | `metadata` | JSON object, ≤ 16 KiB compact JSON, ≤ 64 top-level keys | `413 payload_too_large` |
@@ -88,8 +88,9 @@ scope and server fields → `400 field_not_allowed` (§3).
   never silently ignored, so a caller can never believe it pinned a revision
   that the server did not check.
 - `input_ref` content is fetched only by the execution bridge, with the
-  creator's claims; if its SHA-256 does not match, the invocation ends
-  `failed` with `error.code = "input_digest_mismatch"` (§4.2).
+  creator's claims; the server checks its SHA-256 itself, and on a mismatch
+  the invocation ends `failed` with `error.code = "input_digest_mismatch"`
+  (§4.2). The fetched text is passed to the task together with the prompt.
 - When a budget limit is hit, execution stops and the invocation ends `failed`
   with `error.code = "budget_exceeded"`.
 - When `deadline` passes, execution stops and the invocation ends `failed` with
@@ -132,42 +133,60 @@ scope and server fields → `400 field_not_allowed` (§3).
 
 - Resolvers are a pluggable registry. `input_ref.uri` must be `<scheme>://…`.
   A resolver is registered either for an exact scheme or for a URI prefix
-  (for example `s3://bucket-a/`); the longest matching prefix wins, then the
-  exact scheme. Registration is first-come: a scheme or prefix that is
-  already registered cannot be replaced.
-- A `uri` without a scheme → `400 invalid_request`. A `uri` that no
-  registered resolver matches → `422 input_ref_unresolvable`. Both are checked
-  at create, so nothing is persisted. With nothing registered (the default),
-  every `input_ref` is `422`.
-- The execution bridge always passes the **creator's verified claims**
-  (tenant, project, actor) to the resolver together with the `uri`. A
-  resolver must scope its lookup to those claims.
-- Content larger than the create request-body limit (64 KiB) is rejected,
-  whatever the resolver returns.
+  that ends with `/` (for example `s3://bucket-a/`, which never matches
+  `s3://bucket-a2/…`). A scheme belongs either to one scheme resolver or to
+  prefix resolvers, never both, so a prefix can never shadow a scheme
+  resolver such as the built-in one. Among prefixes the longest match wins.
+  Registration is first-come; a registered scheme or prefix cannot be
+  replaced, and the registry is frozen once startup finishes.
+- Create checks, in order, with nothing persisted on failure: a `uri`
+  without a scheme → `400 invalid_request`; no registered resolver matches →
+  `422 input_ref_unresolvable`; the resolver's create-time check (no I/O)
+  rejects the `uri` → `422 input_ref_unresolvable`, or finds that it names
+  another project than the caller's → `422 input_ref_scope_mismatch`. With
+  nothing registered (the default), every `input_ref` is `422`.
+- On the execution path the server calls the resolver with the
+  **creator's verified claims** (tenant, project, actor), the `uri`, its
+  scheme, the invocation id, a byte cap and a deadline. A resolver must
+  scope its lookup to those claims.
+- The server, not the resolver, enforces the limits and checks the
+  content: at most the create request-body limit (64 KiB); a timeout of
+  `AGENTOS_INVOCATION_INPUT_REF_TIMEOUT_MS` (default 10000, 1–60000; invalid
+  values fall back to the default), cut short by the invocation `deadline`;
+  the SHA-256 is computed by the server and compared with
+  `input_ref.sha256`; the content must be UTF-8 text.
 - Every fetch failure — unknown or malformed `uri`, data that belongs to
-  another project or tenant, content too large, backend error — ends the
-  invocation `failed` with `error.code = "input_ref_fetch_failed"` and the
-  fixed message `input_ref could not be resolved`. A digest mismatch ends
-  `failed` / `input_digest_mismatch` with the fixed message
+  another project or tenant, content too large, timeout, not UTF-8, backend
+  error — ends the invocation `failed` with
+  `error.code = "input_ref_fetch_failed"` and the fixed message
+  `input_ref could not be resolved`. A digest mismatch ends `failed` /
+  `input_digest_mismatch` with the fixed message
   `input_ref content does not match sha256`. Neither echoes the `uri`, the
   digest or the content, so an error never shows whether someone else's data
-  exists.
-- The fetched content is used like inline `input`: when `prompt` is empty it
-  becomes the prompt, decoded as UTF-8 (invalid sequences replaced).
-- **Built-in resolver `wao-artifact://<artifact-id>` (off by default).** It
-  reads coding artifacts uploaded through `/api/v1/artifacts` from the
-  platform's own claims-scoped storage, and makes no outbound network
-  request. `<artifact-id>` is the lowercase hyphenated UUID returned by the
-  upload. Any actor in the same tenant and project can reference an artifact;
-  another project or tenant gets the same `input_ref_fetch_failed` as an
-  unknown id. It is registered only when
-  `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` is truthy (`1`, `true`,
-  `yes`, `on`) and a blob store is configured; it is read at startup. Turning
-  it on in production is a separate decision.
-- Deployments that embed the server can register their own resolvers (by
-  scheme or prefix) before startup; see `src/api/http/invocations_input_ref.rs`.
-  Until one is registered or the built-in is switched on, first integrations
-  should send inline `input` (≤ 8192 bytes).
+  exists. Server logs record only the invocation id, the scheme and the
+  failure class.
+- The fetched content always reaches the task. It is appended after the
+  prompt as one block,
+  `<input_ref uri="…" sha256="…">` + newline + content + newline +
+  `</input_ref>`; without a prompt the block alone is the prompt, so the
+  prompt is never empty.
+- **Built-in resolver `wao-artifact://<project_id>/<artifact-id>` (off by
+  default).** It reads coding artifacts uploaded through `/api/v1/artifacts`
+  from the platform's own claims-scoped storage, and makes no outbound
+  network request. `<project_id>` must equal the caller's project (otherwise
+  create returns `422 input_ref_scope_mismatch`); `<artifact-id>` is the
+  lowercase hyphenated UUID returned by the upload. Any actor in the same
+  tenant and project can reference an artifact; another project or tenant
+  gets the same `input_ref_fetch_failed` as an unknown id. It is registered
+  only when `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` is truthy (`1`,
+  `true`, `yes`, `on`) and a blob store is configured; it is read at startup.
+  Turning it on in production is a separate decision.
+- Configuration can only switch on resolvers compiled into the server; it
+  never loads code. Deployments that embed the server register their own
+  resolvers in code (by scheme or prefix) before startup; see
+  `src/api/http/invocations_input_ref.rs`. Until one is registered or the
+  built-in is switched on, first integrations should send inline `input`
+  (≤ 8192 bytes).
 
 ## 5. Resource (draft)
 
@@ -391,10 +410,12 @@ entered the executor path).
 - `input_ref` uses a pluggable resolver registry (prefix or scheme, §4.2).
   Nothing is registered by default (create → `422 input_ref_unresolvable`);
   the built-in `wao-artifact://` resolver is off by default. A matching
-  resolver fetches bytes on the execution path with the creator's claims;
-  fetch failure → `failed` / `input_ref_fetch_failed`, SHA-256 mismatch →
-  `failed` / `input_digest_mismatch`, both with fixed messages. There is no
-  default outbound/network resolver.
+  resolver fetches bytes on the execution path with the creator's claims,
+  under a server-enforced timeout and size cap; the server checks the SHA-256
+  and passes the text to the task with the prompt. Fetch failure → `failed` /
+  `input_ref_fetch_failed`, SHA-256 mismatch → `failed` /
+  `input_digest_mismatch`, both with fixed messages. There is no default
+  outbound/network resolver.
 - `agent_revision`: until agent definition revisions exist in-tree, create still
   returns `422 agent_revision_unsupported` (never silently ignored; no fake pin).
 - Task events drive state transitions. A lagging SSE subscriber receives a
@@ -460,7 +481,7 @@ safe texts and never echo tokens, inputs or the original request.
 | 404 | `not_found` | Unknown id or another scope (identical body) |
 | 409 | `idempotency_key_conflict`, `idempotency_key_in_progress`, `revision_conflict`, `illegal_transition`, `agent_revision_mismatch` | See §4, §6, §7; a `revision_conflict` body may carry `current_revision` |
 | 413 | `payload_too_large` | Body > 64 KiB, `input` > 8192 bytes or `metadata` > 16 KiB / 64 keys |
-| 422 | `input_ref_unresolvable`, `agent_not_found`, `agent_revision_unsupported` | No registered resolver matches `input_ref.uri`; `agent_id` not found in scope; `agent_revision` sent before agent definition revisions exist (#317, §4) |
+| 422 | `input_ref_unresolvable`, `input_ref_scope_mismatch`, `agent_not_found`, `agent_revision_unsupported` | No registered resolver matches or accepts `input_ref.uri`; `input_ref.uri` names another project than the caller's; `agent_id` not found in scope; `agent_revision` sent before agent definition revisions exist (#317, §4) |
 | 429 | `too_many_active` | Per-scope active limit reached (§7.2); `Retry-After: 5` |
 | 500 | `persistence_failed` | Store write failed; nothing changed |
 | 503 | `execution_disabled`, `invocation_store_full`, `invocation_store_unavailable` | Execution switch off (§8); store still full after the retention sweep (§7.1); invocation store not configured or unreachable |

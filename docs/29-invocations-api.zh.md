@@ -60,7 +60,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | `prompt` / `input` / `input_ref` | 至少出现一个 | `400 invalid_request` |
 | `agent_revision` | 必须等于 `agent_id` 当前修订；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析 | agent 定义修订（[#317](https://github.com/skaiy/wild_agentos/issues/317)）落地之前：带任何值 → `422 agent_revision_unsupported`。#317 之后：不一致 → `409 agent_revision_mismatch`。浮动词或缺 `agent_id` → `400 invalid_request` |
 | `input` | 任意 JSON 值，紧凑序列化 ≤ 8192 字节 | 超限 → `413 payload_too_large` |
-| `input_ref` | `uri` 与 `sha256` 都必填；`uri` 形如 `<scheme>://…`；`sha256` 为 64 位小写十六进制；必须有已注册的解析器匹配该 `uri`（§4.2） | 同时带 `input` 和 `input_ref`，或 `uri` 没有 `<scheme>://` → `400 invalid_request`；没有匹配的解析器 → `422 input_ref_unresolvable` |
+| `input_ref` | `uri` 与 `sha256` 都必填；`uri` 形如 `<scheme>://…`；`sha256` 为 64 位小写十六进制；必须有已注册的解析器匹配并接受该 `uri`（§4.2） | 同时带 `input` 和 `input_ref`，或 `uri` 没有 `<scheme>://` → `400 invalid_request`；没有匹配的解析器，或解析器不接受该 `uri` → `422 input_ref_unresolvable`；`uri` 指向别的项目 → `422 input_ref_scope_mismatch` |
 | `budget.*` | 正整数（≥ 1）；`max_cost` 单位为微美元；未知成员拒绝 | `400 invalid_request` |
 | `deadline` | 带时区偏移的 RFC 3339，晚于创建时的服务端时间 | `400 invalid_request` |
 | `metadata` | JSON 对象，紧凑序列化 ≤ 16 KiB，顶层键 ≤ 64 个 | `413 payload_too_large` |
@@ -68,7 +68,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 
 - `agent_id` 在调用方 scope 内找不到对应定义 → `422 agent_not_found`，不存在的 id 与其他 scope 的 id 返回相同。
 - 当前 `main` 上的 agent 定义没有修订号。在 #317 补上定义修订之前，凡是带 `agent_revision` 的创建一律返回 `422 agent_revision_unsupported`，不持久化任何东西。这个字段绝不会被静默忽略，调用方不会误以为钉住了一个服务端根本没校验的修订。
-- `input_ref` 的内容只由执行桥用创建者的 claims 拉取；SHA-256 不一致时调用以 `failed` 结束，`error.code = "input_digest_mismatch"`（§4.2）。
+- `input_ref` 的内容只由执行桥用创建者的 claims 拉取；SHA-256 由服务端自己核对，不一致时调用以 `failed` 结束，`error.code = "input_digest_mismatch"`（§4.2）。取到的文本和 prompt 一起交给任务。
 - 触达预算上限时停止执行，调用以 `failed` 结束，`error.code = "budget_exceeded"`。
 - 到达 `deadline` 时停止执行，调用以 `failed` 结束，`error.code = "deadline_exceeded"`。仍在 `queued` 的调用同样处理：`queued → failed` 是条件边，只有到期（`error.code = "deadline_exceeded"`）才能走；其他原因的 `queued → failed` 请求一律 `409 illegal_transition`。
 - `metadata` 和其他调用方提供的字段都在资源的 `request` 对象里原样回显（`request.input`、`request.input_ref`、`request.metadata` 等）：服务端不增、不删、不改任何键或值。同一 tenant/project scope 内的所有 actor 都能读到，不要放敏感内容。
@@ -85,14 +85,14 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 
 ### 4.2 `input_ref` 解析器
 
-- 解析器是可插拔的注册表。`input_ref.uri` 必须是 `<scheme>://…`。解析器可以按完整 scheme 注册，也可以按 URI 前缀注册（例如 `s3://bucket-a/`）；匹配时最长前缀优先，其次是完整 scheme。注册先到先得：已注册的 scheme 或前缀不能被替换。
-- `uri` 没有 scheme → `400 invalid_request`；没有任何已注册的解析器匹配该 `uri` → `422 input_ref_unresolvable`。两者都在创建时检查，什么都不落盘。默认什么都没注册，所有 `input_ref` 都返回 `422`。
-- 执行桥调用解析器时，总是把**创建者已校验的 claims**（tenant、project、actor）和 `uri` 一起传入。解析器必须按这些 claims 限定查询范围。
-- 内容超过创建请求体上限（64 KiB）时一律拒绝，不管解析器返回什么。
-- 所有取数失败——`uri` 不存在或格式不对、数据属于别的项目或租户、内容过大、后端出错——都让调用以 `failed` 结束，`error.code = "input_ref_fetch_failed"`，固定文案 `input_ref could not be resolved`。摘要不一致以 `failed` / `input_digest_mismatch` 结束，固定文案 `input_ref content does not match sha256`。两者都不回显 `uri`、摘要或内容，报错不会暴露别人的数据是否存在。
-- 取到的内容按内联 `input` 的方式使用：`prompt` 为空时，内容按 UTF-8 解码（非法字节替换）后作为 prompt。
-- **内置解析器 `wao-artifact://<artifact-id>`（默认关）。** 它从平台自己的、按 claims 隔离的存储里读取通过 `/api/v1/artifacts` 上传的制品，不发起任何对外网络请求。`<artifact-id>` 是上传接口返回的小写带连字符 UUID。同一租户、同一项目内的任何 actor 都能引用；别的项目或租户拿到的结果与 id 不存在相同，都是 `input_ref_fetch_failed`。只有 `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` 为真值（`1`、`true`、`yes`、`on`）且配置了 blob 存储时才注册；启动时读取。生产环境是否开启另行决定。
-- 嵌入本服务的部署方可以在启动前按 scheme 或前缀注册自己的解析器，见 `src/api/http/invocations_input_ref.rs`。在注册解析器或开启内置解析器之前，首批集成应使用内联 `input`（≤ 8192 字节）。
+- 解析器是可插拔的注册表。`input_ref.uri` 必须是 `<scheme>://…`。解析器可以按完整 scheme 注册，也可以按以 `/` 结尾的 URI 前缀注册（例如 `s3://bucket-a/`，它不会误中 `s3://bucket-a2/…`）。同一个 scheme 要么归一个 scheme 解析器，要么归若干前缀解析器，两者不能并存，所以前缀永远遮不住 scheme 解析器（包括内置解析器）。前缀之间最长匹配优先。注册先到先得：已注册的 scheme 或前缀不能被替换；启动完成后注册表冻结。
+- 创建时按以下顺序检查，失败都不落盘：`uri` 没有 scheme → `400 invalid_request`；没有任何已注册的解析器匹配 → `422 input_ref_unresolvable`；解析器的创建期校验（不做 I/O）不接受该 `uri` → `422 input_ref_unresolvable`，或发现它指向调用方之外的项目 → `422 input_ref_scope_mismatch`。默认什么都没注册，所有 `input_ref` 都返回 `422`。
+- 执行路径上，服务端调用解析器时传入**创建者已校验的 claims**（tenant、project、actor）、`uri`、scheme、调用 id、字节上限和截止时间。解析器必须按这些 claims 限定查询范围。
+- 上限和内容检查由服务端负责，不依赖解析器：内容最多等于创建请求体上限（64 KiB）；超时为 `AGENTOS_INVOCATION_INPUT_REF_TIMEOUT_MS`（默认 10000，取值 1–60000，非法值回落默认），调用的 `deadline` 更早时以它为准；SHA-256 由服务端计算并与 `input_ref.sha256` 比对；内容必须是 UTF-8 文本。
+- 所有取数失败——`uri` 不存在或格式不对、数据属于别的项目或租户、内容过大、超时、不是 UTF-8、后端出错——都让调用以 `failed` 结束，`error.code = "input_ref_fetch_failed"`，固定文案 `input_ref could not be resolved`。摘要不一致以 `failed` / `input_digest_mismatch` 结束，固定文案 `input_ref content does not match sha256`。两者都不回显 `uri`、摘要或内容，报错不会暴露别人的数据是否存在。服务端日志只记录调用 id、scheme 和失败类别。
+- 取到的内容一定进入任务：作为一个块追加在 prompt 之后，格式为 `<input_ref uri="…" sha256="…">`、换行、内容、换行、`</input_ref>`；没有 prompt 时这个块本身就是 prompt，prompt 不会为空。
+- **内置解析器 `wao-artifact://<project_id>/<artifact-id>`（默认关）。** 它从平台自己的、按 claims 隔离的存储里读取通过 `/api/v1/artifacts` 上传的制品，不发起任何对外网络请求。`<project_id>` 必须等于调用方的项目（否则创建返回 `422 input_ref_scope_mismatch`）；`<artifact-id>` 是上传接口返回的小写带连字符 UUID。同一租户、同一项目内的任何 actor 都能引用；别的项目或租户拿到的结果与 id 不存在相同，都是 `input_ref_fetch_failed`。只有 `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` 为真值（`1`、`true`、`yes`、`on`）且配置了 blob 存储时才注册；启动时读取。生产环境是否开启另行决定。
+- 配置只能开启已编译进服务端的解析器，不会加载任何代码。嵌入本服务的部署方在启动前用代码按 scheme 或前缀注册自己的解析器，见 `src/api/http/invocations_input_ref.rs`。在注册解析器或开启内置解析器之前，首批集成应使用内联 `input`（≤ 8192 字节）。
 
 ## 5. 资源（草案）
 
@@ -228,7 +228,7 @@ queued ──► running ──► succeeded
 
 - 创建成功（且不是幂等重放）后，服务端按 §7.3 运行中上限准入（或保持 `queued`），再用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
 - `request.budget` 在执行路径上强制：已计量 usage 超过任一给出的 `max_tokens` / `max_tool_calls` / `max_cost`（micro-USD）时，调用以 `failed` / `budget_exceeded` 结束，并尽量带回 `result.usage`。落到 `succeeded` 仍须完整 usage（VAL-016）。
-- `input_ref` 使用可插拔的解析器注册表（按前缀或 scheme，§4.2）。默认什么都没注册（创建 → `422 input_ref_unresolvable`），内置的 `wao-artifact://` 解析器默认关。匹配的解析器在执行路径用创建者的 claims 拉取字节；取数失败 → `failed` / `input_ref_fetch_failed`，SHA-256 不符 → `failed` / `input_digest_mismatch`，两者都是固定文案。不提供默认外网 resolver。
+- `input_ref` 使用可插拔的解析器注册表（按前缀或 scheme，§4.2）。默认什么都没注册（创建 → `422 input_ref_unresolvable`），内置的 `wao-artifact://` 解析器默认关。匹配的解析器在执行路径用创建者的 claims 拉取字节，超时和大小上限由服务端强制；服务端核对 SHA-256 后把文本和 prompt 一起交给任务。取数失败 → `failed` / `input_ref_fetch_failed`，SHA-256 不符 → `failed` / `input_digest_mismatch`，两者都是固定文案。不提供默认外网 resolver。
 - `agent_revision`：在仓库内尚无 agent 定义修订字段前，创建仍返回 `422 agent_revision_unsupported`（不得静默忽略；不假装已 pin）。
 - 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
 - 每次运行都计量，用量随终态迁移写入 `result.usage`。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。
@@ -274,7 +274,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 | 404 | `not_found` | id 不存在或属于其他 scope（body 相同） |
 | 409 | `idempotency_key_conflict`、`idempotency_key_in_progress`、`revision_conflict`、`illegal_transition`、`agent_revision_mismatch` | 见 §4、§6、§7；`revision_conflict` 的 body 可带 `current_revision` |
 | 413 | `payload_too_large` | 请求体 > 64 KiB、`input` > 8192 字节或 `metadata` > 16 KiB / 64 个键 |
-| 422 | `input_ref_unresolvable`、`agent_not_found`、`agent_revision_unsupported` | 没有已注册的解析器匹配 `input_ref.uri`；`agent_id` 在 scope 内不存在；agent 定义修订（#317）落地前请求带了 `agent_revision`（§4） |
+| 422 | `input_ref_unresolvable`、`input_ref_scope_mismatch`、`agent_not_found`、`agent_revision_unsupported` | 没有已注册的解析器匹配或接受 `input_ref.uri`；`input_ref.uri` 指向调用方之外的项目；`agent_id` 在 scope 内不存在；agent 定义修订（#317）落地前请求带了 `agent_revision`（§4） |
 | 429 | `too_many_active` | 达到 scope 内活跃调用上限（§7.2）；带 `Retry-After: 5` |
 | 500 | `persistence_failed` | 存储写入失败，状态未改变 |
 | 503 | `execution_disabled`、`invocation_store_full`、`invocation_store_unavailable` | 执行开关关闭（§8）；保留期清理后存储仍满（§7.1）；调用存储未配置或不可用 |
