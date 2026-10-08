@@ -23,7 +23,7 @@
 
 use std::{
     collections::HashSet,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -43,6 +43,8 @@ pub(crate) const PROVIDER_OUTBOUND_ALLOWED_ORIGINS_ENV: &str = "PROVIDER_OUTBOUN
 /// Upper bound for one probe response body.
 pub(crate) const PROVIDER_PROBE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROVIDER_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for resolving a probe host.
+const PROVIDER_PROBE_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a probe target was refused. Never carries the URL.
 #[derive(Debug, PartialEq, Eq)]
@@ -134,10 +136,14 @@ pub(crate) async fn vet_provider_url(
         .ok_or(ProviderOutboundError::NotAllowed)?;
     let addresses: Vec<SocketAddr> = match host.parse::<IpAddr>() {
         Ok(ip) => vec![SocketAddr::new(ip, port)],
-        Err(_) => tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|_| ProviderOutboundError::Unresolved)?
-            .collect(),
+        Err(_) => tokio::time::timeout(
+            PROVIDER_PROBE_DNS_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| ProviderOutboundError::Unresolved)?
+        .map_err(|_| ProviderOutboundError::Unresolved)?
+        .collect(),
     };
     if addresses.is_empty() {
         return Err(ProviderOutboundError::Unresolved);
@@ -146,13 +152,69 @@ pub(crate) async fn vet_provider_url(
     let refused = addresses.iter().any(|address| {
         let ip = address.ip();
         address.port() != port
-            || never_permitted_outbound_ip(ip)
-            || (blocked_outbound_ip(ip) && !origin_listed)
+            || provider_never_permitted_ip(ip)
+            || (provider_blocked_ip(ip) && !origin_listed)
     });
     if refused {
         return Err(ProviderOutboundError::NotAllowed);
     }
     Ok(VettedProviderTarget { host, addresses })
+}
+
+/// IPv4 address a 6to4 (`2002::/16`) or Teredo (`2001:0::/32`, client part)
+/// IPv6 address tunnels to.
+fn tunneled_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    match s[0] {
+        0x2002 => Some(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        )),
+        0x2001 if s[1] == 0 => {
+            let client = ((u32::from(s[6]) << 16) | u32::from(s[7])) ^ 0xffff_ffff;
+            Some(Ipv4Addr::from(client))
+        }
+        _ => None,
+    }
+}
+
+/// Documentation ranges (TEST-NET-1/2/3, `2001:db8::/32`): never a real
+/// provider, treated like private space.
+fn documentation_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => matches!(
+            ip.octets(),
+            [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+        ),
+        IpAddr::V6(ip) => ip.segments()[..2] == [0x2001, 0x0db8],
+    }
+}
+
+/// Provider probes: the MCP outbound rules plus documentation ranges and
+/// 6to4/Teredo tunnels (a tunnel is only public when what it reaches is).
+fn provider_blocked_ip(ip: IpAddr) -> bool {
+    if blocked_outbound_ip(ip) || documentation_ip(ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V6(v6) => match tunneled_ipv4(v6) {
+            // Teredo is a relay through arbitrary servers: never public.
+            Some(_) if v6.segments()[0] == 0x2001 => true,
+            Some(v4) => provider_blocked_ip(IpAddr::V4(v4)),
+            None => false,
+        },
+        IpAddr::V4(_) => false,
+    }
+}
+
+/// Never usable, even for a listed origin: the MCP rule, also seen through a
+/// 6to4/Teredo tunnel.
+fn provider_never_permitted_ip(ip: IpAddr) -> bool {
+    never_permitted_outbound_ip(ip)
+        || matches!(ip, IpAddr::V6(v6) if tunneled_ipv4(v6)
+            .is_some_and(|v4| never_permitted_outbound_ip(IpAddr::V4(v4))))
 }
 
 /// HTTP client pinned to the vetted addresses: no proxy, no redirects,
@@ -254,7 +316,8 @@ mod tests {
                 );
             }
             // Public literal addresses are allowed without an allowlist.
-            assert_eq!(vet("https://203.0.113.10/v1/models"), Ok(()));
+            assert_eq!(vet("https://8.8.8.8/v1/models"), Ok(()));
+            assert_eq!(vet("https://[2002:808:808::1]/v1/models"), Ok(()));
         });
     }
 
@@ -289,6 +352,53 @@ mod tests {
         with_allowlist(Some("http://127.0.0.1:3000,not-an-origin"), || {
             assert_eq!(
                 vet("http://127.0.0.1:3000/v1/models"),
+                Err(ProviderOutboundError::NotAllowed)
+            );
+        });
+    }
+
+    /// Alternate spellings and tunnels of internal addresses, and documentation
+    /// ranges, are refused without an allowlist.
+    #[test]
+    fn isolation_contract_provider_outbound_rejects_encoded_tunneled_and_documentation_ips() {
+        let _lock = super::super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        with_allowlist(None, || {
+            for url in [
+                // Decimal, octal, hex and short forms of 127.0.0.1 / 10.0.0.1.
+                "http://2130706433/v1/models",
+                "http://0177.0.0.1/v1/models",
+                "http://0x7f.0.0.1/v1/models",
+                "http://127.1/v1/models",
+                "http://167772161/v1/models",
+                "http://012.0.0.1/v1/models",
+                // Decimal 169.254.169.254.
+                "http://2852039166/latest/meta-data",
+                // 6to4 of 127.0.0.1, 10.0.0.1, 169.254.169.254.
+                "http://[2002:7f00:1::1]/v1/models",
+                "http://[2002:a00:1::1]/v1/models",
+                "http://[2002:a9fe:a9fe::1]/latest/meta-data",
+                // Teredo (client 127.0.0.1, and a public-looking one).
+                "http://[2001:0:4136:e378:8000:63bf:80ff:fffe]/v1/models",
+                "http://[2001:0:4136:e378:8000:63bf:f7f7:f7f7]/v1/models",
+                // TEST-NET-1/2/3 and IPv6 documentation.
+                "http://192.0.2.10/v1/models",
+                "http://198.51.100.10/v1/models",
+                "http://203.0.113.10/v1/models",
+                "http://[2001:db8::1]/v1/models",
+            ] {
+                assert_eq!(
+                    vet(url),
+                    Err(ProviderOutboundError::NotAllowed),
+                    "{url} must be refused"
+                );
+            }
+        });
+        // A 6to4 tunnel to metadata stays refused even for a listed origin.
+        with_allowlist(Some("http://[2002:a9fe:a9fe::1]"), || {
+            assert_eq!(
+                vet("http://[2002:a9fe:a9fe::1]/latest/meta-data"),
                 Err(ProviderOutboundError::NotAllowed)
             );
         });

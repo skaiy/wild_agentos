@@ -134,7 +134,119 @@ fn config_builder_with_sources(
             builder = builder.set_override(key, Value::new(Some(&origin), kind))?;
         }
     }
+    bind_deployment_keys_to_their_endpoints(builder, yaml_name, override_path, env)
+}
+
+/// Endpoint/key pairs whose deployment key must not follow a base URL moved by
+/// the runtime override: `(base_url path, api_key path, base_url env, api_key env)`.
+const ENDPOINT_KEY_BINDINGS: &[(&str, &str, &str, &str)] = &[
+    (
+        "gateway.base_url",
+        "gateway.api_key",
+        "AGENT_OS_GATEWAY_BASE_URL",
+        "AGENT_OS_GATEWAY_API_KEY",
+    ),
+    (
+        "embedding.oneapi.base_url",
+        "embedding.oneapi.api_key",
+        "AGENT_OS_EMBEDDING_ONEAPI_BASE_URL",
+        "AGENT_OS_EMBEDDING_ONEAPI_API_KEY",
+    ),
+];
+
+const ENDPOINT_KEY_BINDING_ORIGIN: &str = "endpoint key binding (config_override.json)";
+
+fn json_at<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.')
+        .try_fold(root, |value, segment| value.get(segment))
+}
+
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// A deployment key (config.yaml or environment) belongs to the deployment's
+/// endpoint. When `config_override.json` (written at runtime by
+/// `PUT /api/v1/config` or the model/embedding routes) moves a base URL to a
+/// different endpoint and the environment does not set that base URL, the
+/// deployment key is dropped instead of being sent to the new endpoint after a
+/// restart. Only a key stored in the override itself is used with the
+/// override's endpoint. Keys are never logged.
+fn bind_deployment_keys_to_their_endpoints(
+    mut builder: ConfigBuilder<DefaultState>,
+    yaml_name: &str,
+    override_path: &Path,
+    env: &[(String, String)],
+) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
+    let Some(overrides) = std::fs::read_to_string(override_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+    else {
+        return Ok(builder);
+    };
+    let env_value = |name: &str| {
+        env.iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let mut deployment: Option<Config> = None;
+    for (base_path, key_path, base_env, key_env) in ENDPOINT_KEY_BINDINGS {
+        // An environment base URL beats the override, so the key stays paired
+        // with the deployment's own endpoint.
+        if env_value(base_env).is_some() {
+            continue;
+        }
+        let Some(override_base) =
+            non_blank(json_at(&overrides, base_path).and_then(|v| v.as_str()))
+        else {
+            continue;
+        };
+        if deployment.is_none() {
+            deployment = Some(
+                Config::builder()
+                    .add_source(config::File::with_name(yaml_name).required(false))
+                    .build()?,
+            );
+        }
+        let Some(yaml) = deployment.as_ref() else {
+            continue;
+        };
+        let deployment_base = yaml.get_string(base_path).unwrap_or_default();
+        let deployment_base = normalize_api_base(&deployment_base);
+        if !deployment_base.is_empty() && deployment_base == normalize_api_base(override_base) {
+            continue;
+        }
+        let override_key = non_blank(json_at(&overrides, key_path).and_then(|v| v.as_str()));
+        let deployment_key_present = non_blank(env_value(key_env)).is_some()
+            || non_blank(yaml.get_string(key_path).ok().as_deref()).is_some();
+        let key = match override_key {
+            Some(key) => key.to_string(),
+            None => {
+                if deployment_key_present {
+                    tracing::warn!(
+                        "{base_path} from config_override.json is a different endpoint than the deployment's; \
+                         ignoring the deployment {key_path} for it (set {base_env} together with {key_env}, \
+                         or store a key for the new endpoint)"
+                    );
+                }
+                String::new()
+            }
+        };
+        let origin = ENDPOINT_KEY_BINDING_ORIGIN.to_string();
+        builder =
+            builder.set_override(*key_path, Value::new(Some(&origin), ValueKind::String(key)))?;
+    }
     Ok(builder)
+}
+
+/// `load_config` with explicit layers, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn load_config_layers_for_test(
+    yaml_name: &str,
+    override_path: &Path,
+    env: &[(String, String)],
+) -> Result<Config, ConfigError> {
+    config_builder_with_sources(yaml_name, override_path, env)?.build()
 }
 
 fn load_config() -> Result<Config, ConfigError> {
@@ -1718,6 +1830,78 @@ mod tests {
         assert!(err.contains("(at `gateway.max_retries`)"), "{err}");
         assert!(!err.contains("AGENT_OS_"), "{err}");
         assert!(err.contains("oops"), "{err}");
+    }
+
+    /// #303 review: a deployment key (yaml or env) never follows a base URL
+    /// that the runtime override moved to another endpoint.
+    #[test]
+    fn isolation_contract_deployment_key_does_not_follow_override_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "gateway:\n  base_url: https://deploy.invalid/v1\n  api_key: yaml-deploy-key\n\
+             embedding:\n  oneapi:\n    base_url: https://deploy-emb.invalid/v1\n    api_key: yaml-emb-key\n",
+        )
+        .unwrap();
+        let override_file = dir.path().join("config_override.json");
+        let get = |env: &[(&str, &str)], path: &str| {
+            test_config(dir.path(), env)
+                .unwrap()
+                .get::<String>(path)
+                .unwrap()
+        };
+        let env_keys = [
+            ("AGENT_OS_GATEWAY_API_KEY", "env-deploy-key"),
+            ("AGENT_OS_EMBEDDING_ONEAPI_API_KEY", "env-emb-key"),
+        ];
+
+        // No override: deployment keys as before.
+        assert_eq!(get(&[], "gateway.api_key"), "yaml-deploy-key");
+        assert_eq!(get(&env_keys, "gateway.api_key"), "env-deploy-key");
+
+        // Override moved both endpoints, no key of its own: no deployment key.
+        std::fs::write(
+            &override_file,
+            r#"{"gateway":{"base_url":"https://attacker.invalid"},
+                "embedding":{"oneapi":{"base_url":"https://attacker.invalid/v1"}}}"#,
+        )
+        .unwrap();
+        for env in [&[][..], &env_keys[..]] {
+            assert_eq!(get(env, "gateway.base_url"), "https://attacker.invalid");
+            assert_eq!(get(env, "gateway.api_key"), "");
+            assert_eq!(get(env, "embedding.oneapi.api_key"), "");
+        }
+
+        // The environment base URL beats the override: deployment pair intact.
+        let env_base = [
+            ("AGENT_OS_GATEWAY_BASE_URL", "https://deploy.invalid"),
+            ("AGENT_OS_GATEWAY_API_KEY", "env-deploy-key"),
+        ];
+        assert_eq!(get(&env_base, "gateway.base_url"), "https://deploy.invalid");
+        assert_eq!(get(&env_base, "gateway.api_key"), "env-deploy-key");
+
+        // Same endpoint, different spelling: deployment keys kept.
+        std::fs::write(
+            &override_file,
+            r#"{"gateway":{"base_url":"https://deploy.invalid/"},
+                "embedding":{"oneapi":{"base_url":"https://deploy-emb.invalid"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(get(&env_keys, "gateway.api_key"), "env-deploy-key");
+        assert_eq!(get(&env_keys, "embedding.oneapi.api_key"), "env-emb-key");
+
+        // A key stored with the moved endpoint is the only key used for it.
+        std::fs::write(
+            &override_file,
+            r#"{"gateway":{"base_url":"https://other.invalid","api_key":"override-key"},
+                "embedding":{"oneapi":{"base_url":"https://other.invalid/v1","api_key":"override-emb-key"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(get(&env_keys, "gateway.api_key"), "override-key");
+        assert_eq!(
+            get(&env_keys, "embedding.oneapi.api_key"),
+            "override-emb-key"
+        );
     }
 
     #[test]

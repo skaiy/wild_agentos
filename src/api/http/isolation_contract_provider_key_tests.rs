@@ -584,6 +584,88 @@ async fn isolation_contract_models_test_only_contacts_saved_endpoint() {
     assert_eq!(saved.seen(), vec![Some(format!("Bearer {SAVED_KEY}"))]);
 }
 
+/// Loads configuration the way a restart does: `config.yaml` in `dir`, the
+/// runtime override written by the API, and the given environment.
+fn reload_after_restart(dir: &Path, env: &[(&str, &str)]) -> ::config::Config {
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    crate::config::settings::load_config_layers_for_test(
+        dir.join("config").to_str().unwrap(),
+        &dir.join("config_override.json"),
+        &env,
+    )
+    .unwrap()
+}
+
+/// #303 review: a base URL persisted at runtime must not pick up the
+/// deployment gateway key after a restart.
+#[tokio::test]
+async fn isolation_contract_gateway_deployment_key_does_not_follow_persisted_base_url() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        "gateway:\n  base_url: https://deploy.invalid/v1\n  api_key: test-only-yaml-deploy-key\n",
+    )
+    .unwrap();
+    let router = app(test_state(dir.path()));
+
+    // A dummy key passes the runtime check and the base URL is persisted.
+    let (status, text) = send(
+        &router,
+        Method::PUT,
+        "/api/v1/config",
+        json!({ "gateway": { "base_url": "https://attacker.invalid", "api_key": "dummy" } }),
+        Some(&admin_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {text}");
+    assert!(read_override(dir.path()).contains("https://attacker.invalid"));
+    assert!(!read_override(dir.path()).contains("dummy"));
+
+    for env in [
+        &[][..],
+        &[("AGENT_OS_GATEWAY_API_KEY", "test-only-env-deploy-key")][..],
+    ] {
+        let config = reload_after_restart(dir.path(), env);
+        assert_eq!(
+            config.get_string("gateway.base_url").unwrap(),
+            "https://attacker.invalid"
+        );
+        assert_eq!(config.get_string("gateway.api_key").unwrap(), "");
+    }
+}
+
+/// Same rule for the oneapi embedding endpoint and its deployment key.
+#[test]
+fn isolation_contract_embedding_deployment_key_does_not_follow_persisted_base_url() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        "embedding:\n  oneapi:\n    base_url: https://deploy-emb.invalid/v1\n",
+    )
+    .unwrap();
+    save_config_override(&json!({ "embedding": { "oneapi": {
+        "base_url": "https://attacker.invalid/v1"
+    } } }))
+    .unwrap();
+
+    let config = reload_after_restart(
+        dir.path(),
+        &[("AGENT_OS_EMBEDDING_ONEAPI_API_KEY", "test-only-env-emb-key")],
+    );
+    assert_eq!(
+        config.get_string("embedding.oneapi.base_url").unwrap(),
+        "https://attacker.invalid/v1"
+    );
+    assert_eq!(config.get_string("embedding.oneapi.api_key").unwrap(), "");
+}
+
 fn read_override(dir: &Path) -> String {
     std::fs::read_to_string(dir.join("config_override.json")).unwrap()
 }

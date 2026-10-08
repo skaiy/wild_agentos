@@ -86,13 +86,16 @@ key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 
 - 绝对 `http`/`https` URL，且不带用户凭据；
 - `PROVIDER_OUTBOUND_ALLOWED_ORIGINS`（逗号分隔的 origin，例如
   `https://llm.example.test,http://10.20.0.5:3000`）一旦设置即为精确白名单；
-  白名单内的 origin 可以解析到私网或回环地址；任一条目格式错误则全部拒绝；
-- 未设置白名单时只允许公网地址；`AGENTOS_AUTH_STRICT=true` 时白名单为必填，
+  白名单内的 origin 可以解析到私网或回环地址；任一条目格式错误则全部拒绝。
+  **白名单里的主机名可以解析到内网地址**：谁控制该域名的 DNS，谁就决定探测发往
+  哪里，因此只把自己控制的域名（或 IP 字面量）加入白名单；
+- 未设置白名单时只允许公网地址（文档保留网段、Teredo 地址、以及通往非公网 IPv4
+  的 6to4 地址都视为非公网；十进制/八进制/十六进制的 IPv4 写法会先规范化）；`AGENTOS_AUTH_STRICT=true` 时白名单为必填，
   未设置则所有探测都被拒绝；
 - link-local / 云元数据、未指定地址、组播和广播地址永远不允许，即使 origin 在
   白名单内；
-- 主机名只解析一次，请求固定到已校验的地址并禁用代理；不跟随重定向；响应体
-  上限 1 MiB。
+- 主机名只解析一次（解析超时 5 秒），请求固定到已校验的地址并禁用代理；
+  不跟随重定向；响应体上限 1 MiB。
 
 被拒绝的目标返回 `400 provider_outbound_not_allowed`，响应体固定，绝不回显 URL。
 需要探测私网或回环地址上 provider（例如本地模型服务）的部署必须把其 origin
@@ -102,6 +105,14 @@ key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 
 端点时，必须同时提供非空的 `gateway.api_key`；否则返回
 `400 explicit_api_key_required`，不保存也不生效。已配置的密钥绝不会被带到新端点。
 保持同一端点（包括等价写法）、清空 base URL、或网关未配置密钥时不受影响。
+
+重启后同样成立。`config_override.json` 从不保存网关密钥；启动时，如果 override 中的
+`gateway.base_url` 与部署配置的端点不同，且未设置 `AGENT_OS_GATEWAY_BASE_URL`，
+就丢弃来自部署（`config.yaml` 或 `AGENT_OS_GATEWAY_API_KEY`）的密钥并输出告警
+（告警不含密钥）。只有 override 自带的密钥才会用于 override 的端点。
+`embedding.oneapi.base_url` 与 `AGENT_OS_EMBEDDING_ONEAPI_API_KEY` 适用同一规则。
+如需持久地更换网关端点，请在部署中同时设置 `AGENT_OS_GATEWAY_BASE_URL` 和
+`AGENT_OS_GATEWAY_API_KEY`。
 
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、
 [隔离矩阵](17-isolation-matrix.zh.md)、

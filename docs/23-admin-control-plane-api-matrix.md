@@ -108,15 +108,19 @@ guard before a connection is made:
 - `PROVIDER_OUTBOUND_ALLOWED_ORIGINS` (comma-separated origins, e.g.
   `https://llm.example.test,http://10.20.0.5:3000`), when set, is an exact
   allowlist; a listed origin may resolve to private or loopback addresses;
-  a malformed entry denies everything;
-- without the allowlist only public addresses are allowed; with
+  a malformed entry denies everything. **A hostname on the allowlist may
+  resolve to an internal address**: whoever controls that name's DNS
+  decides where probes go, so list only names you control (or IP literals);
+- without the allowlist only public addresses are allowed (documentation
+  ranges, Teredo addresses, and 6to4 addresses that tunnel to a non-public
+  IPv4 address count as non-public; decimal/octal/hex IPv4 spellings are normalized first); with
   `AGENTOS_AUTH_STRICT=true` the allowlist is required and every probe is
   refused while it is unset;
 - link-local / cloud metadata, unspecified, multicast and broadcast
   addresses are never allowed, even for a listed origin;
 - the host is resolved once and the request is pinned to the vetted
-  addresses with proxies disabled; redirects are not followed; response
-  bodies are capped at 1 MiB.
+  addresses with proxies disabled (resolution times out after 5 s);
+  redirects are not followed; response bodies are capped at 1 MiB.
 
 A refused target gets `400 provider_outbound_not_allowed` with a fixed body
 that never echoes the URL. Deployments that probe a provider on a private or
@@ -128,6 +132,16 @@ while a gateway key is configured must also send a non-empty
 nothing is saved or applied. The configured key is never carried to the new
 endpoint. Keeping the same endpoint (equivalent spelling included), clearing
 the base URL, or a gateway without a key are unaffected.
+
+The same holds across restarts. `config_override.json` never stores the
+gateway key, and at startup a deployment key (`config.yaml` or
+`AGENT_OS_GATEWAY_API_KEY`) is dropped, with a warning that does not include
+the key, when the override's `gateway.base_url` is a different endpoint than
+the deployment's and `AGENT_OS_GATEWAY_BASE_URL` is not set. Only a key stored
+in the override itself is used with the override's endpoint. The same rule
+applies to `embedding.oneapi.base_url` and `AGENT_OS_EMBEDDING_ONEAPI_API_KEY`.
+To move the gateway durably, set `AGENT_OS_GATEWAY_BASE_URL` together with
+`AGENT_OS_GATEWAY_API_KEY` in the deployment.
 
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and
