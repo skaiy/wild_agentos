@@ -56,6 +56,9 @@ use sha2::{Digest, Sha256};
 use super::iam::UserIdentity;
 use super::invocations_enforcement::InputRefRegistry;
 use super::invocations_execution::InvocationCancellationRegistry;
+use super::invocations_input_ref::{
+    InputRefError, INPUT_REF_SCOPE_MISMATCH_ERROR_CODE, INPUT_REF_UNRESOLVABLE_ERROR_CODE,
+};
 use super::invocations_store::{
     invocation_not_found_response, parse_if_match, CreateOutcome, IdempotencyLookup,
     IdempotencyRegistration, Invocation, InvocationBudget, InvocationConfigError,
@@ -128,9 +131,9 @@ pub(crate) struct InvocationsRuntime {
     /// Called after a successful, non-replayed create. `None` until the
     /// execution bridge (#317) installs one in production.
     dispatcher: Option<Arc<dyn InvocationDispatcher>>,
-    /// Pluggable `input_ref` scheme → resolver registry (#331). Empty by
-    /// default (create still `422 input_ref_unresolvable` until a deployment
-    /// or test registers a scheme).
+    /// `input_ref` resolver registry (`invocations_input_ref`). Empty by
+    /// default, so create stays `422 input_ref_unresolvable` until the
+    /// built-in artifact resolver is switched on or an embedder registers one.
     input_refs: InputRefRegistry,
 }
 
@@ -229,14 +232,14 @@ impl InvocationsRuntime {
         &self.cancellations
     }
 
-    /// Shared `input_ref` resolver registry (empty in production v0.12).
+    /// Shared `input_ref` resolver registry. Empty unless the built-in
+    /// artifact resolver is switched on or an embedder registered one
+    /// (`invocations_input_ref`).
     pub(crate) fn input_refs(&self) -> &InputRefRegistry {
         &self.input_refs
     }
 
-    /// Replaces the `input_ref` registry. Test-only until a deployment hook
-    /// registers schemes (v0.12 ships no built-in resolver).
-    #[cfg(test)]
+    /// Replaces the `input_ref` registry (startup wiring and tests).
     pub(crate) fn with_input_refs(mut self, input_refs: InputRefRegistry) -> Self {
         self.input_refs = input_refs;
         self
@@ -383,16 +386,6 @@ fn bounded_id(value: &Value, field: &str) -> Result<String, ApiError> {
     Ok(text.to_string())
 }
 
-fn has_uri_scheme(uri: &str) -> bool {
-    let Some((scheme, rest)) = uri.split_once("://") else {
-        return false;
-    };
-    let mut chars = scheme.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        && !rest.is_empty()
-}
-
 fn parse_input_ref(value: &Value) -> Result<InvocationInputRef, ApiError> {
     let Some(object) = value.as_object() else {
         return Err(invalid_request("input_ref must be an object"));
@@ -405,8 +398,11 @@ fn parse_input_ref(value: &Value) -> Result<InvocationInputRef, ApiError> {
     let (Some(uri), Some(sha256)) = (uri, sha256) else {
         return Err(invalid_request("input_ref requires uri and sha256 strings"));
     };
-    if !has_uri_scheme(uri) {
-        return Err(invalid_request("input_ref.uri must be <scheme>://..."));
+    // Kernel shape check before any resolver routing: lowercase scheme, no
+    // control characters / line breaks, no dot / empty segments, backslash
+    // or encoded dot / slash / backslash (#347 review).
+    if let Err(error) = super::invocations_input_ref::check_input_ref_uri(uri) {
+        return Err(invalid_request(error.message()));
     }
     if sha256.len() != 64
         || !sha256
@@ -456,6 +452,27 @@ fn parse_deadline(value: &Value) -> Result<String, ApiError> {
         return Err(invalid_request("deadline must be in the future"));
     }
     Ok(text.to_string())
+}
+
+/// Create-time `input_ref` rejection (fixed messages, nothing echoed).
+fn input_ref_create_error(error: InputRefError) -> ApiError {
+    match error {
+        InputRefError::NoResolver => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INPUT_REF_UNRESOLVABLE_ERROR_CODE,
+            "no resolver is registered for the input_ref uri",
+        ),
+        InputRefError::ScopeMismatch => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INPUT_REF_SCOPE_MISMATCH_ERROR_CODE,
+            "input_ref uri is outside the caller's project",
+        ),
+        _ => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INPUT_REF_UNRESOLVABLE_ERROR_CODE,
+            "the input_ref uri is not accepted by its resolver",
+        ),
+    }
 }
 
 /// Validates a create body into the stored request. Pure: no I/O, no store.
@@ -751,15 +768,14 @@ pub(crate) async fn create_invocation_handler(
         Err(error) => return error.into_response(),
     };
     if let Some(input_ref) = request.input_ref.as_ref() {
-        let scheme = super::invocations_enforcement::InputRefRegistry::scheme_of(&input_ref.uri);
-        let registered = scheme.is_some_and(|s| state.invocations.input_refs().has_scheme(s));
-        if !registered {
-            return ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "input_ref_unresolvable",
-                "no resolver is registered for the input_ref scheme",
-            )
-            .into_response();
+        // Fail closed: no matching resolver (prefix or scheme), or the
+        // resolver's I/O-free validate rejects the uri for these claims → 422.
+        if let Err(error) = state
+            .invocations
+            .input_refs()
+            .validate(&input_ref.uri, claims)
+        {
+            return input_ref_create_error(error).into_response();
         }
     }
     if let Err(error) = resolve_agent(&state, claims, &request).await {
