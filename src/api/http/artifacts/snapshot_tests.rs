@@ -349,7 +349,7 @@ async fn snapshot_secret_scan_sees_through_json_escapes_without_persisting() {
     let tenant = claims("tenant-a");
     for (name, probe) in escaped_secret_probes() {
         // The raw-byte scan alone misses every probe; only decoding finds it.
-        assert!(!contains_plaintext_secret(probe.as_bytes()), "{name}");
+        assert!(!contains_plaintext_secret(probe.as_bytes()));
         let (status, body) = upload(
             &fx,
             &tenant,
@@ -358,14 +358,14 @@ async fn snapshot_secret_scan_sees_through_json_escapes_without_persisting() {
             probe.as_bytes(),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "must block: {name}");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             body,
             json!({
                 "error": "plaintext secrets are forbidden in coding artifacts",
                 "code": ARTIFACT_SECRET_ERROR_CODE,
             }),
-            "{name}: fixed error, nothing echoed"
+            "fixed error, nothing echoed"
         );
     }
     let (_, listed) = list(&fx, &tenant, None).await;
