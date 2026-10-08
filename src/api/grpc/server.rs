@@ -777,16 +777,19 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_FAILED",
-                        "SA",
-                        &serde_json::json!({"status": "failed", "summary": error.to_string()})
-                            .to_string(),
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &terminal_payload("failed", &error.to_string(), None),
                     )
                     .await;
                 return;
             }
         };
+        // Every LLM call of this run goes through a gateway handle bound to
+        // this run's own usage meter, so concurrent runs never mix counts.
+        let usage_meter = Arc::new(crate::gateway::usage_meter::RunUsageMeter::new());
+        let run_gateway = Arc::new(self.gateway.with_usage_meter(usage_meter.clone()));
         let mut sa = build_supervisor_agent(
-            self.gateway.clone(),
+            run_gateway,
             self.skills.clone(),
             self.blackboard.clone(),
             l0,
@@ -856,6 +859,10 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             }
         };
 
+        let usage = crate::api::http::invocations_store::usage_from_run(
+            &usage_meter.snapshot(),
+            &self.settings.pricing,
+        );
         match execution {
             Ok(result) => {
                 emitter.emit_completion(&result.status, &result.summary, result.output.clone());
@@ -889,9 +896,8 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                     .emit(
                         &spec.task_iri,
                         event_type,
-                        "SA",
-                        &serde_json::json!({"status": result.status, "summary": result.summary})
-                            .to_string(),
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &terminal_payload(&result.status, &result.summary, usage),
                     )
                     .await;
             }
@@ -902,14 +908,92 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_FAILED",
-                        "SA",
-                        &serde_json::json!({"status": "failed", "summary": e.to_string()})
-                            .to_string(),
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &terminal_payload("failed", &e.to_string(), usage),
                     )
                     .await;
             }
         }
     }
+}
+
+#[cfg(test)]
+impl HttpTaskExecutor {
+    /// The production executor wired the way `AgentOSService` wires it (shared
+    /// startup L0 opened legacy read-only, tenant L0 under
+    /// `settings.memory.l0.path`), on top of an existing core's blackboard,
+    /// projection and event bus. Tests only.
+    pub(crate) fn for_tests(
+        core: &crate::core::core_types::SemanticCore,
+        settings: Settings,
+    ) -> Self {
+        let gateway = Arc::new(UnifiedGateway::new(&settings.gateway).expect("gateway"));
+        let legacy_l0 =
+            Arc::new(L0Store::open_legacy_readonly(&settings.memory.l0.path).expect("legacy L0"));
+        let blackboard = core.blackboard.clone();
+        let projection = core.projection.clone();
+        let event_bus = core.events.clone();
+        let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
+        let consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            legacy_l0.clone(),
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let scheduler = Arc::new(MemoryScheduler::new(
+            legacy_l0.clone(),
+            blackboard.clone(),
+            projection.clone(),
+            consistency,
+            memory_bus.clone(),
+        ));
+        let prefetch = Arc::new(PrefetchEngine::new(
+            memory_bus,
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let memory_manager = Arc::new(tokio::sync::Mutex::new(MemoryManager::with_scheduler(
+            legacy_l0,
+            blackboard.clone(),
+            projection,
+            CoreConfig::default(),
+            scheduler.clone(),
+        )));
+        Self {
+            gateway,
+            skills: Arc::new(SkillRegistry::new()),
+            blackboard,
+            l0_root: std::path::PathBuf::from(&settings.memory.l0.path),
+            memory_manager,
+            templates: Arc::new(
+                TemplateEngine::new(std::path::Path::new("src/templates/templates"))
+                    .expect("templates"),
+            ),
+            scheduler,
+            prefetch,
+            unified_graph: Arc::new(UnifiedGraphStore::new().expect("unified graph")),
+            event_bus,
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            settings,
+        }
+    }
+}
+
+/// Payload of the executor's terminal `TASK_COMPLETED` / `TASK_FAILED` event:
+/// `{status, summary}` plus the run's `usage` (same shape as the invocation
+/// `result.usage`) when the run made any LLM call.
+fn terminal_payload(
+    status: &str,
+    summary: &str,
+    usage: Option<crate::api::http::invocations_store::InvocationUsage>,
+) -> String {
+    let mut payload = serde_json::json!({"status": status, "summary": summary});
+    if let Some(usage) = usage {
+        if let Ok(value) = serde_json::to_value(usage) {
+            payload["usage"] = value;
+        }
+    }
+    payload.to_string()
 }
 
 trait RequestSettings {

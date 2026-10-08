@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -8,6 +8,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::config::settings::GatewaySettings;
+use crate::gateway::usage_meter::{CallUsage, RunUsageMeter};
 use crate::llm::stream_processor::MessageStream;
 use crate::CoreError;
 
@@ -178,6 +179,19 @@ pub struct Usage {
     pub total_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_prompt_tokens: Option<u32>,
+    /// Cost the upstream/gateway reported for this call, in USD
+    /// (`usage.cost`). `None` when the upstream reports no cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// Gateway-reported cost of one call (`usage.cost`, USD), when present and
+/// a finite non-negative number.
+pub(crate) fn reported_cost_usd(usage: &Value) -> Option<f64> {
+    usage
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 fn cached_prompt_tokens(usage: &Value) -> Option<u32> {
@@ -206,6 +220,8 @@ impl<'de> Deserialize<'de> for Usage {
             cache_read_input_tokens: Option<u32>,
             #[serde(default)]
             prompt_tokens_details: Option<PromptTokenDetails>,
+            #[serde(default)]
+            cost: Option<f64>,
         }
         #[derive(Deserialize)]
         struct PromptTokenDetails {
@@ -221,6 +237,7 @@ impl<'de> Deserialize<'de> for Usage {
                 .prompt_tokens_details
                 .and_then(|details| details.cached_tokens)
                 .or(raw.cache_read_input_tokens),
+            cost_usd: raw.cost.filter(|cost| cost.is_finite() && *cost >= 0.0),
         })
     }
 }
@@ -251,6 +268,9 @@ pub struct UnifiedGateway {
     /// are sent to `{base_url}/v1/responses`; all other models keep using
     /// `/v1/chat/completions`.
     use_responses_api: RwLock<bool>,
+    /// Per-run usage meter; set only on run-scoped handles created by
+    /// [`Self::with_usage_meter`].
+    usage_meter: Option<Arc<RunUsageMeter>>,
 }
 
 impl UnifiedGateway {
@@ -276,7 +296,50 @@ impl UnifiedGateway {
             providers: RwLock::new(HashMap::new()),
             model_provider: RwLock::new(HashMap::new()),
             use_responses_api: RwLock::new(settings.use_responses_api),
+            usage_meter: None,
         })
+    }
+
+    /// A run-scoped handle that records every call's upstream usage into
+    /// `meter`.
+    ///
+    /// It shares the HTTP client (connection pool) and takes a snapshot of
+    /// the current endpoint, key, model and provider settings; runtime changes
+    /// made afterwards apply to the next run, not to a run already in flight.
+    pub fn with_usage_meter(&self, meter: Arc<RunUsageMeter>) -> Self {
+        Self {
+            base_url: RwLock::new(self.base_url.read().unwrap().clone()),
+            api_key: RwLock::new(self.api_key.read().unwrap().clone()),
+            client: self.client.clone(),
+            model_mapping: RwLock::new(self.model_mapping.read().unwrap().clone()),
+            default_model: RwLock::new(self.default_model.read().unwrap().clone()),
+            timeout_seconds: self.timeout_seconds,
+            max_retries: self.max_retries,
+            retry_base_ms: self.retry_base_ms,
+            providers: RwLock::new(self.providers.read().unwrap().clone()),
+            model_provider: RwLock::new(self.model_provider.read().unwrap().clone()),
+            use_responses_api: RwLock::new(*self.use_responses_api.read().unwrap()),
+            usage_meter: Some(meter),
+        }
+    }
+
+    fn record_call_usage(&self, requested_model: &str, json: &Value, usage: Option<&Usage>) {
+        let Some(meter) = &self.usage_meter else {
+            return;
+        };
+        let served_model = json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(requested_model);
+        meter.record(
+            requested_model,
+            usage.map(|u| CallUsage {
+                model: served_model.to_string(),
+                input_tokens: u64::from(u.prompt_tokens),
+                output_tokens: u64::from(u.completion_tokens),
+                reported_cost_usd: u.cost_usd,
+            }),
+        );
     }
 
     pub fn default_model(&self) -> String {
@@ -476,6 +539,11 @@ impl UnifiedGateway {
                         };
                         match parse(&json) {
                             Ok(result) => {
+                                self.record_call_usage(
+                                    body["model"].as_str().unwrap_or_default(),
+                                    &json,
+                                    result.usage.as_ref(),
+                                );
                                 info!(
                                     model = %body["model"],
                                     usage = ?result.usage.as_ref().map(|u| u.total_tokens),
@@ -845,6 +913,7 @@ impl UnifiedGateway {
             completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             cached_prompt_tokens: cached_prompt_tokens(u),
+            cost_usd: reported_cost_usd(u),
         });
 
         Ok(ChatCompletionResponse {
@@ -947,10 +1016,12 @@ impl UnifiedGateway {
         }
 
         let url = format!("{}/v1/chat/completions", base);
+        // OpenAI-compatible upstreams only report usage on a stream when asked.
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if let Some(temp) = temperature {
             body["temperature"] = serde_json::json!(temp);
@@ -989,13 +1060,33 @@ impl UnifiedGateway {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            // An upstream that rejects `stream_options` gets the request once
+            // more without it. That stream then carries no usage, which the
+            // run's usage meter records as a call without usage (fail closed).
+            if status == reqwest::StatusCode::BAD_REQUEST && body.get("stream_options").is_some() {
+                warn!(
+                    model = %body["model"],
+                    "Upstream rejected stream_options.include_usage; retrying without it (usage will be missing)"
+                );
+                let mut fallback = body.clone();
+                if let Some(map) = fallback.as_object_mut() {
+                    map.remove("stream_options");
+                }
+                return Box::pin(self.send_stream_request(url, api_key, fallback)).await;
+            }
             return Err(CoreError::Internal {
                 message: format!("Stream API error ({}): {}", status, text),
             });
         }
 
         info!(model = %body["model"], "Stream request started");
-        Ok(MessageStream::new(response))
+        let stream = MessageStream::new(response);
+        Ok(match &self.usage_meter {
+            Some(meter) => {
+                stream.with_usage_meter(meter.clone(), body["model"].as_str().unwrap_or_default())
+            }
+            None => stream,
+        })
     }
 }
 

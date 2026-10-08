@@ -1237,6 +1237,7 @@ async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
         input_tokens: Some(1200),
         output_tokens: Some(345),
         cost: Some(2_500_000),
+        cost_source: Some(CostSource::Gateway),
         tool_calls: Some(vec![InvocationToolCallUsage {
             name: "search".into(),
             transport: Some("mcp".into()),
@@ -1367,4 +1368,107 @@ async fn invocations_lifecycle_store_full_sweep_frees_space_then_create_succeeds
             .unwrap_err(),
         InvocationStoreError::StoreFull
     );
+}
+
+// ── #337: usage built from what the run's LLM calls reported ─────────────
+
+fn run_snapshot(
+    calls: &[(&str, u64, u64, Option<f64>)],
+    without_usage: u64,
+) -> crate::gateway::usage_meter::RunUsageSnapshot {
+    let meter = crate::gateway::usage_meter::RunUsageMeter::new();
+    for (model, input, output, cost) in calls {
+        meter.record(
+            model,
+            Some(crate::gateway::usage_meter::CallUsage {
+                model: (*model).into(),
+                input_tokens: *input,
+                output_tokens: *output,
+                reported_cost_usd: *cost,
+            }),
+        );
+    }
+    for _ in 0..without_usage {
+        meter.record("m", None);
+    }
+    meter.snapshot()
+}
+
+fn price_table(entries: &[(&str, f64, f64)]) -> crate::config::settings::PricingSettings {
+    let mut pricing = crate::config::settings::PricingSettings::default();
+    for (model, input, output) in entries {
+        pricing.models.insert(
+            (*model).into(),
+            crate::config::settings::ModelPrice {
+                input_usd_per_million_tokens: *input,
+                output_usd_per_million_tokens: *output,
+            },
+        );
+    }
+    pricing
+}
+
+#[test]
+fn usage_from_run_prefers_gateway_cost() {
+    let run = run_snapshot(
+        &[("m", 100, 10, Some(0.0005)), ("m", 50, 5, Some(0.00025))],
+        0,
+    );
+    let usage = usage_from_run(&run, &price_table(&[("m", 1.0, 1.0)])).unwrap();
+    assert_eq!(usage.model.as_deref(), Some("m"));
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (Some(150), Some(15))
+    );
+    assert_eq!(usage.cost, Some(750));
+    assert_eq!(usage.cost_source, Some(CostSource::Gateway));
+}
+
+#[test]
+fn usage_from_run_uses_price_table_when_any_call_lacks_gateway_cost() {
+    let run = run_snapshot(&[("m", 100, 10, Some(0.0005)), ("n", 3, 1, None)], 0);
+    let pricing = price_table(&[("m", 2.0, 8.0), ("N", 0.5, 0.5)]);
+    let usage = usage_from_run(&run, &pricing).unwrap();
+    // m: 100*2 + 10*8 = 280; n: ceil(3*0.5 + 1*0.5) = 2.
+    assert_eq!(usage.cost, Some(282));
+    assert_eq!(usage.cost_source, Some(CostSource::ConfigPriceTable));
+}
+
+#[test]
+fn usage_from_run_never_fills_in_a_cost() {
+    let run = run_snapshot(&[("m", 100, 10, None)], 0);
+    for pricing in [
+        price_table(&[]),
+        price_table(&[("other", 1.0, 1.0)]),
+        price_table(&[("m", -1.0, 1.0)]),
+        price_table(&[("m", f64::NAN, 1.0)]),
+    ] {
+        let usage = usage_from_run(&run, &pricing).unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cost, None);
+        assert_eq!(usage.cost_source, None);
+    }
+}
+
+#[test]
+fn usage_from_run_leaves_out_tokens_when_a_call_reported_none() {
+    let run = run_snapshot(&[("m", 100, 10, Some(0.1))], 1);
+    let usage = usage_from_run(&run, &price_table(&[("m", 1.0, 1.0)])).unwrap();
+    assert_eq!(usage.input_tokens, None);
+    assert_eq!(usage.output_tokens, None);
+    assert_eq!(usage.cost, None);
+    assert!(usage_from_run(&run_snapshot(&[], 0), &price_table(&[])).is_none());
+}
+
+#[test]
+fn cost_source_serializes_as_closed_snake_case_set() {
+    assert_eq!(
+        serde_json::to_value(CostSource::Gateway).unwrap(),
+        json!("gateway")
+    );
+    assert_eq!(
+        serde_json::to_value(CostSource::ConfigPriceTable).unwrap(),
+        json!("config_price_table")
+    );
+    assert!(serde_json::from_value::<CostSource>(json!("estimate")).is_err());
 }

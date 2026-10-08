@@ -42,6 +42,21 @@ enum MockMode {
     SucceedWithoutUsage,
     Fail,
     HangUntilCancel,
+    /// The memory scheduler's empty `TASK_COMPLETED` reaches the bus before
+    /// the executor's real terminal event (production order, #337).
+    SchedulerEventFirst,
+    /// Executor reports `TASK_COMPLETED` with this SA status and full usage.
+    CompletedWithStatus(&'static str),
+}
+
+fn full_usage() -> Value {
+    json!({
+        "model": "mock-model",
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cost": 42,
+        "cost_source": "gateway"
+    })
 }
 
 #[async_trait]
@@ -55,7 +70,7 @@ impl TaskExecutor for MockExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_COMPLETED",
-                        "mock",
+                        crate::api::http::TASK_TERMINAL_SOURCE,
                         &json!({
                             "status": "succeeded",
                             "summary": "mock-ok",
@@ -63,7 +78,8 @@ impl TaskExecutor for MockExecutor {
                                 "model": "mock-model",
                                 "input_tokens": 11,
                                 "output_tokens": 7,
-                                "cost": 42
+                                "cost": 42,
+                                "cost_source": "gateway"
                             }
                         })
                         .to_string(),
@@ -75,7 +91,7 @@ impl TaskExecutor for MockExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_COMPLETED",
-                        "mock",
+                        crate::api::http::TASK_TERMINAL_SOURCE,
                         &json!({"status": "succeeded", "summary": "missing-usage"}).to_string(),
                     )
                     .await;
@@ -85,8 +101,39 @@ impl TaskExecutor for MockExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_FAILED",
-                        "mock",
+                        crate::api::http::TASK_TERMINAL_SOURCE,
                         &json!({"status": "failed", "summary": "mock-boom"}).to_string(),
+                    )
+                    .await;
+            }
+            MockMode::SchedulerEventFirst => {
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TASK_COMPLETED",
+                        "system:memory_scheduler",
+                        "{}",
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TASK_COMPLETED",
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &json!({"status": "completed", "summary": "real-summary", "usage": full_usage()})
+                            .to_string(),
+                    )
+                    .await;
+            }
+            MockMode::CompletedWithStatus(status) => {
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TASK_COMPLETED",
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &json!({"status": status, "summary": "s", "usage": full_usage()})
+                            .to_string(),
                     )
                     .await;
             }
@@ -96,7 +143,7 @@ impl TaskExecutor for MockExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_FAILED",
-                        "mock",
+                        crate::api::http::TASK_TERMINAL_SOURCE,
                         &json!({"status": "failed", "summary": "cancelled-by-token"}).to_string(),
                     )
                     .await;
@@ -409,4 +456,72 @@ fn claims_from_invocation_round_trips_scope() {
     let claims = claims_from_invocation(&inv).unwrap();
     assert_eq!(claims.tenant_id(), "tenant-a");
     assert_eq!(claims.actor_id(), "alice");
+}
+
+/// #337: the scheduler's empty `TASK_COMPLETED` arrives first; the invocation
+/// must still close on the executor's terminal event (its usage and summary).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_ignores_the_scheduler_task_completed_that_arrives_first() {
+    let h = make_bridge_harness(
+        MockMode::SchedulerEventFirst,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(
+        inv.state,
+        InvocationState::Succeeded,
+        "error={:?}",
+        inv.error
+    );
+    let result = inv.result.as_ref().unwrap();
+    assert_eq!(result.summary, "real-summary");
+    assert_eq!(result.usage.as_ref().unwrap().input_tokens, Some(11));
+}
+
+/// #337: SA statuses other than an explicit success never become `succeeded`,
+/// even with complete usage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_non_success_sa_status_is_not_succeeded() {
+    for status in ["timeout", "partial_failure", "aborted"] {
+        let h = make_bridge_harness(
+            MockMode::CompletedWithStatus(status),
+            Arc::new(ScopedProjectionGate),
+        );
+        let created = create_inv(&h.router, &alice(), body()).await;
+        let id = created.json()["id"].as_str().unwrap().to_string();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+        let inv = wait_terminal(&h.store, &id, &claims).await;
+        assert_eq!(inv.state, InvocationState::Failed, "{status}");
+        let error = inv.error.as_ref().unwrap();
+        assert_eq!(error.code, "task_failed");
+        assert!(error.message.contains(status), "{}", error.message);
+        // Actual usage is still reported on the failed invocation.
+        assert_eq!(
+            inv.result.as_ref().unwrap().usage.as_ref().unwrap().cost,
+            Some(42)
+        );
+        drop(h);
+    }
+}
+
+/// `completed` (what the SA returns) succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_completed_sa_status_succeeds() {
+    let h = make_bridge_harness(
+        MockMode::CompletedWithStatus("completed"),
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(
+        inv.state,
+        InvocationState::Succeeded,
+        "error={:?}",
+        inv.error
+    );
 }

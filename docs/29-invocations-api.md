@@ -173,6 +173,7 @@ scope and server fields → `400 field_not_allowed` (§3).
     "input_tokens": 1200,        // required when status = succeeded
     "output_tokens": 345,        // required when status = succeeded
     "cost": 18000,               // required when status = succeeded; integer micro-USD
+    "cost_source": "gateway",    // required whenever cost is present; see below
     "tool_calls": [{ "name": "…", "transport": "mcp" }]  // optional; see transport below
   }
 }
@@ -180,17 +181,39 @@ scope and server fields → `400 field_not_allowed` (§3).
 
 - **Succeeded usage (VAL-016 / VAL-017).** When `status` is `succeeded`,
   `result.usage` **MUST** be present and include a non-empty `model`,
-  `input_tokens`, `output_tokens`, and an integer `cost` (micro-USD, same unit
-  as `budget.max_cost`). Missing any of these fields means the run **MUST NOT**
-  be recorded as `succeeded` (fail closed: transition to `failed` with
-  `error.code = "incomplete_usage"`, or refuse the terminal write). `provider`
-  and `tool_calls` remain optional on every terminal state.
+  `input_tokens`, `output_tokens`, an integer `cost` (micro-USD, same unit
+  as `budget.max_cost`) and its `cost_source`. Missing any of these fields
+  means the run **MUST NOT** be recorded as `succeeded` (fail closed:
+  transition to `failed` with `error.code = "incomplete_usage"`, or refuse the
+  terminal write). `provider` and `tool_calls` remain optional on every
+  terminal state.
+- **`cost_source` (closed set).** `cost` is never present without
+  `cost_source`, and the server never estimates a cost or fills in `0`:
+  - `gateway` — the upstream or an external gateway reported the cost of
+    every model call in the run (OpenAI-compatible `usage.cost`, in USD,
+    converted to micro-USD and rounded to the nearest integer);
+  - `config_price_table` — no complete gateway figure, so the cost is computed
+    from the operator-configured price table (`pricing.models.<model>` with
+    `input_usd_per_million_tokens` / `output_usd_per_million_tokens`; USD per
+    million tokens equals micro-USD per token; rounded up per model). Every
+    model the run used must have an entry. The table is empty by default.
+  - Neither source → `cost` and `cost_source` are omitted and the run ends
+    `failed` / `incomplete_usage` with a message saying that no cost source is
+    configured.
+- **Metering.** `input_tokens` / `output_tokens` are the sums over every model
+  call the run made (planning, agents, streaming and non-streaming), counted
+  per run so concurrent runs never mix. Streaming chat-completion calls ask
+  the upstream for usage (`stream_options.include_usage`); an upstream that
+  rejects the option is retried once without it. If any call reported no
+  usage, the token counts are omitted rather than undercounted and the run
+  cannot succeed. `model` is the model with the most tokens in the run.
 - On `failed` / `cancelled` / `interrupted`, `usage` is optional; if present,
   its shape must still be valid (unknown members rejected; `cost` integer when
   set). A `failed` invocation can carry `result` with only `usage` (for example
   after `budget_exceeded`) and an empty `summary`.
 - `usage` reports the metering the server already does to enforce `budget`
-  (`budget_exceeded`). It carries no partner or source attribution.
+  (`budget_exceeded`). Apart from `cost_source`, which says how `cost` was
+  obtained, it carries no attribution to partners, callers or integrators.
 - **`tool_calls[].transport` vocabulary (closed set).** Each tool-call entry
   MAY include `transport` with one of:
   `mcp` | `http` | `a2a` | `local` | `unknown`.
@@ -289,7 +312,8 @@ queued ──► running ──► succeeded
   key.
 
 `error.code` values on a failed invocation: `execution_failed`, `interrupted`,
-`deadline_exceeded`, `budget_exceeded`, `input_digest_mismatch`.
+`deadline_exceeded`, `budget_exceeded`, `input_digest_mismatch`,
+`incomplete_usage`, `task_failed`.
 
 ### 7.1 Retention
 
@@ -364,9 +388,14 @@ entered the executor path).
   `input_digest_mismatch`. There is no default outbound/network resolver.
 - `agent_revision`: until agent definition revisions exist in-tree, create still
   returns `422 agent_revision_unsupported` (never silently ignored; no fake pin).
-- Task events drive state transitions. A lagging SSE subscriber receives a
-  `resync` event and should re-read the resource; the persisted state is
-  authoritative.
+- Task events drive state transitions. Only the executor's own terminal event
+  ends an invocation; other components that publish task lifecycle events on
+  the same bus (for example the memory scheduler) are ignored. The executor
+  reports a terminal status: only an explicit success (`completed`, `success`,
+  `succeeded`) can become `succeeded`; any other status (for example `timeout`
+  or `partial_failure`) ends `failed` / `task_failed`, with the actual usage
+  attached. A lagging SSE subscriber receives a `resync` event and should
+  re-read the resource; the persisted state is authoritative.
 - Usage is metered per run and written to `result.usage` with the terminal
   transition. A `succeeded` write requires complete usage per §5 (VAL-016 /
   VAL-017); incomplete usage must not be persisted as `succeeded`.
@@ -411,7 +440,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","pr
 
 event: result
 id: 3.1
-data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","result":{"summary":"…","artifacts":[],"usage":{"input_tokens":1200,"output_tokens":345,"cost":18000}}}
+data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","result":{"summary":"…","artifacts":[],"usage":{"model":"…","input_tokens":1200,"output_tokens":345,"cost":18000,"cost_source":"gateway"}}}
 ```
 
 ## 9. Error codes (draft)
@@ -449,7 +478,8 @@ carry an `ETag` with the current revision.
 - Only the agent definition is pinned (`agent_revision`). Provider, model,
   tool, policy and context revisions are intentionally not pinned server-side
   in v0.12.0; pinning them is a possible follow-up.
-- `usage` has no partner or source attribution.
+- `usage` has no partner, caller or integrator attribution (`cost_source`
+  only says how `cost` was obtained).
 
 ## 11. Prerequisites for integrators
 

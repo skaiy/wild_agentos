@@ -42,21 +42,23 @@ impl TaskExecutor for HoldExecutor {
                 "model": "m",
                 "input_tokens": 100,
                 "output_tokens": 100,
-                "cost": 9_999
+                "cost": 9_999,
+                "cost_source": "gateway"
             })
         } else {
             json!({
                 "model": "m",
                 "input_tokens": 1,
                 "output_tokens": 1,
-                "cost": 1
+                "cost": 1,
+                "cost_source": "gateway"
             })
         };
         self.events
             .emit(
                 &spec.task_iri,
                 "TASK_COMPLETED",
-                "hold",
+                crate::api::http::TASK_TERMINAL_SOURCE,
                 &json!({"status": "succeeded", "summary": "held-ok", "usage": usage}).to_string(),
             )
             .await;

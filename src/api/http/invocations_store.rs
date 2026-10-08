@@ -427,8 +427,79 @@ pub(crate) struct InvocationUsage {
     pub output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<u64>,
+    /// Where `cost` came from; required whenever `cost` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<CostSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<InvocationToolCallUsage>>,
+}
+
+/// Source of [`InvocationUsage::cost`] (closed set, #337). The kernel does no
+/// pricing of its own: cost is either what the gateway reported or what the
+/// operator's price table yields.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CostSource {
+    /// Every LLM call of the run reported its cost upstream (`usage.cost`).
+    Gateway,
+    /// Computed from the operator-configured `pricing.models` table.
+    ConfigPriceTable,
+}
+
+/// Builds `result.usage` from what the run's LLM calls reported (#337).
+///
+/// - `None` when the run made no LLM call.
+/// - Token counts only when every call reported usage; otherwise they are
+///   left out (never under-reported), so the run cannot succeed.
+/// - `model`: the model that consumed the most tokens (ties: the latest one).
+/// - `cost` / `cost_source`: `gateway` when every call reported a cost (sum,
+///   rounded to micro-USD); else `config_price_table` when the operator table
+///   prices every model the run used (per model, rounded up to micro-USD);
+///   else both absent. Never zero-filled or estimated.
+pub(crate) fn usage_from_run(
+    run: &crate::gateway::usage_meter::RunUsageSnapshot,
+    pricing: &crate::config::settings::PricingSettings,
+) -> Option<InvocationUsage> {
+    if run.calls == 0 {
+        return None;
+    }
+    let mut usage = InvocationUsage {
+        model: run.primary_model(),
+        ..InvocationUsage::default()
+    };
+    if !run.tokens_complete() {
+        return Some(usage);
+    }
+    usage.input_tokens = Some(run.input_tokens);
+    usage.output_tokens = Some(run.output_tokens);
+    if run.gateway_cost_complete() {
+        usage.cost = Some((run.reported_cost_usd * 1_000_000.0).round() as u64);
+        usage.cost_source = Some(CostSource::Gateway);
+    } else if let Some(cost) = price_table_cost(run, pricing) {
+        usage.cost = Some(cost);
+        usage.cost_source = Some(CostSource::ConfigPriceTable);
+    }
+    Some(usage)
+}
+
+/// Micro-USD cost from the operator table, or `None` unless every model the
+/// run used has a valid entry. USD per million tokens equals micro-USD per
+/// token, so each model costs `ceil(in * in_price + out * out_price)`.
+fn price_table_cost(
+    run: &crate::gateway::usage_meter::RunUsageSnapshot,
+    pricing: &crate::config::settings::PricingSettings,
+) -> Option<u64> {
+    if run.per_model.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    for (model, tokens) in &run.per_model {
+        let price = pricing.price_for(model)?;
+        let micro_usd = tokens.input_tokens as f64 * price.input_usd_per_million_tokens
+            + tokens.output_tokens as f64 * price.output_usd_per_million_tokens;
+        total = total.saturating_add(micro_usd.ceil() as u64);
+    }
+    Some(total)
 }
 
 /// One tool call in [`InvocationUsage::tool_calls`].

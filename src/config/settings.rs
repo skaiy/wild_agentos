@@ -172,6 +172,59 @@ pub struct Settings {
     pub a2a: A2aSettings,
     #[serde(default)]
     pub online_corpus_watchers: OnlineCorpusWatcherSettings,
+    /// Optional operator price table for invocation cost (#337).
+    #[serde(default)]
+    pub pricing: PricingSettings,
+}
+
+/// Operator-configured unit prices used to compute an invocation's `cost`
+/// when the gateway reports none (`usage.cost_source = config_price_table`).
+///
+/// This is an optional operator input, not kernel pricing: the kernel ships
+/// no prices, and the table is empty by default. With neither a
+/// gateway-reported cost nor a table entry for every model a run used, the
+/// invocation cannot succeed (`incomplete_usage`).
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+pub struct PricingSettings {
+    /// Model name (as reported by the upstream) → unit prices.
+    #[serde(default)]
+    pub models: std::collections::HashMap<String, ModelPrice>,
+}
+
+/// Unit prices of one model, in USD per one million tokens.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrice {
+    pub input_usd_per_million_tokens: f64,
+    pub output_usd_per_million_tokens: f64,
+}
+
+impl ModelPrice {
+    /// Both prices are finite and non-negative.
+    pub fn is_valid(&self) -> bool {
+        [
+            self.input_usd_per_million_tokens,
+            self.output_usd_per_million_tokens,
+        ]
+        .iter()
+        .all(|p| p.is_finite() && *p >= 0.0)
+    }
+}
+
+impl PricingSettings {
+    /// The valid price entry for `model` (exact name first, then a
+    /// case-insensitive match).
+    pub fn price_for(&self, model: &str) -> Option<&ModelPrice> {
+        self.models
+            .get(model)
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(model))
+                    .map(|(_, price)| price)
+            })
+            .filter(|price| price.is_valid())
+    }
 }
 
 /// Deploy-time registrations for the claims-scoped online corpus job watcher.
@@ -1367,6 +1420,7 @@ impl Default for Settings {
             admin_policies: AdminPolicySettings::default(),
             a2a: A2aSettings::default(),
             online_corpus_watchers: OnlineCorpusWatcherSettings::default(),
+            pricing: PricingSettings::default(),
         }
     }
 }

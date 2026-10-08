@@ -206,6 +206,13 @@ pub struct TaskExecSpec {
     pub isolation_claims: crate::isolation::IsolationClaims,
 }
 
+/// `source_agent_iri` of the terminal `TASK_COMPLETED` / `TASK_FAILED` event a
+/// [`TaskExecutor`] publishes for a run. Other components reuse those event
+/// names on the same bus (the memory scheduler emits `TASK_COMPLETED` with an
+/// empty payload when it releases a task), so consumers that need the run's
+/// real outcome — the invocation bridge — only accept this source.
+pub(crate) const TASK_TERMINAL_SOURCE: &str = "SA";
+
 /// 任务执行器抽象：把「触发并驱动一次任务端到端执行」与 HTTP 传输层解耦。
 ///
 /// 实现方（`api::grpc::server::HttpTaskExecutor`）持有已运行服务的共享运行态
