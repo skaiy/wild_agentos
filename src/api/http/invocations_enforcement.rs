@@ -7,22 +7,15 @@
 //! scope). All caps are in-memory and apply to this process only.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use super::invocations_store::{Invocation, InvocationBudget, InvocationUsage};
 
 /// Hit request.budget.max_* during / after a run.
 pub(crate) const BUDGET_EXCEEDED_ERROR_CODE: &str = "budget_exceeded";
-/// `input_ref` bytes do not match the pinned sha256.
-pub(crate) const INPUT_DIGEST_MISMATCH_ERROR_CODE: &str = "input_digest_mismatch";
-/// Resolver returned an error / empty fetch before the digest check.
-pub(crate) const INPUT_REF_FETCH_FAILED_ERROR_CODE: &str = "input_ref_fetch_failed";
 
 /// Default global max **running** invocations (env override below).
 pub(crate) const DEFAULT_MAX_RUNNING_GLOBAL: usize = 64;
@@ -279,83 +272,11 @@ impl FifoScheduler {
     }
 }
 
-/// Pluggable `input_ref` scheme → resolver registry. v0.12 ships empty.
-#[async_trait]
-pub(crate) trait InputRefResolver: Send + Sync {
-    async fn resolve(&self, uri: &str) -> Result<Vec<u8>, String>;
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct InputRefRegistry {
-    by_scheme: Arc<DashMap<String, Arc<dyn InputRefResolver>>>,
-}
-
-impl InputRefRegistry {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Test-only until a deployment hook registers schemes (v0.12 ships empty).
-    #[cfg(test)]
-    pub(crate) fn register(&self, scheme: impl Into<String>, resolver: Arc<dyn InputRefResolver>) {
-        self.by_scheme.insert(scheme.into(), resolver);
-    }
-
-    pub(crate) fn has_scheme(&self, scheme: &str) -> bool {
-        self.by_scheme.contains_key(scheme)
-    }
-
-    /// Extracts the scheme from `uri` (`scheme://…`). `None` if malformed.
-    pub(crate) fn scheme_of(uri: &str) -> Option<&str> {
-        let (scheme, rest) = uri.split_once("://")?;
-        if scheme.is_empty() || rest.is_empty() {
-            return None;
-        }
-        Some(scheme)
-    }
-
-    pub(crate) async fn resolve(&self, uri: &str) -> Result<Vec<u8>, String> {
-        let scheme =
-            Self::scheme_of(uri).ok_or_else(|| "input_ref.uri missing scheme".to_string())?;
-        let resolver = self
-            .by_scheme
-            .get(scheme)
-            .ok_or_else(|| format!("no resolver for scheme {scheme}"))?
-            .clone();
-        resolver.resolve(uri).await
-    }
-}
-
-/// Lowercase hex SHA-256 of `bytes`.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
-/// Fetches `input_ref` and checks the pinned digest.
-/// Returns `Ok(bytes)` on match; typed error codes otherwise.
-pub(crate) async fn fetch_and_verify_input_ref(
-    registry: &InputRefRegistry,
-    uri: &str,
-    expected_sha256: &str,
-) -> Result<Vec<u8>, (&'static str, String)> {
-    let bytes = registry
-        .resolve(uri)
-        .await
-        .map_err(|message| (INPUT_REF_FETCH_FAILED_ERROR_CODE, message))?;
-    let actual = sha256_hex(&bytes);
-    if actual != expected_sha256 {
-        return Err((
-            INPUT_DIGEST_MISMATCH_ERROR_CODE,
-            format!("input_ref digest mismatch: expected {expected_sha256}, got {actual}"),
-        ));
-    }
-    Ok(bytes)
-}
+// `input_ref` resolution lives in `invocations_input_ref` (extension point +
+// built-in artifact resolver); re-exported for the execution bridge.
+pub(crate) use super::invocations_input_ref::{fetch_and_verify_input_ref, InputRefRegistry};
+#[cfg(test)]
+pub(crate) use super::invocations_input_ref::{sha256_hex, InputRefRequest, InputRefResolver};
 
 /// Whether reported `usage` violates any present budget member.
 /// `max_tokens` counts `input_tokens + output_tokens` when both are known;
@@ -425,17 +346,6 @@ pub(crate) fn deadline_already_due(raw: &str) -> bool {
 mod tests {
     use super::*;
     use crate::api::http::invocations_store::InvocationToolCallUsage;
-
-    struct MemoryResolver {
-        body: Vec<u8>,
-    }
-
-    #[async_trait]
-    impl InputRefResolver for MemoryResolver {
-        async fn resolve(&self, _uri: &str) -> Result<Vec<u8>, String> {
-            Ok(self.body.clone())
-        }
-    }
 
     #[test]
     fn running_limits_from_vars() {
@@ -596,27 +506,6 @@ mod tests {
         assert_eq!(scheduler.lock_slots().global_running(), 0);
     }
 
-    #[tokio::test]
-    async fn input_ref_digest_match_and_mismatch() {
-        let body = b"hello-input-ref";
-        let registry = InputRefRegistry::new();
-        registry.register(
-            "mem",
-            Arc::new(MemoryResolver {
-                body: body.to_vec(),
-            }),
-        );
-        let digest = sha256_hex(body);
-        let ok = fetch_and_verify_input_ref(&registry, "mem://x", &digest)
-            .await
-            .unwrap();
-        assert_eq!(ok, body);
-        let err = fetch_and_verify_input_ref(&registry, "mem://x", &("0".repeat(64)))
-            .await
-            .unwrap_err();
-        assert_eq!(err.0, INPUT_DIGEST_MISMATCH_ERROR_CODE);
-    }
-
     #[test]
     fn budget_exceeded_on_tokens_cost_tools() {
         let budget = InvocationBudget {
@@ -666,12 +555,5 @@ mod tests {
         };
 
         assert!(budget_is_exceeded(&budget, &usage));
-    }
-
-    #[test]
-    fn scheme_of_uri() {
-        assert_eq!(InputRefRegistry::scheme_of("mem://a/b"), Some("mem"));
-        assert_eq!(InputRefRegistry::scheme_of("no-scheme"), None);
-        assert_eq!(InputRefRegistry::scheme_of("://missing"), None);
     }
 }

@@ -38,6 +38,7 @@ pub mod guard;
 pub(crate) mod invocations;
 pub(crate) mod invocations_enforcement;
 pub(crate) mod invocations_execution;
+pub mod invocations_input_ref;
 pub(crate) mod invocations_store;
 pub mod kb;
 pub mod market;
@@ -294,8 +295,23 @@ pub fn build_router(
         }
     }
 
+    let blob_store = crate::blob::open_blob_store();
     let invocations_runtime = {
-        let runtime = invocations::InvocationsRuntime::open_default();
+        // Compiled-in resolvers only: config switches the built-in on,
+        // embedders register in code beforehand; both tables freeze here.
+        let env = |key: &str| std::env::var(key).ok();
+        let embedders = invocations_input_ref::deployment_input_ref_registry();
+        let input_refs = invocations_input_ref::startup_input_ref_registry(
+            kg_store.clone(),
+            blob_store.clone(),
+            invocations_input_ref::artifact_resolver_enabled_from_vars(env),
+            embedders,
+        )
+        .with_timeout(invocations_input_ref::input_ref_timeout_from_vars(env))
+        .with_max_bytes(invocations_input_ref::input_ref_max_bytes_from_vars(env));
+        input_refs.freeze();
+        embedders.freeze();
+        let runtime = invocations::InvocationsRuntime::open_default().with_input_refs(input_refs);
         match (runtime.store(), task_executor.as_ref()) {
             (Some(store), Some(executor)) => {
                 let bridge = std::sync::Arc::new(
@@ -331,7 +347,7 @@ pub fn build_router(
         knowledge_bases: Arc::new(tokio::sync::RwLock::new(load_knowledge_bases())),
         knowledge_packs: Arc::new(tokio::sync::RwLock::new(loaded_packs)),
         vector_store,
-        blob_store: crate::blob::open_blob_store(),
+        blob_store,
         task_executor,
         batch_manager,
         api_clients: Arc::new(tokio::sync::RwLock::new(api_gov::load_api_clients())),
