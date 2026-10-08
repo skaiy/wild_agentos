@@ -248,12 +248,12 @@ fn snapshot_depth_limit_matches_value_parsing() {
     // Accepted iff a later `serde_json::Value` parse succeeds.
     for depth in [1, 64, INPUT_SNAPSHOT_MAX_DEPTH] {
         let bytes = nested_array(depth);
-        assert!(parse_snapshot_json(&bytes).is_some(), "depth {depth}");
+        assert!(parse_snapshot_json(&bytes).is_ok(), "depth {depth}");
         assert!(serde_json::from_slice::<Value>(&bytes).is_ok());
     }
     for depth in [INPUT_SNAPSHOT_MAX_DEPTH + 1, 10_000] {
         let bytes = nested_array(depth);
-        assert!(parse_snapshot_json(&bytes).is_none(), "depth {depth}");
+        assert!(parse_snapshot_json(&bytes).is_err(), "depth {depth}");
         assert!(serde_json::from_slice::<Value>(&bytes).is_err());
     }
     let deep_object = format!(
@@ -261,11 +261,11 @@ fn snapshot_depth_limit_matches_value_parsing() {
         "{\"a\":".repeat(INPUT_SNAPSHOT_MAX_DEPTH + 1),
         "}".repeat(INPUT_SNAPSHOT_MAX_DEPTH + 1)
     );
-    assert!(parse_snapshot_json(deep_object.as_bytes()).is_none());
+    assert!(parse_snapshot_json(deep_object.as_bytes()).is_err());
     // Brackets inside strings (including after escaped quotes) do not count.
     let in_strings = format!("[\"{}\", \"\\\"{}\"]", "[".repeat(500), "{".repeat(500));
     assert!(!json_nesting_exceeds(in_strings.as_bytes(), 1));
-    assert!(parse_snapshot_json(in_strings.as_bytes()).is_some());
+    assert!(parse_snapshot_json(in_strings.as_bytes()).is_ok());
 }
 
 #[tokio::test]
@@ -405,4 +405,49 @@ fn walk_files(dir: &std::path::Path) -> usize {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn snapshot_with_duplicate_keys_is_rejected_unpersisted() {
+    let fx = Fixture::new();
+    let tenant = claims("tenant-a");
+    // Escaped fake key under the first of two equal keys: `Value` keeps only
+    // the last one, so without the duplicate check nothing would see it.
+    let hidden = format!(r#"{{"k":"\u0073k-proj-{}","k":"x"}}"#, "FAKE".repeat(6));
+    let duplicates = [
+        hidden,
+        r#"{"outer":{"a":1,"\u0061":2}}"#.to_string(),
+        r#"[{"id":1},{"id":2,"id":3}]"#.to_string(),
+    ];
+    for (index, content) in duplicates.iter().enumerate() {
+        let (status, body) = upload(
+            &fx,
+            &tenant,
+            ArtifactKind::InputSnapshot,
+            None,
+            content.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "duplicate #{index}");
+        assert_eq!(
+            body,
+            json!({
+                "error": "input_snapshot objects must not repeat a key",
+                "code": INPUT_SNAPSHOT_DUPLICATE_KEY_CODE,
+            }),
+            "duplicate #{index}: fixed error, nothing echoed"
+        );
+    }
+    let (_, listed) = list(&fx, &tenant, None).await;
+    assert_eq!(listed["count"], 0);
+    assert_eq!(walk_files(&fx.root.join("blobs")), 0, "nothing written");
+
+    // Equal keys in different objects, or differing only in case, are fine.
+    let distinct = br#"{"k":"x","K":"y","nested":{"k":"z"},"list":[{"k":1},{"k":2}]}"#;
+    let (status, body) = upload(&fx, &tenant, ArtifactKind::InputSnapshot, None, distinct).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        parse_snapshot_json(b"{\"a\":1"),
+        Err(SnapshotJsonError::Invalid)
+    );
 }
