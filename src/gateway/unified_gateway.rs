@@ -1514,6 +1514,40 @@ mod tests {
         assert_eq!(usage.total_tokens, 18);
     }
 
+    /// N1 (#337): a non-streaming Responses API reply reports usage only with
+    /// both token counts within u32; null, partial or out-of-range usage is
+    /// "no usage", never 0/0 and never truncated.
+    #[test]
+    fn responses_reply_usage_needs_both_counts_within_u32() {
+        let reply = |usage: serde_json::Value| {
+            let json = serde_json::json!({
+                "id": "resp_u",
+                "status": "completed",
+                "output": [
+                    {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "hi"}]}
+                ],
+                "usage": usage,
+            });
+            UnifiedGateway::parse_responses_response(&json)
+                .unwrap()
+                .usage
+        };
+        let usage = reply(serde_json::json!({"input_tokens": 7, "output_tokens": 3})).unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (7, 3));
+        for missing in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"input_tokens": 7}),
+            serde_json::json!({"output_tokens": 3}),
+            serde_json::json!({"input_tokens": null, "output_tokens": 3}),
+            serde_json::json!({"input_tokens": 4_294_967_296u64, "output_tokens": 3}),
+            serde_json::json!({"input_tokens": -1, "output_tokens": 3}),
+        ] {
+            assert!(reply(missing.clone()).is_none(), "{missing}");
+        }
+    }
+
     #[test]
     fn test_parse_responses_response_plain_text() {
         let json = serde_json::json!({
