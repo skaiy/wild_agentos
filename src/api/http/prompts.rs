@@ -25,7 +25,7 @@ pub(crate) async fn list_prompts_handler(State(state): State<Arc<AppState>>) -> 
     }))
 }
 
-/// POST /api/v1/prompts — 创建新版本（G7：仅 DA 角色）
+/// POST /api/v1/prompts — 创建新版本（#302：仅平台管理员；注册表全进程共享）
 #[derive(Deserialize)]
 pub(crate) struct CreatePromptRequest {
     name: String,
@@ -41,7 +41,9 @@ pub(crate) async fn create_prompt_handler(
     identity: UserIdentity,
     Json(body): Json<CreatePromptRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
+    // #302: the prompt registry is process-global (one registry, one active
+    // version for every tenant), so writes need a platform administrator.
+    if let Err(e) = identity.require_platform_admin("prompt registry writes") {
         return e.into_response();
     }
     if body.name.trim().is_empty()
@@ -79,7 +81,9 @@ pub(crate) async fn activate_prompt_handler(
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
+    // #302: the prompt registry is process-global (one registry, one active
+    // version for every tenant), so writes need a platform administrator.
+    if let Err(e) = identity.require_platform_admin("prompt registry writes") {
         return e.into_response();
     }
     if state.prompts.activate(&id) {
@@ -109,7 +113,9 @@ pub(crate) async fn canary_prompt_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<CanaryRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
+    // #302: the prompt registry is process-global (one registry, one active
+    // version for every tenant), so writes need a platform administrator.
+    if let Err(e) = identity.require_platform_admin("prompt registry writes") {
         return e.into_response();
     }
     if state
@@ -132,7 +138,9 @@ pub(crate) async fn delete_prompt_handler(
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_role("DA") {
+    // #302: the prompt registry is process-global (one registry, one active
+    // version for every tenant), so writes need a platform administrator.
+    if let Err(e) = identity.require_platform_admin("prompt registry writes") {
         return e.into_response();
     }
     if state.prompts.delete_version(&id) {
