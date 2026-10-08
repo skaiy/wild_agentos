@@ -431,7 +431,10 @@ impl SupervisorAgent {
                 .await;
 
                 if let Some(scheduler) = &self.scheduler {
-                    if let Err(error) = scheduler.on_task_complete(task_iri).await {
+                    if let Err(error) = scheduler
+                        .on_task_complete(task_iri, &self.runner.l0_store)
+                        .await
+                    {
                         warn!(
                             task_iri = %task_iri,
                             error = %error,
@@ -467,7 +470,10 @@ impl SupervisorAgent {
         }
 
         if let Some(scheduler) = &self.scheduler {
-            if let Err(error) = scheduler.on_task_complete(task_iri).await {
+            if let Err(error) = scheduler
+                .on_task_complete(task_iri, &self.runner.l0_store)
+                .await
+            {
                 warn!(
                     task_iri = %task_iri,
                     error = %error,

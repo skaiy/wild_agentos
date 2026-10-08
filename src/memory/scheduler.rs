@@ -148,8 +148,20 @@ impl MemoryScheduler {
         Ok(session.evict_by_policy())
     }
 
-    pub async fn on_task_complete(&self, task_iri: &str) -> Result<(), CoreError> {
-        self.blackboard.flush_dirty_nodes(&self.l0_store)?;
+    /// Finish a task: persist its dirty L2 nodes, then release its subtree.
+    ///
+    /// `tenant_l0` must be the claims-verified L0 handle of the run that owns
+    /// `task_iri`. The scheduler's own startup handle is the shared legacy
+    /// store, which is read-only and has no tenant, so completion never writes
+    /// there. Only the task's own subtree is flushed, so dirty nodes of
+    /// concurrent runs (possibly other tenants) are never written into this
+    /// tenant's store. A read-only `tenant_l0` still rejects the write.
+    pub async fn on_task_complete(
+        &self,
+        task_iri: &str,
+        tenant_l0: &L0Store,
+    ) -> Result<(), CoreError> {
+        self.blackboard.flush_dirty_subtree(task_iri, tenant_l0)?;
         if let Err(e) = self.consistency.on_l2_write(task_iri, task_iri, &[]).await {
             tracing::warn!("Consistency on_l2_write failed: {}", e);
         }
@@ -423,8 +435,83 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_task_complete() {
-        let (scheduler, _dir) = setup_scheduler();
-        let result = scheduler.on_task_complete("iri://task_complete").await;
+        let (scheduler, dir) = setup_scheduler();
+        let tenant_l0 = L0Store::new(dir.path().join("tenant").to_str().unwrap()).unwrap();
+        let result = scheduler
+            .on_task_complete("iri://task_complete", &tenant_l0)
+            .await;
         assert!(result.is_ok());
+    }
+
+    /// Production wiring: the scheduler holds the shared legacy L0, which is
+    /// read-only. Completion must flush the task's dirty nodes into the run's
+    /// own tenant L0 instead, and must leave other tasks' dirty nodes alone.
+    #[tokio::test]
+    async fn completion_flushes_only_the_task_subtree_into_the_run_tenant_l0() {
+        let dir = tempdir().unwrap();
+        let legacy_dir = dir.path().join("legacy");
+        let legacy = Arc::new(L0Store::open_legacy_readonly(legacy_dir.to_str().unwrap()).unwrap());
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), 1024));
+        let memory_bus = Arc::new(MemoryBus::new(Arc::new(EventBus::new(100))));
+        let consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            legacy.clone(),
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let scheduler = MemoryScheduler::new(
+            legacy.clone(),
+            blackboard.clone(),
+            projection,
+            consistency,
+            memory_bus,
+        );
+        let tenant_a =
+            crate::isolation::IsolationClaims::from_verified("tenant-a", "p", "u").unwrap();
+        let tenant_a_l0 = L0Store::open_for_claims(dir.path(), &tenant_a).unwrap();
+
+        let config = crate::CoreConfig::default();
+        let own = "iri://task/run-a/result";
+        let other = "iri://task/run-b/result";
+        for iri in [own, other] {
+            // A second write marks the node dirty (Modified).
+            blackboard.write_node(iri, r#"{"v":1}"#, &config).unwrap();
+            blackboard.write_node(iri, r#"{"v":2}"#, &config).unwrap();
+            assert!(blackboard.read_node(iri).unwrap().unwrap().dirty);
+        }
+
+        scheduler
+            .on_task_complete("iri://task/run-a", &tenant_a_l0)
+            .await
+            .expect("completion must not write the read-only legacy L0");
+
+        assert!(tenant_a_l0.retrieve(own).unwrap().is_some());
+        assert!(
+            tenant_a_l0.retrieve(other).unwrap().is_none(),
+            "another task's dirty node must not land in this tenant's L0"
+        );
+        assert!(blackboard.read_node(other).unwrap().unwrap().dirty);
+        assert_eq!(legacy.count().unwrap(), 0);
+    }
+
+    /// A run without a writable tenant handle still fails closed rather than
+    /// silently dropping its dirty nodes.
+    #[tokio::test]
+    async fn completion_with_a_read_only_handle_still_rejects_the_write() {
+        let (scheduler, dir) = setup_scheduler();
+        let read_only =
+            L0Store::open_legacy_readonly(dir.path().join("ro").to_str().unwrap()).unwrap();
+        let blackboard = scheduler.blackboard.clone();
+        let config = crate::CoreConfig::default();
+        let iri = "iri://task/ro-run/result";
+        blackboard.write_node(iri, r#"{"v":1}"#, &config).unwrap();
+        blackboard.write_node(iri, r#"{"v":2}"#, &config).unwrap();
+
+        let err = scheduler
+            .on_task_complete("iri://task/ro-run", &read_only)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::PermissionDenied { .. }), "{err}");
     }
 }

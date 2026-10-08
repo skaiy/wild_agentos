@@ -1617,3 +1617,7 @@ fn clean_content(text: &str) -> String {
         cleaned
     }
 }
+
+#[cfg(test)]
+#[path = "executor_l0_completion_tests.rs"]
+mod executor_l0_completion_tests;
