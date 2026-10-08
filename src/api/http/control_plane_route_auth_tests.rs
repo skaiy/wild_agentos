@@ -402,6 +402,7 @@ async fn control_plane_routes_require_verified_claims_and_da() {
         .0,
         StatusCode::SERVICE_UNAVAILABLE
     );
+    // #303: tightened, tenant DA no longer probes global provider config.
     assert_eq!(
         request(
             &router,
@@ -412,8 +413,20 @@ async fn control_plane_routes_require_verified_claims_and_da() {
         )
         .await
         .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            &router,
+            Method::POST,
+            "/api/v1/models/test",
+            json!({"resource_id": "missing"}),
+            Some(&platform_admin),
+        )
+        .await
+        .0,
         StatusCode::BAD_REQUEST,
-        "the normal model validation result proves the DA request passed the gate"
+        "the normal model validation result proves the platform admin passed the gate"
     );
     // #274: tightened, explicit tenant DA no longer activates global embedding.
     assert_eq!(
@@ -588,6 +601,7 @@ async fn provider_models_authorization_precedes_outbound_request() {
             "AGENTOS_DATA_DIR",
             data_dir.path().to_string_lossy().into_owned(),
         ),
+        ("AGENTOS_PLATFORM_ADMIN_TENANT", "tenant-a".into()),
     ]);
     let requests = Arc::new(AtomicUsize::new(0));
     let mock_requests = requests.clone();
@@ -639,14 +653,49 @@ async fn provider_models_authorization_precedes_outbound_request() {
     );
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 
+    // #303: tightened, tenant DA is refused before any outbound request.
     let da = jwt(&["DA"], Some("project-a"));
     assert_eq!(
         request(
             &router,
             Method::POST,
             "/api/v1/providers/models",
-            body,
+            body.clone(),
             Some(&da),
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // #267: a loopback endpoint is refused without the outbound allowlist.
+    let platform_admin = jwt(&["PLATFORM_ADMIN"], Some("project-a"));
+    assert_eq!(
+        request(
+            &router,
+            Method::POST,
+            "/api/v1/providers/models",
+            body.clone(),
+            Some(&platform_admin),
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let _allow = EnvGuard::set(&[(
+        "PROVIDER_OUTBOUND_ALLOWED_ORIGINS",
+        format!("http://{address}"),
+    )]);
+    assert_eq!(
+        request(
+            &router,
+            Method::POST,
+            "/api/v1/providers/models",
+            body,
+            Some(&platform_admin),
         )
         .await
         .0,

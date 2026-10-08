@@ -18,6 +18,9 @@ use super::config::{
     hot_reload_embedding, json_deep_merge, same_provider_endpoint, save_config_override,
 };
 use super::iam::UserIdentity;
+use super::provider_outbound::{
+    not_allowed_response, pinned_client, read_capped_body, vet_provider_url, ProviderOutboundError,
+};
 use super::AppState;
 
 /// 图片上传单文件体积上限（10MiB）。
@@ -225,6 +228,30 @@ pub(crate) struct ModelTestRequest {
     modality: String,
 }
 
+/// Error text for a probe host that did not resolve; never echoes the host.
+const UNRESOLVED_PROBE: &str = "provider endpoint could not be resolved";
+
+fn unresolved_probe(started: std::time::Instant) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": false,
+            "http_status": 0,
+            "latency_ms": started.elapsed().as_millis() as u64,
+            "error": UNRESOLVED_PROBE,
+        })),
+    )
+        .into_response()
+}
+
+fn http_client_setup_failed() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "HTTP 客户端构造失败" })),
+    )
+        .into_response()
+}
+
 /// 32x32 纯白 PNG(base64),vision 连通性测试的最小图片载荷。
 /// 注:部分 VL 模型(如 Qwen3-VL)要求图片每边 > 28px,且校验 PNG 完整性,故用合法 32x32 而非 1x1。
 const TEST_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR42u3NMQ0AAAwDoPo33arYsQQMkB6LQCAQCAQCgUAg+BIMi1X0ptsIcT0AAAAASUVORK5CYII=";
@@ -236,7 +263,8 @@ pub(crate) async fn test_model_handler(
     identity: UserIdentity,
     Json(req): Json<ModelTestRequest>,
 ) -> Response {
-    if let Err(error) = identity.require_control_plane_da("model operations") {
+    // #303: probes read global provider config and use global keys.
+    if let Err(error) = identity.require_platform_admin("model operations") {
         return error.into_response();
     }
     let m = crate::config::settings::Settings::load_models();
@@ -291,21 +319,6 @@ pub(crate) async fn test_model_handler(
             .into_response();
     }
     let base = crate::config::settings::normalize_api_base(&provider.base_url);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            provider.timeout_seconds.clamp(3, 60),
-        ))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("HTTP 客户端构造失败: {e}") })),
-            )
-                .into_response()
-        }
-    };
     let started = std::time::Instant::now();
     let (url, body) = match modality.as_str() {
         "embedding" => (
@@ -331,6 +344,16 @@ pub(crate) async fn test_model_handler(
             json!({ "model": model, "max_tokens": 1, "messages": [{ "role": "user", "content": "ping" }] }),
         ),
     };
+    // #267: vet the saved endpoint like any caller URL, resolve once, pin.
+    let target = match vet_provider_url(&url).await {
+        Ok(target) => target,
+        Err(ProviderOutboundError::NotAllowed) => return not_allowed_response(),
+        Err(ProviderOutboundError::Unresolved) => return unresolved_probe(started),
+    };
+    let client = match pinned_client(&target, provider.timeout_seconds) {
+        Ok(c) => c,
+        Err(_) => return http_client_setup_failed(),
+    };
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", provider.api_key))
@@ -346,7 +369,10 @@ pub(crate) async fn test_model_handler(
             let mut out = json!({ "ok": ok, "http_status": http_status, "latency_ms": latency_ms });
             // embedding 成功时回传维度;其余 modality 不解析 body。
             if ok && modality == "embedding" {
-                if let Ok(v) = r.json::<Value>().await {
+                if let Some(v) = read_capped_body(r)
+                    .await
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                {
                     if let Some(dim) = v
                         .get("data")
                         .and_then(|d| d.as_array())
@@ -404,7 +430,8 @@ pub(crate) async fn provider_models_handler(
     identity: UserIdentity,
     Json(req): Json<ProviderModelsRequest>,
 ) -> Response {
-    if let Err(error) = identity.require_control_plane_da("model operations") {
+    // #303: probes read global provider config and use global keys.
+    if let Err(error) = identity.require_platform_admin("model operations") {
         return error.into_response();
     }
     // 端点/密钥解析：内联优先，缺省按 provider_id 回填持久化值。
@@ -435,20 +462,22 @@ pub(crate) async fn provider_models_handler(
             .into_response();
     }
     let base = crate::config::settings::normalize_api_base(&base_url);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout.clamp(3, 60)))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("HTTP 客户端构造失败: {e}") })),
-            )
-                .into_response()
-        }
-    };
     let url = format!("{base}/v1/models");
+    // #267: allowlist / public-only check before any connection; the vetted
+    // answer is pinned so a second DNS lookup cannot redirect the probe.
+    let target = match vet_provider_url(&url).await {
+        Ok(target) => target,
+        Err(ProviderOutboundError::NotAllowed) => return not_allowed_response(),
+        Err(ProviderOutboundError::Unresolved) => return (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "http_status": 0, "models": [], "error": UNRESOLVED_PROBE })),
+        )
+            .into_response(),
+    };
+    let client = match pinned_client(&target, timeout) {
+        Ok(c) => c,
+        Err(_) => return http_client_setup_failed(),
+    };
     let mut rb = client.get(&url).header("Content-Type", "application/json");
     if !api_key.is_empty() {
         rb = rb.header("Authorization", format!("Bearer {api_key}"));
@@ -459,7 +488,10 @@ pub(crate) async fn provider_models_handler(
             let ok = r.status().is_success();
             let mut models: Vec<Value> = vec![];
             if ok {
-                if let Ok(v) = r.json::<Value>().await {
+                if let Some(v) = read_capped_body(r)
+                    .await
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                {
                     if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
                         for item in arr {
                             if let Some(id) = item.get("id").and_then(|x| x.as_str()) {

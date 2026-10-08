@@ -23,7 +23,7 @@ inferred from a screen name.
 | Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`; `GET /api/v1/skills/manifest`; `POST /api/v1/skills/import-git`; `GET /api/v1/skills/pipeline-runs`; `POST /api/v1/skills/pipeline-rerun` | Skill mutations require `DA`; reads do not have a uniform `IsolationClaims` gate. | **Existing** |
 | KB · Ontology | `#/kb-ontology` | `GET, POST /api/v1/kb/bases`; `GET, POST /api/v1/kb/categories`; `GET, POST /api/v1/knowledge-packs`; `GET /api/v1/ontology/types`; `GET /api/v1/ontology/health` | KB graph/vector ingestion, catalog CRUD, and ontology writes use verified tenant/project `IsolationClaims`; missing claims fail closed. | **Existing** |
 | Isolation | `#/isolation` | No create-tenant HTTP path. Local read-only diagnostic: `scripts/isolation-diagnose --data-root <path>` | JWT verification mints tenant/project claims. The diagnostic CLI needs no JWT and remains a read-only local import/inventory aid; it is not an HTTP endpoint. | **Existing** — no Admin create-tenant form |
-| Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`; `PUT, DELETE /api/v1/api-clients/:id`; `POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`; `GET /api/v1/api-audit`; `GET, PUT /api/v1/config`; `POST /api/v1/models/test`; `POST /api/v1/providers/models`; `POST /api/v1/embedding/activate` | API clients, keys, and audit require verified explicit claims plus `DA` and are isolated by verified tenant; cross-tenant mutations return the same 404 as missing records. `PUT /api/v1/config` (all sections) and `POST /api/v1/embedding/activate` require `require_platform_admin`: verified JWT with explicit non-empty tenant/project, exact `PLATFORM_ADMIN` role, and tenant matching the non-default `AGENTOS_PLATFORM_ADMIN_TENANT` (fail-closed if unset). No `DA` needed. `GET /api/v1/config` requires a verified JWT plus either `require_control_plane_da` (verified explicit tenant/project + DA) or `require_platform_admin`; the response omits secret-looking fields (names normalized by lowercasing and dropping `_`/`-`, e.g. `api_key`, `accessToken`, `client_secret`, `private_key`, `authorization`, `credentials`) and exposes credentials only as `*_configured` booleans. The Admin config page needs a DA token with tenant and project, or a platform-admin token; model test/provider discovery retain their DA gate. | **Wired** |
+| Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`; `PUT, DELETE /api/v1/api-clients/:id`; `POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`; `GET /api/v1/api-audit`; `GET, PUT /api/v1/config`; `POST /api/v1/models/test`; `POST /api/v1/providers/models`; `POST /api/v1/embedding/activate` | API clients, keys, and audit require verified explicit claims plus `DA` and are isolated by verified tenant; cross-tenant mutations return the same 404 as missing records. `PUT /api/v1/config` (all sections) and `POST /api/v1/embedding/activate` require `require_platform_admin`: verified JWT with explicit non-empty tenant/project, exact `PLATFORM_ADMIN` role, and tenant matching the non-default `AGENTOS_PLATFORM_ADMIN_TENANT` (fail-closed if unset). No `DA` needed. `GET /api/v1/config` requires a verified JWT plus either `require_control_plane_da` (verified explicit tenant/project + DA) or `require_platform_admin`; the response omits secret-looking fields (names normalized by lowercasing and dropping `_`/`-`, e.g. `api_key`, `accessToken`, `client_secret`, `private_key`, `authorization`, `credentials`) and exposes credentials only as `*_configured` booleans. The Admin config page needs a DA token with tenant and project, or a platform-admin token; `POST /api/v1/models/test` and `POST /api/v1/providers/models` also require `require_platform_admin` (#303) and pass the provider outbound guard (#267); see "Provider probes and the gateway key" below. | **Wired** |
 | Memory · Blackboard | `#/memory` (also deep-link `#/blackboard`) | `GET /api/v1/blackboard/tasks`; `GET /api/v1/blackboard/nodes?task_iri=…` | Verified tenant/project `IsolationClaims`; legacy records without persisted scope are not returned. | **Existing** |
 | Ops | `#/ops` | `GET /api/v1/batch/agents`; `POST /api/v1/batch/agents/:name/control`; `GET /api/v1/guard/audit`; `GET /api/v1/guard/stats`; `GET /metrics` | Batch list/control require verified isolation claims plus `DA`. Guard audit/stats require verified tenant/project claims, use the same scoped set, and redact sensitive values. `GET /metrics` is a process-global scrape endpoint on the **HTTP API address** (`api.http_addr`, often `:8080` or `:8081` in demos)—not on `api.metrics_port` (default 9090), which has no listener (#324). | **Wired** — batch claims + DA |
 | Online corpus | `#/online-corpus-jobs` | `GET, POST /api/v1/online-corpus-jobs`; `GET /api/v1/online-corpus-jobs/observability`; `GET /api/v1/online-corpus-jobs/:id`; `POST /api/v1/online-corpus-jobs/:id/cancel`; `POST /api/v1/online-corpus-jobs/:id/run` | Verified tenant/project `IsolationClaims`; list, read, transition, runner, and observability data are scoped. | **Existing** |
@@ -93,6 +93,41 @@ administrator must resolve the collision first. While the id is shared, active
 keys under it fail authentication with `401`; a revoked key fails with `403`
 `key_revoked` instead, shared id or not. Each tenant should revoke its keys
 before the collision is cleared—otherwise they become usable again once it is.
+
+### Provider probes and the gateway key (#267, #303)
+
+`POST /api/v1/models/test` and `POST /api/v1/providers/models` read global
+provider configuration and may use saved provider keys, so they require a
+platform administrator; a tenant `DA` gets `403 platform_admin_required`
+before any outbound request.
+
+Every probe target, caller-supplied or saved, passes the provider outbound
+guard before a connection is made:
+
+- absolute `http`/`https` URL without user credentials;
+- `PROVIDER_OUTBOUND_ALLOWED_ORIGINS` (comma-separated origins, e.g.
+  `https://llm.example.test,http://10.20.0.5:3000`), when set, is an exact
+  allowlist; a listed origin may resolve to private or loopback addresses;
+  a malformed entry denies everything;
+- without the allowlist only public addresses are allowed; with
+  `AGENTOS_AUTH_STRICT=true` the allowlist is required and every probe is
+  refused while it is unset;
+- link-local / cloud metadata, unspecified, multicast and broadcast
+  addresses are never allowed, even for a listed origin;
+- the host is resolved once and the request is pinned to the vetted
+  addresses with proxies disabled; redirects are not followed; response
+  bodies are capped at 1 MiB.
+
+A refused target gets `400 provider_outbound_not_allowed` with a fixed body
+that never echoes the URL. Deployments that probe a provider on a private or
+loopback address (for example a local model server) must list its origin.
+
+`PUT /api/v1/config` that moves `gateway.base_url` to a different endpoint
+while a gateway key is configured must also send a non-empty
+`gateway.api_key`; otherwise it returns `400 explicit_api_key_required` and
+nothing is saved or applied. The configured key is never carried to the new
+endpoint. Keeping the same endpoint (equivalent spelling included), clearing
+the base URL, or a gateway without a key are unaffected.
 
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and

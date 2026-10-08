@@ -23,7 +23,7 @@ Admin 页面，不是内核路径。“所需 claims”只陈述当前内核行�
 | Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`；`GET /api/v1/skills/manifest`；`POST /api/v1/skills/import-git`；`GET /api/v1/skills/pipeline-runs`；`POST /api/v1/skills/pipeline-rerun` | Skill 变更要求 `DA`；读取没有统一的 `IsolationClaims` 门禁。 | **已有** |
 | KB · Ontology | `#/kb-ontology` | `GET, POST /api/v1/kb/bases`；`GET, POST /api/v1/kb/categories`；`GET, POST /api/v1/knowledge-packs`；`GET /api/v1/ontology/types`；`GET /api/v1/ontology/health` | KB 图/向量摄取、目录 CRUD 和本体写入使用已验证的 tenant/project `IsolationClaims`；缺失 claims 会 fail closed。 | **已有** |
 | Isolation | `#/isolation` | 没有 create-tenant HTTP 路径。本地只读诊断：`scripts/isolation-diagnose --data-root <path>` | JWT 验证 mint tenant/project claims。诊断 CLI 不需 JWT，仍可作为只读本地导入/盘点辅助；它不是 HTTP endpoint。 | **已有** — 没有 Admin 建租户表单 |
-| Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`；`PUT, DELETE /api/v1/api-clients/:id`；`POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`；`GET /api/v1/api-audit`；`GET, PUT /api/v1/config`；`POST /api/v1/models/test`；`POST /api/v1/providers/models`；`POST /api/v1/embedding/activate` | API client、key、audit 要求 verified explicit claims 加 `DA`，按已验证 tenant 隔离；跨租户变更与不存在的记录返回相同 404。`PUT /api/v1/config`（所有配置段）和 `POST /api/v1/embedding/activate` 要求 `require_platform_admin`：经验证的 JWT 带明确非空 tenant/project、精确的 `PLATFORM_ADMIN` 角色，tenant 与非 `default` 的 `AGENTOS_PLATFORM_ADMIN_TENANT` 一致（未配置时 fail closed）；无需 `DA`。`GET /api/v1/config` 要求经验证的 JWT，并满足 `require_control_plane_da`（verified explicit tenant/project + DA）或 `require_platform_admin` 之一；响应去掉疑似密钥字段（字段名先转小写并去掉 `_`/`-` 再匹配，如 `api_key`、`accessToken`、`client_secret`、`private_key`、`authorization`、`credentials`），凭据仅以 `*_configured` 布尔值表示。Admin 配置页需要包含 tenant 和 project 的 DA token，或平台管理员 token；模型测试/发现仍使用原 DA 门禁。 | **已接线** |
+| Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`；`PUT, DELETE /api/v1/api-clients/:id`；`POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`；`GET /api/v1/api-audit`；`GET, PUT /api/v1/config`；`POST /api/v1/models/test`；`POST /api/v1/providers/models`；`POST /api/v1/embedding/activate` | API client、key、audit 要求 verified explicit claims 加 `DA`，按已验证 tenant 隔离；跨租户变更与不存在的记录返回相同 404。`PUT /api/v1/config`（所有配置段）和 `POST /api/v1/embedding/activate` 要求 `require_platform_admin`：经验证的 JWT 带明确非空 tenant/project、精确的 `PLATFORM_ADMIN` 角色，tenant 与非 `default` 的 `AGENTOS_PLATFORM_ADMIN_TENANT` 一致（未配置时 fail closed）；无需 `DA`。`GET /api/v1/config` 要求经验证的 JWT，并满足 `require_control_plane_da`（verified explicit tenant/project + DA）或 `require_platform_admin` 之一；响应去掉疑似密钥字段（字段名先转小写并去掉 `_`/`-` 再匹配，如 `api_key`、`accessToken`、`client_secret`、`private_key`、`authorization`、`credentials`），凭据仅以 `*_configured` 布尔值表示。Admin 配置页需要包含 tenant 和 project 的 DA token，或平台管理员 token；`POST /api/v1/models/test` 和 `POST /api/v1/providers/models` 同样要求 `require_platform_admin`（#303），并经过 provider 出站守卫（#267），见下文“Provider 探测与网关密钥”。 | **已接线** |
 | Memory · 黑板 | `#/memory`（也可深链至 `#/blackboard`） | `GET /api/v1/blackboard/tasks`；`GET /api/v1/blackboard/nodes?task_iri=…` | 已验证的 tenant/project `IsolationClaims`；没有持久化作用域的历史记录不得返回。 | **已有** |
 | Ops | `#/ops` | `GET /api/v1/batch/agents`；`POST /api/v1/batch/agents/:name/control`；`GET /api/v1/guard/audit`；`GET /api/v1/guard/stats`；`GET /metrics` | Batch list/control 要求已验证的 isolation claims 加 `DA`。guard audit/stats 要求已验证 tenant/project claims，使用同一作用域集合，并会脱敏敏感值。`GET /metrics` 是挂在 **HTTP API 地址**（`api.http_addr`，演示常见 `:8080` / `:8081`）上的进程全局抓取端点，**不是** `api.metrics_port`（默认 9090）——该端口没有监听（#324）。 | **已接线** — batch claims + DA |
 | 在线语料 | `#/online-corpus-jobs` | `GET, POST /api/v1/online-corpus-jobs`；`GET /api/v1/online-corpus-jobs/observability`；`GET /api/v1/online-corpus-jobs/:id`；`POST /api/v1/online-corpus-jobs/:id/cancel`；`POST /api/v1/online-corpus-jobs/:id/run` | 已验证的 tenant/project `IsolationClaims`；list、read、transition、runner 和 observability 数据都有作用域。 | **已有** |
@@ -74,6 +74,34 @@ key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 
 冲突。id 仍被共用时，其下处于有效状态的 key 鉴权返回 `401`；已撤销的 key 鉴权返回
 `403` `key_revoked`，与是否共用 id 无关。各 tenant 应在冲突解除前撤销自己的 key——
 否则冲突解除后，这些 key 会重新变得可用。
+
+### Provider 探测与网关密钥（#267、#303）
+
+`POST /api/v1/models/test` 和 `POST /api/v1/providers/models` 读取全局 provider
+配置，并可能使用已保存的 provider 密钥，因此要求平台管理员；租户 `DA` 在任何出站
+请求之前即得到 `403 platform_admin_required`。
+
+每个探测目标（调用方提供的或已保存的）在建立连接前都要经过 provider 出站守卫：
+
+- 绝对 `http`/`https` URL，且不带用户凭据；
+- `PROVIDER_OUTBOUND_ALLOWED_ORIGINS`（逗号分隔的 origin，例如
+  `https://llm.example.test,http://10.20.0.5:3000`）一旦设置即为精确白名单；
+  白名单内的 origin 可以解析到私网或回环地址；任一条目格式错误则全部拒绝；
+- 未设置白名单时只允许公网地址；`AGENTOS_AUTH_STRICT=true` 时白名单为必填，
+  未设置则所有探测都被拒绝；
+- link-local / 云元数据、未指定地址、组播和广播地址永远不允许，即使 origin 在
+  白名单内；
+- 主机名只解析一次，请求固定到已校验的地址并禁用代理；不跟随重定向；响应体
+  上限 1 MiB。
+
+被拒绝的目标返回 `400 provider_outbound_not_allowed`，响应体固定，绝不回显 URL。
+需要探测私网或回环地址上 provider（例如本地模型服务）的部署必须把其 origin
+加入白名单。
+
+`PUT /api/v1/config` 在已配置网关密钥的情况下把 `gateway.base_url` 改到另一个
+端点时，必须同时提供非空的 `gateway.api_key`；否则返回
+`400 explicit_api_key_required`，不保存也不生效。已配置的密钥绝不会被带到新端点。
+保持同一端点（包括等价写法）、清空 base URL、或网关未配置密钥时不受影响。
 
 内核底层契约参见[隔离契约](17-isolation-contract.zh.md)、
 [隔离矩阵](17-isolation-matrix.zh.md)、

@@ -90,6 +90,34 @@ pub(crate) fn same_provider_endpoint(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
+/// Whether applying `patch` would send the configured gateway key to a new
+/// endpoint (#303).
+///
+/// The key belongs to the endpoint it was configured with. A patch that moves
+/// `gateway.base_url` to a different endpoint must carry its own non-empty
+/// `gateway.api_key`; otherwise the request is refused before anything is
+/// saved or applied. Clearing the base URL, keeping the same endpoint, or a
+/// gateway without a key are unaffected.
+fn gateway_key_would_follow_new_base_url(
+    gateway: &crate::gateway::unified_gateway::UnifiedGateway,
+    patch: &Value,
+) -> bool {
+    let Some(gw_patch) = patch.get("gateway").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let Some(new_base) = gw_patch.get("base_url").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let explicit_key = gw_patch
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .is_some_and(|key| !key.trim().is_empty());
+    !explicit_key
+        && gateway.api_key_configured()
+        && !new_base.trim().is_empty()
+        && !same_provider_endpoint(new_base, &gateway.base_url())
+}
+
 /// 将网关配置持久化到运行期覆盖文件，重启后由 Settings::load() 生效。
 /// Gateway API keys are runtime-only and never written to this file.
 pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
@@ -380,6 +408,16 @@ pub(crate) async fn update_config_handler(
         return error.into_response();
     }
     let patch = request.into_patch();
+    if gateway_key_would_follow_new_base_url(&state.gateway, &patch) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "explicit_api_key_required",
+                "message": "changing gateway.base_url requires an explicit gateway.api_key",
+            })),
+        )
+            .into_response();
+    }
 
     if let Err(error) = save_config_override(&patch) {
         return (
