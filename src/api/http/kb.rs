@@ -2694,6 +2694,9 @@ mod kb_ingest_tests {
 #[cfg(test)]
 mod isolation_contract {
     #![allow(deprecated)]
+    // Test-only lock held for the whole test by design (serializes process-global env/state);
+    // code under test never takes it, so holding it across `.await` cannot deadlock.
+    #![allow(clippy::await_holding_lock)]
 
     use super::*;
     use crate::api::http::{api_gov::ApiUsageState, AppState, TEST_ENV_LOCK};
