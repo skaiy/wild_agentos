@@ -285,7 +285,7 @@ scope and server fields → `400 field_not_allowed` (§3).
   call the run made (planning, agents, streaming and non-streaming), counted
   per run so concurrent runs never mix. Streaming chat-completion calls ask
   the upstream for usage (`stream_options.include_usage`); an upstream that
-  answers 4xx with an error naming `stream_options` or `include_usage` is
+  answers 400 or 422 with an error naming `stream_options` or `include_usage` is
   retried once without it. A call counts as soon as the upstream answered
   2xx, even if the body then failed to parse and was retried. A usage block
   counts only with both token counts present as integers that fit in 32 bits;
@@ -487,7 +487,7 @@ entered the executor path).
   invocation. `POST /api/v1/events` rejects every `TASK_*` event type
   (case-insensitive) with `403 reserved_event_type` for every role, and sets
   the event source to `external:http:<sub>` itself; a `source` member in the
-  body is ignored. The executor reports a terminal status: only an explicit success (`completed`, `success`,
+  body is ignored and dropped from the stored payload. The executor reports a terminal status: only an explicit success (`completed`, `success`,
   `succeeded`) can become `succeeded`; any other status (for example `timeout`
   or `partial_failure`) ends `failed` / `task_failed`, with the actual usage
   attached. A lagging SSE subscriber receives a `resync` event and should

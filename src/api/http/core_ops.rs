@@ -201,9 +201,15 @@ pub(crate) async fn emit_event_handler(
     // The source is set by the server from the verified caller; a `source`
     // member in the body is ignored, so no caller can speak as an executor.
     let source = external_event_source(&identity);
+    // Drop the caller's `source` from the stored payload too, so no reader of
+    // the payload can mistake it for the event's origin.
+    let mut stored = payload.clone();
+    if let Some(body) = stored.as_object_mut() {
+        body.remove("source");
+    }
     let event_id = state
         .core
-        .emit_event(task_iri, event_type, &source, &payload.to_string())
+        .emit_event(task_iri, event_type, &source, &stored.to_string())
         .await;
     Json(json!({"event_id": event_id, "status": "emitted"})).into_response()
 }
@@ -980,6 +986,12 @@ mod tests {
         let event = rx.try_recv().expect("custom event emitted");
         assert_eq!(event.event_type, "CUSTOM");
         assert_eq!(event.source_agent_iri, "external:http:test-user");
+        let stored: Value = serde_json::from_str(&event.payload).unwrap();
+        assert!(
+            stored.get("source").is_none(),
+            "caller-written source must not stay in the payload: {stored}"
+        );
+        assert_eq!(stored["task_iri"], task_iri);
 
         match previous_auth_mode {
             Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
