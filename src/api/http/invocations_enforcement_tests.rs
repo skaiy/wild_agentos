@@ -14,11 +14,11 @@ use crate::api::http::control_plane_route_auth_tests::{test_state_with_invocatio
 use crate::api::http::invocations_enforcement::{
     sha256_hex, FifoScheduler, InputRefRegistry, InputRefRequest, InputRefResolver,
     InvocationRunningLimits, RunningScope, BUDGET_EXCEEDED_ERROR_CODE,
-    INPUT_DIGEST_MISMATCH_ERROR_CODE,
 };
 use crate::api::http::invocations_execution::{InvocationExecutionBridge, ProjectionContextGate};
 use crate::api::http::invocations_input_ref::{
-    InputRefError, INPUT_DIGEST_MISMATCH_MESSAGE, INPUT_REF_FETCH_FAILED_ERROR_CODE,
+    startup_input_ref_registry, InputRefError, INPUT_DIGEST_MISMATCH_ERROR_CODE,
+    INPUT_DIGEST_MISMATCH_MESSAGE, INPUT_REF_FETCH_FAILED_ERROR_CODE,
     INPUT_REF_FETCH_FAILED_MESSAGE,
 };
 use crate::api::http::invocations_store::{
@@ -452,6 +452,76 @@ async fn input_ref_unregistered_scheme_still_422() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"], "input_ref_unresolvable");
+}
+
+/// A well-formed `input_ref` (valid `<scheme>://…` uri + 64 lowercase hex
+/// sha256) that no registered resolver can serve is `422
+/// input_ref_unresolvable`, never `400`, whatever else the body carries.
+/// Covers the production default registry (built-in artifact resolver off)
+/// and registries that only serve other schemes / prefixes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_ref_valid_shape_without_resolver_is_422_not_400() {
+    let sha = sha256_hex(b"payload");
+    let artifact = "wao-artifact://123e4567-e89b-42d3-a456-426614174000";
+    let production_default = startup_input_ref_registry(
+        Arc::new(oxigraph::store::Store::new().unwrap()),
+        None,
+        false,
+    );
+    let other_scheme = InputRefRegistry::new();
+    other_scheme
+        .register_scheme("mem", MemResolver::new(b"x"))
+        .unwrap();
+    let other_prefix = InputRefRegistry::new();
+    other_prefix
+        .register_prefix("s3://allowed/", MemResolver::new(b"x"))
+        .unwrap();
+    let bodies = [
+        json!({"input_ref": {"uri": artifact, "sha256": sha}}),
+        json!({"prompt": "summarise", "input_ref": {"uri": artifact, "sha256": sha}}),
+        json!({"input_ref": {"uri": "s3://bucket/key", "sha256": sha}}),
+        json!({"input_ref": {"uri": "https://example.test/a?b=c", "sha256": sha}}),
+        json!({"input_ref": {"uri": "S3://allowed/key", "sha256": sha}}),
+        json!({
+            "prompt": "p",
+            "input_ref": {"uri": "s3://other/key", "sha256": sha},
+            "budget": {"max_tokens": 10},
+            "deadline": "2999-01-01T00:00:00Z",
+            "metadata": {"k": "v"}
+        }),
+    ];
+    for (name, registry) in [
+        ("production default", production_default),
+        ("other scheme", other_scheme),
+        ("other prefix", other_prefix),
+    ] {
+        let h = make_harness(InvocationRunningLimits::default(), registry, false);
+        for body in &bodies {
+            let (status, resp) = create_prompt(&h, &alice(), body.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{name}: {body} -> {resp}"
+            );
+            assert_eq!(resp["error"], "input_ref_unresolvable", "{name}: {body}");
+        }
+        assert!(
+            h.store
+                .list_for_claims(&alice_claims(), None)
+                .await
+                .is_empty(),
+            "{name}: nothing persisted"
+        );
+        // Shape errors stay 400 so the two classes are distinguishable.
+        let (status, resp) = create_prompt(
+            &h,
+            &alice(),
+            json!({"input_ref": {"uri": "s3://bucket/key", "sha256": sha.to_uppercase()}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {resp}");
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

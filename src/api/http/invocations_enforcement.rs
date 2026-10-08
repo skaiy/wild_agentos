@@ -6,12 +6,9 @@
 //! per-scope **running** caps (FIFO by `created_at` within a scope).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use super::invocations_store::{Invocation, InvocationBudget, InvocationUsage};
@@ -241,10 +238,7 @@ impl FifoScheduler {
 
 // `input_ref` resolution lives in `invocations_input_ref` (extension point +
 // built-in artifact resolver); re-exported for the execution bridge.
-pub(crate) use super::invocations_input_ref::{
-    fetch_and_verify_input_ref, InputRefRegistry, INPUT_DIGEST_MISMATCH_ERROR_CODE,
-    INPUT_REF_FETCH_FAILED_ERROR_CODE,
-};
+pub(crate) use super::invocations_input_ref::{fetch_and_verify_input_ref, InputRefRegistry};
 #[cfg(test)]
 pub(crate) use super::invocations_input_ref::{sha256_hex, InputRefRequest, InputRefResolver};
 
