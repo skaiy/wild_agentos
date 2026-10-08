@@ -160,6 +160,31 @@ sequenceDiagram
     end
 ```
 
+### 微工具的作用域与生命周期（#311）
+
+`ToolExecutor` 在进程内被所有 run、agent 和租户共用，因此生成的读取器
+（`read_full_result_{call_id}`、`query_{type}`、`get_entity_details`、
+`expand_relation`）以及它们读取的完整结果都有归属，而不是全局共享：
+
+- **归属。** 每份存储结果和每个读取器都属于一个
+  `MicroToolOwner { tenant_id, project_id, run_id, agent_id }`。tenant 和 project
+  取自该 run 已验证的隔离 claims（没有 claims 时为空）；`run_id` 取自 run guard；
+  `agent_id` 是正在运行的 agent。都不取自模型输出。
+- **存储 key。** `iri://tool-result/{tenant}/{project}/{run_id}/{agent_id}/{call_id}`，
+  每段都做百分号转义。模型看到的仍是短引用 `iri://tool-result/{call_id}`；
+  模型提供方给的 call_id 在不同 run、不同租户之间重复也不会撞车。
+- **可见性。** 读取器不再写进共享工具表。一个 run 的本轮 schema 只列出它自己的读取器
+  （最新 5 个），读取器也只在同一归属方发起的受控调用里才能解析。其他调用方
+  （包括同一 run 里的另一个 agent）得到的响应与调用一个从未存在的工具完全相同。
+- **图谱化。** 只有带已验证 claims 时才做，写进由这些 claims 生成的图
+  （`graphify_json_for_claims`）。没有 claims 时不做图谱化，改为截断，并注册
+  `read_full_result_{call_id}` 读取器。
+- **生命周期。** 完整结果只保存在内存中，不再写入 L0。run 结束时删除该 run 的
+  读取器和结果。另有 TTL（默认 1 小时，`AGENTOS_MICRO_TOOL_TTL_SECS`）和总量上限
+  （读取器、结果各 1024 条，超限淘汰最旧的），内存不随 run 数增长。
+- 旧版本曾把完整结果以 `iri://tool-result/{call_id}` 写入 L0。现在已没有代码读取这些条目，
+  可以等其自然过期，或由运维删除。
+
 ## UTF-8 安全处理
 
 所有截断操作都确保在字符边界进行：

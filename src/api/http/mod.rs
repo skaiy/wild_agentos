@@ -781,6 +781,9 @@ mod isolation_contract_anonymous_route_sweep_tests;
 mod isolation_contract_invocations_tests;
 
 #[cfg(test)]
+mod isolation_contract_body_before_auth_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
