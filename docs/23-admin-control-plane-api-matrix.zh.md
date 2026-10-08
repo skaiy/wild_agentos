@@ -44,6 +44,13 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
 [#223](https://github.com/skaiy/wild_agentos/issues/223) 和
 [#224](https://github.com/skaiy/wild_agentos/issues/224)）。
 
+控制面写路由先鉴权、后读取请求体（#312）：`PUT /api/v1/config`、
+`POST /api/v1/models/test`、`POST /api/v1/providers/models` 和
+`POST /api/v1/embedding/activate` 对未认证的调用方返回 `401`，对未通过门禁的
+调用方返回 `403`，无论请求体是什么，响应字节都相同。请求体错误（schema 错误
+`422`、JSON 语法错误 `400`、非 JSON content type `415`）只返回给已授权的调用方，
+字段名不会泄露给其他人。
+
 隔离诊断无需 token 是刻意设计：它是本地、只读的文件系统工具，
 既不创建 tenant，也不授予 HTTP 访问。
 

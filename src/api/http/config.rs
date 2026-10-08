@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -515,7 +515,7 @@ pub(crate) async fn config_handler(
 pub(crate) async fn update_config_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Json(request): Json<ConfigUpdateRequest>,
+    body: Request,
 ) -> impl IntoResponse {
     if let Some(error) = require_verified_jwt(&identity, "update") {
         return error;
@@ -524,6 +524,11 @@ pub(crate) async fn update_config_handler(
     if let Err(error) = identity.require_platform_admin("configuration updates") {
         return error.into_response();
     }
+    // #312: the body is parsed only after both gates.
+    let request: ConfigUpdateRequest = match super::models::parse_json_body(body).await {
+        Ok(request) => request,
+        Err(rejection) => return rejection,
+    };
     let patch = request.into_patch();
     if gateway_key_would_follow_new_base_url(&state.gateway, &patch) {
         return (
@@ -1103,7 +1108,24 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // #312: tightened. A caller that is not a platform admin is refused
+        // before the body is parsed, so it no longer learns the schema (was 422).
+        assert_eq!(unknown_field.status(), StatusCode::FORBIDDEN);
+        assert!(!tmp.join("config_override.json").exists());
+        // The strict schema still applies to an authorized caller.
+        let admin_unknown_field = router
+            .clone()
+            .oneshot(put_config(
+                Some(token_for(vec!["PLATFORM_ADMIN"], Some("test-project"))),
+                json!({"gateway": {"base_url": "https://blocked.example"}, "unexpected": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            admin_unknown_field.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(!tmp.join("config_override.json").exists());
         let non_da = router
             .clone()
             .oneshot(put_config(

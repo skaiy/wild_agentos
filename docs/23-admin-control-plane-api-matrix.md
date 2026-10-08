@@ -50,6 +50,14 @@ browsing ([#221](https://github.com/skaiy/wild_agentos/issues/221),
 [#223](https://github.com/skaiy/wild_agentos/issues/223), and
 [#224](https://github.com/skaiy/wild_agentos/issues/224)).
 
+Control-plane write routes authorize before they read the request body
+(#312): `PUT /api/v1/config`, `POST /api/v1/models/test`,
+`POST /api/v1/providers/models` and `POST /api/v1/embedding/activate` answer
+`401` to unauthenticated callers and `403` to callers that fail the gate, with
+the same bytes whatever the body is. Body errors (`422` for a schema error,
+`400` for malformed JSON, `415` for a non-JSON content type) are returned only
+to authorized callers, so field names never reach anyone else.
+
 The isolation diagnostic is intentionally still usable
 without a token because it is a local, read-only filesystem tool. It neither
 creates tenants nor grants HTTP access.
