@@ -220,7 +220,14 @@ pub(crate) fn claims_from_invocation(invocation: &Invocation) -> Result<Isolatio
 }
 
 /// Prompt text used for `init_task_with_claims` / `TaskExecSpec`.
-pub(crate) fn prompt_from_invocation(invocation: &Invocation) -> String {
+///
+/// Resolved `input_ref` content stands in for inline `input` (the two are
+/// mutually exclusive): a non-empty `prompt` wins, otherwise the content,
+/// decoded as UTF-8 (invalid sequences replaced), is the prompt.
+pub(crate) fn prompt_from_invocation(
+    invocation: &Invocation,
+    input_ref_bytes: Option<&[u8]>,
+) -> String {
     if let Some(prompt) = invocation
         .request
         .prompt
@@ -232,6 +239,9 @@ pub(crate) fn prompt_from_invocation(invocation: &Invocation) -> String {
     }
     if let Some(input) = invocation.request.input.as_ref() {
         return input.to_string();
+    }
+    if let Some(bytes) = input_ref_bytes {
+        return String::from_utf8_lossy(bytes).into_owned();
     }
     String::new()
 }
@@ -567,17 +577,7 @@ async fn run_invocation(
         return;
     }
 
-    // Resolve input_ref before task init (digest mismatch → queued→failed).
-    if let Some(input_ref) = invocation.request.input_ref.as_ref() {
-        match fetch_and_verify_input_ref(&input_refs, &input_ref.uri, &input_ref.sha256).await {
-            Ok(_bytes) => {}
-            Err((code, message)) => {
-                let _ = fail_pre_execution(&store, &invocation, code, &message).await;
-                return;
-            }
-        }
-    }
-
+    // Claims first: the input_ref resolver must always know who is asking.
     let claims = match claims_from_invocation(&invocation) {
         Ok(claims) => claims,
         Err(message) => {
@@ -592,7 +592,22 @@ async fn run_invocation(
         }
     };
 
-    let prompt = prompt_from_invocation(&invocation);
+    // Resolve input_ref with the caller's claims before task init (any
+    // failure / digest mismatch → queued→failed with a fixed message).
+    let mut input_ref_bytes = None;
+    if let Some(input_ref) = invocation.request.input_ref.as_ref() {
+        match fetch_and_verify_input_ref(&input_refs, &claims, &input_ref.uri, &input_ref.sha256)
+            .await
+        {
+            Ok(bytes) => input_ref_bytes = Some(bytes),
+            Err((code, message)) => {
+                let _ = fail_pre_execution(&store, &invocation, code, message).await;
+                return;
+            }
+        }
+    }
+
+    let prompt = prompt_from_invocation(&invocation, input_ref_bytes.as_deref());
     let task_iri = match core
         .init_task_with_claims(&prompt, None, None, None, None, &claims)
         .await

@@ -168,6 +168,32 @@ fn load_metadata(
     claims: &IsolationClaims,
     id: Option<&str>,
 ) -> Result<Vec<ArtifactMetadata>, (StatusCode, Json<Value>)> {
+    query_metadata(&state.kg_store, claims, id).map_err(|error| {
+        let message = match error {
+            ArtifactMetadataError::Store => "artifact metadata store unavailable",
+            ArtifactMetadataError::Query => "artifact metadata query failed",
+        };
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": message })),
+        )
+    })
+}
+
+/// Why an artifact metadata lookup failed (no detail is ever returned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactMetadataError {
+    Store,
+    Query,
+}
+
+/// Reads artifact metadata from the claims graph only. `id` must already be a
+/// validated UUID when present (it is interpolated into the query).
+fn query_metadata(
+    kg_store: &Arc<oxigraph::store::Store>,
+    claims: &IsolationClaims,
+    id: Option<&str>,
+) -> Result<Vec<ArtifactMetadata>, ArtifactMetadataError> {
     let query = match id {
         Some(id) => format!(
             "SELECT ?metadata WHERE {{ <{}> <{}> ?metadata }}",
@@ -179,14 +205,10 @@ fn load_metadata(
             ARTIFACT_METADATA_PREDICATE
         ),
     };
-    let rows = artifact_store(state)?
+    let rows = KnowledgeGraphStore::with_shared_store(kg_store.clone())
+        .map_err(|_| ArtifactMetadataError::Store)?
         .query_sparql_for_claims(claims, &query)
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "artifact metadata query failed" })),
-            )
-        })?;
+        .map_err(|_| ArtifactMetadataError::Query)?;
     Ok(rows
         .iter()
         // KnowledgeGraphStore preserves SPARQL variable spelling, including
@@ -199,6 +221,57 @@ fn load_metadata(
         .filter_map(|encoded| STANDARD.decode(encoded).ok())
         .filter_map(|raw| serde_json::from_slice(&raw).ok())
         .collect())
+}
+
+/// One artifact's metadata from the caller's claims graph (tenant + project),
+/// for the built-in `input_ref` resolver. `Ok(None)` when the id is not a
+/// UUID or has no record in this scope; `Err` when the store fails.
+pub(crate) fn load_artifact_metadata(
+    kg_store: &Arc<oxigraph::store::Store>,
+    claims: &IsolationClaims,
+    id: &str,
+) -> Result<Option<ArtifactMetadata>, ArtifactMetadataError> {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Ok(None);
+    }
+    Ok(query_metadata(kg_store, claims, Some(id))?
+        .into_iter()
+        .find(|record| record.id == id))
+}
+
+/// Whether `metadata.blob_key` is the key the upload route derives from the
+/// id and kind, so a resolver never follows a key it did not mint.
+pub(crate) fn is_canonical_blob_key(metadata: &ArtifactMetadata) -> bool {
+    metadata.blob_key == artifact_key(&metadata.id, metadata.kind)
+}
+
+/// Test helper: writes `metadata` into the claims graph exactly as the upload
+/// route does, without an `AppState`.
+#[cfg(test)]
+pub(crate) fn write_metadata_for_tests(
+    kg_store: &Arc<oxigraph::store::Store>,
+    claims: &IsolationClaims,
+    metadata: &ArtifactMetadata,
+) {
+    let metadata_index = STANDARD.encode(serde_json::to_vec(metadata).unwrap());
+    KnowledgeGraphStore::with_shared_store(kg_store.clone())
+        .unwrap()
+        .write_quads_for_claims(
+            claims,
+            &[RdfQuad {
+                subject: artifact_subject(&metadata.id),
+                predicate: ARTIFACT_METADATA_PREDICATE.to_string(),
+                object: RdfValue::Literal(metadata_index),
+                graph: None,
+            }],
+        )
+        .unwrap();
+}
+
+/// Test helper: the blob key the upload route derives for `id` / `kind`.
+#[cfg(test)]
+pub(crate) fn artifact_key_for_tests(id: &str, kind: ArtifactKind) -> String {
+    artifact_key(id, kind)
 }
 
 /// POST /api/v1/artifacts — persist one replayable coding artifact.

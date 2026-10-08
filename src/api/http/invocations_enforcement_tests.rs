@@ -12,10 +12,15 @@ use serde_json::json;
 use super::*;
 use crate::api::http::control_plane_route_auth_tests::{test_state_with_invocations, EnvGuard};
 use crate::api::http::invocations_enforcement::{
-    sha256_hex, FifoScheduler, InputRefRegistry, InputRefResolver, InvocationRunningLimits,
-    RunningScope, BUDGET_EXCEEDED_ERROR_CODE, INPUT_DIGEST_MISMATCH_ERROR_CODE,
+    sha256_hex, FifoScheduler, InputRefRegistry, InputRefRequest, InputRefResolver,
+    InvocationRunningLimits, RunningScope, BUDGET_EXCEEDED_ERROR_CODE,
+    INPUT_DIGEST_MISMATCH_ERROR_CODE,
 };
 use crate::api::http::invocations_execution::{InvocationExecutionBridge, ProjectionContextGate};
+use crate::api::http::invocations_input_ref::{
+    InputRefError, INPUT_DIGEST_MISMATCH_MESSAGE, INPUT_REF_FETCH_FAILED_ERROR_CODE,
+    INPUT_REF_FETCH_FAILED_MESSAGE,
+};
 use crate::api::http::invocations_store::{
     InvocationState, InvocationStore, InvocationStoreConfig, DEADLINE_EXCEEDED_ERROR_CODE,
 };
@@ -65,12 +70,37 @@ impl TaskExecutor for HoldExecutor {
 
 struct MemResolver {
     body: Vec<u8>,
+    /// `(tenant, project, actor)` of every call.
+    seen: std::sync::Mutex<Vec<(String, String, String)>>,
+}
+
+impl MemResolver {
+    fn new(body: &[u8]) -> Arc<Self> {
+        Arc::new(Self {
+            body: body.to_vec(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
 }
 
 #[async_trait]
 impl InputRefResolver for MemResolver {
-    async fn resolve(&self, _uri: &str) -> Result<Vec<u8>, String> {
+    async fn resolve(&self, request: InputRefRequest<'_>) -> Result<Vec<u8>, InputRefError> {
+        self.seen.lock().unwrap().push((
+            request.claims.tenant_id().to_string(),
+            request.claims.project_id().to_string(),
+            request.claims.actor_id().to_string(),
+        ));
         Ok(self.body.clone())
+    }
+}
+
+struct NotFoundResolver;
+
+#[async_trait]
+impl InputRefResolver for NotFoundResolver {
+    async fn resolve(&self, _request: InputRefRequest<'_>) -> Result<Vec<u8>, InputRefError> {
+        Err(InputRefError::NotFound)
     }
 }
 
@@ -372,12 +402,9 @@ async fn budget_exceeded_fails_with_usage() {
 async fn input_ref_digest_mismatch_fails() {
     let body = b"payload-v1";
     let registry = InputRefRegistry::new();
-    registry.register(
-        "mem",
-        Arc::new(MemResolver {
-            body: body.to_vec(),
-        }),
-    );
+    registry
+        .register_scheme("mem", MemResolver::new(body))
+        .unwrap();
     let h = make_harness(InvocationRunningLimits::default(), registry, false);
     let wrong = "0".repeat(64);
     let (status, resp) = create_prompt(
@@ -397,6 +424,10 @@ async fn input_ref_digest_mismatch_fails() {
     assert_eq!(
         inv.error.as_ref().map(|e| e.code.as_str()),
         Some(INPUT_DIGEST_MISMATCH_ERROR_CODE)
+    );
+    assert_eq!(
+        inv.error.as_ref().map(|e| e.message.as_str()),
+        Some(INPUT_DIGEST_MISMATCH_MESSAGE)
     );
     assert_eq!(h.calls.load(Ordering::SeqCst), 0);
 }
@@ -427,12 +458,8 @@ async fn input_ref_unregistered_scheme_still_422() {
 async fn input_ref_matching_digest_runs() {
     let payload = b"ok-bytes";
     let registry = InputRefRegistry::new();
-    registry.register(
-        "mem",
-        Arc::new(MemResolver {
-            body: payload.to_vec(),
-        }),
-    );
+    let resolver = MemResolver::new(payload);
+    registry.register_scheme("mem", resolver.clone()).unwrap();
     let h = make_harness(InvocationRunningLimits::default(), registry, false);
     let (status, resp) = create_prompt(
         &h,
@@ -445,6 +472,70 @@ async fn input_ref_matching_digest_runs() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
     let id = resp["id"].as_str().unwrap().to_string();
+    wait_calls(&h.calls, 1).await;
+    h.release.notify_one();
+    wait_state(&h.store, &alice_claims(), &id, InvocationState::Succeeded).await;
+    // The resolver was called with the creator's verified claims.
+    assert_eq!(
+        resolver.seen.lock().unwrap().as_slice(),
+        &[(
+            "tenant-a".to_string(),
+            "project-a".to_string(),
+            "alice".to_string()
+        )]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_ref_fetch_failure_fails_with_fixed_message() {
+    let registry = InputRefRegistry::new();
+    registry
+        .register_prefix("s3://bucket/", Arc::new(NotFoundResolver))
+        .unwrap();
+    let h = make_harness(InvocationRunningLimits::default(), registry, false);
+    let uri = "s3://bucket/tenant-b/secret-key";
+    let (status, resp) = create_prompt(
+        &h,
+        &alice(),
+        json!({"prompt": "p", "input_ref": {"uri": uri, "sha256": sha256_hex(b"x")}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    let id = resp["id"].as_str().unwrap().to_string();
+
+    wait_state(&h.store, &alice_claims(), &id, InvocationState::Failed).await;
+    let inv = h.store.get_for_claims(&alice_claims(), &id).await.unwrap();
+    let error = inv.error.unwrap();
+    assert_eq!(error.code, INPUT_REF_FETCH_FAILED_ERROR_CODE);
+    assert_eq!(error.message, INPUT_REF_FETCH_FAILED_MESSAGE);
+    assert!(!error.message.contains("s3"));
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_ref_prefix_registration_gates_create() {
+    let registry = InputRefRegistry::new();
+    registry
+        .register_prefix("s3://allowed/", MemResolver::new(b"x"))
+        .unwrap();
+    let h = make_harness(InvocationRunningLimits::default(), registry, false);
+    let (status, body) = create_prompt(
+        &h,
+        &alice(),
+        json!({"input_ref": {"uri": "s3://other/key", "sha256": sha256_hex(b"x")}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], "input_ref_unresolvable");
+
+    let (status, body) = create_prompt(
+        &h,
+        &alice(),
+        json!({"input_ref": {"uri": "s3://allowed/key", "sha256": sha256_hex(b"x")}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
     wait_calls(&h.calls, 1).await;
     h.release.notify_one();
     wait_state(&h.store, &alice_claims(), &id, InvocationState::Succeeded).await;

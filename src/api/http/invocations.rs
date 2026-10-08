@@ -128,9 +128,9 @@ pub(crate) struct InvocationsRuntime {
     /// Called after a successful, non-replayed create. `None` until the
     /// execution bridge (#317) installs one in production.
     dispatcher: Option<Arc<dyn InvocationDispatcher>>,
-    /// Pluggable `input_ref` scheme → resolver registry (#331). Empty by
-    /// default (create still `422 input_ref_unresolvable` until a deployment
-    /// or test registers a scheme).
+    /// `input_ref` resolver registry (`invocations_input_ref`). Empty by
+    /// default, so create stays `422 input_ref_unresolvable` until the
+    /// built-in artifact resolver is switched on or an embedder registers one.
     input_refs: InputRefRegistry,
 }
 
@@ -229,14 +229,14 @@ impl InvocationsRuntime {
         &self.cancellations
     }
 
-    /// Shared `input_ref` resolver registry (empty in production v0.12).
+    /// Shared `input_ref` resolver registry. Empty unless the built-in
+    /// artifact resolver is switched on or an embedder registered one
+    /// (`invocations_input_ref`).
     pub(crate) fn input_refs(&self) -> &InputRefRegistry {
         &self.input_refs
     }
 
-    /// Replaces the `input_ref` registry. Test-only until a deployment hook
-    /// registers schemes (v0.12 ships no built-in resolver).
-    #[cfg(test)]
+    /// Replaces the `input_ref` registry (startup wiring and tests).
     pub(crate) fn with_input_refs(mut self, input_refs: InputRefRegistry) -> Self {
         self.input_refs = input_refs;
         self
@@ -751,13 +751,16 @@ pub(crate) async fn create_invocation_handler(
         Err(error) => return error.into_response(),
     };
     if let Some(input_ref) = request.input_ref.as_ref() {
-        let scheme = super::invocations_enforcement::InputRefRegistry::scheme_of(&input_ref.uri);
-        let registered = scheme.is_some_and(|s| state.invocations.input_refs().has_scheme(s));
-        if !registered {
+        // Fail closed: no matching resolver (prefix or scheme) → 422.
+        if !state
+            .invocations
+            .input_refs()
+            .has_resolver_for(&input_ref.uri)
+        {
             return ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "input_ref_unresolvable",
-                "no resolver is registered for the input_ref scheme",
+                "no resolver is registered for the input_ref uri",
             )
             .into_response();
         }
