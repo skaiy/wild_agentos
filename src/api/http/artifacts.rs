@@ -94,24 +94,8 @@ fn valid_task_iri(task_iri: &str) -> bool {
         && !task_iri.bytes().any(|byte| byte.is_ascii_control())
 }
 
-/// Blocks recognizable credential material before it can be persisted. This is
-/// intentionally conservative: replay inputs must reference secrets through
-/// environment variables or a secret manager, never embed their values.
-fn contains_plaintext_secret(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    [
-        "-----begin ",
-        "private key-----",
-        "aws_secret_access_key",
-        "github_pat_",
-        "ghp_",
-        "xoxb-",
-        "xoxp-",
-        "sk-",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
-}
+mod secret_guard;
+use secret_guard::matching_secret_rules;
 
 fn require_claims(identity: &UserIdentity) -> Result<&IsolationClaims, (StatusCode, Json<Value>)> {
     identity.isolation_claims().ok_or_else(|| {
@@ -235,10 +219,17 @@ pub(crate) async fn upload_artifact_handler(
         )
             .into_response();
     }
-    if contains_plaintext_secret(&bytes) {
+    // Replay inputs must reference credentials through environment variables
+    // or a secret manager, never embed their values. Only rule names (never the
+    // matched value) are returned so callers can locate the offending field.
+    let matched_rules = matching_secret_rules(&bytes);
+    if !matched_rules.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "plaintext secrets are forbidden in coding artifacts" })),
+            Json(json!({
+                "error": "plaintext secrets are forbidden in coding artifacts",
+                "matched_rules": matched_rules,
+            })),
         )
             .into_response();
     }
@@ -376,6 +367,7 @@ pub(crate) async fn download_artifact_handler(
 
 #[cfg(test)]
 mod tests {
+    use super::secret_guard::contains_plaintext_secret;
     use super::*;
     use crate::{
         api::http::{api_gov::ApiUsageState, SharedVectorStore},
@@ -389,7 +381,8 @@ mod tests {
     #[test]
     fn artifact_kinds_and_secret_guard_are_explicit() {
         assert_eq!(ArtifactKind::Patch.extension(), "patch");
-        assert!(contains_plaintext_secret(b"export TOKEN=ghp_aSecretValue"));
+        let token = ["export TOKEN=gh", "p_", &"aSecretValue".repeat(3)].concat();
+        assert!(contains_plaintext_secret(token.as_bytes()));
         assert!(!contains_plaintext_secret(
             b"export TOKEN=\"$TOKEN_FROM_ENV\""
         ));
@@ -492,5 +485,54 @@ mod tests {
     #[test]
     fn artifacts_reject_missing_verified_claims() {
         assert!(require_claims(&UserIdentity::anonymous()).is_err());
+    }
+
+    async fn upload(
+        state: &Arc<AppState>,
+        claims: &IsolationClaims,
+        content: &[u8],
+    ) -> (StatusCode, Value) {
+        let identity =
+            crate::api::http::iam::test_identity_from_verified_claims(claims.clone(), vec![]);
+        let response = upload_artifact_handler(
+            State(state.clone()),
+            identity,
+            Json(ArtifactUploadRequest {
+                kind: ArtifactKind::RunTranscript,
+                task_iri: "iri://task/secret-guard".to_string(),
+                content_base64: STANDARD.encode(content),
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_ordinary_words_and_rejects_real_tokens_without_persisting() {
+        let root = std::env::temp_dir().join(format!("artifact-test-{}", uuid::Uuid::new_v4()));
+        let state = test_state(root.clone());
+        let claims = IsolationClaims::from_verified("tenant-a", "project", "actor-a").unwrap();
+
+        let ordinary =
+            br#"{"task-id":"task-1","risk-level":"low","disk-free":"9G","ask-user":true}"#;
+        let (status, body) = upload(&state, &claims, ordinary).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let token = ["{\"key\":\"s", "k-", &"Ab3dE5gH7j".repeat(5), "\"}"].concat();
+        let (status, body) = upload(&state, &claims, token.as_bytes()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["matched_rules"], json!(["sk_api_key"]));
+        assert!(
+            !body.to_string().contains("Ab3dE5gH7j"),
+            "value must not echo"
+        );
+
+        // Only the ordinary upload was persisted.
+        assert_eq!(load_metadata(&state, &claims, None).unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

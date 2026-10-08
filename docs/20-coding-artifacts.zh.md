@@ -28,5 +28,26 @@ graph 内的条目；`GET /api/v1/artifacts/{id}/download` 也先执行同一验
 ## 重放与安全
 
 `task_iri` 把 patch、轨迹或脚本与 checkpoint/task 执行关联。复现脚本必须从环境变量
-或 secret manager 获得凭据。上传会拒绝可识别的明文私钥和常见 access-token 形式；
-元数据不会返回 secret。此 API 不读取或迁移历史 blob 对象。
+或 secret manager 获得凭据；元数据不会返回 secret。此 API 不读取或迁移历史 blob 对象。
+
+### 明文密钥拦截
+
+内容中嵌入了凭据**值**时，上传返回 `400` 和 `matched_rules`（只有规则名，从不回显命中的文本），
+且不落盘。规则按真实凭据格式匹配，而不是裸子串：token 前缀必须位于 ASCII 单词边界
+（输入开头，或 `[A-Za-z0-9_]` 以外的字符之后），后面必须跟足够长度的 token 字符，
+大小写与真实格式一致。
+
+| 规则 | 匹配 |
+| --- | --- |
+| `pem_armor_header` | 任意 `-----BEGIN <大写标签>-----` 行 |
+| `pem_private_key_marker` | `PRIVATE KEY-----` / `PRIVATE KEY BLOCK-----` |
+| `aws_secret_access_key` | `aws_secret_access_key`、`aws-secret-access-key` 或 `SecretAccessKey`（不分大小写），可选引号，`:`/`=`，再跟 40 个 `[A-Za-z0-9/+=]` |
+| `aws_access_key_id` | `AKIA`/`ASIA` + 16 个 `[0-9A-Z]`，两侧都有边界 |
+| `github_fine_grained_pat` | `github_pat_` + 至少 22 个 `[A-Za-z0-9_]` |
+| `github_token` | `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_` + 至少 36 个 `[A-Za-z0-9]` |
+| `slack_token` | `xoxa-`/`xoxb-`/`xoxp-`/`xoxo-`/`xoxs-`/`xoxr-` + 至少 10 个 `[A-Za-z0-9-]` |
+| `sk_api_key` | `sk-` + 至少 20 个 `[A-Za-z0-9_-]`（覆盖 `sk-proj-…`、`sk-ant-…`） |
+
+`task-`、`risk-`、`disk-`、`ask-` 等普通词不会命中；按名字引用凭据
+（`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`、`TOKEN="$TOKEN_FROM_ENV"`）是允许的。
+
