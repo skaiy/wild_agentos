@@ -365,7 +365,16 @@ fn bind_deployment_keys_to_their_endpoints(
             continue;
         }
         let noncanonical = runtime_override.noncanonical.contains(section);
-        if !noncanonical {
+        // A base URL that is present but not a string (`null`, an array or
+        // an object) is a moved endpoint: fail closed instead of skipping the
+        // binding because `get_string` fails on it (#303 re-review).
+        let non_string_base = overrides.get::<Value>(base_path).is_ok_and(|value| {
+            matches!(
+                value.kind,
+                ValueKind::Nil | ValueKind::Array(_) | ValueKind::Table(_)
+            )
+        });
+        if !noncanonical && !non_string_base {
             let override_base = override_string(base_path);
             let Some(override_base) = non_blank(override_base.as_deref()) else {
                 continue;
@@ -2219,6 +2228,65 @@ mod tests {
             }
             // The sample really is ambiguous (both spellings win sometimes).
             assert!(moved > 0 && moved < DUPLICATE_LOADS, "{raw}: moved {moved}");
+        }
+    }
+
+    /// #303 re-review nit: an override whose `base_url` is present but not
+    /// a string (`null`, an array or an object) counts as a moved endpoint
+    /// in the binding itself, for `gateway` and `embedding.oneapi` alike, so
+    /// the deployment key (yaml or environment) is replaced by an empty key.
+    /// Checked on the bound key, not on `Settings` deserialization.
+    #[test]
+    fn isolation_contract_non_string_override_base_url_drops_deployment_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), DEPLOY_LAYERS_YAML).unwrap();
+        let override_file = dir.path().join("config_override.json");
+        let non_strings = [
+            serde_json::json!(null),
+            serde_json::json!(["https://deploy.invalid/v1"]),
+            serde_json::json!({ "url": "https://deploy.invalid/v1" }),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ];
+        let sections = [
+            (
+                "gateway.api_key",
+                "embedding.oneapi.api_key",
+                ["yaml-emb-key", "env-emb-key"],
+            ),
+            (
+                "embedding.oneapi.api_key",
+                "gateway.api_key",
+                ["yaml-deploy-key", "env-deploy-key"],
+            ),
+        ];
+        for base in &non_strings {
+            for (key_path, other_key_path, other_keys) in sections {
+                let raw = if key_path == "gateway.api_key" {
+                    serde_json::json!({ "gateway": { "base_url": base } })
+                } else {
+                    serde_json::json!({ "embedding": { "oneapi": { "base_url": base } } })
+                };
+                std::fs::write(&override_file, raw.to_string()).unwrap();
+                for (env, other_key) in [
+                    (&[][..], other_keys[0]),
+                    (&DEPLOY_ENV_KEYS[..], other_keys[1]),
+                ] {
+                    let config = test_config(dir.path(), env).unwrap();
+                    let key = config.get_string(key_path).unwrap();
+                    assert!(
+                        !DEPLOYMENT_KEYS.contains(&key.as_str()),
+                        "{raw}: {key_path}"
+                    );
+                    assert_eq!(key, "", "{raw}: {key_path}");
+                    // The other section is untouched.
+                    assert_eq!(
+                        config.get_string(other_key_path).unwrap(),
+                        other_key,
+                        "{raw}: {other_key_path}"
+                    );
+                }
+            }
         }
     }
 
