@@ -15,7 +15,107 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    env:
+      IMAGE: wild-agentos-core:ci
+      RUST_AUDIT_INFO_VERSION: 0.5.4
+
     steps:
     - uses: actions/checkout@v4
+
+    - name: Check Dockerfile RUST_VERSION matches rust-toolchain.toml
+      run: |
+        set -euo pipefail
+        want="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+        have="$(sed -n 's/^ARG RUST_VERSION=\(.*\)$/\1/p' Dockerfile)"
+        echo "rust-toolchain.toml: ${want}  Dockerfile RUST_VERSION: ${have}"
+        test -n "${want}" && test "${want}" = "${have}"
+
     - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag my-image-name:$(date +%s)
+      run: docker build . --file Dockerfile --tag "$IMAGE"
+
+    - name: Image size
+      run: docker image ls "$IMAGE" --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+    - name: Builder rustc matches rust-toolchain.toml
+      run: |
+        set -euo pipefail
+        # Same build, stopped at the builder stage (fully cached from the step above).
+        docker build . --file Dockerfile --target builder --tag wild-agentos-core:builder-ci
+        want="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+        have="$(docker run --rm --entrypoint rustc wild-agentos-core:builder-ci --version | cut -d' ' -f2)"
+        echo "rust-toolchain.toml: ${want}  image builder rustc: ${have}"
+        test "${want}" = "${have}"
+
+    - name: Runtime image has no shell, curl or package manager
+      run: |
+        set -euo pipefail
+        cid="$(docker create "$IMAGE")"
+        docker export "$cid" | tar -t > image-files.txt
+        docker rm "$cid" >/dev/null
+        wc -l < image-files.txt
+        found=0
+        for path in bin/sh bin/bash bin/dash usr/bin/sh usr/bin/bash usr/bin/dash \
+                    bin/busybox usr/bin/curl usr/bin/wget \
+                    usr/bin/apt usr/bin/apt-get usr/bin/dpkg usr/bin/apk; do
+          if grep -qx "${path}" image-files.txt; then
+            echo "::error::runtime image contains ${path}"
+            found=1
+          fi
+        done
+        test "$found" = 0
+        grep -qx 'usr/local/bin/wild-agent-os-core' image-files.txt
+        grep -qx 'app/config.yaml' image-files.txt
+
+    - name: Runtime image runs as non-root
+      run: |
+        set -euo pipefail
+        user="$(docker image inspect "$IMAGE" --format '{{.Config.User}}')"
+        echo "image user: ${user}"
+        case "${user%%:*}" in
+          ""|0|root) echo "::error::image must not run as root"; exit 1 ;;
+        esac
+
+    - name: Embedded dependency list is readable (cargo auditable)
+      run: |
+        set -euo pipefail
+        cid="$(docker create "$IMAGE")"
+        docker cp "$cid:/usr/local/bin/wild-agent-os-core" ./core-bin
+        docker rm "$cid" >/dev/null
+        cargo install rust-audit-info --locked --version "$RUST_AUDIT_INFO_VERSION"
+        rust-audit-info ./core-bin > audit-info.json
+        jq -e '.packages | length > 100' audit-info.json
+        jq -e '[.packages[] | select(.name == "wild-agent-os-core")] | length == 1' audit-info.json
+        jq -e '[.packages[] | select(.name == "openssl-sys" or .name == "native-tls")] | length == 0' audit-info.json
+        jq -r '.packages | length' audit-info.json
+
+    - name: Fresh container on an empty data volume becomes healthy
+      run: |
+        set -euo pipefail
+        docker volume create wao-ci-data >/dev/null
+        # Throwaway HS256 secret generated here; no gateway key is configured.
+        docker run -d --name wao-ci \
+          -e AGENTOS_JWT_SECRET="$(openssl rand -hex 32)" \
+          -v wao-ci-data:/app/data \
+          --health-interval=2s --health-start-period=60s \
+          "$IMAGE"
+        status=""
+        for _ in $(seq 1 60); do
+          status="$(docker inspect --format '{{.State.Health.Status}}' wao-ci)"
+          running="$(docker inspect --format '{{.State.Running}}' wao-ci)"
+          echo "health=${status} running=${running}"
+          [ "$status" = healthy ] && break
+          [ "$running" = true ] || break
+          sleep 2
+        done
+        if [ "$status" != healthy ]; then
+          docker logs wao-ci 2>&1 | tail -n 80
+          docker inspect --format '{{json .State.Health}}' wao-ci | jq .
+          exit 1
+        fi
+        docker inspect --format '{{json .State.Health.Log}}' wao-ci | jq -r '.[-1].Output'
+        # The data volume must be writable by the non-root user.
+        # The server itself created its graph store under the volume (uid 10001).
+        docker run --rm -v wao-ci-data:/data busybox:1.36 sh -c 'ls -ln /data && test -d /data/kg && test "$(stat -c %u /data/kg)" = 10001'
+        docker stop -t 15 wao-ci
+        docker rm wao-ci >/dev/null
+        docker volume rm wao-ci-data >/dev/null
