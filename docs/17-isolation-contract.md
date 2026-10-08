@@ -396,8 +396,13 @@ falls back to a tenant graph or vector namespace.
 
 `L0Store::open_for_claims` creates and writes only the tenant directory minted
 from `l0_path()` under its supplied L0 root (the `/data/l0/{tenant}` contract).
-Production HTTP task execution opens `open_for_claims` when JWT-verified claims
-are present, so PDCA persistence uses that tenant directory. Without claims it
+Production HTTP task execution gets that tenant directory's handle from a
+process-wide `TenantL0Registry` when JWT-verified claims are present, so PDCA
+persistence uses that tenant directory. redb locks `l0.redb` exclusively, so
+all concurrent runs of one tenant, in any of its projects, share one open
+handle instead of each opening the file; the registry closes the handle once
+no run uses it. The lock is per process: two Core processes must not share one
+L0 root. Without claims it
 keeps the startup L0 store, which `L0Store::new` opened read-only; writes through
 that historical shared database fail closed. The historical
 `./data/l0_store/l0.redb` database has not been migrated.

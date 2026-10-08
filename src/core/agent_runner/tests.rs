@@ -1433,3 +1433,61 @@ fn isolation_contract_prompt_e2e_fake_llm_excludes_foreign_canary() {
         server.abort();
     });
 }
+
+// ── #311: routed tool results are owned by run/agent/tenant ──
+
+#[tokio::test]
+async fn isolation_contract_routed_result_reader_is_owner_scoped_and_not_in_l0() {
+    use crate::tools::tool_executor::MicroToolOwner;
+
+    let runner = create_test_runner();
+    let guard = runner.begin_tool_restriction_run("iri://task/micro-311");
+    let owner = MicroToolOwner::new(None, guard.run_id(), "agent-a");
+    let other_agent = MicroToolOwner::new(None, guard.run_id(), "agent-b");
+    let settings = crate::config::settings::ToolResultRouterSettings::default();
+    let big = format!("CANARY-311 {}", "x".repeat(settings.threshold_large + 100));
+    let l0_before = runner.l0_store.count().unwrap_or(0);
+
+    let message = runner
+        .route_tool_result(&big, "web_fetch", "call_311", &owner, None)
+        .await;
+
+    // The model still sees the short reference; the storage key carries the owner.
+    assert!(message.contains("iri://tool-result/call_311"), "{message}");
+    assert!(!message.contains(&owner.storage_key("call_311")));
+    let executor = runner.tool_executor.read().clone();
+    assert!(executor.has_micro_reader(&owner, "read_full_result_call_311"));
+    assert!(!executor.has_micro_reader(&other_agent, "read_full_result_call_311"));
+    assert_eq!(runner.l0_store.count().unwrap_or(0), l0_before);
+
+    let store = executor.micro_tool_store();
+    assert_eq!(store.counts(), (1, 1));
+    drop(guard);
+    assert_eq!(store.counts(), (0, 0));
+}
+
+#[tokio::test]
+async fn isolation_contract_graphify_needs_verified_claims() {
+    use crate::tools::tool_executor::MicroToolOwner;
+
+    let runner = create_test_runner();
+    let guard = runner.begin_tool_restriction_run("iri://task/graphify-311");
+    let owner = MicroToolOwner::new(None, guard.run_id(), "agent-a");
+    let settings = crate::config::settings::ToolResultRouterSettings::default();
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while serde_json::to_string(&rows).unwrap().len() <= settings.threshold_large + 100 {
+        rows.push(json!({"id": format!("p{i}"), "type": "person", "name": format!("name {i}")}));
+        i += 1;
+    }
+    let structured = serde_json::to_string(&rows).unwrap();
+
+    runner
+        .route_tool_result(&structured, "db_query", "call_g", &owner, None)
+        .await;
+
+    // Without claims: no graphify, no shared `query_*` readers; only this
+    // owner's full-result reader.
+    let names = runner.tool_executor.read().micro_tool_names_for(&owner);
+    assert_eq!(names, vec!["read_full_result_call_g".to_string()]);
+}

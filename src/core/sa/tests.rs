@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(test)]
+// Nested `tests` module inside `tests.rs` keeps existing test paths stable and avoids
+// re-indenting the whole file; no other module shares this name.
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
     use crate::core::agent_instance::AgentRole;
