@@ -236,11 +236,16 @@ pub(crate) async fn skill_mcp_handler(
 /// project and the DA role. Returns the verified tenant that owns the write.
 fn verified_exposure_tenant(identity: &UserIdentity) -> Result<String, (StatusCode, Json<Value>)> {
     identity.require_control_plane_da("skill exposure writes")?;
-    Ok(identity
-        .isolation_claims()
-        .expect("control-plane DA requires verified claims")
-        .tenant_id()
-        .to_owned())
+    let claims = identity.isolation_claims().ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "verified_isolation_claims_required",
+                "message": "verified isolation claims required for skill exposure writes",
+            })),
+        )
+    })?;
+    Ok(claims.tenant_id().to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,9 +264,21 @@ pub(crate) async fn list_skill_exposures_handler(identity: UserIdentity) -> impl
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
     }
+    // #302: filter by the verified tenant, never the unverified identity field.
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "verified_isolation_claims_required",
+                "message": "verified isolation claims required for skill exposures",
+            })),
+        )
+            .into_response();
+    };
+    let tenant_id = claims.tenant_id();
     let exposures: Vec<_> = load_exposures()
         .into_iter()
-        .filter(|exposure| exposure.tenant_id == identity.tenant_id)
+        .filter(|exposure| exposure.tenant_id == tenant_id)
         .collect();
     Json(json!({"count": exposures.len(), "exposures": exposures})).into_response()
 }

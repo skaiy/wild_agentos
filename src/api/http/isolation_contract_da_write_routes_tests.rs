@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::{
     body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
-    routing::{delete, post, put},
+    routing::{delete, get, post, put},
     Router,
 };
 use base64::Engine;
@@ -114,7 +114,10 @@ fn router(state: Arc<AppState>) -> Router {
             install_package_handler, publish_package_handler, rollback_package_handler,
             upgrade_package_handler,
         },
-        mcp_skills::{delete_skill_exposure_handler, upsert_skill_exposure_handler},
+        mcp_skills::{
+            delete_skill_exposure_handler, list_skill_exposures_handler,
+            upsert_skill_exposure_handler,
+        },
         prompts::{
             activate_prompt_handler, canary_prompt_handler, create_prompt_handler,
             delete_prompt_handler,
@@ -156,7 +159,9 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/mcp/skill-exposures",
-            post(upsert_skill_exposure_handler).delete(delete_skill_exposure_handler),
+            get(list_skill_exposures_handler)
+                .post(upsert_skill_exposure_handler)
+                .delete(delete_skill_exposure_handler),
         )
         .route(
             "/api/v1/kb/bases/:id/reindex",
@@ -500,6 +505,34 @@ async fn isolation_contract_skill_exposure_writes_use_verified_tenant() {
         assert_eq!(stored(), before, "{method} {uri} changed exposures");
     }
 
+    // Listing is scoped to the verified tenant.
+    let list_uri = "/api/v1/mcp/skill-exposures";
+    for caller in [Caller::Anonymous, Caller::XIdentity(&spoofed_b)] {
+        let (status, _) = call(&app, Method::GET, list_uri, caller, Value::Null).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        list_uri,
+        Caller::Bearer(&da_a),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 0, "tenant-a saw tenant-b's exposure");
+    let owner_list = token("tenant-b", &["DA"], Some("project-b"));
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        list_uri,
+        Caller::Bearer(&owner_list),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 1);
+
     // Another tenant's DA cannot remove tenant-b's exposure: 404, unchanged.
     let (status, _) = call(
         &app,
@@ -572,6 +605,20 @@ async fn isolation_contract_kb_reindex_requires_owner_control_plane_da() {
     .await;
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
     assert_eq!(foreign["error"], missing["error"]);
+    assert_eq!(state.knowledge_bases.read().await[0], kb, "KB was touched");
+
+    // Same tenant, another project: also 404 as if missing, KB untouched.
+    let other_project = token("tenant-b", &["DA"], Some("project-other"));
+    let (status, same_tenant) = call(
+        &app,
+        Method::POST,
+        uri,
+        Caller::Bearer(&other_project),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(same_tenant["error"], missing["error"]);
     assert_eq!(state.knowledge_bases.read().await[0], kb, "KB was touched");
 
     // Positive control: the owner reaches the handler body (no vector store
