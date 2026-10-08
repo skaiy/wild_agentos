@@ -87,7 +87,6 @@ const INCONCLUSIVE: &[(&str, &str)] = &[
     ("POST", "/api/v1/api-clients"),
     ("POST", "/api/v1/artifacts"),
     ("POST", "/api/v1/batch/agents/:name/control"),
-    ("POST", "/api/v1/embedding/activate"),
     ("POST", "/api/v1/events"),
     ("POST", "/api/v1/images/upload"),
     ("POST", "/api/v1/kb/bases"),
