@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::config::{
-    hot_reload_embedding, json_deep_merge, same_provider_endpoint, save_config_override,
+    hot_reload_embedding, json_deep_merge, same_provider_endpoint, save_config_override_off_runtime,
 };
 use super::iam::UserIdentity;
 use super::provider_outbound::{
@@ -626,7 +626,7 @@ pub(crate) async fn activate_embedding_handler(
             }
         }
     });
-    let persisted = save_config_override(&patch).is_ok();
+    let persisted = save_config_override_off_runtime(&patch).await.is_ok();
     // 更新脱敏快照（去明文 key，转 api_key_configured）。
     {
         let mut info = state.config_info.write().await;

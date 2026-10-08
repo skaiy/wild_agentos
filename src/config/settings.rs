@@ -194,11 +194,35 @@ impl RuntimeOverride {
         let config = Config::builder()
             .add_source(config::File::from_str(text, config::FileFormat::Json))
             .build()?;
+        let noncanonical = if spelling_guard_disabled_for_test() {
+            Vec::new()
+        } else {
+            noncanonical_keyed_sections(text)
+        };
         Ok(Self {
             config,
-            noncanonical: noncanonical_keyed_sections(text),
+            noncanonical,
         })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test switch the spelling guard off on its own thread, so the
+    /// single-read part of the fix can be checked through the real load path.
+    static SPELLING_GUARD_DISABLED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn spelling_guard_disabled_for_test() -> bool {
+    SPELLING_GUARD_DISABLED_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn spelling_guard_disabled_for_test() -> bool {
+    false
 }
 
 /// Sections of the raw override where a key could fold into another one.
@@ -2129,35 +2153,58 @@ mod tests {
         }
     }
 
+    /// Switches the spelling guard off on this thread until dropped.
+    struct SpellingGuardOff;
+
+    impl SpellingGuardOff {
+        fn new() -> Self {
+            SPELLING_GUARD_DISABLED_FOR_TEST.with(|off| off.set(true));
+            Self
+        }
+    }
+
+    impl Drop for SpellingGuardOff {
+        fn drop(&mut self) {
+            SPELLING_GUARD_DISABLED_FOR_TEST.with(|off| off.set(false));
+        }
+    }
+
     /// The single-read part of the fix on its own: with the spelling guard
-    /// switched off, the key binding and the merged configuration still see
-    /// the same folded override (one parse per load), so a load that ends up
-    /// on the other endpoint has no deployment key and a load that ends up on
-    /// the deployment endpoint keeps it. Before the fix the override was
-    /// parsed twice and the two parses could fold differently.
+    /// switched off, a load through the real path
+    /// (`config_builder_with_sources`, via `load_config_layers_for_test`)
+    /// gives the key binding and the merged configuration the same folded
+    /// override (one read and one parse per load), so a load that ends up on
+    /// the other endpoint has no deployment key and a load that ends up on
+    /// the deployment endpoint keeps it. If the override were read or parsed
+    /// twice, the two parses would fold differently in some loads and this
+    /// test would fail (#303 re-review nit: the earlier version called
+    /// `builder_from_layers` directly and could not see such a regression).
     #[test]
     fn isolation_contract_override_is_read_once_per_load() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.yaml"), DEPLOY_LAYERS_YAML).unwrap();
         let yaml = dir.path().join("config");
+        let override_file = dir.path().join("config_override.json");
         let env: Vec<(String, String)> = DEPLOY_ENV_KEYS
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect();
         for (base_path, key_path, deploy_base, raw) in duplicate_cased_override_samples() {
+            // The guard would otherwise drop the deployment key outright.
+            assert!(
+                !RuntimeOverride::from_text(raw)
+                    .unwrap()
+                    .noncanonical
+                    .is_empty(),
+                "{raw}"
+            );
+            std::fs::write(&override_file, raw).unwrap();
+            let _guard_off = SpellingGuardOff::new();
             let mut moved = 0;
             for _ in 0..DUPLICATE_LOADS {
-                let deployment = Config::builder()
-                    .add_source(config::File::with_name(yaml.to_str().unwrap()).required(false))
-                    .build()
-                    .unwrap();
-                let mut runtime_override = RuntimeOverride::from_text(raw).unwrap();
-                assert!(!runtime_override.noncanonical.is_empty(), "{raw}");
-                runtime_override.noncanonical.clear();
-                let config = builder_from_layers(&deployment, Some(&runtime_override), &env)
-                    .unwrap()
-                    .build()
-                    .unwrap();
+                let config =
+                    load_config_layers_for_test(yaml.to_str().unwrap(), &override_file, &env)
+                        .unwrap();
                 let base = config.get_string(base_path).unwrap();
                 let key = config.get_string(key_path).unwrap();
                 if normalize_api_base(&base) == normalize_api_base(deploy_base) {
