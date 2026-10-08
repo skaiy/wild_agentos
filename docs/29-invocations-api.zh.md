@@ -211,9 +211,12 @@ queued ──► running ──► succeeded
 与 §7.2 的「非终态活跃上限」不同：这里只统计已被准入**运行**（占有 running 槽 / 进入 executor 路径）的调用。
 
 - 全局运行中上限：默认 **64**，环境变量 `AGENTOS_INVOCATION_MAX_RUNNING_GLOBAL`（≥ 1）。
-- 每 scope（tenant_id + project_id）运行中上限：默认 **8**，环境变量 `AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE`（≥ 1）。
-- 任一上限触顶时，新创建的调用保持 `queued`，**不**调用 `TaskExecutor`，直到有槽位释放。
-- 运行中调用到达终态（或启动后被取消）时，按该 scope 内 `created_at`（再按 `id`）启动仍为 `queued` 的最老一条——同 scope FIFO。各 scope 不共享 per-scope 配额，只共享全局上限。
+- 每租户（tenant_id，合计该租户所有项目）运行中上限：默认 **16**，环境变量 `AGENTOS_INVOCATION_MAX_RUNNING_PER_TENANT`（≥ 1）。防止一个租户靠多开项目占满全局上限。
+- 每 scope（tenant_id + project_id）运行中上限：默认 **8**，环境变量 `AGENTOS_INVOCATION_MAX_RUNNING_PER_SCOPE`（≥ 1）。一个 scope 实际能同时运行的数量是 `min(每 scope, 每租户, 全局)`。
+- 三个环境变量的值不是正整数（`0`、负数、非数字）时按默认值处理。
+- 任一上限触顶时，新创建的调用保持 `queued`，**不**调用 `TaskExecutor`，直到有槽位释放。不会因此返回新的错误码，HTTP 契约不变。
+- 运行中调用到达终态（或启动后被取消）时，按该 scope 内 `created_at`（再按 `id`）启动仍为 `queued` 的最老一条——同 scope FIFO。各 scope 不共享 per-scope 配额；同一租户的各 scope 共享每租户上限；所有 scope 共享全局上限。不同 scope 之间没有排队次序：槽位空出时，由各 scope 的队首竞争。
+- 这些上限都在进程内存中计数，只在单个进程内生效；多实例部署时每个实例各自计数，不跨实例共享。
 - 仍为 `queued` 的调用若 `deadline` 到期 → `queued → failed`，`error.code = "deadline_exceeded"`（该条件边除 §8 预执行系统码外仅此原因）。运行中到期则取消 executor token，并以 `failed` / `deadline_exceeded` 结束。
 
 ## 8. 执行
