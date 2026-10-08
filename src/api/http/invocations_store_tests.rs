@@ -1427,7 +1427,7 @@ fn usage_from_run_prefers_gateway_cost() {
 #[test]
 fn usage_from_run_uses_price_table_when_any_call_lacks_gateway_cost() {
     let run = run_snapshot(&[("m", 100, 10, Some(0.0005)), ("n", 3, 1, None)], 0);
-    let pricing = price_table(&[("m", 2.0, 8.0), ("N", 0.5, 0.5)]);
+    let pricing = price_table(&[("m", 2.0, 8.0), ("n", 0.5, 0.5)]);
     let usage = usage_from_run(&run, &pricing).unwrap();
     // m: 100*2 + 10*8 = 280; n: ceil(3*0.5 + 1*0.5) = 2.
     assert_eq!(usage.cost, Some(282));
@@ -1440,6 +1440,8 @@ fn usage_from_run_never_fills_in_a_cost() {
     for pricing in [
         price_table(&[]),
         price_table(&[("other", 1.0, 1.0)]),
+        // Exact names only: no case folding.
+        price_table(&[("M", 1.0, 1.0)]),
         price_table(&[("m", -1.0, 1.0)]),
         price_table(&[("m", f64::NAN, 1.0)]),
     ] {

@@ -29,17 +29,14 @@ use super::invocations_store::{
     InvocationStore, InvocationUsage, TransitionPatch, DEADLINE_EXCEEDED_ERROR_CODE,
     PROJECTION_CONTEXT_MISSING_ERROR_CODE, TASK_INIT_FAILED_ERROR_CODE,
 };
-use super::{TaskExecSpec, TaskExecutor};
+use super::{TaskExecSpec, TaskExecutor, TaskOutcome, TaskOutcomeKind};
 use crate::core::core_types::SemanticCore;
-use crate::core::event_bus::EventBus;
 use crate::isolation::IsolationClaims;
 
 /// Incomplete `result.usage` when closing as `succeeded` (VAL-016 / VAL-017).
 pub(crate) const INCOMPLETE_USAGE_ERROR_CODE: &str = "incomplete_usage";
 /// Executor join failed with a panic / unexpected abort.
 pub(crate) const EXECUTOR_PANIC_ERROR_CODE: &str = "executor_panic";
-/// Executor finished (or was abandoned) without a TASK_COMPLETED / TASK_FAILED event.
-pub(crate) const TERMINAL_EVENT_MISSING_ERROR_CODE: &str = "terminal_event_missing";
 /// Soft upper bound for persisted result summaries (#317 scrub).
 pub(crate) const MAX_RESULT_SUMMARY_CHARS: usize = 4_096;
 /// Scoped frame used for the H4 projection gate (non-SPARQL, task-local).
@@ -161,24 +158,6 @@ impl IncompleteUsage {
     }
 }
 
-/// Source of the executor's terminal `TASK_COMPLETED` / `TASK_FAILED` event.
-/// Other publishers reuse those event names on the same bus (the memory
-/// scheduler emits `TASK_COMPLETED` with `"{}"` before the executor finishes),
-/// so the bridge only treats events from these sources as terminal.
-pub(crate) const BRIDGE_TERMINAL_SOURCE: &str = "invocation";
-
-/// Whether `event` is the terminal event of `task_iri` from the executor (or
-/// the bridge's own backstop).
-pub(crate) fn is_executor_terminal_event(
-    event: &crate::core::event_bus::Event,
-    task_iri: &str,
-) -> bool {
-    event.task_iri == task_iri
-        && (event.event_type == "TASK_COMPLETED" || event.event_type == "TASK_FAILED")
-        && (event.source_agent_iri == super::TASK_TERMINAL_SOURCE
-            || event.source_agent_iri == BRIDGE_TERMINAL_SOURCE)
-}
-
 /// SA result statuses that mean the task actually completed. Anything else
 /// (`timeout`, `partial_failure`, …) must not become `succeeded`.
 pub(crate) fn status_is_success(status: &str) -> bool {
@@ -294,29 +273,6 @@ pub(crate) fn prompt_from_invocation(invocation: &Invocation) -> String {
     String::new()
 }
 
-/// Parses summary, usage and SA `status` out of a TASK_* event payload.
-pub(crate) fn parse_terminal_payload(
-    payload: &str,
-) -> (String, Option<InvocationUsage>, Option<String>) {
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return (scrub_result_summary(payload), None, None);
-    };
-    let summary = value
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let usage = value
-        .get("usage")
-        .cloned()
-        .and_then(|u| serde_json::from_value::<InvocationUsage>(u).ok());
-    let status = value
-        .get("status")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    (scrub_result_summary(&summary), usage, status)
-}
-
 /// Production dispatcher: FIFO running caps → input_ref → init task →
 /// projection gate → TaskExecutor → state drive (#317 / #331).
 pub(crate) struct InvocationExecutionBridge {
@@ -324,7 +280,6 @@ pub(crate) struct InvocationExecutionBridge {
     cancellations: InvocationCancellationRegistry,
     core: Arc<SemanticCore>,
     executor: Arc<dyn TaskExecutor>,
-    events: Arc<EventBus>,
     shutdown: CancellationToken,
     projection_gate: Arc<dyn ProjectionContextGate>,
     scheduler: Arc<FifoScheduler>,
@@ -364,13 +319,11 @@ impl InvocationExecutionBridge {
         scheduler: Arc<FifoScheduler>,
         input_refs: InputRefRegistry,
     ) -> Self {
-        let events = core.events.clone();
         Self {
             store,
             cancellations,
             core,
             executor,
-            events,
             shutdown,
             projection_gate,
             scheduler,
@@ -419,7 +372,6 @@ impl InvocationDispatcher for InvocationExecutionBridge {
             store: self.store.clone(),
             core: self.core.clone(),
             executor: self.executor.clone(),
-            events: self.events.clone(),
             gate: self.projection_gate.clone(),
             input_refs: self.input_refs.clone(),
             scheduler: self.scheduler.clone(),
@@ -606,7 +558,6 @@ struct InvocationRunDeps {
     store: Arc<InvocationStore>,
     core: Arc<SemanticCore>,
     executor: Arc<dyn TaskExecutor>,
-    events: Arc<EventBus>,
     gate: Arc<dyn ProjectionContextGate>,
     input_refs: InputRefRegistry,
     scheduler: Arc<FifoScheduler>,
@@ -621,7 +572,6 @@ async fn run_invocation(
         store,
         core,
         executor,
-        events,
         gate,
         input_refs,
         scheduler,
@@ -713,9 +663,6 @@ async fn run_invocation(
     // Store row left `queued`; wake peers that were waiting for a new FIFO head.
     scheduler.notify().notify_waiters();
 
-    // Subscribe before spawning the executor so early events are not missed.
-    let mut rx = events.subscribe();
-
     let spec = TaskExecSpec {
         prompt,
         task_iri: task_iri.clone(),
@@ -725,165 +672,101 @@ async fn run_invocation(
         isolation_claims: claims.clone(),
     };
 
-    let exec_task_iri = task_iri.clone();
-    let exec_events = events.clone();
-    let mut execution = tokio::spawn(async move {
-        executor.execute(spec).await;
-    });
+    // The terminal state comes only from what `execute` returns. Events on the
+    // shared bus can come from other components (the memory scheduler emits
+    // `TASK_COMPLETED`) or from callers, so the bridge never reads them (#337).
+    let mut execution = tokio::spawn(async move { executor.execute(spec).await });
 
-    let mut terminal_event = None;
-    let mut executor_done = false;
-
-    while terminal_event.is_none() {
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled(), if !executor_done => {
-                // Requested cancel: wait for the executor to unwind, then
-                // prefer a real terminal event if one arrived; else cancelled.
-                let join = (&mut execution).await;
-                if let Ok(event) = rx.try_recv() {
-                    if is_executor_terminal_event(&event, &task_iri) {
-                        terminal_event = Some(event);
-                        break;
-                    }
-                }
-                // Drain a few more events briefly.
-                for _ in 0..8 {
-                    match rx.try_recv() {
-                        Ok(event) if is_executor_terminal_event(&event, &task_iri) => {
-                            terminal_event = Some(event);
-                            break;
+    let join = tokio::select! {
+        biased;
+        join = &mut execution => join,
+        _ = cancellation.cancelled() => {
+            // Requested cancel: wait for the executor to unwind and keep its
+            // real outcome if it finished anyway; otherwise record cancelled.
+            let join = (&mut execution).await;
+            match join {
+                Ok(outcome) if outcome.kind != TaskOutcomeKind::Cancelled => Ok(outcome),
+                Ok(_) => {
+                    // Deadline watcher may already have written failed/deadline_exceeded.
+                    if let Ok(current) = store.get_for_claims(&claims, &invocation.id).await {
+                        if current.state.is_terminal()
+                            || current
+                                .error
+                                .as_ref()
+                                .is_some_and(|e| e.code == DEADLINE_EXCEEDED_ERROR_CODE)
+                        {
+                            return;
                         }
-                        Ok(_) => continue,
-                        Err(_) => break,
                     }
-                }
-                if terminal_event.is_some() {
-                    break;
-                }
-                if let Err(error) = join {
-                    if error.is_panic() {
-                        let _ = fail_running(
-                            &store,
+                    let _ = store
+                        .transition_for_claims(
                             &claims,
                             &invocation.id,
-                            EXECUTOR_PANIC_ERROR_CODE,
-                            &format!("task executor panicked: {error}"),
                             None,
+                            InvocationState::Cancelled,
+                            TransitionPatch::default(),
                         )
                         .await;
-                        return;
-                    }
+                    return;
                 }
-                // Deadline watcher may already have written failed/deadline_exceeded.
-                if let Ok(current) = store.get_for_claims(&claims, &invocation.id).await {
-                    if current.state.is_terminal() {
-                        return;
-                    }
-                    if current
-                        .error
-                        .as_ref()
-                        .is_some_and(|e| e.code == DEADLINE_EXCEEDED_ERROR_CODE)
-                    {
-                        return;
-                    }
-                }
-                let _ = store
-                    .transition_for_claims(
-                        &claims,
-                        &invocation.id,
-                        None,
-                        InvocationState::Cancelled,
-                        TransitionPatch::default(),
-                    )
-                    .await;
-                return;
-            }
-            join = &mut execution, if !executor_done => {
-                executor_done = true;
-                match join {
-                    Ok(()) => {}
-                    Err(error) => {
-                        let _ = exec_events
-                            .emit(
-                                &exec_task_iri,
-                                "TASK_FAILED",
-                                BRIDGE_TERMINAL_SOURCE,
-                                &serde_json::json!({
-                                    "status": "failed",
-                                    "summary": format!(
-                                        "task executor terminated unexpectedly: {error}"
-                                    ),
-                                })
-                                .to_string(),
-                            )
-                            .await;
-                    }
-                }
-            }
-            result = rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        if is_executor_terminal_event(&event, &task_iri) {
-                            terminal_event = Some(event);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
-                    }
-                }
+                Err(error) => Err(error),
             }
         }
+    };
 
-        // Executor finished but terminal event not yet received: keep
-        // receiving for a short window, then fail closed.
-        if executor_done && terminal_event.is_none() {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(event)) if is_executor_terminal_event(&event, &task_iri) => {
-                    terminal_event = Some(event);
-                }
-                Ok(Ok(_)) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(_)) | Err(_) => break,
-            }
-        }
-    }
-
-    let Some(event) = terminal_event else {
-        let current = store.get_for_claims(&claims, &invocation.id).await.ok();
-        if current.as_ref().is_some_and(|inv| inv.state.is_terminal()) {
+    let outcome = match join {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let (code, message) = if error.is_panic() {
+                (
+                    EXECUTOR_PANIC_ERROR_CODE,
+                    format!("task executor panicked: {error}"),
+                )
+            } else {
+                (
+                    "task_failed",
+                    format!("task executor terminated unexpectedly: {error}"),
+                )
+            };
+            let _ = fail_running(&store, &claims, &invocation.id, code, &message, None).await;
             return;
         }
+    };
+    if outcome.kind == TaskOutcomeKind::Cancelled {
+        // Cancelled without a cancel request (for example the executor's own
+        // run timeout fired its token): the run did not complete.
         let _ = fail_running(
             &store,
             &claims,
             &invocation.id,
-            TERMINAL_EVENT_MISSING_ERROR_CODE,
-            "execution ended without a terminal task event",
-            None,
+            "task_failed",
+            "task execution was cancelled",
+            outcome.usage,
         )
         .await;
         return;
-    };
+    }
 
-    apply_terminal_event(&store, &claims, &invocation, &event).await;
+    apply_task_outcome(&store, &claims, &invocation, outcome).await;
 }
 
-async fn apply_terminal_event(
+async fn apply_task_outcome(
     store: &InvocationStore,
     claims: &IsolationClaims,
     invocation: &Invocation,
-    event: &crate::core::event_bus::Event,
+    outcome: TaskOutcome,
 ) {
     let id = invocation.id.as_str();
-    let (summary, usage, status) = parse_terminal_payload(&event.payload);
-    if event.event_type == "TASK_COMPLETED" {
-        // The executor reports TASK_COMPLETED for every finished run; only an
+    let TaskOutcome {
+        kind,
+        status,
+        summary,
+        usage,
+    } = outcome;
+    let summary = scrub_result_summary(&summary);
+    if kind == TaskOutcomeKind::Completed {
+        // The executor completes every pipeline it finishes; only an
         // explicitly successful SA status may become `succeeded` (#337).
-        let status = status.unwrap_or_default();
         if !status_is_success(&status) {
             let _ = fail_running(
                 store,
@@ -1144,43 +1027,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_events_only_from_the_executor_or_the_bridge() {
-        let event = |source: &str, event_type: &str| crate::core::event_bus::Event {
-            event_id: "e".into(),
-            task_iri: "iri://task/t".into(),
-            event_type: event_type.into(),
-            source_agent_iri: source.into(),
-            payload: "{}".into(),
-            payload_json_ld: String::new(),
-            timestamp: chrono::Utc::now(),
-            sequence: 0,
-            type_mask: 0,
-            priority: Default::default(),
-        };
-        let t = "iri://task/t";
-        assert!(is_executor_terminal_event(
-            &event(super::super::TASK_TERMINAL_SOURCE, "TASK_COMPLETED"),
-            t
-        ));
-        assert!(is_executor_terminal_event(
-            &event(BRIDGE_TERMINAL_SOURCE, "TASK_FAILED"),
-            t
-        ));
-        assert!(!is_executor_terminal_event(
-            &event("system:memory_scheduler", "TASK_COMPLETED"),
-            t
-        ));
-        assert!(!is_executor_terminal_event(
-            &event(super::super::TASK_TERMINAL_SOURCE, "TASK_STARTED"),
-            t
-        ));
-        assert!(!is_executor_terminal_event(
-            &event(super::super::TASK_TERMINAL_SOURCE, "TASK_COMPLETED"),
-            "iri://task/other"
-        ));
-    }
-
-    #[test]
     fn only_explicit_success_statuses_succeed() {
         for ok in ["completed", "success", "succeeded"] {
             assert!(status_is_success(ok));
@@ -1254,25 +1100,5 @@ mod tests {
             MAX_RESULT_SUMMARY_CHARS
         );
         assert!(scrub_result_summary("leak api_key=secret").contains("[redacted]"));
-    }
-
-    #[test]
-    fn parse_terminal_payload_reads_usage() {
-        let payload = serde_json::json!({
-            "status": "succeeded",
-            "summary": "ok",
-            "usage": {
-                "model": "m",
-                "input_tokens": 1,
-                "output_tokens": 2,
-                "cost": 3
-            }
-        })
-        .to_string();
-        let (summary, usage, _) = parse_terminal_payload(&payload);
-        assert_eq!(summary, "ok");
-        let usage = usage.expect("usage");
-        assert_eq!(usage.model.as_deref(), Some("m"));
-        assert_eq!(usage.cost, Some(3));
     }
 }

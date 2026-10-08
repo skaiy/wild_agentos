@@ -768,7 +768,8 @@ pub struct HttpTaskExecutor {
 
 #[async_trait::async_trait]
 impl crate::api::http::TaskExecutor for HttpTaskExecutor {
-    async fn execute(&self, spec: crate::api::http::TaskExecSpec) {
+    async fn execute(&self, spec: crate::api::http::TaskExecSpec) -> crate::api::http::TaskOutcome {
+        use crate::api::http::TaskOutcome;
         let l0 = match self.tenant_l0.get_or_open(&spec.isolation_claims) {
             Ok(l0) => l0,
             Err(error) => {
@@ -789,7 +790,7 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                         &terminal_payload("failed", &error.to_string(), None),
                     )
                     .await;
-                return;
+                return TaskOutcome::failed(error.to_string(), None);
             }
         };
         // Every LLM call of this run goes through a gateway handle bound to
@@ -844,6 +845,8 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
         };
 
         let cancellation = spec.cancellation.clone();
+        // Set only when the caller's token (not our own timeout) stopped the run.
+        let mut cancelled_by_caller = false;
         let execution = if self.settings.agents.timeout_seconds > 0 {
             let timeout = std::time::Duration::from_secs(self.settings.agents.timeout_seconds);
             tokio::select! {
@@ -854,16 +857,22 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                         message: format!("task execution timed out after {} seconds", timeout.as_secs()),
                     })
                 }
-                _ = cancellation.cancelled() => Err(crate::CoreError::Internal {
-                    message: "task execution cancelled".to_string(),
-                }),
+                _ = cancellation.cancelled() => {
+                    cancelled_by_caller = true;
+                    Err(crate::CoreError::Internal {
+                        message: "task execution cancelled".to_string(),
+                    })
+                }
             }
         } else {
             tokio::select! {
                 result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
-                _ = cancellation.cancelled() => Err(crate::CoreError::Internal {
-                    message: "task execution cancelled".to_string(),
-                }),
+                _ = cancellation.cancelled() => {
+                    cancelled_by_caller = true;
+                    Err(crate::CoreError::Internal {
+                        message: "task execution cancelled".to_string(),
+                    })
+                }
             }
         };
 
@@ -871,7 +880,7 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             &usage_meter.snapshot(),
             &self.settings.pricing,
         );
-        match execution {
+        let outcome = match execution {
             Ok(result) => {
                 emitter.emit_completion(&result.status, &result.summary, result.output.clone());
                 if let Some(client) = &a2a_client {
@@ -905,9 +914,10 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                         &spec.task_iri,
                         event_type,
                         crate::api::http::TASK_TERMINAL_SOURCE,
-                        &terminal_payload(&result.status, &result.summary, usage),
+                        &terminal_payload(&result.status, &result.summary, usage.clone()),
                     )
                     .await;
+                TaskOutcome::completed(result.status, result.summary, usage)
             }
             Err(e) => {
                 emitter.emit_error("ExecutionError", &e.to_string(), "SA", false);
@@ -917,16 +927,22 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                         &spec.task_iri,
                         "TASK_FAILED",
                         crate::api::http::TASK_TERMINAL_SOURCE,
-                        &terminal_payload("failed", &e.to_string(), usage),
+                        &terminal_payload("failed", &e.to_string(), usage.clone()),
                     )
                     .await;
+                if cancelled_by_caller {
+                    TaskOutcome::cancelled(usage)
+                } else {
+                    TaskOutcome::failed(e.to_string(), usage)
+                }
             }
-        }
+        };
 
         // Release this run's clone of the tenant handle, then close tenant
         // handles no other run is still using.
         drop(sa);
         self.tenant_l0.release_idle();
+        outcome
     }
 }
 

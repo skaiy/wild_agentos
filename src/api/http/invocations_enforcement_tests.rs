@@ -34,7 +34,7 @@ struct HoldExecutor {
 
 #[async_trait]
 impl TaskExecutor for HoldExecutor {
-    async fn execute(&self, spec: TaskExecSpec) {
+    async fn execute(&self, spec: TaskExecSpec) -> crate::api::http::TaskOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.release.notified().await;
         let usage = if self.over_budget {
@@ -62,6 +62,11 @@ impl TaskExecutor for HoldExecutor {
                 &json!({"status": "succeeded", "summary": "held-ok", "usage": usage}).to_string(),
             )
             .await;
+        crate::api::http::TaskOutcome::completed(
+            "succeeded",
+            "held-ok",
+            Some(serde_json::from_value(usage).expect("usage")),
+        )
     }
 }
 

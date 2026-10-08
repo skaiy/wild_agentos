@@ -286,8 +286,8 @@ impl SupervisorAgent {
         }
 
         let mut results = Vec::new();
-        for h in handles {
-            match h.await {
+        for joined in join_all_aborting_on_drop(handles).await {
+            match joined {
                 Ok(Ok(res)) => results.push(res),
                 Ok(Err(e)) => warn!("Parallel agent failed: {}", e),
                 Err(e) => warn!("Parallel agent panicked: {}", e),
@@ -1718,6 +1718,32 @@ Output only JSON."#,
     }
 }
 
+/// Awaits every task in order. If the returned future is dropped first (run
+/// timeout or cancellation), the tasks still running are aborted: otherwise
+/// parallel agents keep calling the LLM after the run ended and its usage was
+/// reported (#337). Aborting a finished task is a no-op.
+async fn join_all_aborting_on_drop<T>(
+    handles: Vec<tokio::task::JoinHandle<T>>,
+) -> Vec<Result<T, tokio::task::JoinError>> {
+    let _abort_on_drop = AbortOnDrop(handles.iter().map(|h| h.abort_handle()).collect());
+    let mut joined = Vec::with_capacity(handles.len());
+    for handle in handles {
+        joined.push(handle.await);
+    }
+    joined
+}
+
+/// Aborts the wrapped tasks when dropped.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod plan_policy_tests {
     use super::*;
@@ -1828,5 +1854,58 @@ mod plan_policy_tests {
             assert!(completed.is_empty());
             assert!(da_output.is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod abort_on_drop_tests {
+    use super::join_all_aborting_on_drop;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// N2 (#337): when the run times out or is cancelled, the future waiting
+    /// on the parallel agents is dropped, and the agents still running stop
+    /// instead of calling the LLM unmetered after the run ended.
+    #[tokio::test]
+    async fn dropping_the_wait_aborts_the_running_parallel_agents() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let handles = (0..3)
+            .map(|i| {
+                let finished = finished.clone();
+                tokio::spawn(async move {
+                    // The first agent finishes; the others are still running
+                    // when the wait is dropped.
+                    let ms = if i == 0 { 1 } else { 300 };
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(100),
+            join_all_aborting_on_drop(handles),
+        )
+        .await;
+        assert!(waited.is_err(), "the wait must have timed out");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "agents still running when the wait was dropped must be aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_to_the_end_returns_every_result_in_order() {
+        let handles = (0..3u32)
+            .map(|i| tokio::spawn(async move { i * 10 }))
+            .collect::<Vec<_>>();
+        let joined: Vec<u32> = join_all_aborting_on_drop(handles)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(joined, vec![0, 10, 20]);
     }
 }

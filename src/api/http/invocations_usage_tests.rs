@@ -43,6 +43,10 @@ struct StubConfig {
     /// Answer `400` to streaming calls that carry `stream_options`, like an
     /// upstream that does not know the option.
     reject_stream_options: bool,
+    /// Answer the first non-streaming call with a 2xx body that carries usage
+    /// but cannot be parsed as a chat completion (no `choices`), so the
+    /// gateway retries it.
+    malformed_first_plain_reply: bool,
 }
 
 #[derive(Default)]
@@ -51,6 +55,7 @@ struct StubStats {
     stream_calls: AtomicUsize,
     stream_calls_asking_usage: AtomicUsize,
     rejected_stream_calls: AtomicUsize,
+    malformed_replies: AtomicUsize,
 }
 
 impl StubStats {
@@ -143,6 +148,16 @@ async fn spawn_stub_llm(config: StubConfig) -> (String, Arc<StubStats>) {
                     .into_response()
             } else {
                 stats.plain_calls.fetch_add(1, Ordering::SeqCst);
+                if config.malformed_first_plain_reply
+                    && stats.malformed_replies.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    return axum::Json(json!({
+                        "id": "c",
+                        "model": STUB_MODEL,
+                        "usage": stub_usage(config),
+                    }))
+                    .into_response();
+                }
                 axum::Json(json!({
                     "id": "c",
                     "model": STUB_MODEL,
@@ -215,10 +230,12 @@ async fn usage_harness(config: StubConfig, price_table: bool) -> UsageHarness {
         dir.path(),
         InvocationsRuntime::new(Some(store.clone()), true),
     );
-    let executor = Arc::new(HttpTaskExecutor::for_tests(
-        &bootstrap.core,
-        settings_for(&base_url, dir.path(), price_table),
-    ));
+    let mut settings = settings_for(&base_url, dir.path(), price_table);
+    if config.malformed_first_plain_reply {
+        settings.gateway.max_retries = 1;
+        settings.gateway.retry_base_ms = 10;
+    }
+    let executor = Arc::new(HttpTaskExecutor::for_tests(&bootstrap.core, settings));
     let input_refs = InputRefRegistry::new();
     let runtime =
         InvocationsRuntime::new(Some(store.clone()), true).with_input_refs(input_refs.clone());
@@ -349,12 +366,14 @@ const COST_AND_USAGE: StubConfig = StubConfig {
     stream_usage: true,
     delay_ms: 0,
     reject_stream_options: false,
+    malformed_first_plain_reply: false,
 };
 const USAGE_NO_COST: StubConfig = StubConfig {
     report_cost: false,
     stream_usage: true,
     delay_ms: 0,
     reject_stream_options: false,
+    malformed_first_plain_reply: false,
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -459,6 +478,7 @@ async fn production_run_with_missing_stream_usage_fails_closed() {
             stream_usage: false,
             delay_ms: 0,
             reject_stream_options: false,
+            malformed_first_plain_reply: false,
         },
         true,
     )
@@ -507,6 +527,7 @@ async fn production_concurrent_runs_do_not_mix_usage() {
             stream_usage: true,
             delay_ms: 150,
             reject_stream_options: false,
+            malformed_first_plain_reply: false,
         },
         false,
     )
@@ -553,6 +574,7 @@ async fn production_run_retries_without_stream_options_then_fails_closed() {
             stream_usage: true,
             delay_ms: 0,
             reject_stream_options: true,
+            malformed_first_plain_reply: false,
         },
         true,
     )
@@ -570,4 +592,37 @@ async fn production_run_retries_without_stream_options_then_fails_closed() {
     assert_eq!(inv.state, InvocationState::Failed);
     assert_eq!(inv.error.as_ref().unwrap().code, "incomplete_usage");
     assert_eq!(usage_of(&inv).input_tokens, None);
+}
+
+/// N2 (#337): a 2xx reply the gateway could not parse, and so retried, was
+/// still billed upstream; it is metered, so the run's usage includes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn production_run_meters_a_2xx_reply_that_failed_to_parse() {
+    let h = usage_harness(
+        StubConfig {
+            malformed_first_plain_reply: true,
+            ..COST_AND_USAGE
+        },
+        false,
+    )
+    .await;
+    let id = create(&h, &alice(), prompt_body()).await;
+    let inv = wait_terminal(&h, &id, &alice_claims()).await;
+    assert!(
+        h.stats.malformed_replies.load(Ordering::SeqCst) >= 1,
+        "the stub must have sent the malformed reply"
+    );
+    assert_eq!(
+        inv.state,
+        InvocationState::Succeeded,
+        "error={:?}",
+        inv.error
+    );
+    // `total()` counts the malformed reply too.
+    let calls = h.stats.total();
+    let usage = usage_of(&inv);
+    assert_eq!(usage.input_tokens, Some(calls * PROMPT_TOKENS));
+    assert_eq!(usage.output_tokens, Some(calls * COMPLETION_TOKENS));
+    assert_eq!(usage.cost, Some(calls * CALL_COST_MICRO_USD));
+    assert_eq!(usage.cost_source, Some(CostSource::Gateway));
 }

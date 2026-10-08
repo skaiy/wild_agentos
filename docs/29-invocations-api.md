@@ -193,10 +193,24 @@ scope and server fields → `400 field_not_allowed` (§3).
     every model call in the run (OpenAI-compatible `usage.cost`, in USD,
     converted to micro-USD and rounded to the nearest integer);
   - `config_price_table` — no complete gateway figure, so the cost is computed
-    from the operator-configured price table (`pricing.models.<model>` with
-    `input_usd_per_million_tokens` / `output_usd_per_million_tokens`; USD per
-    million tokens equals micro-USD per token; rounded up per model). Every
-    model the run used must have an entry. The table is empty by default.
+    from the operator-configured price table (`pricing.models`, a list of
+    entries with `model`, `input_usd_per_million_tokens` and
+    `output_usd_per_million_tokens`; USD per million tokens equals micro-USD
+    per token; rounded up per model). Every model the run used must have an
+    entry. The table is empty by default. `model` is the model name exactly as
+    the upstream returns it in its response (`model`), matched exactly: no
+    case folding, prefixes or aliases. The server refuses to start when the
+    table has a negative, NaN or infinite price, an empty or repeated model
+    name, two names that differ only in letter case, or an unknown member (for
+    example a misspelled `modls`). Example:
+
+    ```yaml
+    pricing:
+      models:
+        - model: "GPT-4.1"
+          input_usd_per_million_tokens: 2.0
+          output_usd_per_million_tokens: 8.0
+    ```
   - Neither source → `cost` and `cost_source` are omitted and the run ends
     `failed` / `incomplete_usage` with a message saying that no cost source is
     configured.
@@ -204,9 +218,15 @@ scope and server fields → `400 field_not_allowed` (§3).
   call the run made (planning, agents, streaming and non-streaming), counted
   per run so concurrent runs never mix. Streaming chat-completion calls ask
   the upstream for usage (`stream_options.include_usage`); an upstream that
-  rejects the option is retried once without it. If any call reported no
-  usage, the token counts are omitted rather than undercounted and the run
-  cannot succeed. `model` is the model with the most tokens in the run.
+  answers 4xx with an error naming `stream_options` or `include_usage` is
+  retried once without it. A call counts as soon as the upstream answered
+  2xx, even if the body then failed to parse and was retried. A usage block
+  counts only with both token counts present as integers that fit in 32 bits;
+  `null`, a missing count or an out-of-range value means "no usage reported",
+  never zero. If any call reported no usage, the token counts are omitted
+  rather than undercounted and the run cannot succeed. When a run times out
+  or is cancelled, its still-running agents are stopped. `model` is the model
+  with the most tokens in the run.
 - On `failed` / `cancelled` / `interrupted`, `usage` is optional; if present,
   its shape must still be valid (unknown members rejected; `cost` integer when
   set). A `failed` invocation can carry `result` with only `usage` (for example
@@ -388,10 +408,14 @@ entered the executor path).
   `input_digest_mismatch`. There is no default outbound/network resolver.
 - `agent_revision`: until agent definition revisions exist in-tree, create still
   returns `422 agent_revision_unsupported` (never silently ignored; no fake pin).
-- Task events drive state transitions. Only the executor's own terminal event
-  ends an invocation; other components that publish task lifecycle events on
-  the same bus (for example the memory scheduler) are ignored. The executor
-  reports a terminal status: only an explicit success (`completed`, `success`,
+- The terminal state comes only from the outcome the executor returns to the
+  server when the run ends, never from task events. Events on the shared task
+  event bus (including `TASK_COMPLETED` / `TASK_FAILED`) feed SSE streams only;
+  other components and callers can publish there, so they never end an
+  invocation. `POST /api/v1/events` rejects every `TASK_*` event type
+  (case-insensitive) with `403 reserved_event_type` for every role, and sets
+  the event source to `external:http:<sub>` itself; a `source` member in the
+  body is ignored. The executor reports a terminal status: only an explicit success (`completed`, `success`,
   `succeeded`) can become `succeeded`; any other status (for example `timeout`
   or `partial_failure`) ends `failed` / `task_failed`, with the actual usage
   attached. A lagging SSE subscriber receives a `resync` event and should
