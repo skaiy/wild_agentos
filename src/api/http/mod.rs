@@ -38,6 +38,7 @@ pub mod guard;
 pub(crate) mod invocations;
 pub(crate) mod invocations_enforcement;
 pub(crate) mod invocations_execution;
+pub mod invocations_input_ref;
 pub(crate) mod invocations_store;
 pub mod kb;
 pub mod market;
@@ -294,8 +295,23 @@ pub fn build_router(
         }
     }
 
+    let blob_store = crate::blob::open_blob_store();
     let invocations_runtime = {
-        let runtime = invocations::InvocationsRuntime::open_default();
+        // Compiled-in resolvers only: config switches the built-in on,
+        // embedders register in code beforehand; both tables freeze here.
+        let env = |key: &str| std::env::var(key).ok();
+        let embedders = invocations_input_ref::deployment_input_ref_registry();
+        let input_refs = invocations_input_ref::startup_input_ref_registry(
+            kg_store.clone(),
+            blob_store.clone(),
+            invocations_input_ref::artifact_resolver_enabled_from_vars(env),
+            embedders,
+        )
+        .with_timeout(invocations_input_ref::input_ref_timeout_from_vars(env))
+        .with_max_bytes(invocations_input_ref::input_ref_max_bytes_from_vars(env));
+        input_refs.freeze();
+        embedders.freeze();
+        let runtime = invocations::InvocationsRuntime::open_default().with_input_refs(input_refs);
         match (runtime.store(), task_executor.as_ref()) {
             (Some(store), Some(executor)) => {
                 let bridge = std::sync::Arc::new(
@@ -331,7 +347,7 @@ pub fn build_router(
         knowledge_bases: Arc::new(tokio::sync::RwLock::new(load_knowledge_bases())),
         knowledge_packs: Arc::new(tokio::sync::RwLock::new(loaded_packs)),
         vector_store,
-        blob_store: crate::blob::open_blob_store(),
+        blob_store,
         task_executor,
         batch_manager,
         api_clients: Arc::new(tokio::sync::RwLock::new(api_gov::load_api_clients())),
@@ -781,6 +797,9 @@ mod isolation_contract_anonymous_route_sweep_tests;
 mod isolation_contract_invocations_tests;
 
 #[cfg(test)]
+mod isolation_contract_da_write_routes_tests;
+
+#[cfg(test)]
 mod isolation_contract_body_before_auth_tests;
 
 #[cfg(test)]
@@ -824,6 +843,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         std::env::set_var("AGENTOS_AUTH_STRICT", "true");
+        // #302: the skill registry is process-global; writes need a platform admin.
+        std::env::set_var(
+            crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV,
+            "t-platform",
+        );
 
         let l0 = tmp.join("l0");
         std::fs::create_dir_all(&l0).unwrap();
@@ -911,6 +935,18 @@ mod tests {
         };
         let id_a = id_of("svc-tesla", "t-tesla");
         let id_b = id_of("svc-byd", "t-byd");
+        let platform_admin = encode(
+            &Header::default(),
+            &JwtClaims {
+                sub: "svc-platform".to_string(),
+                tenant_id: "t-platform".to_string(),
+                project_id: Some("ops".to_string()),
+                roles: vec![crate::api::http::iam::PLATFORM_ADMIN_ROLE.to_string()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap();
 
         let fault_node = |tenant: &str, code: &str, label: &str| -> Value {
             json!({
@@ -993,7 +1029,7 @@ mod tests {
         let agent_id = agent["id"].as_str().unwrap().to_string();
         assert!(!agent_id.is_empty());
 
-        // [3] 注册多个 Skill（DA 角色）
+        // [3] 注册多个 Skill（#302：全局技能注册表写入需要平台管理员）
         let skill = |iri: &str, name: &str| -> Value {
             json!({
                 "skill_iri": iri, "name": name, "description": name,
@@ -1007,10 +1043,25 @@ mod tests {
             ("skill://battery/repair-order-gen", "维修工单生成"),
             ("skill://battery/severity-triage", "故障严重度分级"),
         ] {
-            let (st, _) = post_json(&router, "/api/v1/skills", skill(iri, name), Some(&id_a)).await;
+            let (st, _) = post_json(
+                &router,
+                "/api/v1/skills",
+                skill(iri, name),
+                Some(&platform_admin),
+            )
+            .await;
             assert_eq!(st, StatusCode::CREATED, "skill {} should register", iri);
         }
-        // 负向：严格模式下匿名注册应 403
+        // 负向：租户 DA 不能写全局技能注册表（#302）
+        let (st, _) = post_json(
+            &router,
+            "/api/v1/skills",
+            skill("skill://battery/tenant", "租户技能"),
+            Some(&id_a),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // 负向：匿名注册应 401（#302 起先要求已验证 JWT，旧为 403）
         let (st, _) = post_json(
             &router,
             "/api/v1/skills",
@@ -1018,7 +1069,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
 
         // [4] 跨租户会话隔离（claims 自动应用租户命名图）
         let list = || {
@@ -1069,6 +1120,7 @@ mod tests {
         // 清理
         std::env::remove_var("AGENTOS_DATA_DIR");
         std::env::remove_var("AGENTOS_AUTH_STRICT");
+        std::env::remove_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

@@ -232,6 +232,22 @@ pub(crate) async fn skill_mcp_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
+/// Gate for exposure writes (#302): verified JWT scope with an explicit
+/// project and the DA role. Returns the verified tenant that owns the write.
+fn verified_exposure_tenant(identity: &UserIdentity) -> Result<String, (StatusCode, Json<Value>)> {
+    identity.require_control_plane_da("skill exposure writes")?;
+    let claims = identity.isolation_claims().ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "verified_isolation_claims_required",
+                "message": "verified isolation claims required for skill exposure writes",
+            })),
+        )
+    })?;
+    Ok(claims.tenant_id().to_owned())
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct McpSkillExposureRequest {
     pub skill_iri: String,
@@ -248,9 +264,21 @@ pub(crate) async fn list_skill_exposures_handler(identity: UserIdentity) -> impl
     if let Err(error) = identity.require_role("DA") {
         return error.into_response();
     }
+    // #302: filter by the verified tenant, never the unverified identity field.
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "verified_isolation_claims_required",
+                "message": "verified isolation claims required for skill exposures",
+            })),
+        )
+            .into_response();
+    };
+    let tenant_id = claims.tenant_id();
     let exposures: Vec<_> = load_exposures()
         .into_iter()
-        .filter(|exposure| exposure.tenant_id == identity.tenant_id)
+        .filter(|exposure| exposure.tenant_id == tenant_id)
         .collect();
     Json(json!({"count": exposures.len(), "exposures": exposures})).into_response()
 }
@@ -261,9 +289,12 @@ pub(crate) async fn upsert_skill_exposure_handler(
     identity: UserIdentity,
     Json(request): Json<McpSkillExposureRequest>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_role("DA") {
-        return error.into_response();
-    }
+    // #302: the exposure is owned by the verified tenant, never by an
+    // unverified X-Identity tenant or the non-strict anonymous bypass.
+    let tenant_id = match verified_exposure_tenant(&identity) {
+        Ok(tenant_id) => tenant_id,
+        Err(error) => return error.into_response(),
+    };
     if request.skill_iri.starts_with("iri://") {
         return (
             StatusCode::FORBIDDEN,
@@ -302,7 +333,7 @@ pub(crate) async fn upsert_skill_exposure_handler(
     }
 
     let exposure = McpSkillExposure {
-        tenant_id: identity.tenant_id.clone(),
+        tenant_id,
         skill_iri: request.skill_iri,
         tool_name: request.tool_name,
         enabled: request.enabled,
@@ -347,13 +378,14 @@ pub(crate) async fn delete_skill_exposure_handler(
     identity: UserIdentity,
     Query(query): Query<McpSkillExposureQuery>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_role("DA") {
-        return error.into_response();
-    }
+    let tenant_id = match verified_exposure_tenant(&identity) {
+        Ok(tenant_id) => tenant_id,
+        Err(error) => return error.into_response(),
+    };
     let mut exposures = load_exposures();
     let before = exposures.len();
     exposures.retain(|exposure| {
-        !(exposure.tenant_id == identity.tenant_id && exposure.skill_iri == query.skill_iri)
+        !(exposure.tenant_id == tenant_id && exposure.skill_iri == query.skill_iri)
     });
     if exposures.len() == before {
         return StatusCode::NOT_FOUND.into_response();

@@ -20,7 +20,7 @@ inferred from a screen name.
 | Runs | `#/runs` | `GET /api/v1/tasks` | Verified tenant/project `IsolationClaims`; lists only the caller’s persisted scope. | **Existing** |
 | Runs — task detail | `#/runs` | `GET /api/v1/tasks/:task_iri`, `GET /api/v1/tasks/:task_iri/status`, `GET /api/v1/tasks/:task_iri/details`, `GET /api/v1/tasks/trends` | Verified tenant/project `IsolationClaims`; detail reads require the same persisted task scope as the Runs list, and trends aggregate only that scope. | **Existing** |
 | Agents | `#/agents` | `GET, POST /api/v1/agents`; `PUT, DELETE /api/v1/agents/:id`; `POST /api/v1/agents/:id/chat` | Verified tenant/project `IsolationClaims`; user Agents are listed and mutated only in the caller’s persisted scope. The unscoped platform catalog remains shared runtime metadata. | **Existing** |
-| Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`; `GET /api/v1/skills/manifest`; `POST /api/v1/skills/import-git`; `GET /api/v1/skills/pipeline-runs`; `POST /api/v1/skills/pipeline-rerun` | Skill mutations require `DA`; reads do not have a uniform `IsolationClaims` gate. | **Existing** |
+| Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`; `GET /api/v1/skills/manifest`; `POST /api/v1/skills/import-git`; `GET /api/v1/skills/pipeline-runs`; `POST /api/v1/skills/pipeline-rerun` | Skill mutations (`POST`/`DELETE /api/v1/skills`, `import-git`, `pipeline-rerun`) change the process-global skill registry and require `require_platform_admin` (#302); a tenant `DA` gets `403 platform_admin_required`. Reads do not have a uniform `IsolationClaims` gate. | **Existing** |
 | KB · Ontology | `#/kb-ontology` | `GET, POST /api/v1/kb/bases`; `GET, POST /api/v1/kb/categories`; `GET, POST /api/v1/knowledge-packs`; `GET /api/v1/ontology/types`; `GET /api/v1/ontology/health` | KB graph/vector ingestion, catalog CRUD, and ontology writes use verified tenant/project `IsolationClaims`; missing claims fail closed. | **Existing** |
 | Isolation | `#/isolation` | No create-tenant HTTP path. Local read-only diagnostic: `scripts/isolation-diagnose --data-root <path>` | JWT verification mints tenant/project claims. The diagnostic CLI needs no JWT and remains a read-only local import/inventory aid; it is not an HTTP endpoint. | **Existing** — no Admin create-tenant form |
 | Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`; `PUT, DELETE /api/v1/api-clients/:id`; `POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`; `GET /api/v1/api-audit`; `GET, PUT /api/v1/config`; `POST /api/v1/models/test`; `POST /api/v1/providers/models`; `POST /api/v1/embedding/activate` | API clients, keys, and audit require verified explicit claims plus `DA` and are isolated by verified tenant; cross-tenant mutations return the same 404 as missing records. `PUT /api/v1/config` (all sections) and `POST /api/v1/embedding/activate` require `require_platform_admin`: verified JWT with explicit non-empty tenant/project, exact `PLATFORM_ADMIN` role, and tenant matching the non-default `AGENTOS_PLATFORM_ADMIN_TENANT` (fail-closed if unset). No `DA` needed. `GET /api/v1/config` requires a verified JWT plus either `require_control_plane_da` (verified explicit tenant/project + DA) or `require_platform_admin`; the response omits secret-looking fields (names normalized by lowercasing and dropping `_`/`-`, e.g. `api_key`, `accessToken`, `client_secret`, `private_key`, `authorization`, `credentials`) and exposes credentials only as `*_configured` booleans. The Admin config page needs a DA token with tenant and project, or a platform-admin token; model test/provider discovery retain their DA gate. | **Wired** |
@@ -61,6 +61,23 @@ to authorized callers, so field names never reach anyone else.
 The isolation diagnostic is intentionally still usable
 without a token because it is a local, read-only filesystem tool. It neither
 creates tenants nor grants HTTP access.
+
+### Write routes outside the matrix (#302)
+
+These kernel write routes have no dedicated Admin screen row above, but follow
+the same two gates:
+
+- **Process-global → `require_platform_admin`.** `POST /api/v1/prompts`,
+  `POST /api/v1/prompts/:id/activate`, `PUT /api/v1/prompts/:id/canary`,
+  `DELETE /api/v1/prompts/:id` (one prompt registry and one active version
+  for every tenant). Prompt reads are unchanged.
+- **Tenant-scoped → `require_control_plane_da`** (verified JWT, explicit
+  tenant and project, `DA`): `POST /api/v1/market/packages` and
+  `.../:name/{install,rollback,upgrade}`; `POST, DELETE
+  /api/v1/mcp/skill-exposures` (the owning tenant is taken from verified
+  claims, never from `X-Identity`); `POST /api/v1/kb/bases/:id/reindex`.
+- Another tenant's knowledge base, skill exposure, or private market package
+  answers the same `404` as a missing one.
 
 ### API client id collisions and recovery
 
