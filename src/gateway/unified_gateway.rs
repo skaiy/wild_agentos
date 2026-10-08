@@ -1127,10 +1127,15 @@ impl UnifiedGateway {
 }
 
 /// Whether an error answer to a streaming request means the upstream does
-/// not accept `stream_options`: a 4xx whose body mentions `stream_options`
-/// or `include_usage`.
+/// not accept `stream_options`: a 400 or 422 (the statuses upstreams use
+/// for a request they cannot accept) whose body mentions `stream_options` or
+/// `include_usage`. Other 4xx (auth, not found, rate limit, too large) are
+/// not about the option even when the body echoes it.
 fn rejects_stream_options(status: reqwest::StatusCode, body: &str) -> bool {
-    if !status.is_client_error() {
+    if !matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
         return false;
     }
     let body = body.to_ascii_lowercase();
@@ -1142,7 +1147,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_options_rejection_needs_a_4xx_naming_the_option() {
+    fn stream_options_rejection_needs_a_400_or_422_naming_the_option() {
         use reqwest::StatusCode;
         assert!(rejects_stream_options(
             StatusCode::BAD_REQUEST,
@@ -1164,6 +1169,21 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "stream_options crashed the server"
         ));
+        // Other 4xx are not a rejection of the option, even when the body
+        // names it.
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(
+                !rejects_stream_options(status, "request with stream_options.include_usage"),
+                "{status}"
+            );
+        }
     }
 
     #[test]
