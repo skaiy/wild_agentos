@@ -37,6 +37,9 @@ pub async fn probe(url: &str, timeout: Duration) -> Result<(), String> {
         .timeout(timeout)
         .connect_timeout(timeout)
         .no_proxy()
+        // Never follow redirects: only the local /health answer counts, and a
+        // redirect must not send the probe to another host.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "unhealthy: failed to build HTTP client".to_string())?;
     let response = client.get(url).send().await.map_err(|error| {
@@ -110,6 +113,33 @@ mod tests {
         .await;
         let error = probe(&url, HEALTHCHECK_TIMEOUT).await.unwrap_err();
         assert_eq!(error, "unhealthy: /health returned 503");
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_follow_redirects() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_hits = hits.clone();
+        let url = serve(
+            Router::new()
+                .route(
+                    "/health",
+                    get(|| async { axum::response::Redirect::temporary("/elsewhere") }),
+                )
+                .route(
+                    "/elsewhere",
+                    get(move || {
+                        let hits = target_hits.clone();
+                        async move {
+                            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            "ok"
+                        }
+                    }),
+                ),
+        )
+        .await;
+        let error = probe(&url, HEALTHCHECK_TIMEOUT).await.unwrap_err();
+        assert_eq!(error, "unhealthy: /health returned 307");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

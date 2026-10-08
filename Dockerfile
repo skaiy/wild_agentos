@@ -8,11 +8,21 @@
 #   国内/受限网络: --build-arg MIRROR=docker.m.daocloud.io/
 # DISTROLESS: distroless 镜像仓库前缀(带尾部/)。默认 gcr.io/distroless/。
 # RUST_VERSION: 必须与 rust-toolchain.toml 的 channel 一致(构建时校验，不一致直接失败)。
+#
+# 基础镜像按 tag@sha256:<digest> 固定（digest 是多架构 index 的 digest）。tag 只作可读标注，
+# 拉取以 digest 为准；MIRROR / DISTROLESS 换成镜像源时 digest 同样生效——镜像源必须原样
+# 代理上游 manifest，否则拉取直接失败，不会悄悄换成别的镜像。
+# 更新方式（改 RUST_VERSION 或定期刷新安全补丁时）：
+#   docker buildx imagetools inspect rust:<RUST_VERSION>-slim-bookworm      # 取 Digest
+#   docker buildx imagetools inspect gcr.io/distroless/cc-debian12:nonroot  # 取 Digest
+# 把结果写进下面的 RUST_IMAGE_DIGEST / DISTROLESS_DIGEST（或用 crane digest <image>）。
 # ─────────────────────────────────────────────────────────────
 ARG MIRROR=docker.io/
 ARG DISTROLESS=gcr.io/distroless/
 ARG RUST_VERSION=1.90.0
-FROM ${MIRROR}library/rust:${RUST_VERSION}-slim-bookworm AS builder
+ARG RUST_IMAGE_DIGEST=sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9
+ARG DISTROLESS_DIGEST=sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+FROM ${MIRROR}library/rust:${RUST_VERSION}-slim-bookworm@${RUST_IMAGE_DIGEST} AS builder
 
 # tonic-build 需 protobuf-compiler；tree-sitter/oxigraph(RocksDB) 需 C/C++ 工具链(gcc/g++)。
 # reqwest 只用 rustls，不再需要 libssl-dev / pkg-config。
@@ -49,7 +59,7 @@ COPY src ./src
 COPY benches ./benches
 
 # 默认 feature（含 ontology），不含 embeddings/causal 重依赖
-RUN cargo auditable build --release --bin wild-agent-os-core \
+RUN cargo auditable build --locked --release --bin wild-agent-os-core \
     && strip target/release/wild-agent-os-core
 
 # 运行镜像没有 shell，不能 RUN mkdir；在这里建好数据/日志目录，带属主一起 COPY。
@@ -57,7 +67,7 @@ RUN cargo auditable build --release --bin wild-agent-os-core \
 RUN mkdir -p /out/app/data /out/app/logs
 
 # ─────────────────────────────────────────────────────────────
-FROM ${DISTROLESS}cc-debian12:nonroot AS runtime
+FROM ${DISTROLESS}cc-debian12:nonroot@${DISTROLESS_DIGEST} AS runtime
 
 COPY --from=builder --chown=10001:10001 /out/app /app
 COPY --from=builder /build/target/release/wild-agent-os-core /usr/local/bin/wild-agent-os-core

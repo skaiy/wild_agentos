@@ -13,6 +13,16 @@ The `Dockerfile` builds the Core server (`wild-agent-os-core`) in two stages.
   dependency list in the binary. Scan a deployed binary directly with
   `cargo audit bin <binary>` or print the list with `rust-audit-info <binary>`.
 - HTTP clients use rustls only; the binary does not link OpenSSL.
+- `cargo auditable build --locked`: the build fails instead of re-resolving
+  dependencies when `Cargo.lock` is out of date.
+- Base images are pinned as `tag@sha256:<digest>` (`RUST_IMAGE_DIGEST`,
+  `DISTROLESS_DIGEST`); the digest wins, also behind a registry mirror
+  (`MIRROR` / `DISTROLESS`), which must serve the upstream manifest unchanged.
+  Refresh with `docker buildx imagetools inspect <image:tag>` (or
+  `crane digest`) whenever `RUST_VERSION` changes or to pick up base-image
+  security updates.
+- `.dockerignore` keeps `.env*` (except `.env.example`), `*.pem`, `*.key` and
+  similar credential files out of the build context.
 
 ## Runtime stage
 
@@ -33,7 +43,7 @@ There is no curl in the image. The binary has a `healthcheck` subcommand:
 ```
 
 It requests `GET http://127.0.0.1:${AGENT_OS_HTTP_PORT:-8080}/health` with a
-3-second timeout and exits `0` on HTTP 200, `1` otherwise (non-200, connection
+3-second timeout, never follows redirects, and exits `0` on HTTP 200, `1` otherwise (non-200, connection
 failure, timeout). It reads no secrets and prints no environment values. The
 `Dockerfile` `HEALTHCHECK` and `docker-compose.yml` use it in exec form.
 Kubernetes keeps its `httpGet` probes (`deploy/k8s/deployment.yaml`).
