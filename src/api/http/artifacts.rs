@@ -1,4 +1,4 @@
-//! Claims-scoped, replayable coding artifacts.
+//! Claims-scoped, replayable coding artifacts and immutable input snapshots.
 //!
 //! Artifact bytes live below the tenant-minted blob prefix.  Their JSON index is
 //! stored as an RDF literal in the claims-minted graph, so neither request data
@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -37,6 +37,9 @@ pub enum ArtifactKind {
     Patch,
     RunTranscript,
     ReproduceScript,
+    /// Immutable UTF-8 JSON input uploaded before an invocation exists, for
+    /// example to be referenced through `input_ref`.
+    InputSnapshot,
 }
 
 impl ArtifactKind {
@@ -45,6 +48,7 @@ impl ArtifactKind {
             Self::Patch => "text/x-diff; charset=utf-8",
             Self::RunTranscript => "text/plain; charset=utf-8",
             Self::ReproduceScript => "text/x-shellscript; charset=utf-8",
+            Self::InputSnapshot => "application/json",
         }
     }
 
@@ -53,15 +57,30 @@ impl ArtifactKind {
             Self::Patch => "patch",
             Self::RunTranscript => "log",
             Self::ReproduceScript => "sh",
+            Self::InputSnapshot => "json",
         }
+    }
+
+    /// Replay kinds describe one execution and must name it. Input snapshots
+    /// are uploaded before any task exists, so their link is optional.
+    fn requires_task_iri(self) -> bool {
+        !matches!(self, Self::InputSnapshot)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        serde_json::from_value(Value::String(value.to_string())).ok()
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ArtifactUploadRequest {
     pub kind: ArtifactKind,
-    /// IRI of the task/checkpoint execution this artifact can replay.
-    pub task_iri: String,
+    /// IRI of the task/checkpoint execution this artifact can replay. Required
+    /// for replay kinds, optional for `input_snapshot`. It is only shape-checked
+    /// and stored: it is not resolved, authorized against, or queried, so a
+    /// caller may supply its own business IRI/URN.
+    #[serde(default)]
+    pub task_iri: Option<String>,
     /// Standard base64-encoded artifact bytes. This avoids storing request
     /// credentials in a multipart side channel and is bounded by the route.
     pub content_base64: String,
@@ -71,7 +90,10 @@ pub struct ArtifactUploadRequest {
 pub struct ArtifactMetadata {
     pub id: String,
     pub kind: ArtifactKind,
-    pub task_iri: String,
+    /// `null` when an `input_snapshot` was uploaded without a task link.
+    /// Records written before this field became optional still deserialize.
+    #[serde(default)]
+    pub task_iri: Option<String>,
     pub blob_key: String,
     pub content_type: String,
     pub size_bytes: usize,
@@ -104,6 +126,182 @@ const ARTIFACT_SECRET_ERROR_CODE: &str = "artifact_plaintext_secret";
 /// secret manager, never embed their values.
 fn contains_plaintext_secret(bytes: &[u8]) -> bool {
     crate::utils::secret_scan::contains_plaintext_secret(&String::from_utf8_lossy(bytes))
+}
+
+/// Deepest accepted `input_snapshot` nesting (arrays/objects). This is what
+/// `serde_json`'s default recursion limit (128) admits, so every accepted
+/// snapshot can later be parsed into a `serde_json::Value` by the platform
+/// or a caller.
+pub(crate) const INPUT_SNAPSHOT_MAX_DEPTH: usize = 127;
+
+/// Stable code for an `input_snapshot` that repeats an object key; the key is
+/// never echoed.
+const INPUT_SNAPSHOT_DUPLICATE_KEY_CODE: &str = "input_snapshot_duplicate_key";
+
+/// Why an `input_snapshot` body was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotJsonError {
+    /// Not UTF-8 JSON, or nested deeper than [`INPUT_SNAPSHOT_MAX_DEPTH`].
+    Invalid,
+    /// Some object repeats a key. Parsers disagree on which value wins, so a
+    /// value hidden behind the "losing" duplicate could escape the scan.
+    DuplicateKey,
+}
+
+/// Parses `bytes` as UTF-8 JSON nested at most [`INPUT_SNAPSHOT_MAX_DEPTH`]
+/// levels into a `serde_json::Value`, refusing duplicate object keys at any
+/// depth. Parsing into a value (not `IgnoredAny`, which skips string contents
+/// and is not depth-limited) validates every string; the explicit depth
+/// pre-scan keeps the limit independent of `serde_json` defaults and rejects
+/// deep input cheaply.
+fn parse_snapshot_json(bytes: &[u8]) -> Result<Value, SnapshotJsonError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| SnapshotJsonError::Invalid)?;
+    if json_nesting_exceeds(text.as_bytes(), INPUT_SNAPSHOT_MAX_DEPTH) {
+        return Err(SnapshotJsonError::Invalid);
+    }
+    serde_json::from_str::<UniqueKeyValue>(text)
+        .map(|UniqueKeyValue(value)| value)
+        .map_err(|error| {
+            // The visitor accepts every JSON type, so its only data error is
+            // the duplicate-key one; syntax/EOF errors mean invalid JSON.
+            if error.is_data() {
+                SnapshotJsonError::DuplicateKey
+            } else {
+                SnapshotJsonError::Invalid
+            }
+        })
+}
+
+/// A `serde_json::Value` whose objects must not repeat a key.
+struct UniqueKeyValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueKeyValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer
+            .deserialize_any(UniqueKeyVisitor)
+            .map(UniqueKeyValue)
+    }
+}
+
+struct UniqueKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeyVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(UniqueKeyValue(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut members = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if members.contains_key(&key) {
+                // Never echo the key: it may itself be sensitive.
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            let UniqueKeyValue(member) = map.next_value()?;
+            members.insert(key, member);
+        }
+        Ok(Value::Object(members))
+    }
+}
+
+/// Secret scan over a parsed JSON snapshot. The raw-byte scan cannot see
+/// credentials hidden behind JSON escapes (`\u0073k-…`, `gh\u0070_…`, `\/`,
+/// or an escaped separator before `sk-`), so every decoded string and object
+/// key is scanned, plus `key=value` for string members so a credential
+/// assigned to its well-known name is still recognized. Recursion is bounded
+/// because [`parse_snapshot_json`] caps nesting at
+/// [`INPUT_SNAPSHOT_MAX_DEPTH`].
+fn snapshot_contains_plaintext_secret(value: &Value) -> bool {
+    use crate::utils::secret_scan::contains_plaintext_secret as scan;
+    match value {
+        Value::String(text) => scan(text),
+        Value::Array(items) => items.iter().any(snapshot_contains_plaintext_secret),
+        Value::Object(members) => members.iter().any(|(key, member)| {
+            scan(key)
+                || match member {
+                    Value::String(text) => scan(text) || scan(&format!("{key}={text}")),
+                    other => snapshot_contains_plaintext_secret(other),
+                }
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn plaintext_secret_rejection() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "plaintext secrets are forbidden in coding artifacts",
+            "code": ARTIFACT_SECRET_ERROR_CODE,
+        })),
+    )
+        .into_response()
+}
+
+/// True when array/object nesting outside string literals exceeds `max`.
+fn json_nesting_exceeds(bytes: &[u8], max: usize) -> bool {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > max {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 fn require_claims(identity: &UserIdentity) -> Result<&IsolationClaims, (StatusCode, Json<Value>)> {
@@ -277,12 +475,22 @@ pub(crate) async fn upload_artifact_handler(
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
-    if !valid_task_iri(&request.task_iri) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "task_iri must be a non-empty control-character-free IRI" })),
-        )
-            .into_response();
+    match request.task_iri.as_deref() {
+        Some(task_iri) if !valid_task_iri(task_iri) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "task_iri must be a non-empty control-character-free IRI" })),
+            )
+                .into_response();
+        }
+        None if request.kind.requires_task_iri() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "task_iri is required for this artifact kind" })),
+            )
+                .into_response();
+        }
+        _ => {}
     }
     let bytes = match STANDARD.decode(&request.content_base64) {
         Ok(bytes) => bytes,
@@ -301,15 +509,33 @@ pub(crate) async fn upload_artifact_handler(
         )
             .into_response();
     }
+    if request.kind == ArtifactKind::InputSnapshot {
+        let snapshot = match parse_snapshot_json(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(SnapshotJsonError::Invalid) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "input_snapshot content must be valid UTF-8 JSON" })),
+                )
+                    .into_response();
+            }
+            Err(SnapshotJsonError::DuplicateKey) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "input_snapshot objects must not repeat a key",
+                        "code": INPUT_SNAPSHOT_DUPLICATE_KEY_CODE,
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if snapshot_contains_plaintext_secret(&snapshot) {
+            return plaintext_secret_rejection();
+        }
+    }
     if contains_plaintext_secret(&bytes) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "plaintext secrets are forbidden in coding artifacts",
-                "code": ARTIFACT_SECRET_ERROR_CODE,
-            })),
-        )
-            .into_response();
+        return plaintext_secret_rejection();
     }
     let blob = match &state.blob_store {
         Some(blob) => blob.clone(),
@@ -359,21 +585,44 @@ pub(crate) async fn upload_artifact_handler(
         .into_response()
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ListArtifactsQuery {
+    /// Optional exact kind filter, e.g. `?kind=input_snapshot`.
+    kind: Option<String>,
+}
+
 /// GET /api/v1/artifacts — list metadata in only the caller's claims graph.
 pub(crate) async fn list_artifacts_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
+    Query(query): Query<ListArtifactsQuery>,
 ) -> Response {
     let claims = match require_claims(&identity) {
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
+    let kind = match query.kind.as_deref().map(ArtifactKind::parse) {
+        None => None,
+        Some(Some(kind)) => Some(kind),
+        Some(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "unknown artifact kind" })),
+            )
+                .into_response()
+        }
+    };
     match load_metadata(&state, claims, None) {
-        Ok(artifacts) => (
-            StatusCode::OK,
-            Json(json!({ "count": artifacts.len(), "artifacts": artifacts })),
-        )
-            .into_response(),
+        Ok(mut artifacts) => {
+            if let Some(kind) = kind {
+                artifacts.retain(|artifact| artifact.kind == kind);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({ "count": artifacts.len(), "artifacts": artifacts })),
+            )
+                .into_response()
+        }
         Err(response) => response.into_response(),
     }
 }
@@ -444,6 +693,9 @@ pub(crate) async fn download_artifact_handler(
 }
 
 #[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -473,7 +725,7 @@ mod tests {
         assert!(!valid_task_iri("iri://task/\ninvalid"));
     }
 
-    fn test_state(root: std::path::PathBuf) -> Arc<AppState> {
+    pub(super) fn test_state(root: std::path::PathBuf) -> Arc<AppState> {
         let gateway = UnifiedGateway::new(&GatewaySettings {
             base_url: "http://localhost".to_string(),
             api_key: String::new(),
@@ -530,7 +782,7 @@ mod tests {
         let metadata = ArtifactMetadata {
             id: id.clone(),
             kind: ArtifactKind::Patch,
-            task_iri: "iri://task/94".to_string(),
+            task_iri: Some("iri://task/94".to_string()),
             blob_key: artifact_key(&id, ArtifactKind::Patch),
             content_type: ArtifactKind::Patch.content_type().to_string(),
             size_bytes: 12,
@@ -577,7 +829,7 @@ mod tests {
             identity,
             Json(ArtifactUploadRequest {
                 kind: ArtifactKind::RunTranscript,
-                task_iri: "iri://task/secret-guard".to_string(),
+                task_iri: Some("iri://task/secret-guard".to_string()),
                 content_base64: STANDARD.encode(content),
             }),
         )
