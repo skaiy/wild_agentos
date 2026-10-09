@@ -24,13 +24,12 @@ use serde_json::{json, Value};
 
 use crate::isolation::IsolationScopeProvenance;
 use crate::tools::mcp::{MCPError, MCPMessage};
-use crate::tools::skill_pipeline::PipelineRun;
 use crate::tools::skill_registry::SkillMeta;
 
 use super::iam::{AuthMethod, UserIdentity};
 use super::{
     data_dir,
-    skills::{is_tenant_published_skill_async, pipeline_runs_snapshot, skill_published_for_tenant},
+    skills::{admission_snapshot, is_tenant_published_skill_async, skill_published_for_tenant},
     AppState,
 };
 
@@ -140,21 +139,29 @@ where
 
 /// One pipeline snapshot for every exposure in this request. The pipeline
 /// lock is released before the exposure lock is taken.
-fn load_mcp_view() -> std::io::Result<(Vec<PipelineRun>, Vec<McpSkillExposure>)> {
-    let runs = match pipeline_runs_snapshot() {
-        Ok(runs) => runs,
+fn load_mcp_view() -> std::io::Result<(
+    std::collections::HashMap<String, super::skills::SkillIriOwnerRecord>,
+    Vec<McpSkillExposure>,
+)> {
+    let owners = match admission_snapshot() {
+        Ok(view) => view.owners,
         Err(error) => {
             tracing::error!(error = %error, "pipeline run store is unreadable");
-            Vec::new()
+            std::collections::HashMap::new()
         }
     };
     let _guard = lock_exposure_store();
     let exposures = load_exposures_unlocked()?;
-    Ok((runs, exposures))
+    Ok((owners, exposures))
 }
 
-async fn load_mcp_view_async(
-) -> Result<(Vec<PipelineRun>, Vec<McpSkillExposure>), (StatusCode, Json<Value>)> {
+async fn load_mcp_view_async() -> Result<
+    (
+        std::collections::HashMap<String, super::skills::SkillIriOwnerRecord>,
+        Vec<McpSkillExposure>,
+    ),
+    (StatusCode, Json<Value>),
+> {
     match tokio::task::spawn_blocking(load_mcp_view).await {
         Ok(Ok(view)) => Ok(view),
         Ok(Err(error)) => Err(exposure_store_error(error)),
@@ -232,7 +239,7 @@ fn mcp_tool(skill: &SkillMeta, exposure: &McpSkillExposure) -> Value {
 }
 
 fn exposed_skill(
-    runs: &[PipelineRun],
+    owners: &std::collections::HashMap<String, super::skills::SkillIriOwnerRecord>,
     exposures: &[McpSkillExposure],
     state: &AppState,
     tenant_id: &str,
@@ -243,7 +250,7 @@ fn exposed_skill(
         (exposure.enabled
             && exposure_in_scope(exposure, tenant_id, project_id)
             && exposure.tool_name == tool_name
-            && skill_published_for_tenant(runs, &exposure.skill_iri, tenant_id, project_id)
+            && skill_published_for_tenant(owners.get(&exposure.skill_iri), tenant_id, project_id)
             && !exposure.skill_iri.starts_with("iri://"))
         .then(|| {
             state
@@ -317,7 +324,7 @@ pub(crate) async fn skill_mcp_handler(
             message.id.unwrap_or(Value::Null),
         ),
         Some("tools/list") => {
-            let (runs, exposures) = match load_mcp_view_async().await {
+            let (owners, exposures) = match load_mcp_view_async().await {
                 Ok(view) => view,
                 Err(error) => return error.into_response(),
             };
@@ -327,8 +334,7 @@ pub(crate) async fn skill_mcp_handler(
                     exposure.enabled
                         && exposure_in_scope(exposure, &tenant_id, &project_id)
                         && skill_published_for_tenant(
-                            &runs,
-                            &exposure.skill_iri,
+                            owners.get(&exposure.skill_iri),
                             &tenant_id,
                             &project_id,
                         )
@@ -352,12 +358,12 @@ pub(crate) async fn skill_mcp_handler(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let (runs, exposures) = match load_mcp_view_async().await {
+            let (owners, exposures) = match load_mcp_view_async().await {
                 Ok(view) => view,
                 Err(error) => return error.into_response(),
             };
             let Some((exposure, skill)) = exposed_skill(
-                &runs,
+                &owners,
                 &exposures,
                 &state,
                 &tenant_id,

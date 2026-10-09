@@ -157,15 +157,20 @@ scoped to the verified tenant and project and defaults to deny; `iri://`
 kernel Skills are never eligible. List, create, and delete all require a
 control-plane DA (verified JWT, explicit project, `DA`). `POST /mcp` returns
 only exposures for that same verified tenant and project. The first successful admission run that records a publisher tenant and project
-owns that skill IRI. A later run by another tenant, including
-`POST /api/v1/market/packages`, is rejected with `409` and
-`skill_iri_owned_by_another_tenant` and does not replace the owner or clear
-the owner's tools. The exposure gate uses that owner. It allows an exposure
-only while the owner's own latest run is still a passing tenant-visibility
-publish, so a newer run written by someone else does not move the gate.
-Another project in the same tenant may still create its own exposure. A run
-with no publisher tenant or project authorizes none; each load that finds
-such runs logs a warning and updates a counter, and those rows stay on disk.
+owns that skill IRI. The owner is stored in `skill_iri_owners.json` and is
+not removed when admission history is truncated to the latest 200 runs. A
+later run by another tenant, including `POST /api/v1/market/packages`, is
+rejected with `409` and `skill_iri_owned_by_another_tenant` and does not
+replace the owner or clear the owner's tools. The `skill://` tenant segment
+must equal the publisher's verified tenant, so one tenant cannot pre-claim
+another's namespace. One market package contains at most 32 skills and is
+written only after every embedded skill passes; a conflict writes none of
+that package's runs. The exposure gate uses the stored owner. It allows an
+exposure only while that owner's own latest admission is still a passing
+tenant-visibility publish. Another project in the same tenant may still
+create its own exposure. A run with no publisher tenant or project authorizes
+none. The first load in a process that finds such runs logs one warning and
+updates a counter, and those rows stay on disk.
 Platform-admin registration is recorded under the platform tenant. A customer
 tenant cannot currently expose those skills. `GET /api/v1/skills/pipeline-runs`
 is unauthenticated and omits `publisher_tenant_id` and `publisher_project_id`.

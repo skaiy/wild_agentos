@@ -1335,6 +1335,9 @@ async fn isolation_contract_skill_exposure_legacy_publish_has_no_tenant() {
         .unwrap()
         .remove("publisher_project_id");
     std::fs::write(&path, serde_json::to_string_pretty(&runs).unwrap()).unwrap();
+    // Legacy history predates the owner file. Seeding from these runs must
+    // not invent an owner when the publisher tenant was never recorded.
+    std::fs::remove_file(dir.path().join("skill_iri_owners.json")).unwrap();
 
     let app = router(state);
     let da = token("tenant-a", &["DA"], Some("project-a"));
@@ -1550,6 +1553,317 @@ async fn isolation_contract_market_republish_cannot_steal_skill_iri() {
     assert!(final_text.contains(description), "{tools}");
     assert!(final_text.contains("classifiedCode"), "{tools}");
     assert!(!final_text.contains(overwrite), "{tools}");
+}
+
+fn market_skill(iri: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "skill_iri": iri,
+        "name": "weather",
+        "description": description,
+        "version": "1.0.0",
+        "category": "weather",
+        "security_level": "normal",
+        "allowed_roles": ["DA"],
+        "input_schema": input_schema,
+        "output_schema": {"type": "object"},
+        "compiled_template": "{}"
+    })
+}
+
+/// A tenant cannot pre-claim another tenant's skill namespace.
+#[tokio::test]
+async fn isolation_contract_market_rejects_skill_iri_outside_publisher_tenant() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let app = router(test_state(dir.path()));
+    let da_b = token("tenant-b", &["DA"], Some("project-b"));
+    let da_a = token("tenant-a", &["DA"], Some("project-a"));
+    let iri = "skill://tenant-a/future";
+
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_b),
+        json!({
+            "name": "squat",
+            "version": "1.0.0",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effect_level": "none",
+            "visibility": "private",
+            "skills": [market_skill(iri, "pre-claimed", json!({"type": "object"}))]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{rejected}");
+    assert_eq!(rejected["error"], "skill_iri_tenant_mismatch");
+    assert!(!dir.path().join("skill_iri_owners.json").exists());
+    assert!(!dir.path().join("pipeline_runs.json").exists());
+
+    let (status, published) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_a),
+        json!({
+            "name": "owned-later",
+            "version": "1.0.0",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effect_level": "none",
+            "visibility": "private",
+            "skills": [market_skill(iri, "tenant-a skill", json!({"type": "object"}))]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{published}");
+}
+
+/// One package cannot contain more skills than the cap, and a failing skill
+/// does not leave earlier skills from the same package in the admission file.
+#[tokio::test]
+async fn isolation_contract_market_package_is_capped_and_atomic() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let app = router(state.clone());
+    let da_b = token("tenant-b", &["DA"], Some("project-b"));
+    let too_many: Vec<_> = (0..=super::skills::MARKET_PACKAGE_SKILL_CAP)
+        .map(|index| {
+            market_skill(
+                &format!("skill://tenant-b/cap-{index}"),
+                "junk",
+                json!({"type": "object"}),
+            )
+        })
+        .collect();
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_b),
+        json!({
+            "name": "overflow",
+            "version": "1.0.0",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effect_level": "none",
+            "visibility": "private",
+            "skills": too_many
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    assert_eq!(rejected["error"], "package contains too many skills");
+    assert!(!dir.path().join("pipeline_runs.json").exists());
+
+    let (status, failed) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_b),
+        json!({
+            "name": "partial",
+            "version": "1.0.0",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effect_level": "none",
+            "visibility": "private",
+            "skills": [
+                market_skill("skill://tenant-b/kept", "should not land", json!({"type": "object"})),
+                market_skill("skill://tenant-b/bad", "invalid", json!({"type": 123}))
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{failed}");
+    assert!(!dir.path().join("pipeline_runs.json").exists());
+    assert!(!dir.path().join("market_packages.json").exists());
+    assert!(!dir.path().join("skill_iri_owners.json").exists());
+
+    // A 409 on a later skill must not leave the earlier skill's run behind.
+    let owned = "skill://tenant-a/locked";
+    publish_exposed_skill(&state, owned, "tenant-a", "project-a");
+    let (status, conflict) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_b),
+        json!({
+            "name": "mixed",
+            "version": "1.0.0",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effect_level": "none",
+            "visibility": "private",
+            "skills": [
+                market_skill("skill://tenant-b/earlier", "should not land", json!({"type": "object"})),
+                market_skill(owned, "stolen", json!({"type": "object"}))
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"], "skill_iri_owned_by_another_tenant");
+    let runs: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("pipeline_runs.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        runs.iter()
+            .all(|run| run["skill_iri"] != "skill://tenant-b/earlier"),
+        "{runs:?}"
+    );
+    let owners: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("skill_iri_owners.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        owners
+            .iter()
+            .all(|owner| owner["skill_iri"] != "skill://tenant-b/earlier"),
+        "{owners:?}"
+    );
+    assert!(!dir.path().join("market_packages.json").exists());
+}
+
+/// Flooding past the admission-history cap must not drop tenant A's owner
+/// or clear tenant A's tools, and tenant B still cannot republish the IRI.
+#[tokio::test]
+async fn isolation_contract_market_flood_cannot_drop_skill_owner() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-a/secret-skill";
+    let description = "tenant-a classified briefing";
+    let schema = json!({"type": "object", "properties": {"classifiedCode": {"type": "string"}}});
+    publish_exposed_skill_meta(
+        &state,
+        iri,
+        "tenant-a",
+        "project-a",
+        description,
+        schema.clone(),
+    );
+    for index in 0..super::skills::PIPELINE_RUNS_CAP {
+        publish_exposed_skill(
+            &state,
+            &format!("skill://tenant-b/junk-{index}"),
+            "tenant-b",
+            "project-b",
+        );
+    }
+    let runs: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("pipeline_runs.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(runs.len(), super::skills::PIPELINE_RUNS_CAP);
+    assert!(
+        runs.iter().all(|run| run["skill_iri"] != iri),
+        "owner run was not evicted"
+    );
+
+    let app = router(state);
+    let da_a = token("tenant-a", &["DA"], Some("project-a"));
+    let da_b = token("tenant-b", &["DA"], Some("project-b"));
+    let (status, created) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_a),
+        json!({"skill_iri": iri, "tool_name": "secret.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, stolen) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_b),
+        json!({
+            "name": "stolen",
+            "version": "1.0.0",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effect_level": "none",
+            "visibility": "tenant",
+            "skills": [market_skill(iri, description, schema)]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stolen}");
+    assert_eq!(stolen["error"], "skill_iri_owned_by_another_tenant");
+    let stolen_text = stolen.to_string();
+    assert!(!stolen_text.contains(description), "{stolen}");
+    assert!(!stolen_text.contains("classifiedCode"), "{stolen}");
+
+    let (status, exposure) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_b),
+        json!({"skill_iri": iri, "tool_name": "secret.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{exposure}");
+
+    let (status, tools) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da_a),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 1);
+    let text = tools.to_string();
+    assert!(text.contains(description), "{tools}");
+    assert!(text.contains("classifiedCode"), "{tools}");
+}
+
+/// import-git rejects an IRI owned by another tenant before it clones.
+/// Removing that pre-check turns this into a clone failure instead of 409.
+#[tokio::test]
+async fn isolation_contract_import_git_rejects_foreign_skill_iri() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://platform/imported";
+    let description = "original briefing";
+    publish_exposed_skill_meta(
+        &state,
+        iri,
+        "tenant-a",
+        "project-a",
+        description,
+        json!({"type": "object"}),
+    );
+    let app = router(state.clone());
+    let platform_admin = token("platform", &[PLATFORM_ADMIN_ROLE], Some("ops"));
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/skills/import-git",
+        Caller::Bearer(&platform_admin),
+        json!({
+            "repo_url": "https://127.0.0.1:1/not-a-repo.git",
+            "skill_iri": iri
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["error"], "skill_iri_owned_by_another_tenant");
+    assert_eq!(
+        state.core.skills.get_skill(iri).unwrap().description,
+        description
+    );
 }
 
 /// KB reindex: another tenant's knowledge base answers 404 (as if missing)

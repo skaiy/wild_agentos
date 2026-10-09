@@ -86,13 +86,18 @@ the same two gates:
   warning when those rows are loaded; an operator removes them by editing
   the file. `POST /mcp` rejects a verified token with no project claim
   (`403 mcp_claims_incomplete`). The first successful admission run that
-  records a publisher tenant and project owns the skill IRI. Another tenant
-  republishing it, including `POST /api/v1/market/packages`, receives `409
-  skill_iri_owned_by_another_tenant` and does not replace that owner. Only
-  the owner can expose the Skill, and only while that owner's own latest run
-  is still a passing tenant-visibility publish. A run with no publisher
-  tenant authorizes none; loads that find such runs log a warning and update
-  a counter. Platform-admin registration is recorded under the platform
+  records a publisher tenant and project owns the skill IRI. That owner is
+  kept in `skill_iri_owners.json` and is not dropped when admission history
+  is truncated to 200 runs. Another tenant republishing it, including
+  `POST /api/v1/market/packages`, receives `409
+  skill_iri_owned_by_another_tenant` and does not replace that owner. The
+  `skill://` tenant segment must equal the publisher's verified tenant. A
+  market package holds at most 32 skills and writes no runs unless every
+  embedded skill passes. Only the owner can expose the Skill, and only while
+  that owner's own latest admission is still a passing tenant-visibility
+  publish. A run with no publisher tenant authorizes none. The first load in
+  a process that finds such runs logs one warning and updates a counter.
+  Platform-admin registration is recorded under the platform
   tenant, and a customer tenant cannot currently expose those skills.
   Unauthenticated `GET /api/v1/skills/pipeline-runs` omits the publisher
   tenant and project. The refusal omits the Skill description and input schema.

@@ -26,8 +26,8 @@ use crate::{
 use super::{
     iam::UserIdentity,
     skills::{
-        append_pipeline_run_async, pipeline_write_response, skill_iri_blocked_for_tenant,
-        skill_iri_conflict_response,
+        append_pipeline_runs_async, pipeline_write_response, reject_skill_iri_write,
+        MARKET_PACKAGE_SKILL_CAP,
     },
     AppState,
 };
@@ -278,20 +278,26 @@ pub(crate) async fn publish_package_handler(
         return (StatusCode::CONFLICT, Json(json!({"error": "package version already exists; published versions are immutable"}))).into_response();
     }
 
-    // The first tenant that admitted a skill IRI owns it. Check every embedded
-    // skill before running the pipeline so a foreign IRI cannot replace the
-    // registered skill or be recorded under this caller.
+    if request.skills.len() > MARKET_PACKAGE_SKILL_CAP {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "package contains too many skills",
+                "limit": MARKET_PACKAGE_SKILL_CAP,
+            })),
+        )
+            .into_response();
+    }
+
+    // Check every embedded skill before running the pipeline. A later 409
+    // must not leave earlier skills from this package in the admission file.
     for skill in &request.skills {
-        match skill_iri_blocked_for_tenant(&skill.skill_iri, claims.tenant_id()).await {
-            Ok(true) => return skill_iri_conflict_response(),
-            Ok(false) => {}
-            Err(response) => return response,
+        if let Err(response) = reject_skill_iri_write(&skill.skill_iri, claims.tenant_id()).await {
+            return response;
         }
     }
 
-    // Use the same admission gate as standalone Skills. Publication is atomic:
-    // no package is persisted if any embedded Skill fails its gate or if the
-    // admission record is rejected because another tenant already owns the IRI.
+    let mut runs = Vec::with_capacity(request.skills.len());
     for skill in &request.skills {
         let mut ctx = PipelineContext::local(PipelineSource::Market, identity.user_id.clone());
         ctx.record_publisher(claims.tenant_id(), claims.project_id());
@@ -307,17 +313,17 @@ pub(crate) async fn publish_package_handler(
             &ctx,
             Box::new(|_| Ok("market package admission".into())),
         );
-        let permitted = run.gate_passed;
-        if let Err(error) = append_pipeline_run_async(run.clone()).await {
-            return pipeline_write_response(error);
-        }
-        if !permitted {
+        if !run.gate_passed {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error": "embedded Skill failed admission gate", "pipeline_run": run})),
             )
                 .into_response();
         }
+        runs.push(run);
+    }
+    if let Err(error) = append_pipeline_runs_async(runs).await {
+        return pipeline_write_response(error);
     }
 
     let package = MarketPackage {
