@@ -149,7 +149,12 @@ fn classify(status: &str) -> ProbeClass {
 
 /// Query strings that let a probe get past a required `Query` extractor, so the
 /// sweep observes the handler instead of a 400.
-const PROBE_QUERIES: &[(&str, &str)] = &[("/api/v1/skills/manifest", "iri=skill://sweep/probe")];
+const PROBE_QUERIES: &[(&str, &str)] = &[
+    ("/api/v1/skills/manifest", "iri=skill://sweep/probe"),
+    // Duplicate unknown `kind` must be 401 for an anonymous caller. A query
+    // parser that runs first answers 400 and this route leaves the protected set.
+    ("/api/v1/ontology/health", "kind=a&kind=b"),
+];
 
 /// Minimal valid bodies so a probe gets past the JSON extractor and reaches
 /// the handler's auth check (otherwise the route would be inconclusive).
@@ -174,6 +179,7 @@ const MUST_BE_PROTECTED: &[(&str, &str)] = &[
     ("GET", "/v1/invocations/:id"),
     ("POST", "/v1/invocations/:id/cancel"),
     ("GET", "/v1/invocations/:id/events"),
+    ("GET", "/api/v1/ontology/health"),
 ];
 
 const ROUTER_SOURCE: &str = include_str!("mod.rs");

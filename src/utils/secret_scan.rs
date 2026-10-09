@@ -46,7 +46,8 @@ const RULES: &[(&str, &str)] = &[
     // percent-encoded byte (`%20`, `%3D`). `sk-` inside `task-` / `risk-` /
     // `disk-` / `ask-` (or after `_` / `-`) is not a key prefix. Other prefix
     // rules match the issued prefix as a substring, so they do not need this
-    // boundary. A lowercase hyphenated name is dropped later; see
+    // boundary. A lowercase hyphenated name whose every segment is letters
+    // (final segment may be `v` plus digits) is dropped later; see
     // [`is_kebab_sk_token`].
     ("sk_api_key", SK_API_KEY_PATTERN),
 ];
@@ -91,9 +92,9 @@ fn matching_rule_indexes(text: &str) -> Vec<usize> {
 
 /// True when some `sk-` match is a credential rather than a kebab identifier.
 ///
-/// A digit requirement on every body would also drop the letter-only shapes
-/// the regression samples use, so only a lowercase hyphenated name is ignored.
-/// If the set matched but no token could be read, the hit stays (fail closed).
+/// A digit in any segment is a credential. The only name shape with a digit is
+/// a trailing `v` plus digits (`…-v2`). If the set matched but no token could
+/// be read, the hit stays (fail closed).
 fn sk_match_is_credential(text: &str) -> bool {
     let mut saw_token = false;
     for captures in SK_TOKEN.captures_iter(text) {
@@ -106,42 +107,44 @@ fn sk_match_is_credential(text: &str) -> bool {
     !saw_token
 }
 
-/// `sk-learn-classification-examples-v2` and similar kebab names.
+/// A lowercase hyphenated name, not a credential.
 ///
-/// Optional `proj-` / `ant-` prefixes are not part of the name. A segment of
-/// 16 or more characters that contains a digit stays a credential, as does
-/// any uppercase or underscore.
+/// After `sk-`, split on `-`. There must be at least three segments and at
+/// least two segments of one or more `[a-z]`. Every segment must be `[a-z]+`,
+/// except the final segment may be `v` plus one or more digits
+/// (`sk-learn-classification-examples-v2`). `proj` and `ant` are ordinary
+/// segments. Any other digit, an uppercase letter, or `_` is a credential.
 fn is_kebab_sk_token(token: &str) -> bool {
-    let Some(rest) = token.strip_prefix("sk-") else {
+    let Some(body) = token.strip_prefix("sk-") else {
         return false;
     };
-    let body = rest
-        .strip_prefix("proj-")
-        .or_else(|| rest.strip_prefix("ant-"))
-        .unwrap_or(rest);
     let segments: Vec<&str> = body.split('-').collect();
     if segments.len() < 3 {
         return false;
     }
-    if segments.iter().any(|segment| {
-        segment.is_empty()
-            || !segment
-                .chars()
-                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    let last = segments.len() - 1;
+    if !segments.iter().enumerate().all(|(index, segment)| {
+        is_letter_segment(segment) || (index == last && is_version_segment(segment))
     }) {
-        return false;
-    }
-    if segments
-        .iter()
-        .any(|segment| segment.len() >= 16 && segment.chars().any(|ch| ch.is_ascii_digit()))
-    {
         return false;
     }
     segments
         .iter()
-        .filter(|segment| segment.chars().all(|ch| ch.is_ascii_lowercase()))
+        .filter(|segment| is_letter_segment(segment))
         .count()
         >= 2
+}
+
+fn is_letter_segment(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_lowercase())
+}
+
+/// Trailing version on a kebab name, such as `v2`.
+fn is_version_segment(segment: &str) -> bool {
+    let Some(digits) = segment.strip_prefix('v') else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Names of all rules that match `text`; diagnostics for tests only.

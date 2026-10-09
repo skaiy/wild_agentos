@@ -58,6 +58,16 @@ pub(crate) fn review_regression_samples() -> Vec<(&'static str, String)> {
             "aws_secret_access_key",
             cat(&["'aws_secret_", "access_key' => '", &aws, "'"]),
         ),
+        // Lowercase hyphenated keys with a digit in a segment. A letters-only
+        // name exemption must not let these through.
+        (
+            "sk_api_key",
+            cat(&["s", "k-q7xk2mzp9w-abtrvnqe-hzkwplms-x83kd0q2a1"]),
+        ),
+        (
+            "sk_api_key",
+            cat(&["s", "k-proj-abcdefgh-ijklmnop-q1w2e3r4t5y6u7i"]),
+        ),
     ]
 }
 
@@ -257,9 +267,8 @@ fn json_unicode_and_control_escapes_are_sk_boundaries() {
     assert_eq!(matched_rules(&ordinary), Vec::<&str>::new());
 }
 
-/// Requiring a digit in every `sk-` body would drop letter-only regression
-/// samples. Kebab names are excluded instead, and a one-character mutation
-/// back into a credential shape is still rejected.
+/// A name is exempt only when every segment after `sk-` is lowercase letters,
+/// or the final segment is `v` plus digits. Digit-bearing keys stay rejected.
 #[test]
 fn kebab_identifiers_are_not_secrets_and_mutations_stay_rejected() {
     assert_eq!(RULES[SK_API_KEY_RULE].0, "sk_api_key");
@@ -289,6 +298,9 @@ fn kebab_identifiers_are_not_secrets_and_mutations_stay_rejected() {
         cat(&["s", "k-Learn-classification-examples-v2"]),
         // A long digit segment is a credential body, not a word.
         cat(&["s", "k-learn-classification-", &long_hex]),
+        // Lowercase keys with a digit in a segment. Main blocked both.
+        cat(&["s", "k-q7xk2mzp9w-abtrvnqe-hzkwplms-x83kd0q2a1"]),
+        cat(&["s", "k-proj-abcdefgh-ijklmnop-q1w2e3r4t5y6u7i"]),
     ];
     for sample in &mutations {
         assert_eq!(
