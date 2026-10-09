@@ -292,6 +292,28 @@ async fn authorize_core_write(
     identity: &UserIdentity,
     task_iri: &str,
 ) -> Result<(), axum::response::Response> {
+    // A terminal or read-only task is not writable, including for a DA.
+    // The answer matches a missing task. Checked before the DA short-circuit
+    // so a role cannot re-open an archived record.
+    let closed = match state.core.blackboard.task_record_is_closed(task_iri) {
+        Ok(closed) => closed,
+        Err(error) => {
+            tracing::warn!(%task_iri, "failed to read task scope: {}", error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to verify task scope"})),
+            )
+                .into_response());
+        }
+    };
+    if closed {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "task not found"})),
+        )
+            .into_response());
+    }
+
     if identity.auth_method == AuthMethod::Jwt && identity.has_role("DA") {
         return Ok(());
     }
@@ -411,19 +433,57 @@ pub(crate) async fn list_blackboard_tasks_handler(
         )
             .into_response();
     };
-    let tasks: Vec<_> = state
+    let nodes = match state
         .core
         .blackboard
-        .list_task_summaries()
+        .tasks_in_scope(claims.tenant_id(), claims.project_id())
+    {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = claims.tenant_id(),
+                "failed to read scoped blackboard tasks: {error}"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to read tasks"})),
+            )
+                .into_response();
+        }
+    };
+    let hierarchy: std::collections::HashMap<String, crate::memory::l2_blackboard::TaskSummary> =
+        state
+            .core
+            .blackboard
+            .list_task_summaries()
+            .into_iter()
+            .map(|summary| (summary.task_iri.clone(), summary))
+            .collect();
+    let tasks: Vec<_> = nodes
         .into_iter()
-        .filter(|summary| {
-            state
-                .core
-                .blackboard
-                .read_node(&summary.task_iri)
+        .filter(|node| task_is_in_scope(&node.json_ld, claims))
+        .map(|node| {
+            let status = serde_json::from_str::<Value>(&node.json_ld)
                 .ok()
-                .flatten()
-                .is_some_and(|task| task_is_in_scope(&task.json_ld, claims))
+                .and_then(|task| {
+                    task.get("status")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            if let Some(existing) = hierarchy.get(&node.iri) {
+                let mut summary = existing.clone();
+                summary.status = status;
+                summary
+            } else {
+                crate::memory::l2_blackboard::TaskSummary {
+                    task_iri: node.iri.clone(),
+                    status,
+                    node_count: state.core.blackboard.get_task_nodes(&node.iri).len(),
+                    parent: None,
+                    children: 0,
+                }
+            }
         })
         .collect();
     Json(json!({ "count": tasks.len(), "tasks": tasks })).into_response()

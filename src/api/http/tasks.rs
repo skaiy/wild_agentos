@@ -139,37 +139,44 @@ pub(crate) async fn list_tasks_handler(
             .into_response();
     };
 
-    let mut tasks: Vec<Value> = state
+    let nodes = match state
         .core
         .blackboard
-        .list_task_summaries()
+        .tasks_in_scope(claims.tenant_id(), claims.project_id())
+    {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = claims.tenant_id(),
+                "failed to read scoped tasks: {error}"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to read tasks"})),
+            )
+                .into_response();
+        }
+    };
+    let mut tasks: Vec<Value> = nodes
         .into_iter()
-        .filter_map(|summary| {
-            let node = state.core.blackboard.read_node(&summary.task_iri).ok()??;
+        .filter_map(|node| {
             let task: Value = serde_json::from_str(&node.json_ld).ok()?;
-            let is_task = task.get("@type").is_some_and(|kind| {
-                kind.as_str() == Some("Task")
-                    || kind.as_array().is_some_and(|kinds| {
-                        kinds.iter().any(|value| value.as_str() == Some("Task"))
-                    })
-            });
-            let in_scope = task.get("tenant_id").and_then(Value::as_str)
-                == Some(claims.tenant_id())
-                && task.get("project_id").and_then(Value::as_str) == Some(claims.project_id());
-            if !is_task || !in_scope {
+            // `tasks_in_scope` already applies the verified tenant and project.
+            // Check again so a store row cannot widen the caller's scope.
+            if !task_is_in_scope(&node.json_ld, claims) {
                 return None;
             }
-
             let created_at = task
                 .get("created_at")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| node.created_at.to_rfc3339());
+            let task_iri = node.iri.clone();
             Some(json!({
-                "id": summary.task_iri,
-                "iri": summary.task_iri,
-                "task_iri": summary.task_iri,
-                "status": task.get("status").and_then(Value::as_str).unwrap_or(&summary.status),
+                "id": task_iri,
+                "iri": task_iri,
+                "task_iri": task_iri,
+                "status": task.get("status").and_then(Value::as_str).unwrap_or("unknown"),
                 "created_at": created_at,
                 "interrupt_status": Value::Null,
                 "approval_status": Value::Null,
@@ -236,16 +243,26 @@ pub(crate) async fn stream_task_handler(
         Err(response) => return response,
     };
     if let Some(task_iri) = req.task_iri.as_deref() {
-        // A supplied task_iri must name a Task in the caller's own
-        // tenant+project; anything else answers like a missing one (no
-        // existence oracle). There is no platform-admin exception: executing
-        // with the admin's claims against another scope's task would mix
-        // outputs across scopes. Admins inspect other tasks via read routes.
-        let in_scope = matches!(
-            state.core.read_node(task_iri).await,
-            Ok(Some(node)) if task_is_in_scope(&node.json_ld, claims)
-        );
-        if !in_scope {
+        // A supplied task_iri must name a live Task in the caller's own
+        // tenant+project. A missing task, another scope, or a terminal /
+        // read-only record all answer like a missing one (no existence
+        // oracle). There is no platform-admin exception: executing with the
+        // admin's claims against another scope's task would mix outputs
+        // across scopes. Admins inspect other tasks via read routes.
+        let closed = state
+            .core
+            .blackboard
+            .task_record_is_closed(task_iri)
+            .unwrap_or(true);
+        let runnable = match state.core.read_node(task_iri).await {
+            Ok(Some(node)) => task_is_in_scope(&node.json_ld, claims) && !closed,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(%task_iri, "failed to read task before stream: {}", error);
+                false
+            }
+        };
+        if !runnable {
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
         }
     }
@@ -862,7 +879,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
-        routing::get,
+        routing::{get, post},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -871,11 +888,14 @@ mod tests {
 
     use super::*;
     use crate::{
+        api::http::core_ops::{emit_event_handler, write_node_handler},
         api::http::{api_gov::ApiUsageState, iam::JwtClaims, AppState, TEST_ENV_LOCK},
         config::GatewaySettings,
+        core::agent_instance::AgentRole,
         core::core_types::{CoreConfig, SemanticCore},
         gateway::unified_gateway::UnifiedGateway,
         isolation::IsolationClaims,
+        memory::l2_blackboard::{Blackboard, ScopeTerm},
         tools::prompt_registry::PromptRegistry,
     };
 
@@ -1518,6 +1538,582 @@ mod tests {
 
         restore_env("AGENTOS_AUTH_MODE", saved_mode);
         restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    fn hs256_env() -> (Option<std::ffi::OsString>, Option<std::ffi::OsString>) {
+        let saved_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let saved_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        (saved_mode, saved_secret)
+    }
+
+    fn encode_path_segment(value: &str) -> String {
+        let mut encoded = String::new();
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(byte as char);
+                }
+                _ => encoded.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        encoded
+    }
+
+    async fn get_at(router: &Router, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
+        let mut request = Request::builder().method("GET").uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&body)
+                .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&body).into_owned()})),
+        )
+    }
+
+    fn read_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/api/v1/tasks", get(list_tasks_handler))
+            .route("/api/v1/tasks/:task_iri", get(get_task_handler))
+            .with_state(state)
+    }
+
+    fn scheduler_for(core: &SemanticCore) -> crate::memory::scheduler::MemoryScheduler {
+        let bus = std::sync::Arc::new(crate::memory::MemoryBus::new(core.events.clone()));
+        let consistency = std::sync::Arc::new(crate::memory::ConsistencyEngine::new(
+            bus.clone(),
+            core.l0_store.clone(),
+            core.blackboard.clone(),
+            core.projection.clone(),
+        ));
+        crate::memory::scheduler::MemoryScheduler::new(
+            core.l0_store.clone(),
+            core.blackboard.clone(),
+            core.projection.clone(),
+            consistency,
+            bus,
+        )
+    }
+
+    fn core_on_blackboard(
+        blackboard: std::sync::Arc<Blackboard>,
+        l0_path: &std::path::Path,
+    ) -> SemanticCore {
+        let l0_store = std::sync::Arc::new(
+            crate::memory::L0Store::new(l0_path.to_str().expect("utf-8 l0 path")).unwrap(),
+        );
+        let config = CoreConfig {
+            l0_storage_path: l0_path.to_string_lossy().into_owned(),
+            enable_metrics: false,
+            ..CoreConfig::default()
+        };
+        SemanticCore {
+            projection: std::sync::Arc::new(crate::memory::ProjectionEngine::new(
+                blackboard.clone(),
+                config.max_projection_size,
+            )),
+            blackboard,
+            skills: std::sync::Arc::new(crate::tools::skill_registry::SkillRegistry::new()),
+            events: std::sync::Arc::new(crate::core::EventBus::new(config.event_buffer_size)),
+            validation: std::sync::Arc::new(crate::core::validation::ValidationEngine::new(
+                config.max_node_size,
+            )),
+            checkpoints: std::sync::Arc::new(crate::core::CheckpointManager::with_persistence(
+                l0_store.clone(),
+            )),
+            l0_store,
+            config,
+        }
+    }
+
+    fn state_from_core(core: std::sync::Arc<SemanticCore>) -> Arc<AppState> {
+        let gateway = Arc::new(
+            UnifiedGateway::new(&GatewaySettings {
+                base_url: "http://localhost".into(),
+                api_key: String::new(),
+                default_model: "test-model".into(),
+                timeout_seconds: 30,
+                max_retries: 1,
+                retry_base_ms: 500,
+                use_responses_api: false,
+                model_mapping: std::collections::HashMap::new(),
+            })
+            .unwrap(),
+        );
+        Arc::new(AppState {
+            core,
+            gateway,
+            kg_store: Arc::new(oxigraph::store::Store::new().unwrap()),
+            config_info: Arc::new(tokio::sync::RwLock::new(json!({}))),
+            agents_info: json!({}),
+            mcp_servers: Arc::new(tokio::sync::RwLock::new(vec![])),
+            user_agents: Arc::new(tokio::sync::RwLock::new(vec![])),
+            prompts: Arc::new(PromptRegistry::new()),
+            kb_categories: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
+            knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            blob_store: None,
+            task_executor: None,
+            batch_manager: None,
+            api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
+            api_usage: Arc::new(ApiUsageState::default()),
+            online_corpus_jobs: Arc::new(tokio::sync::RwLock::new(vec![])),
+            online_corpus_queue_capacity: 10,
+            invocations: crate::api::http::invocations::InvocationsRuntime::unavailable(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    fn task_iris_of(body: &Value) -> Vec<String> {
+        body["tasks"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|task| task["task_iri"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// #372: completion must not delete the task from the persistent graph, and
+    /// the invocation's `task_iri` must still resolve for the owning scope only.
+    #[tokio::test]
+    async fn completed_task_stays_in_the_kg_and_resolves_for_its_scope_only() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (saved_mode, saved_secret) = hs256_env();
+
+        let state = test_state();
+        let owner = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let other = IsolationClaims::from_verified("tenant-b", "project-b", "actor-b").unwrap();
+        let task_a = state
+            .core
+            .init_task_with_claims("alpha-work-product", None, None, None, None, &owner)
+            .await
+            .unwrap();
+        let task_b = state
+            .core
+            .init_task_with_claims("beta-secret-product", None, None, None, None, &other)
+            .await
+            .unwrap();
+
+        let l0_dir = tempfile::tempdir().unwrap();
+        let tenant_l0 =
+            crate::memory::L0Store::new(l0_dir.path().join("tenant").to_str().unwrap()).unwrap();
+        scheduler_for(&state.core)
+            .on_task_complete(&task_a, &tenant_l0)
+            .await
+            .expect("completion archives the task instead of deleting it");
+
+        state.core.blackboard.flush_oxigraph();
+        let triples = state
+            .core
+            .blackboard
+            .query_with_bindings(
+                "SELECT ?p WHERE { ?s ?p ?o }",
+                &[("s", ScopeTerm::Iri(&task_a))],
+            )
+            .expect("oxigraph query");
+        assert!(
+            !triples.is_empty(),
+            "completion must not delete the task from the persistent KG"
+        );
+        let archived = state
+            .core
+            .blackboard
+            .query_with_bindings(
+                "SELECT ?json WHERE { GRAPH <https://wildagentos.org/graph/task-archive> { ?s <https://wildagentos.org/prop/jsonLd> ?json } }",
+                &[("s", ScopeTerm::Iri(&task_a))],
+            )
+            .expect("archive query");
+        assert!(
+            !archived.is_empty(),
+            "completion must keep a read-only archive of the task"
+        );
+
+        let router = read_router(state.clone());
+        let owner_token = jwt("tenant-a", "project-a");
+        let other_token = jwt("tenant-b", "project-b");
+        let other_project_token = jwt("tenant-a", "project-b");
+        let task_a_uri = format!("/api/v1/tasks/{}", encode_path_segment(&task_a));
+
+        let (status, body) = get_at(&router, &task_a_uri, Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record: Value =
+            serde_json::from_str(body["node"]["json_ld"].as_str().expect("json_ld")).unwrap();
+        assert_eq!(record["status"], "completed");
+        assert_eq!(record["read_only"], true);
+        assert_eq!(record["tenant_id"], "tenant-a");
+        assert_eq!(record["project_id"], "project-a");
+        assert_eq!(record["user_input"], "alpha-work-product");
+
+        let (status, body) = get_at(&router, &task_a_uri, Some(&other_token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.to_string().contains("alpha-work-product"));
+        assert!(!body.to_string().contains(&task_a));
+
+        let (status, body) = get_at(&router, &task_a_uri, Some(&other_project_token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.to_string().contains("alpha-work-product"));
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed = task_iris_of(&body);
+        assert!(listed.contains(&task_a), "{body}");
+        assert!(!listed.contains(&task_b), "{body}");
+        assert!(!body.to_string().contains("beta-secret-product"));
+        assert_eq!(body["tasks"][0]["status"], "completed");
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&other_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed = task_iris_of(&body);
+        assert!(listed.contains(&task_b), "{body}");
+        assert!(!listed.contains(&task_a), "{body}");
+        assert!(!body.to_string().contains("alpha-work-product"));
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    /// #432: a new process state opened on the same KG must list and get the
+    /// owning scope's tasks, including one that already completed, and no others.
+    #[tokio::test]
+    async fn tasks_rehydrate_from_the_same_kg_after_restart_for_the_owning_scope_only() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (saved_mode, saved_secret) = hs256_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let kg_path = dir.path().join("kg");
+        let l0_path = dir.path().join("l0");
+        std::fs::create_dir_all(&l0_path).unwrap();
+        let task_a;
+        let task_b;
+        {
+            let store = std::sync::Arc::new(oxigraph::store::Store::open(&kg_path).unwrap());
+            let blackboard = std::sync::Arc::new(Blackboard::with_store(store).unwrap());
+            let core = std::sync::Arc::new(core_on_blackboard(blackboard, &l0_path));
+            let owner = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+            let other = IsolationClaims::from_verified("tenant-b", "project-b", "actor-b").unwrap();
+            task_a = core
+                .init_task_with_claims("alpha-kept", None, None, None, None, &owner)
+                .await
+                .unwrap();
+            task_b = core
+                .init_task_with_claims("beta-kept", None, None, None, None, &other)
+                .await
+                .unwrap();
+            let tenant_l0 =
+                crate::memory::L0Store::new(dir.path().join("tenant-l0").to_str().unwrap())
+                    .unwrap();
+            scheduler_for(&core)
+                .on_task_complete(&task_a, &tenant_l0)
+                .await
+                .unwrap();
+            core.blackboard.flush_oxigraph();
+        }
+
+        let store = std::sync::Arc::new(oxigraph::store::Store::open(&kg_path).unwrap());
+        let blackboard = std::sync::Arc::new(Blackboard::with_store(store).unwrap());
+        let state = state_from_core(std::sync::Arc::new(core_on_blackboard(
+            blackboard, &l0_path,
+        )));
+        let router = read_router(state);
+        let owner_token = jwt("tenant-a", "project-a");
+        let other_token = jwt("tenant-b", "project-b");
+        let other_project_token = jwt("tenant-a", "project-b");
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1, "{body}");
+        let listed = task_iris_of(&body);
+        assert_eq!(listed, vec![task_a.clone()], "{body}");
+        assert!(!body.to_string().contains("beta-kept"));
+        assert!(!body.to_string().contains(&task_b));
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&other_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1, "{body}");
+        let listed = task_iris_of(&body);
+        assert_eq!(listed, vec![task_b.clone()], "{body}");
+        assert_eq!(body["tasks"][0]["status"], "pending");
+        assert!(!body.to_string().contains("alpha-kept"));
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&other_project_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 0, "{body}");
+        assert!(!body.to_string().contains(&task_a));
+        assert!(!body.to_string().contains(&task_b));
+
+        let task_a_uri = format!("/api/v1/tasks/{}", encode_path_segment(&task_a));
+        let task_b_uri = format!("/api/v1/tasks/{}", encode_path_segment(&task_b));
+        let (status, body) = get_at(&router, &task_a_uri, Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record: Value =
+            serde_json::from_str(body["node"]["json_ld"].as_str().expect("json_ld")).unwrap();
+        assert_eq!(record["status"], "completed");
+        assert_eq!(record["tenant_id"], "tenant-a");
+        assert_eq!(record["project_id"], "project-a");
+
+        let (status, body) = get_at(&router, &task_a_uri, Some(&other_token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.to_string().contains("alpha-kept"));
+
+        let (status, body) = get_at(&router, &task_b_uri, Some(&other_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record: Value =
+            serde_json::from_str(body["node"]["json_ld"].as_str().expect("json_ld")).unwrap();
+        assert_eq!(record["status"], "pending");
+        assert_eq!(record["tenant_id"], "tenant-b");
+        assert_eq!(record["project_id"], "project-b");
+
+        let (status, body) = get_at(&router, &task_b_uri, Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.to_string().contains("beta-kept"));
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    /// Archived and other terminal records cannot be re-run or written. The
+    /// write routes answer with the same 404 they use for a missing task.
+    #[tokio::test]
+    async fn poc434_archived_record_is_not_writable_or_rerunnable() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (saved_mode, saved_secret) = hs256_env();
+
+        let state = test_state();
+        let owner = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let task_a = state
+            .core
+            .init_task_with_claims("alpha-work-product", None, None, None, None, &owner)
+            .await
+            .unwrap();
+        let task_live = state
+            .core
+            .init_task_with_claims("still-running", None, None, None, None, &owner)
+            .await
+            .unwrap();
+        let l0_dir = tempfile::tempdir().unwrap();
+        let tenant_l0 =
+            crate::memory::L0Store::new(l0_dir.path().join("tenant").to_str().unwrap()).unwrap();
+        let scheduler = scheduler_for(&state.core);
+        scheduler
+            .on_task_complete(&task_a, &tenant_l0)
+            .await
+            .expect("first completion archives the task");
+        let again = scheduler.on_task_complete(&task_a, &tenant_l0).await;
+        assert!(
+            again.is_err(),
+            "scheduler must reject a second completion of an archived task"
+        );
+        let context = scheduler
+            .on_context_request(AgentRole::Plan, &task_a, Some(&owner))
+            .await;
+        assert!(
+            context.is_err(),
+            "scheduler must not serve context for an archived task"
+        );
+
+        let router = Router::new()
+            .route("/api/v1/tasks", get(list_tasks_handler))
+            .route("/api/v1/tasks/stream", post(stream_task_handler))
+            .route("/api/v1/tasks/:task_iri", get(get_task_handler))
+            .route("/api/v1/nodes", post(write_node_handler))
+            .route("/api/v1/events", post(emit_event_handler))
+            .with_state(state.clone());
+        let token = jwt("tenant-a", "project-a");
+        let task_uri = format!("/api/v1/tasks/{}", encode_path_segment(&task_a));
+
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/tasks/stream",
+                Some(&token),
+                json!({"prompt": "run it again", "task_iri": task_a}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "not found");
+        assert!(!body.to_string().contains("started"));
+
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/nodes",
+                Some(&token),
+                json!({"task_iri": task_a, "json_ld": r#"{"@type":"Note","note":"mutated"}"#}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "task not found");
+
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/events",
+                Some(&token),
+                json!({"task_iri": task_a, "event_type": "CUSTOM", "note": "mutated"}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "task not found");
+
+        let (status, body) = get_at(&router, &task_uri, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record: Value =
+            serde_json::from_str(body["node"]["json_ld"].as_str().expect("json_ld")).unwrap();
+        assert_eq!(record["status"], "completed");
+        assert_eq!(record["read_only"], true);
+        assert_eq!(record["user_input"], "alpha-work-product");
+        assert!(!record.to_string().contains("mutated"));
+
+        let (status, live_body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/nodes",
+                Some(&token),
+                json!({"task_iri": task_live, "json_ld": r#"{"@type":"Note"}"#}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{live_body}");
+
+        let failed = serde_json::json!({
+            "@id": task_live,
+            "@type": "Task",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "status": "failed",
+            "user_input": "still-running",
+            "created_at": "2026-01-02T03:04:05Z"
+        });
+        state
+            .core
+            .blackboard
+            .write_node(&task_live, &failed.to_string(), &state.core.config)
+            .unwrap();
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/tasks/stream",
+                Some(&token),
+                json!({"prompt": "retry", "task_iri": task_live}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "not found");
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/events",
+                Some(&token),
+                json!({"task_iri": task_live, "event_type": "CUSTOM"}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "task not found");
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    /// A client node labeled Task, carrying another scope's tenant and project,
+    /// must not show up in that scope's task list.
+    #[tokio::test]
+    async fn client_written_child_task_does_not_appear_in_the_other_scope() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (saved_mode, saved_secret) = hs256_env();
+
+        let state = test_state();
+        let owner = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let task = state
+            .core
+            .init_task_with_claims("owner-prompt", None, None, None, None, &owner)
+            .await
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/tasks", get(list_tasks_handler))
+            .route("/api/v1/nodes", post(write_node_handler))
+            .with_state(state);
+        let owner_token = jwt("tenant-a", "project-a");
+        let victim_token = jwt("tenant-b", "project-b");
+        let planted = serde_json::json!({
+            "@type": "Task",
+            "tenant_id": "tenant-b",
+            "project_id": "project-b",
+            "status": "pending",
+            "user_input": "planted-prompt"
+        })
+        .to_string();
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/nodes",
+                Some(&owner_token),
+                json!({"task_iri": task, "json_ld": planted}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let child_iri = body["node_iri"].as_str().unwrap_or("").to_string();
+        assert!(child_iri.contains("/node_"), "{body}");
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&victim_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 0, "{body}");
+        let rendered = body.to_string();
+        assert!(!rendered.contains("planted-prompt"));
+        assert!(!rendered.contains(&child_iri));
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed = task_iris_of(&body);
+        assert_eq!(listed, vec![task]);
+        assert!(!body.to_string().contains("planted-prompt"));
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    async fn response_json(response: axum::response::Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes).into_owned()})),
+        )
     }
 
     fn restore_env(name: &str, previous: Option<std::ffi::OsString>) {
