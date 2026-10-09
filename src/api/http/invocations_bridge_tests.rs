@@ -704,15 +704,26 @@ async fn running_invocation(h: &BridgeHarness) -> (String, String) {
 /// after a real cancel it ends `cancelled`, never `succeeded`.
 async fn assert_not_closed_by_forgery(h: &BridgeHarness, id: &str) {
     let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let inv = h.store.get_for_claims(&claims, id).await.unwrap();
-    assert_eq!(
-        inv.state,
-        InvocationState::Running,
-        "forged event must not end the run: {:?} {:?}",
-        inv.result,
-        inv.error
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let inv = h.store.get_for_claims(&claims, id).await.unwrap();
+        if inv.state == InvocationState::Running {
+            break;
+        }
+        assert!(
+            !inv.state.is_terminal(),
+            "forged event must not end the run: {:?} {:?}",
+            inv.result,
+            inv.error
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never running: {:?} {:?}",
+            inv.state,
+            inv.error
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let cancel = call(
         &h.router,
         "POST",

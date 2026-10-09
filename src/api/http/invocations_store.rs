@@ -529,28 +529,34 @@ where
     D: serde::Deserializer<'de>,
 {
     let transport = Option::<String>::deserialize(deserializer)?;
-    if transport.as_deref().is_none_or(is_valid_tool_transport) {
-        Ok(transport)
-    } else {
-        Err(serde::de::Error::custom(
-            "tool_calls[].transport must be mcp, http, a2a, local, or unknown",
-        ))
+    match transport {
+        Some(value) if !is_valid_tool_transport(&value) => {
+            // Reads are lenient (#338): a stored transport outside the closed
+            // set must not fail the whole file. The raw value is not logged.
+            tracing::warn!(
+                "invocation usage tool transport is outside the closed set; recording unknown"
+            );
+            Ok(Some("unknown".to_string()))
+        }
+        other => Ok(other),
     }
 }
 
 /// Transport recorded for a built-in tool. Direct-network built-ins are
 /// `http`; every other in-process built-in is `local`. The recorded entry
-/// is only the name and this transport.
+/// is only the name and this transport. Production recording classifies
+/// through the run meter; this helper stays for tests that build usage
+/// directly.
+#[cfg(test)]
 pub(crate) fn built_in_tool_transport(name: &str) -> &'static str {
-    match name {
-        "web_search" | "web_fetch" | "http_request" | "knowledge_import_url" => "http",
-        _ => "local",
-    }
+    crate::core::tool_controller::recorded_builtin_transport(name)
 }
 
 /// Copies built-in tool names onto `usage.tool_calls`. Only `name` and
 /// `transport` are written. An empty name list leaves `usage` unchanged,
-/// including when it was absent.
+/// including when it was absent. Test helper: the executor attaches meter
+/// entries instead of calling this.
+#[cfg(test)]
 pub(crate) fn record_builtin_tool_calls(
     usage: Option<InvocationUsage>,
     tool_names: impl IntoIterator<Item = impl AsRef<str>>,
@@ -574,6 +580,29 @@ pub(crate) fn record_builtin_tool_calls(
     }
     let mut usage = usage.unwrap_or_default();
     usage.tool_calls = Some(tool_calls);
+    Some(usage)
+}
+
+/// Copies tool attempts already classified on the run meter onto
+/// `usage.tool_calls`. An empty list leaves `usage` unchanged. Names and
+/// transports are stored as recorded; this does not re-classify them.
+pub(crate) fn attach_metered_tool_calls(
+    usage: Option<InvocationUsage>,
+    calls: &[crate::gateway::usage_meter::MeteredToolCall],
+) -> Option<InvocationUsage> {
+    if calls.is_empty() {
+        return usage;
+    }
+    let mut usage = usage.unwrap_or_default();
+    usage.tool_calls = Some(
+        calls
+            .iter()
+            .map(|call| InvocationToolCallUsage {
+                name: call.name.clone(),
+                transport: Some(call.transport.clone()),
+            })
+            .collect(),
+    );
     Some(usage)
 }
 

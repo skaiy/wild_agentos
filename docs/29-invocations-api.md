@@ -332,15 +332,22 @@ scope and server fields → `400 field_not_allowed` (§3).
   - `a2a` — tool call that went through the A2A outbound path; **do not overload
     `http` for A2A**. A2A invocations use `transport = "a2a"` as a distinct value.
   - `local` — in-process / built-in tool with no network hop.
-  - `unknown` — transport could not be classified; prefer an explicit value when
-    known. Values outside this set are rejected at write time.
-  The executor records each built-in tool call on the usage it returns, with
-  `name` and `transport` only. Arguments and results are not persisted.
-  In-process built-ins use `local`. Built-ins that make a direct network
-  request (`web_search`, `web_fetch`, `http_request`, `knowledge_import_url`)
-  use `http`. `request.budget.max_tool_calls` is enforced against that
-  recorded list when `tool_calls` is present. Task events on the shared bus
-  do not add tool calls.
+  - `unknown` — transport could not be classified. A stored value outside this
+    set is read back as `unknown`, and a warning is logged without the raw
+    value. New writes still reject a transport outside the set.
+  The executor records each tool attempt that reached the run's tool tracker,
+  on the usage it returns for every terminal outcome (succeeded, failed,
+  cancelled, and timed out), including attempts from earlier cycles of the
+  same run. Only `name` and `transport` are stored. Arguments and results are
+  not persisted. A name the model supplied that is not a registered tool, or
+  a call refused by policy or reported as not found, is stored as the fixed
+  name `<unregistered>` with transport `unknown`. Recorded names are capped
+  at 64 bytes. Registered built-ins that make a network request
+  (`web_search`, `web_fetch`, `http_request`, `knowledge_import_url`,
+  `knowledge_extract`, `create_skill`, `convert_skill`, `bash`) use `http`.
+  Other registered in-process built-ins use `local`. `request.budget.max_tool_calls`
+  is enforced against that recorded list when `tool_calls` is present. Task
+  events on the shared bus do not add tool calls.
 
 ### 5.1 List response
 
@@ -524,7 +531,8 @@ entered the executor path).
   attached. A lagging SSE subscriber receives a `resync` event and should
   re-read the resource; the persisted state is authoritative.
 - Usage is metered per run and written to `result.usage` with the terminal
-  transition, including built-in `tool_calls` the executor recorded (§5).
+  transition, including tool attempts the executor recorded for that run
+  (§5) on success, failure, cancellation, and timeout.
   A `succeeded` write requires complete usage per §5 (VAL-016 / VAL-017);
   incomplete usage must not be persisted as `succeeded`. Usage that does not
   match the §5 shape ends the run `failed` / `invalid_usage` and is not stored.

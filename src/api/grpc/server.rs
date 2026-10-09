@@ -880,15 +880,15 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             &usage_meter.snapshot(),
             &self.settings.pricing,
         );
+        // Tool attempts accumulate on this run's meter as they reach the
+        // tracker, including earlier PDCA cycles and calls whose TaskResult
+        // was dropped. Success, error, timeout, and cancel all carry them.
+        usage = crate::api::http::invocations_store::attach_metered_tool_calls(
+            usage,
+            &usage_meter.tool_calls(),
+        );
         let outcome = match execution {
             Ok(result) => {
-                usage = crate::api::http::invocations_store::record_builtin_tool_calls(
-                    usage,
-                    result
-                        .tracked_actions
-                        .iter()
-                        .map(|action| action.tool_name.as_str()),
-                );
                 emitter.emit_completion(&result.status, &result.summary, result.output.clone());
                 if let Some(client) = &a2a_client {
                     if self.settings.a2a.outbound.enabled

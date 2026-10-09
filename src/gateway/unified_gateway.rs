@@ -323,6 +323,12 @@ impl UnifiedGateway {
         }
     }
 
+    /// The meter bound by [`Self::with_usage_meter`], if this handle is
+    /// run-scoped.
+    pub fn usage_meter(&self) -> Option<Arc<RunUsageMeter>> {
+        self.usage_meter.clone()
+    }
+
     /// Records one upstream call that returned 2xx (and so may have been
     /// billed) into the run's meter. `json` is the parsed body, or `None` when
     /// the body could not be read or parsed; then the call counts as one
