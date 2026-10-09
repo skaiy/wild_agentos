@@ -43,6 +43,7 @@ enum MockMode {
     SucceedWithUsage,
     SucceedWithWebSearch,
     SucceedWithTwoWebSearches,
+    SucceedWithMalformedUsage,
     SucceedWithoutUsage,
     Fail,
     HangUntilCancel,
@@ -142,6 +143,27 @@ impl TaskExecutor for MockExecutor {
                                 "input_tokens": 11,
                                 "output_tokens": 7,
                                 "cost": 42
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            }
+            MockMode::SucceedWithMalformedUsage => {
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TASK_COMPLETED",
+                        "mock",
+                        &json!({
+                            "status": "succeeded",
+                            "summary": "must-not-succeed",
+                            "usage": {
+                                "model": "mock-model",
+                                "input_tokens": 11,
+                                "output_tokens": 7,
+                                "cost": 42,
+                                "unrecognized": true
                             }
                         })
                         .to_string(),
@@ -367,6 +389,23 @@ async fn bridge_incomplete_usage_fails_closed() {
     assert_eq!(
         inv.error.as_ref().map(|e| e.code.as_str()),
         Some("incomplete_usage")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_malformed_usage_fails_closed() {
+    let h = make_bridge_harness(
+        MockMode::SucceedWithMalformedUsage,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(inv.state, InvocationState::Failed);
+    assert_eq!(
+        inv.error.as_ref().map(|error| error.code.as_str()),
+        Some("invalid_usage")
     );
 }
 
