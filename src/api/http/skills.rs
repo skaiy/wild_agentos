@@ -78,11 +78,25 @@ pub(crate) fn pipeline_runs_path() -> std::path::PathBuf {
 /// 保留的最近流水线运行记录条数上限（超出则裁剪最早记录）。
 const PIPELINE_RUNS_CAP: usize = 200;
 
-/// 从磁盘加载流水线运行记录（最新在前）；文件不存在或解析失败时返回空列表。
-fn load_pipeline_runs() -> Vec<crate::tools::skill_pipeline::PipelineRun> {
+/// Serializes pipeline-run read-modify-write in this process.
+static PIPELINE_RUNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_pipeline_runs() -> std::sync::MutexGuard<'static, ()> {
+    PIPELINE_RUNS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// 从磁盘加载流水线运行记录（最新在前）。文件不存在时为空；解析失败是错误，
+/// 调用方不得把它写成空列表。
+fn load_pipeline_runs_unlocked() -> std::io::Result<Vec<crate::tools::skill_pipeline::PipelineRun>>
+{
     match std::fs::read_to_string(pipeline_runs_path()) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(content) => serde_json::from_str(&content).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
 }
 
@@ -90,8 +104,11 @@ fn load_pipeline_runs() -> Vec<crate::tools::skill_pipeline::PipelineRun> {
 /// succeeded with tenant visibility. This makes an MCP exposure fail closed if
 /// the Skill is later replaced by session-scoped authoring or a failed rerun.
 pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
-    load_pipeline_runs()
-        .into_iter()
+    let _guard = lock_pipeline_runs();
+    let Ok(runs) = load_pipeline_runs_unlocked() else {
+        return false;
+    };
+    runs.into_iter()
         .find(|run| run.skill_iri == skill_iri)
         .is_some_and(|run| {
             run.published
@@ -100,11 +117,13 @@ pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
         })
 }
 
-/// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。best-effort。
+/// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。
+/// 读-改-写持有进程锁，落盘走临时文件 + fsync + rename。解析失败时不写。
 pub(crate) fn append_pipeline_run(
     run: &crate::tools::skill_pipeline::PipelineRun,
 ) -> std::io::Result<()> {
-    let mut runs = load_pipeline_runs();
+    let _guard = lock_pipeline_runs();
+    let mut runs = load_pipeline_runs_unlocked()?;
     runs.insert(0, run.clone());
     if runs.len() > PIPELINE_RUNS_CAP {
         runs.truncate(PIPELINE_RUNS_CAP);
@@ -113,8 +132,9 @@ pub(crate) fn append_pipeline_run(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = serde_json::to_string_pretty(&runs).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(&path, content)
+    let bytes = serde_json::to_vec_pretty(&runs)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    super::config::write_file_atomically(&path, &bytes)
 }
 
 pub(crate) async fn list_skills_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -854,7 +874,18 @@ pub(crate) struct PipelineRunsQuery {
 pub(crate) async fn list_pipeline_runs_handler(
     Query(q): Query<PipelineRunsQuery>,
 ) -> impl IntoResponse {
-    let mut runs = load_pipeline_runs();
+    let _guard = lock_pipeline_runs();
+    let mut runs = match load_pipeline_runs_unlocked() {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::error!(error = %error, "pipeline run store is unreadable");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "pipeline_runs_unreadable"})),
+            )
+                .into_response();
+        }
+    };
     if let Some(iri) = q.iri.filter(|s| !s.is_empty()) {
         runs.retain(|r| r.skill_iri == iri);
     }
@@ -865,6 +896,7 @@ pub(crate) async fn list_pipeline_runs_handler(
         "count": runs.len(),
         "runs": runs,
     }))
+    .into_response()
 }
 
 /// POST /api/v1/skills/pipeline-rerun 的请求体。
@@ -1090,6 +1122,75 @@ mod tests {
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
+
+    fn sample_pipeline_run(index: usize) -> crate::tools::skill_pipeline::PipelineRun {
+        use crate::tools::skill_pipeline::{PipelineRun, PipelineSource, SkillVisibility};
+        PipelineRun {
+            run_id: format!("run-{index}"),
+            skill_iri: format!("skill://test/parallel-{index}"),
+            skill_name: "parallel".into(),
+            version: "1.0.0".into(),
+            source: PipelineSource::Manual,
+            visibility: SkillVisibility::Tenant,
+            tenant_promotion_review: None,
+            triggered_by: "tester".into(),
+            repo_url: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            duration_ms: 1,
+            stages: vec![],
+            gate_passed: true,
+            published: true,
+            summary: "published".into(),
+        }
+    }
+
+    /// #430: concurrent appends keep every row, and a corrupt file is not rewritten.
+    #[test]
+    fn pipeline_runs_keep_concurrent_appends_and_do_not_rewrite_a_corrupt_file() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        const N: usize = 40;
+        std::thread::scope(|scope| {
+            for index in 0..N {
+                scope.spawn(move || {
+                    append_pipeline_run(&sample_pipeline_run(index)).unwrap();
+                });
+            }
+        });
+        let stored: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("pipeline_runs.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.len(), N);
+        let ids: std::collections::HashSet<_> = stored
+            .iter()
+            .map(|run| run["run_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids.len(), N);
+
+        let path = dir.path().join("pipeline_runs.json");
+        let garbage = b"[{";
+        std::fs::write(&path, garbage).unwrap();
+        assert!(append_pipeline_run(&sample_pipeline_run(99)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), garbage);
+        assert!(!is_tenant_published_skill("skill://test/parallel-0"));
+    }
+
     // ── 纯函数单元测试 ────────────────────────────────────────────────────────
 
     #[test]

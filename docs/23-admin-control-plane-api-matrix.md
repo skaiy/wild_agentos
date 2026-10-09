@@ -79,8 +79,13 @@ the same two gates:
   `POST /api/v1/kb/bases/:id/reindex`.
 - Another tenant's knowledge base, skill exposure, or private market package
   answers the same `404` as a missing one. Another project's skill exposure
-  in the same tenant does too. A stored skill exposure with no `project_id`
-  is not listed, called, or deleted until a DA recreates it for one project.
+  in the same tenant does too. A `project_id` in the skill-exposure body is
+  ignored. A stored skill exposure with no `project_id`, or with `project_id`
+  empty, is not listed, called, or deleted. Creating it again adds a new row
+  and leaves the old one in the exposure file. Each process start logs a
+  warning when those rows are loaded; an operator removes them by editing
+  the file. `POST /mcp` rejects a verified token with no project claim
+  (`403 mcp_claims_incomplete`).
 
 ### API client id collisions and recovery
 

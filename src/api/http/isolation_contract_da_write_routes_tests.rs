@@ -900,6 +900,287 @@ async fn isolation_contract_skill_exposure_legacy_rows_fail_closed() {
     );
 }
 
+/// #384 review: a token with no project claim is `VerifiedDefaulted` and would
+/// otherwise match a same-tenant project whose id is the literal `default`.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_mcp_rejects_defaulted_project() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://acme/default-project";
+    publish_exposed_skill(&state, iri);
+    let app = router(state);
+    let explicit_default = token("tenant-a", &["DA"], Some("default"));
+    let defaulted = token("tenant-a", &["DA"], None);
+
+    let (status, created) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&explicit_default),
+        json!({"skill_iri": iri, "tool_name": "default.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["exposure"]["project_id"], "default");
+
+    let list_rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let call_rpc = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "default.lookup", "arguments": {}}
+    });
+    for body in [list_rpc.clone(), call_rpc.clone()] {
+        let (status, error) =
+            call(&app, Method::POST, "/mcp", Caller::Bearer(&defaulted), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
+        assert_eq!(error["error"], "mcp_claims_incomplete");
+        assert_eq!(error["missing_field"], "project_id");
+    }
+
+    let (status, tools) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&explicit_default),
+        list_rpc,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(tools["result"]["tools"][0]["name"], "default.lookup");
+    let (status, called) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&explicit_default),
+        call_rpc,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{called}");
+    assert_eq!(called["result"]["content"][0]["json"]["status"], "accepted");
+}
+
+/// A client-supplied project_id does not choose the row's project.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_ignores_body_project_id() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://acme/body-project";
+    publish_exposed_skill(&state, iri);
+    let app = router(state);
+    let da_b = token("tenant-a", &["DA"], Some("project-b"));
+
+    let (status, created) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_b),
+        json!({
+            "skill_iri": iri,
+            "tool_name": "body.lookup",
+            "enabled": true,
+            "project_id": "project-a"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["exposure"]["project_id"], "project-b");
+    let rows = exposure_rows(dir.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["project_id"], "project-b");
+    assert_eq!(rows[0]["tenant_id"], "tenant-a");
+    assert!(rows.iter().all(|row| row["project_id"] != "project-a"));
+}
+
+/// An empty `project_id` is the same fail-closed legacy row as a missing one.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_blank_project_id_fails_closed() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-b/blank";
+    publish_exposed_skill(&state, iri);
+    let path = dir.path().join("mcp_skill_exposures.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!([{
+            "tenant_id": "tenant-b",
+            "project_id": "",
+            "skill_iri": iri,
+            "tool_name": "blank.tool",
+            "enabled": true
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let app = router(state);
+    let da = token("tenant-b", &["DA"], Some("project-b"));
+
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 0, "blank project_id was visible: {listed}");
+
+    let (blank_status, blank_body) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/mcp/skill-exposures?skill_iri={iri}"),
+        Caller::Bearer(&da),
+        Value::Null,
+    )
+    .await;
+    let (missing_status, missing_body) = call(
+        &app,
+        Method::DELETE,
+        "/api/v1/mcp/skill-exposures?skill_iri=skill://tenant-b/missing",
+        Caller::Bearer(&da),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(blank_status, missing_status);
+    assert_eq!(blank_body, missing_body);
+    assert_eq!(blank_status, StatusCode::NOT_FOUND);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+    let (status, tools) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 0);
+
+    let (status, upserted) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da),
+        json!({"skill_iri": iri, "tool_name": "blank.tool", "enabled": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{upserted}");
+    let rows = exposure_rows(dir.path());
+    assert!(
+        rows.iter().any(|row| {
+            row["skill_iri"] == iri && row["project_id"] == "" && row["enabled"] == true
+        }),
+        "blank project_id row was adopted: {rows:?}"
+    );
+}
+
+/// #430: concurrent creates must not drop rows.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_concurrent_creates_keep_every_row() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    const N: usize = 40;
+    for i in 0..N {
+        publish_exposed_skill(&state, &format!("skill://acme/parallel-{i}"));
+    }
+    let app = router(state);
+    let da = token("tenant-a", &["DA"], Some("project-a"));
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..N {
+        let app = app.clone();
+        let da = da.clone();
+        tasks.spawn(async move {
+            call(
+                &app,
+                Method::POST,
+                "/api/v1/mcp/skill-exposures",
+                Caller::Bearer(&da),
+                json!({
+                    "skill_iri": format!("skill://acme/parallel-{i}"),
+                    "tool_name": format!("tool.{i}"),
+                    "enabled": true
+                }),
+            )
+            .await
+        });
+    }
+    let mut created = 0;
+    while let Some(joined) = tasks.join_next().await {
+        let (status, body) = joined.expect("create task");
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        created += 1;
+    }
+    assert_eq!(created, N);
+    let rows = exposure_rows(dir.path());
+    assert_eq!(rows.len(), N, "concurrent creates lost rows: {rows:?}");
+    let names: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|row| row["tool_name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names.len(), N);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("mcp_skill_exposures.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}
+
+/// #430: a file that will not parse is left untouched.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_corrupt_file_is_not_rewritten() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://acme/corrupt";
+    publish_exposed_skill(&state, iri);
+    let path = dir.path().join("mcp_skill_exposures.json");
+    let garbage = b"[{";
+    std::fs::write(&path, garbage).unwrap();
+    let app = router(state);
+    let da = token("tenant-a", &["DA"], Some("project-a"));
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da),
+        json!({"skill_iri": iri, "tool_name": "corrupt.tool", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "skill_exposure_store_failed");
+    assert_eq!(std::fs::read(&path).unwrap(), garbage);
+
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/mcp/skill-exposures?skill_iri={iri}"),
+        Caller::Bearer(&da),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "skill_exposure_store_failed");
+    assert_eq!(std::fs::read(&path).unwrap(), garbage);
+}
+
 /// KB reindex: another tenant's knowledge base answers 404 (as if missing)
 /// and is never marked as reindexing.
 #[tokio::test]

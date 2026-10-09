@@ -156,8 +156,14 @@ entry through `POST /api/v1/mcp/skill-exposures`. The exposure configuration is
 scoped to the verified tenant and project and defaults to deny; `iri://`
 kernel Skills are never eligible. List, create, and delete all require a
 control-plane DA (verified JWT, explicit project, `DA`). `POST /mcp` returns
-only exposures for that same verified tenant and project. A stored exposure
-without `project_id` is ignored until a DA recreates it.
+only exposures for that same verified tenant and project. A verified token
+with no project claim is rejected with `403` and `mcp_claims_incomplete`; a
+project whose id is the literal `default` is still valid when the claim names
+it. A stored exposure with no `project_id`, or with `project_id` empty, is
+not listed, called, updated, or deleted. Creating it again adds a new row and
+leaves the old one in `mcp_skill_exposures.json`. Each process start logs a
+warning when those rows are loaded. An operator removes them by editing that
+file; the API does not.
 
 The MCP endpoint requires a verified Bearer JWT even in development mode. Tool
 discovery is filtered by tenant, project, and the Skill's `allowed_roles`; calls

@@ -7,7 +7,9 @@
 //!
 //! Each exposure belongs to one verified tenant and project. Rows stored
 //! before `project_id` existed stay on disk but are not listed, updated,
-//! deleted, or served over MCP until a DA recreates them.
+//! deleted, or served over MCP. Creating one again adds a new row. The old
+//! row stays until an operator removes it from the file. Each process start
+//! logs a warning when such rows are loaded.
 
 use std::sync::Arc;
 
@@ -20,11 +22,16 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::isolation::IsolationScopeProvenance;
 use crate::tools::mcp::{MCPError, MCPMessage};
 use crate::tools::skill_registry::SkillMeta;
 
 use super::iam::{AuthMethod, UserIdentity};
 use super::{data_dir, skills::is_tenant_published_skill, AppState};
+
+/// Serializes exposure read-modify-write in this process. The guard is never
+/// held across `.await`.
+static EXPOSURE_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct McpSkillExposure {
@@ -58,35 +65,59 @@ fn exposure_in_scope(exposure: &McpSkillExposure, tenant_id: &str, project_id: &
     exposure.tenant_id == tenant_id && exposure_project_id(exposure) == Some(project_id)
 }
 
-fn load_exposures() -> Vec<McpSkillExposure> {
-    let exposures: Vec<McpSkillExposure> = std::fs::read_to_string(exposures_path())
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+fn lock_exposure_store() -> std::sync::MutexGuard<'static, ()> {
+    EXPOSURE_STORE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Missing file is an empty store. A file that will not parse is an error:
+/// callers must not replace it with `[]`.
+fn load_exposures_unlocked() -> std::io::Result<Vec<McpSkillExposure>> {
+    let text = match std::fs::read_to_string(exposures_path()) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let exposures: Vec<McpSkillExposure> = serde_json::from_str(&text)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     let legacy = exposures
         .iter()
         .filter(|exposure| exposure_project_id(exposure).is_none())
         .count();
     if legacy > 0 {
+        // Once per process, so each restart warns again. The rows stay on disk.
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             tracing::warn!(
                 legacy_count = legacy,
-                "MCP skill exposures without project_id are ignored; recreate them for a project"
+                "MCP skill exposures without a project_id are ignored; a new create adds another row and these stay on disk until removed by hand"
             );
         });
     }
-    exposures
+    Ok(exposures)
 }
 
-fn save_exposures(exposures: &[McpSkillExposure]) -> std::io::Result<()> {
+fn load_exposures() -> Result<Vec<McpSkillExposure>, (StatusCode, Json<Value>)> {
+    let _guard = lock_exposure_store();
+    load_exposures_unlocked().map_err(exposure_store_error)
+}
+
+fn save_exposures_unlocked(exposures: &[McpSkillExposure]) -> std::io::Result<()> {
     let path = exposures_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(exposures).unwrap_or_else(|_| "[]".into()),
+    let bytes = serde_json::to_vec_pretty(exposures)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    super::config::write_file_atomically(&path, &bytes)
+}
+
+fn exposure_store_error(error: std::io::Error) -> (StatusCode, Json<Value>) {
+    tracing::error!(error = %error, "MCP skill exposure store failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "skill_exposure_store_failed"})),
     )
 }
 
@@ -137,14 +168,15 @@ fn mcp_tool(skill: &SkillMeta, exposure: &McpSkillExposure) -> Value {
 }
 
 fn exposed_skill(
+    exposures: &[McpSkillExposure],
     state: &AppState,
     tenant_id: &str,
     project_id: &str,
     tool_name: &str,
 ) -> Option<(McpSkillExposure, SkillMeta)> {
-    load_exposures().into_iter().find_map(|exposure| {
+    exposures.iter().find_map(|exposure| {
         (exposure.enabled
-            && exposure_in_scope(&exposure, tenant_id, project_id)
+            && exposure_in_scope(exposure, tenant_id, project_id)
             && exposure.tool_name == tool_name
             && is_tenant_published_skill(&exposure.skill_iri)
             && !exposure.skill_iri.starts_with("iri://"))
@@ -153,10 +185,32 @@ fn exposed_skill(
                 .core
                 .skills
                 .get_skill(&exposure.skill_iri)
-                .map(|skill| (exposure, skill))
+                .map(|skill| (exposure.clone(), skill))
         })
         .flatten()
     })
+}
+
+/// A verified token whose project was defaulted is not an explicit project.
+/// `POST /mcp` rejects it before any exposure is read, same as catalog invoke.
+fn reject_defaulted_mcp_scope(identity: &UserIdentity) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(claims) = identity.isolation_claims() else {
+        return Ok(());
+    };
+    if claims.provenance() != IsolationScopeProvenance::VerifiedDefaulted {
+        return Ok(());
+    }
+    let missing_field = claims
+        .missing_scope_field()
+        .map(|field| field.as_str())
+        .unwrap_or("project_id");
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "mcp_claims_incomplete",
+            "missing_field": missing_field,
+        })),
+    ))
 }
 
 fn mcp_claims_scope(identity: &UserIdentity) -> Option<(String, String)> {
@@ -184,6 +238,9 @@ pub(crate) async fn skill_mcp_handler(
         )
             .into_response();
     };
+    if let Err(error) = reject_defaulted_mcp_scope(&identity) {
+        return error.into_response();
+    }
 
     let response = match message.method.as_deref() {
         Some("initialize") => MCPMessage::response(
@@ -195,8 +252,12 @@ pub(crate) async fn skill_mcp_handler(
             message.id.unwrap_or(Value::Null),
         ),
         Some("tools/list") => {
-            let tools: Vec<Value> = load_exposures()
-                .into_iter()
+            let exposures = match load_exposures() {
+                Ok(exposures) => exposures,
+                Err(error) => return error.into_response(),
+            };
+            let tools: Vec<Value> = exposures
+                .iter()
                 .filter(|exposure| {
                     exposure.enabled
                         && exposure_in_scope(exposure, &tenant_id, &project_id)
@@ -209,7 +270,7 @@ pub(crate) async fn skill_mcp_handler(
                         .skills
                         .get_skill(&exposure.skill_iri)
                         .filter(|skill| has_skill_role(&identity, skill))
-                        .map(|skill| mcp_tool(&skill, &exposure))
+                        .map(|skill| mcp_tool(&skill, exposure))
                 })
                 .collect();
             MCPMessage::response(json!({"tools": tools}), message.id.unwrap_or(Value::Null))
@@ -221,7 +282,12 @@ pub(crate) async fn skill_mcp_handler(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let Some((exposure, skill)) = exposed_skill(&state, &tenant_id, &project_id, tool_name)
+            let exposures = match load_exposures() {
+                Ok(exposures) => exposures,
+                Err(error) => return error.into_response(),
+            };
+            let Some((exposure, skill)) =
+                exposed_skill(&exposures, &state, &tenant_id, &project_id, tool_name)
             else {
                 return (
                     StatusCode::NOT_FOUND,
@@ -320,7 +386,11 @@ pub(crate) async fn list_skill_exposures_handler(identity: UserIdentity) -> impl
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
-    let exposures: Vec<_> = load_exposures()
+    let exposures = match load_exposures() {
+        Ok(exposures) => exposures,
+        Err(error) => return error.into_response(),
+    };
+    let exposures: Vec<_> = exposures
         .into_iter()
         .filter(|exposure| exposure_in_scope(exposure, &tenant_id, &project_id))
         .collect();
@@ -377,6 +447,8 @@ pub(crate) async fn upsert_skill_exposure_handler(
             .into_response();
     }
 
+    // `project_id` in the body is not a field of this request. The row is
+    // owned by the verified claims even when a client sends another project.
     let exposure = McpSkillExposure {
         tenant_id: tenant_id.clone(),
         project_id: Some(project_id.clone()),
@@ -384,7 +456,11 @@ pub(crate) async fn upsert_skill_exposure_handler(
         tool_name: request.tool_name,
         enabled: request.enabled,
     };
-    let mut exposures = load_exposures();
+    let _guard = lock_exposure_store();
+    let mut exposures = match load_exposures_unlocked() {
+        Ok(exposures) => exposures,
+        Err(error) => return exposure_store_error(error).into_response(),
+    };
     if let Some(existing) = exposures.iter_mut().find(|existing| {
         exposure_in_scope(existing, &tenant_id, &project_id)
             && existing.skill_iri == exposure.skill_iri
@@ -402,17 +478,13 @@ pub(crate) async fn upsert_skill_exposure_handler(
     } else {
         exposures.push(exposure.clone());
     }
-    match save_exposures(&exposures) {
+    match save_exposures_unlocked(&exposures) {
         Ok(()) => (
             StatusCode::CREATED,
             Json(json!({"status": "ok", "exposure": exposure})),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("failed to persist MCP Skill exposure: {error}")})),
-        )
-            .into_response(),
+        Err(error) => exposure_store_error(error).into_response(),
     }
 }
 
@@ -431,7 +503,11 @@ pub(crate) async fn delete_skill_exposure_handler(
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
-    let mut exposures = load_exposures();
+    let _guard = lock_exposure_store();
+    let mut exposures = match load_exposures_unlocked() {
+        Ok(exposures) => exposures,
+        Err(error) => return exposure_store_error(error).into_response(),
+    };
     let before = exposures.len();
     exposures.retain(|exposure| {
         !(exposure_in_scope(exposure, &tenant_id, &project_id)
@@ -440,9 +516,9 @@ pub(crate) async fn delete_skill_exposure_handler(
     if exposures.len() == before {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match save_exposures(&exposures) {
+    match save_exposures_unlocked(&exposures) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(error) => exposure_store_error(error).into_response(),
     }
 }
 

@@ -68,8 +68,11 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
   claims，不取自 `X-Identity`，也不取自回落的默认 project）；
   `POST /api/v1/kb/bases/:id/reindex`。
 - 其他租户的知识库、技能暴露记录或市场私有包，与不存在时返回同样的 `404`。同一 tenant
-  下其他 project 的技能暴露也是如此。没有 `project_id` 的已存技能暴露不可列出、不可调用、
-  不可删除，直到 DA 为某一个 project 重新创建。
+  下其他 project 的技能暴露也是如此。技能暴露请求体里的 `project_id` 会被忽略。
+  没有 `project_id`、或 `project_id` 为空的已存技能暴露不可列出、不可调用、不可删除。
+  再次创建只会新增一行，旧行仍留在暴露文件里。进程每次启动并加载到这些行时都会记一条
+  警告；操作者通过编辑该文件删除它们。`POST /mcp` 会拒绝没有 project claim 的已验证
+  token（`403 mcp_claims_incomplete`）。
 
 ### API client id 冲突与恢复
 
