@@ -142,6 +142,9 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 
 - **成功态 usage（VAL-016 / VAL-017）。** 当 `status` 为 `succeeded` 时，`result.usage` **必须**存在，且包含非空 `model`、`input_tokens`、`output_tokens` 以及整数 `cost`（微美元，与 `budget.max_cost` 同单位）。缺任一项就**不得**记为 `succeeded`（失败关闭：迁到 `failed` 且 `error.code = "incomplete_usage"`，或拒绝该终态写入）。`provider` 与 `tool_calls` 在所有终态上仍可选。
 - 在 `failed` / `cancelled` / `interrupted` 路径上，`usage` 可选；若带了，结构仍须合法（未知成员拒绝；有 `cost` 时必须是整数）。`failed` 的调用也可以带 `result`，其中只有 `usage`（例如 `budget_exceeded` 之后），`summary` 为空。
+- **usage 严格形状。** `usage` 只接受 `provider`、`model`、`input_tokens`、
+  `output_tokens`、`cost` 与 `tool_calls`；每条 tool-call 只接受 `name` 和
+  `transport`。非法 usage 绝不静默当作未提供。
 - `usage` 报告的是服务端为执行 `budget`（`budget_exceeded`）本来就在做的计量，不含任何合作方或来源归因。
 - **`tool_calls[].transport` 词表（闭集）。** 每条 tool-call 可带 `transport`，取值只能是：
   `mcp` | `http` | `a2a` | `local` | `unknown`。
@@ -150,6 +153,8 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
   - `a2a` — 走 A2A 出站路径的工具调用；**不要用 `http` 兼指 A2A**。A2A 调用使用独立取值 `transport = "a2a"`。
   - `local` — 进程内 / 内置工具，无网络跳转。
   - `unknown` — 无法判定时使用；已知时优先写明确取值。闭集以外的值在写入时拒绝。
+  内置调用只记录名称和 transport，不记录参数或结果。进程内内置工具使用
+  `local`；`web_search` 等直接联网的内置工具使用 `http`。
 
 ### 5.1 列表响应
 

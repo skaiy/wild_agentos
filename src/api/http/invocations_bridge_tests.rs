@@ -15,7 +15,9 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::api::http::control_plane_route_auth_tests::{test_state_with_invocations, EnvGuard};
-use crate::api::http::invocations_enforcement::{FifoScheduler, InputRefRegistry};
+use crate::api::http::invocations_enforcement::{
+    FifoScheduler, InputRefRegistry, BUDGET_EXCEEDED_ERROR_CODE,
+};
 use crate::api::http::invocations_execution::{
     claims_from_invocation, projection_context_is_nonempty, InvocationExecutionBridge,
     ProjectionContextGate, ScopedProjectionGate, PROJECTION_GATE_FRAME,
@@ -39,6 +41,8 @@ struct MockExecutor {
 #[derive(Clone, Copy)]
 enum MockMode {
     SucceedWithUsage,
+    SucceedWithWebSearch,
+    SucceedWithTwoWebSearches,
     SucceedWithoutUsage,
     Fail,
     HangUntilCancel,
@@ -51,6 +55,80 @@ impl TaskExecutor for MockExecutor {
         *self.seen_claims.lock().unwrap() = Some(spec.isolation_claims.clone());
         match self.mode {
             MockMode::SucceedWithUsage => {
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TASK_COMPLETED",
+                        "mock",
+                        &json!({
+                            "status": "succeeded",
+                            "summary": "mock-ok",
+                            "usage": {
+                                "model": "mock-model",
+                                "input_tokens": 11,
+                                "output_tokens": 7,
+                                "cost": 42
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            }
+            MockMode::SucceedWithWebSearch => {
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TOOL_CALL",
+                        "mock",
+                        &json!({
+                            "event": {
+                                "ToolCall": {
+                                    "tool_name": "web_search",
+                                    "arguments_json": {"query": "never persist this"}
+                                }
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TASK_COMPLETED",
+                        "mock",
+                        &json!({
+                            "status": "succeeded",
+                            "summary": "mock-ok",
+                            "usage": {
+                                "model": "mock-model",
+                                "input_tokens": 11,
+                                "output_tokens": 7,
+                                "cost": 42
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            }
+            MockMode::SucceedWithTwoWebSearches => {
+                for query in ["first", "second"] {
+                    self.events
+                        .emit(
+                            &spec.task_iri,
+                            "TOOL_CALL",
+                            "mock",
+                            &json!({
+                                "event": {
+                                    "ToolCall": {
+                                        "tool_name": "web_search",
+                                        "arguments_json": {"query": query}
+                                    }
+                                }
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                }
                 self.events
                     .emit(
                         &spec.task_iri,
@@ -289,6 +367,61 @@ async fn bridge_incomplete_usage_fails_closed() {
     assert_eq!(
         inv.error.as_ref().map(|e| e.code.as_str()),
         Some("incomplete_usage")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_records_builtin_tool_calls_without_arguments_or_results() {
+    let h = make_bridge_harness(
+        MockMode::SucceedWithWebSearch,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(inv.state, InvocationState::Succeeded);
+    let tool_calls = inv
+        .result
+        .as_ref()
+        .and_then(|result| result.usage.as_ref())
+        .and_then(|usage| usage.tool_calls.as_ref())
+        .expect("built-in tool call usage");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].name, "web_search");
+    assert_eq!(tool_calls[0].transport.as_deref(), Some("http"));
+    let persisted = serde_json::to_string(&tool_calls).unwrap();
+    assert!(!persisted.contains("arguments_json"));
+    assert!(!persisted.contains("never persist this"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_max_tool_calls_fails_after_recorded_builtin_calls() {
+    let h = make_bridge_harness(
+        MockMode::SucceedWithTwoWebSearches,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(
+        &h.router,
+        &alice(),
+        json!({"prompt": "search", "budget": {"max_tool_calls": 1}}),
+    )
+    .await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(inv.state, InvocationState::Failed);
+    assert_eq!(
+        inv.error.as_ref().map(|error| error.code.as_str()),
+        Some(BUDGET_EXCEEDED_ERROR_CODE)
+    );
+    assert_eq!(
+        inv.result
+            .as_ref()
+            .and_then(|result| result.usage.as_ref())
+            .and_then(|usage| usage.tool_calls.as_ref())
+            .map(Vec::len),
+        Some(2)
     );
 }
 

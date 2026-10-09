@@ -274,6 +274,10 @@ scope and server fields → `400 field_not_allowed` (§3).
   its shape must still be valid (unknown members rejected; `cost` integer when
   set). A `failed` invocation can carry `result` with only `usage` (for example
   after `budget_exceeded`) and an empty `summary`.
+- **Strict usage shape.** `usage` accepts only `provider`, `model`,
+  `input_tokens`, `output_tokens`, `cost`, and `tool_calls`; each tool-call
+  entry accepts only `name` and `transport`. Invalid usage is never silently
+  treated as absent.
 - `usage` reports the metering the server already does to enforce `budget`
   (`budget_exceeded`). It carries no partner or source attribution.
 - **`tool_calls[].transport` vocabulary (closed set).** Each tool-call entry
@@ -286,6 +290,9 @@ scope and server fields → `400 field_not_allowed` (§3).
   - `local` — in-process / built-in tool with no network hop.
   - `unknown` — transport could not be classified; prefer an explicit value when
     known. Values outside this set are rejected at write time.
+  Built-in calls are recorded without arguments or results. In-process
+  built-ins use `local`; direct-network built-ins such as `web_search` use
+  `http`.
 
 ### 5.1 List response
 

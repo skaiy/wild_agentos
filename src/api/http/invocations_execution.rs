@@ -26,8 +26,9 @@ use super::invocations_enforcement::{
 };
 use super::invocations_store::{
     scrub_secret_shaped_text, Invocation, InvocationErrorInfo, InvocationResult, InvocationState,
-    InvocationStore, InvocationUsage, TransitionPatch, DEADLINE_EXCEEDED_ERROR_CODE,
-    PROJECTION_CONTEXT_MISSING_ERROR_CODE, TASK_INIT_FAILED_ERROR_CODE,
+    InvocationStore, InvocationToolCallUsage, InvocationUsage, TransitionPatch,
+    DEADLINE_EXCEEDED_ERROR_CODE, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
+    TASK_INIT_FAILED_ERROR_CODE,
 };
 use super::{TaskExecSpec, TaskExecutor};
 use crate::core::core_types::SemanticCore;
@@ -40,6 +41,9 @@ pub(crate) const INCOMPLETE_USAGE_ERROR_CODE: &str = "incomplete_usage";
 pub(crate) const EXECUTOR_PANIC_ERROR_CODE: &str = "executor_panic";
 /// Executor finished (or was abandoned) without a TASK_COMPLETED / TASK_FAILED event.
 pub(crate) const TERMINAL_EVENT_MISSING_ERROR_CODE: &str = "terminal_event_missing";
+/// A terminal event carried a `usage` object that does not match the public
+/// contract. Never silently turn that into missing usage and succeed.
+pub(crate) const INVALID_USAGE_ERROR_CODE: &str = "invalid_usage";
 /// Soft upper bound for persisted result summaries (#317 scrub).
 pub(crate) const MAX_RESULT_SUMMARY_CHARS: usize = 4_096;
 /// Scoped frame used for the H4 projection gate (non-SPARQL, task-local).
@@ -297,20 +301,49 @@ fn neutralize_input_ref_close(text: &str) -> String {
 }
 
 /// Parses usage (+ summary) out of a TASK_* event payload.
-pub(crate) fn parse_terminal_payload(payload: &str) -> (String, Option<InvocationUsage>) {
+pub(crate) fn parse_terminal_payload(
+    payload: &str,
+) -> Result<(String, Option<InvocationUsage>), String> {
     let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return (scrub_result_summary(payload), None);
+        return Ok((scrub_result_summary(payload), None));
     };
     let summary = value
         .get("summary")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let usage = value
-        .get("usage")
-        .cloned()
-        .and_then(|u| serde_json::from_value::<InvocationUsage>(u).ok());
-    (scrub_result_summary(&summary), usage)
+    let usage = match value.get("usage") {
+        Some(usage) => Some(
+            serde_json::from_value::<InvocationUsage>(usage.clone())
+                .map_err(|_| "terminal event usage is invalid".to_string())?,
+        ),
+        None => None,
+    };
+    Ok((scrub_result_summary(&summary), usage))
+}
+
+/// Built-in tools execute in process unless their implementation makes a
+/// direct network request. The persisted usage deliberately excludes tool
+/// arguments and results, which can contain sensitive data.
+pub(crate) fn built_in_tool_transport(name: &str) -> &'static str {
+    match name {
+        "web_search" | "web_fetch" | "http_request" | "knowledge_import_url" => "http",
+        _ => "local",
+    }
+}
+
+fn tool_call_from_event(event: &crate::core::event_bus::Event) -> Option<InvocationToolCallUsage> {
+    if event.event_type != "TOOL_CALL" {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(&event.payload).ok()?;
+    let name = payload
+        .pointer("/event/ToolCall/tool_name")
+        .and_then(Value::as_str)?;
+    (!name.trim().is_empty()).then(|| InvocationToolCallUsage {
+        name: name.to_string(),
+        transport: Some(built_in_tool_transport(name).to_string()),
+    })
 }
 
 /// Production dispatcher: FIFO running caps → input_ref → init task →
@@ -750,6 +783,7 @@ async fn run_invocation(
     });
 
     let mut terminal_event = None;
+    let mut tool_calls = Vec::new();
     let mut executor_done = false;
 
     while terminal_event.is_none() {
@@ -852,6 +886,9 @@ async fn run_invocation(
                         if event.task_iri != task_iri {
                             continue;
                         }
+                        if let Some(tool_call) = tool_call_from_event(&event) {
+                            tool_calls.push(tool_call);
+                        }
                         if event.event_type == "TASK_COMPLETED"
                             || event.event_type == "TASK_FAILED"
                         {
@@ -903,7 +940,7 @@ async fn run_invocation(
         return;
     };
 
-    apply_terminal_event(&store, &claims, &invocation, &event).await;
+    apply_terminal_event(&store, &claims, &invocation, &event, tool_calls).await;
 }
 
 async fn apply_terminal_event(
@@ -911,9 +948,21 @@ async fn apply_terminal_event(
     claims: &IsolationClaims,
     invocation: &Invocation,
     event: &crate::core::event_bus::Event,
+    tool_calls: Vec<InvocationToolCallUsage>,
 ) {
     let id = invocation.id.as_str();
-    let (summary, usage) = parse_terminal_payload(&event.payload);
+    let (summary, mut usage) = match parse_terminal_payload(&event.payload) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = fail_running(store, claims, id, INVALID_USAGE_ERROR_CODE, &message, None).await;
+            return;
+        }
+    };
+    if !tool_calls.is_empty() {
+        if let Some(usage) = usage.as_mut() {
+            usage.tool_calls = Some(tool_calls);
+        }
+    }
     if event.event_type == "TASK_COMPLETED" {
         // Budget gate before VAL-016 succeeded write (#331).
         if let (Some(budget), Some(usage_ref)) =
@@ -1181,10 +1230,33 @@ mod tests {
             }
         })
         .to_string();
-        let (summary, usage) = parse_terminal_payload(&payload);
+        let (summary, usage) = parse_terminal_payload(&payload).unwrap();
         assert_eq!(summary, "ok");
         let usage = usage.expect("usage");
         assert_eq!(usage.model.as_deref(), Some("m"));
         assert_eq!(usage.cost, Some(3));
+    }
+
+    #[test]
+    fn malformed_terminal_usage_is_not_silently_dropped() {
+        let payload = serde_json::json!({
+            "summary": "ok",
+            "usage": {
+                "model": "m",
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "cost": 3,
+                "unexpected": true
+            }
+        })
+        .to_string();
+        assert!(parse_terminal_payload(&payload).is_err());
+    }
+
+    #[test]
+    fn built_in_network_tools_are_recorded_as_http() {
+        assert_eq!(built_in_tool_transport("web_search"), "http");
+        assert_eq!(built_in_tool_transport("web_fetch"), "http");
+        assert_eq!(built_in_tool_transport("file_read"), "local");
     }
 }

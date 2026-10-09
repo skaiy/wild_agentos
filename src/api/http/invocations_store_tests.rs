@@ -1278,6 +1278,60 @@ async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
     assert!(no_usage.get("usage").is_none());
 }
 
+#[tokio::test]
+async fn invocation_usage_rejects_unknown_members_and_invalid_transport_at_write_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    let running = invocation_in(&store, &claims, InvocationState::Running).await;
+    let before = store.get_for_claims(&claims, &running.id).await.unwrap();
+    let invalid = InvocationUsage {
+        model: Some("model".into()),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+        cost: Some(1),
+        tool_calls: Some(vec![InvocationToolCallUsage {
+            name: "tool".into(),
+            transport: Some("smtp".into()),
+        }]),
+        ..InvocationUsage::default()
+    };
+    assert_eq!(
+        store
+            .transition_for_claims(
+                &claims,
+                &running.id,
+                None,
+                InvocationState::Succeeded,
+                TransitionPatch {
+                    result: Some(InvocationResult {
+                        summary: "nope".into(),
+                        artifacts: vec![],
+                        usage: Some(invalid),
+                    }),
+                    ..TransitionPatch::default()
+                },
+            )
+            .await,
+        Err(InvocationStoreError::InvalidUsage(
+            "tool_calls[].transport must be mcp, http, a2a, local, or unknown"
+        ))
+    );
+    assert_eq!(
+        store.get_for_claims(&claims, &running.id).await.unwrap(),
+        before
+    );
+
+    let malformed = serde_json::json!({
+        "model": "model",
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cost": 1,
+        "extra": true
+    });
+    assert!(serde_json::from_value::<InvocationUsage>(malformed).is_err());
+}
+
 /// Fills the store with terminal (`succeeded`) records, all inside the
 /// retention window, until it holds exactly [`MAX_STORED_INVOCATIONS`].
 /// Writes memory and disk directly: 10 000 single creates would rewrite the
