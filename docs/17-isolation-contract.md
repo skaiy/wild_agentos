@@ -54,9 +54,15 @@ missing task, and a task outside that scope all return gRPC `NOT_FOUND` with
 the message `not found`. The status does not include a `request_id`. Approval
 results apply only when the event's task matches the waiting task.
 
+The bearer is checked when the RPC is accepted, including the moment a stream
+opens. It is not checked again for the life of that stream. A token that
+expires while `ExecuteTaskStream` or `ChatStream` is open does not close the
+stream.
+
 `api.grpc_addr` defaults to `127.0.0.1:50051`. `AGENT_OS_API_GRPC_ADDR` overrides
 it. Listening on another interface is explicit configuration; the shipped
-`config.yaml` uses the loopback default.
+`config.yaml` uses the loopback default. A value that is not a socket address
+fails process startup.
 
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.

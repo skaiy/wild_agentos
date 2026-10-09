@@ -42,8 +42,12 @@ gRPC 使用同一套校验。每个方法都要求 metadata `authorization: Bear
 消息为 `not found`。该状态不包含 `request_id`。审批结果仅在事件的任务与正在
 等待的任务一致时生效。
 
+Bearer 在 RPC 被接受时校验，包括打开流的那一刻。流存续期间不会再次校验。
+`ExecuteTaskStream` 或 `ChatStream` 已经打开后，令牌过期不会关闭该流。
+
 `api.grpc_addr` 默认为 `127.0.0.1:50051`。`AGENT_OS_API_GRPC_ADDR` 可覆盖它。
 监听其他网卡必须显式配置；随仓库提供的 `config.yaml` 使用 loopback 默认值。
+无法解析为套接字地址的值会导致进程启动失败。
 
 ## 平台级配置不属于任何租户
 

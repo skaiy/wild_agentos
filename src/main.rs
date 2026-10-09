@@ -1,7 +1,7 @@
 use wild_agent_os_core::api::grpc::auth::jwt_interceptor;
 use wild_agent_os_core::api::grpc::server::seapp::se_kernel_service_server::SeKernelServiceServer;
 use wild_agent_os_core::api::grpc::server::AgentOSService;
-use wild_agent_os_core::config::settings::Settings;
+use wild_agent_os_core::config::settings::{parse_grpc_listen_addr, Settings};
 use wild_agent_os_core::utils::data_paths::migrate_legacy_home_data;
 use wild_agent_os_core::utils::init_logging;
 
@@ -81,11 +81,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&settings.output.directory)?;
     std::fs::create_dir_all(&settings.memory.l0.path)?;
 
-    let addr = settings
-        .api
-        .grpc_addr
-        .parse()
-        .unwrap_or_else(|_| "127.0.0.1:50051".parse().expect("default addr parse"));
+    let addr = match parse_grpc_listen_addr(&settings.api.grpc_addr) {
+        Ok(addr) => addr,
+        Err(error) => {
+            eprintln!("Configuration error: {error}");
+            eprintln!("Check your configuration (config.yaml or the mapped AGENT_OS_* variables)");
+            std::process::exit(1);
+        }
+    };
     let shutdown = CancellationToken::new();
     let agent_os_service = AgentOSService::new_with_shutdown(settings, shutdown.clone())
         .map_err(Box::<dyn std::error::Error>::from)?;

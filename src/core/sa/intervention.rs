@@ -800,4 +800,20 @@ mod tests {
         let other_payload = approval_event("iri://task/a", "iri://task/b", request_id);
         assert!(matching_approval_result(&other_payload, "iri://task/a", request_id).is_none());
     }
+
+    #[test]
+    fn isolation_contract_approval_result_for_other_task_without_payload_task_iri_is_ignored() {
+        let request_id = "approval_same_request";
+        let mut other = approval_event("iri://task/b", "iri://task/b", request_id);
+        other.payload = serde_json::json!({
+            "request_id": request_id,
+            "approved": true,
+        })
+        .to_string();
+        assert!(
+            !other.payload.contains("task_iri"),
+            "this case is the approval whose payload names no task"
+        );
+        assert!(matching_approval_result(&other, "iri://task/a", request_id).is_none());
+    }
 }

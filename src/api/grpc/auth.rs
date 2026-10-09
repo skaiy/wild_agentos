@@ -92,6 +92,34 @@ pub(crate) fn redact_request_ids(payload: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::redact_request_ids;
+
+    #[test]
+    fn isolation_contract_redact_request_ids_removes_nested_and_non_json() {
+        let nested = r#"{"ok":true,"meta":{"request_id":"secret-id"},"items":[{"request_id":"also-secret","n":1}]}"#;
+        let redacted = redact_request_ids(nested);
+        assert!(!redacted.contains("request_id"));
+        assert!(!redacted.contains("secret"));
+        let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["meta"], serde_json::json!({}));
+        assert_eq!(value["items"][0]["n"], 1);
+        assert!(value["items"][0].get("request_id").is_none());
+
+        assert_eq!(
+            redact_request_ids(r#"{"status":"running","turn":2}"#),
+            r#"{"status":"running","turn":2}"#
+        );
+        assert_eq!(redact_request_ids("request_id=plain-text"), "{}");
+        assert_eq!(
+            redact_request_ids(r#"{"request_id_note":"still names the field"}"#),
+            "{}"
+        );
+    }
+}
+
 fn strip_request_id(value: &mut Value) {
     match value {
         Value::Object(map) => {
