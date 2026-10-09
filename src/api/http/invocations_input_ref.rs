@@ -59,11 +59,9 @@
 //! [`ArtifactInputRefResolver`] serves `wao-artifact://<project_id>/<artifact-id>`
 //! from the platform's own claims-scoped artifact store (`/api/v1/artifacts`).
 //! It is **off by default** (`AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED`)
-//! and makes no outbound network request. Leave the switch unset: it may be
-//! enabled only in a build that accepts solely the `input_snapshot` artifact
-//! kind and requires the fetched bytes' SHA-256 to equal both the metadata
-//! digest and the caller-pinned digest (this build does both; the default
-//! stays off). The project segment must equal the caller's `project_id`
+//! and makes no outbound network request. Leave the switch unset: enabling
+//! it requires #378. This build rejects `input_snapshot` uploads. The
+//! project segment must equal the caller's `project_id`
 //! (checked at create); the artifact is looked up under the caller's claims,
 //! so another project or tenant gets the same failure as an unknown id.
 
@@ -113,12 +111,11 @@ pub const MAX_INPUT_REF_TIMEOUT: Duration = Duration::from_secs(60);
 pub const ARTIFACT_INPUT_REF_SCHEME: &str = "wao-artifact";
 /// Env switch for the built-in artifact resolver (default off).
 ///
-/// Do not set this until the running build (1) resolves only an
-/// `input_snapshot` artifact and (2) requires the fetched bytes' SHA-256 to
-/// equal both the digest stored on the artifact and the caller-pinned
-/// digest, failing closed with one error that does not say which digest
-/// differed. This build includes both checks. The default remains off;
-/// turning the resolver on is a separate decision. Invocation execution
+/// Do not set this. Enabling the switch requires #378 (`input_snapshot`
+/// upload validation). This build rejects those uploads. The resolver still
+/// accepts only an `input_snapshot` whose bytes match both the stored digest
+/// and the caller pin, and that is not enough to enable the switch. The
+/// default remains off. Invocation execution
 /// (`AGENTOS_INVOCATION_EXECUTION_ENABLED`) stays off by default as well.
 pub const ARTIFACT_INPUT_REF_ENABLED_ENV: &str = "AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED";
 

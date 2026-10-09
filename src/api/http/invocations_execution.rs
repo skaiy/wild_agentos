@@ -300,9 +300,10 @@ pub(crate) const INPUT_REF_UNTRUSTED_NOTICE: &str =
 /// The block is part of the task prompt (task goal / user turn), never a
 /// system prompt. The notice line and the outer tags are unchanged. The uri
 /// attribute is XML-escaped (`&`, `"`, `'`, `<`, `>`). The content escapes
-/// every `&` to `&amp;` and every `<` and fullwidth `＜` (U+FF1C) to `&lt;`
-/// (`&` first, so the result is unambiguous), so the content cannot open or
-/// close an `input_ref` tag.
+/// every `&` to `&amp;` and every `<`, fullwidth `＜` (U+FF1C), small
+/// less-than `﹤` (U+FE64), and single left angle quote `‹` (U+2039) to
+/// `&lt;` (`&` first, so the result is unambiguous), so the content cannot
+/// open or close an `input_ref` tag.
 pub(crate) fn input_ref_block(uri: &str, sha256: &str, text: &str) -> String {
     let uri = uri
         .replace('&', "&amp;")
@@ -317,13 +318,13 @@ pub(crate) fn input_ref_block(uri: &str, sha256: &str, text: &str) -> String {
 }
 
 /// Escapes `input_ref` content so it cannot introduce a tag. `&` is escaped
-/// first, then `<` and fullwidth less-than (U+FF1C).
+/// first, then `<` and look-alike less-than signs (U+FF1C, U+FE64, U+2039).
 fn escape_input_ref_content(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
             '&' => out.push_str("&amp;"),
-            '<' | '\u{FF1C}' => out.push_str("&lt;"),
+            '<' | '\u{FF1C}' | '\u{FE64}' | '\u{2039}' => out.push_str("&lt;"),
             other => out.push(other),
         }
     }

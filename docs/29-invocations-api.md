@@ -183,8 +183,9 @@ scope and server fields → `400 field_not_allowed` (§3).
   then `<input_ref uri="…" sha256="…">` + newline + content + newline +
   `</input_ref>`; without a prompt the block alone is the prompt, so the
   prompt is never empty. The `uri` attribute is XML-escaped (`&`, `"`, `'`,
-  `<`, `>`). In the content, every `&` becomes `&amp;` and every `<` and
-  fullwidth `＜` (U+FF1C) becomes `&lt;` (`&` first), so the content cannot
+  `<`, `>`). In the content, every `&` becomes `&amp;` and every `<`,
+  fullwidth `＜` (U+FF1C), small less-than `﹤` (U+FE64), and `‹` (U+2039)
+  becomes `&lt;` (`&` first), so the content cannot
   open or close an `input_ref` tag. The notice line and the outer tags are
   left as written. The block goes only into the task prompt (task goal /
   user turn), never into a system prompt.
@@ -209,11 +210,9 @@ scope and server fields → `400 field_not_allowed` (§3).
   `input_ref_fetch_failed` as an unknown id. The resolver is registered only
   when `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` is truthy (`1`,
   `true`, `yes`, `on`) and a blob store is configured; it is read at startup.
-  **Leave the variable unset.** Do not enable it on a build that lacks the
-  `input_snapshot` kind check and the dual digest check. This API includes
-  both, and the switch still defaults to off. Turning it on is a separate
-  decision. Invocation execution (`AGENTOS_INVOCATION_EXECUTION_ENABLED`)
-  also stays off by default.
+  **Leave the variable unset.** Enabling the switch requires #378.
+  This build rejects `input_snapshot` uploads. Invocation execution
+  (`AGENTOS_INVOCATION_EXECUTION_ENABLED`) also stays off by default.
 - Configuration can only switch on resolvers compiled into the server; it
   never loads code. Deployments that embed the server register their own
   resolvers in code (by scheme or prefix) before startup; see

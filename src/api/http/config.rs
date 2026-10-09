@@ -862,6 +862,11 @@ pub(crate) async fn hot_reload_embedding(
         tracing::error!(error = %error, "embedding hot reload failed to create the vector store directory");
         return Err(EmbeddingReloadError::Io(error.kind()));
     }
+    // The reload rotates any previous store away, so an open or read failure
+    // has to be on this fresh directory. Tests plant that failure here; the
+    // release build has no fixture.
+    #[cfg(test)]
+    plant_embedding_reload_fixture(&vdir);
     let new_store = match HyperspaceStore::open(&vdir, new_embed) {
         Ok(store) => store,
         Err(error) => {
@@ -874,6 +879,36 @@ pub(crate) async fn hot_reload_embedding(
     tracing::info!(old_dim = ?old_dim, new_dim, dim_changed, "embedding 已热切换，向量库原子换入");
     let reindex_queued = spawn_reindex_all_vector_kbs(state.clone()).await;
     Ok((old_dim.unwrap_or(0), new_dim, dim_changed, reindex_queued))
+}
+
+/// Test-only. `AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE=open` makes the fresh
+/// store directory unwritable. `=read` leaves an unreadable `active.wal` for
+/// the store open to read. Absent in release builds.
+#[cfg(test)]
+fn plant_embedding_reload_fixture(vdir: &std::path::Path) {
+    let Ok(mode) = std::env::var("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE") else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match mode.as_str() {
+            "open" => {
+                let _ = std::fs::set_permissions(vdir, std::fs::Permissions::from_mode(0o555));
+            }
+            "read" => {
+                let wal = vdir.join("active.wal");
+                if std::fs::write(&wal, b"not-a-wal").is_ok() {
+                    let _ = std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o000));
+                }
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (mode, vdir);
+    }
 }
 
 #[cfg(test)]

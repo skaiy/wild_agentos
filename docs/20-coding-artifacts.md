@@ -1,9 +1,10 @@
 # 20. Claims-Scoped Coding Artifacts
 
 Replayable outputs from coding agents are stored through the claims-scoped
-artifact API. It supports `patch`, `run_transcript`, `reproduce_script`, and
-`input_snapshot`. The built-in invocation `input_ref` resolver reads only
-`input_snapshot`, and that resolver stays off by default (see
+artifact API. It supports `patch`, `run_transcript`, and `reproduce_script`.
+`input_snapshot` is the kind the built-in invocation `input_ref` resolver
+reads; `POST /api/v1/artifacts` rejects that kind until #378, and the
+resolver stays off by default (see
 [29-invocations-api.md](29-invocations-api.md)).
 Each upload requires JWT-verified `IsolationClaims`; development `X-Identity`,
 API keys, and anonymous requests receive `401`.

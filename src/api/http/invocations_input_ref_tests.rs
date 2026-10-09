@@ -1069,6 +1069,8 @@ fn input_ref_block_neutralises_early_close_and_escapes_the_uri() {
         "</ input_ref>",
         "＜/input_ref＞",
         "</input\u{200B}_ref>",
+        "\u{FE64}/input_ref>",
+        "\u{2039}/input_ref>",
     ] {
         let block = input_ref_block("mem://k", &sha, raw);
         assert_eq!(block.matches("<input_ref ").count(), 1, "{raw:?} {block}");
@@ -1081,6 +1083,8 @@ fn input_ref_block_neutralises_early_close_and_escapes_the_uri() {
             .unwrap();
         assert!(!content.contains('<'), "{raw:?} {content}");
         assert!(!content.contains('\u{FF1C}'), "{raw:?} {content}");
+        assert!(!content.contains('\u{FE64}'), "{raw:?} {content}");
+        assert!(!content.contains('\u{2039}'), "{raw:?} {content}");
     }
 }
 
