@@ -292,6 +292,28 @@ async fn authorize_core_write(
     identity: &UserIdentity,
     task_iri: &str,
 ) -> Result<(), axum::response::Response> {
+    // A terminal or read-only task is not writable, including for a DA.
+    // The answer matches a missing task. Checked before the DA short-circuit
+    // so a role cannot re-open an archived record.
+    let closed = match state.core.blackboard.task_record_is_closed(task_iri) {
+        Ok(closed) => closed,
+        Err(error) => {
+            tracing::warn!(%task_iri, "failed to read task scope: {}", error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to verify task scope"})),
+            )
+                .into_response());
+        }
+    };
+    if closed {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "task not found"})),
+        )
+            .into_response());
+    }
+
     if identity.auth_method == AuthMethod::Jwt && identity.has_role("DA") {
         return Ok(());
     }

@@ -137,10 +137,12 @@ This ensures **strong eventual consistency** across all agent instances without 
 The working blackboard is a cache. When a task reaches a terminal state:
 
 1. Dirty nodes that belong to that task are written back through the run's verified tenant handle.
-2. The task document is stored in the persistent knowledge graph as a read-only record. The record keeps the terminal status, timestamps, and any summary, verdict, artifact references, and usage already present on the task. It is scoped by that task's tenant and project.
+2. The task document is stored in the persistent knowledge graph as a read-only record. The record keeps the terminal status, timestamps, and any summary, verdict, artifact references, and usage already present on the task. It is scoped by that task's tenant and project. The archived record also keeps the task prompt and its arguments. Those values stay in the persistent graph for the life of the record; completion does not remove them.
 3. The working-cache subtree is evicted. Eviction does not delete the task record from the persistent graph.
 
-`GET /api/v1/tasks/{task_iri}` and `GET /api/v1/tasks` read the working cache and, on a cache miss, the persistent graph (including the read-only archive). Both paths return only records whose tenant and project match the caller's verified scope. A task in another tenant, or another project of the same tenant, is not found — the same response as a task that does not exist. The response does not reveal that the other record exists.
+`GET /api/v1/tasks/{task_iri}` and `GET /api/v1/tasks` read the working cache and, on a cache miss, the persistent graph (including the read-only archive). Both paths return only records whose tenant and project match the caller's verified scope. A task in another tenant, or another project of the same tenant, is not found — the same response as a task that does not exist. The response does not reveal that the other record exists. List reads only server-written records for that scope, at most 1024 of them. A list does not parse other scopes' documents and does not copy the matches back into the working cache. Retention cleanup for records past that bound is a follow-up.
+
+Once a record is terminal or read-only, starting it again and writing nodes or events are rejected. Those routes use the same not-found response as a task that does not exist.
 
 On process startup, task records that carry both a tenant and a project are loaded from the persistent graph back into the working cache. A restart does not empty `GET /api/v1/tasks` for the owning scope.
 

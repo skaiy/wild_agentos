@@ -17,9 +17,17 @@ use crate::{CoreConfig, CoreError};
 
 /// Canonical JSON-LD document, so a cache miss can rebuild the task exactly.
 const JSON_LD_PREDICATE: &str = "https://wildagentos.org/prop/jsonLd";
+const TENANT_PREDICATE: &str = "https://wildagentos.org/prop/tenant_id";
+const PROJECT_PREDICATE: &str = "https://wildagentos.org/prop/project_id";
+/// Server-written task documents (created or updated by the task root path).
+/// Client node writes stay in the default graph and are not task records.
+const TASK_RECORD_GRAPH: &str = "https://wildagentos.org/graph/tasks";
 /// Claims-scoped archive graph. Completion writes here and never deletes it;
 /// only an explicit node delete removes these quads.
 const TASK_ARCHIVE_GRAPH: &str = "https://wildagentos.org/graph/task-archive";
+/// One scoped list/read stops after this many server-written task records.
+/// Dropping older archived records past this bound is a retention follow-up.
+const TASK_SCOPE_READ_BOUND: usize = 1024;
 
 /// Filter criteria for query_nodes_filtered()
 ///
@@ -112,6 +120,8 @@ pub struct Blackboard {
 
     /// Pending Oxigraph sync thread handles — joined on flush_oxigraph()
     pending_syncs: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// IRIs of task documents written by the server, not by a client node write.
+    server_task_iris: DashMap<String, ()>,
 }
 
 impl Blackboard {
@@ -133,6 +143,7 @@ impl Blackboard {
             agent_registry: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(Vec::new()),
             pending_syncs: std::sync::Mutex::new(Vec::new()),
+            server_task_iris: DashMap::new(),
         };
         blackboard.rehydrate_tasks_from_store()?;
         Ok(blackboard)
@@ -154,6 +165,7 @@ impl Blackboard {
             agent_registry: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(Vec::new()),
             pending_syncs: std::sync::Mutex::new(Vec::new()),
+            server_task_iris: DashMap::new(),
         })
     }
 
@@ -190,6 +202,12 @@ impl Blackboard {
             serde_json::from_str(json_ld).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("JSON parse error: {}", e),
             })?;
+
+        if let Some(owner) = guarded_task_iri(node_iri) {
+            if self.task_record_is_closed(&owner)? {
+                return Err(CoreError::TaskNotFound { iri: owner });
+            }
+        }
 
         let task_iri = extract_task_iri(node_iri);
 
@@ -316,6 +334,12 @@ impl Blackboard {
         }
         self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
 
+        // Only the task root is a server-written record. A client child, even
+        // one labeled @type Task, stays out of the task graphs.
+        if is_persistent_task_root(node_iri, &parsed) {
+            self.persist_server_task_record(node_iri, &parsed)?;
+        }
+
         debug!(node_iri = %node_iri, size = size, is_update = is_update, "Node written to blackboard (cache + oxigraph)");
         Ok(())
     }
@@ -377,10 +401,11 @@ impl Blackboard {
             }
         }
 
-        // Task documents keep a canonical JSON-LD literal so list/get can
-        // rebuild the record after the working cache is evicted or the
-        // process restarts. Other node types stay property-only.
-        if is_task_document(parsed) {
+        // Task roots keep a canonical JSON-LD literal so list/get can rebuild
+        // the record after the working cache is evicted or the process
+        // restarts. Child nodes, including a client node labeled Task, stay
+        // property-only so they are not task records.
+        if is_persistent_task_root(node_iri, parsed) {
             if let Ok(canonical) = serde_json::to_string(parsed) {
                 let escaped = Self::escape_sparql_string(&canonical);
                 triples.push(format!(r#"{subject} <{JSON_LD_PREDICATE}> "{escaped}" ."#));
@@ -467,16 +492,18 @@ impl Blackboard {
             if let Err(e) = self.store.update(&delete_sparql) {
                 warn!(node_iri = %node_iri, error = %e, "Failed to delete triples from oxigraph");
             }
-            // Explicit delete also removes the read-only archive. Completion
-            // uses `evict_node` and does not reach this path.
+            // Explicit delete also removes the server record and the archive.
+            // Completion uses `evict_node` and does not reach this path.
             if let Some(subject) = sparql_subject(node_iri) {
-                let archive_delete = format!(
-                    "DELETE WHERE {{ GRAPH <{TASK_ARCHIVE_GRAPH}> {{ {subject} ?p ?o . }} }}"
-                );
-                if let Err(e) = self.store.update(&archive_delete) {
-                    warn!(node_iri = %node_iri, error = %e, "Failed to delete task archive triples");
+                for graph in [TASK_ARCHIVE_GRAPH, TASK_RECORD_GRAPH] {
+                    let graph_delete =
+                        format!("DELETE WHERE {{ GRAPH <{graph}> {{ {subject} ?p ?o . }} }}");
+                    if let Err(e) = self.store.update(&graph_delete) {
+                        warn!(node_iri = %node_iri, error = %e, "Failed to delete server task triples");
+                    }
                 }
             }
+            self.server_task_iris.remove(node_iri);
 
             self.unindex_node(node_iri, &node);
 
@@ -1008,14 +1035,16 @@ impl Blackboard {
         self.type_index.write().clear();
         self.node_count.store(0, Ordering::Relaxed);
         self.total_bytes.store(0, Ordering::Relaxed);
+        self.server_task_iris.clear();
 
         if let Err(e) = self.store.update("DELETE WHERE { ?s ?p ?o . }") {
             warn!(error = %e, "Failed to clear oxigraph store");
         }
-        let archive_clear =
-            format!("DELETE WHERE {{ GRAPH <{TASK_ARCHIVE_GRAPH}> {{ ?s ?p ?o . }} }}");
-        if let Err(e) = self.store.update(&archive_clear) {
-            warn!(error = %e, "Failed to clear task archive graph");
+        for graph in [TASK_ARCHIVE_GRAPH, TASK_RECORD_GRAPH] {
+            let graph_clear = format!("DELETE WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o . }} }}");
+            if let Err(e) = self.store.update(&graph_clear) {
+                warn!(error = %e, "Failed to clear server task graph");
+            }
         }
     }
 
@@ -2027,8 +2056,49 @@ impl Blackboard {
             });
         }
         Self::sync_to_oxigraph_sync(&self.store, task_iri, &doc)?;
-        Self::sync_task_archive_graph(&self.store, task_iri, &doc)?;
+        self.persist_server_task_record(task_iri, &doc)?;
+        Self::sync_named_task_graph(&self.store, TASK_ARCHIVE_GRAPH, task_iri, &doc)?;
+        if let Ok(archived) = serde_json::to_string(&doc) {
+            if let Some(mut slot) = self.node_cache.get_mut(task_iri) {
+                let mut node = (**slot).clone();
+                node.size = archived.len();
+                node.json_ld = archived;
+                node.dirty = false;
+                *slot = Arc::new(node);
+            }
+        }
         Ok(true)
+    }
+
+    /// True when the task document is terminal or marked read-only.
+    ///
+    /// A cache hit is not enough on its own: completion writes the archive
+    /// before it evicts, so the graph is checked as well. Does not insert
+    /// into the working cache.
+    pub fn task_record_is_closed(&self, task_iri: &str) -> Result<bool, CoreError> {
+        if let Some(node) = self.node_cache.get(task_iri) {
+            if task_json_is_closed(&node.json_ld) {
+                return Ok(true);
+            }
+        }
+        Ok(self
+            .persisted_task_document(task_iri)?
+            .is_some_and(|doc| document_is_closed(&doc)))
+    }
+
+    /// Write `doc` into the server task graph and remember that this IRI is a
+    /// server task record. Client child nodes must not call this.
+    pub fn persist_server_task_record(
+        &self,
+        task_iri: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), CoreError> {
+        if !is_task_document(doc) || !document_has_scope(doc) {
+            return Ok(());
+        }
+        Self::sync_named_task_graph(&self.store, TASK_RECORD_GRAPH, task_iri, doc)?;
+        self.server_task_iris.insert(task_iri.to_string(), ());
+        Ok(())
     }
 
     /// Task records visible to one verified tenant and project.
@@ -2044,15 +2114,23 @@ impl Blackboard {
     ) -> Result<Vec<Arc<Node>>, CoreError> {
         let mut by_iri: std::collections::BTreeMap<String, Arc<Node>> =
             std::collections::BTreeMap::new();
-        for (iri, doc) in self.persisted_task_documents()? {
+        // Graph rows are not inserted into the working cache. A list call must
+        // not refill every archived task.
+        for (iri, doc) in self.persisted_task_documents_in_scope(tenant_id, project_id)? {
             if !document_in_scope(&doc, tenant_id, project_id) {
                 continue;
             }
-            if let Some(node) = self.remember_task_document(&iri, &doc)? {
-                by_iri.insert(iri, node);
-            }
+            let node = if let Some(cached) = self.node_cache.get(&iri) {
+                cached.clone()
+            } else {
+                Arc::new(node_from_document(&iri, &doc)?)
+            };
+            by_iri.insert(iri, node);
         }
         for summary in self.list_task_summaries() {
+            if !self.server_task_iris.contains_key(&summary.task_iri) {
+                continue;
+            }
             let Some(node) = self
                 .node_cache
                 .get(&summary.task_iri)
@@ -2064,7 +2142,17 @@ impl Blackboard {
                 by_iri.insert(summary.task_iri, node);
             }
         }
-        Ok(by_iri.into_values().collect())
+        let mut tasks: Vec<Arc<Node>> = by_iri.into_values().collect();
+        if tasks.len() > TASK_SCOPE_READ_BOUND {
+            warn!(
+                bound = TASK_SCOPE_READ_BOUND,
+                tenant_id,
+                "scoped task read hit the bound; archive retention cleanup is a follow-up"
+            );
+            tasks.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+            tasks.truncate(TASK_SCOPE_READ_BOUND);
+        }
+        Ok(tasks)
     }
 
     fn rehydrate_tasks_from_store(&self) -> Result<(), CoreError> {
@@ -2156,6 +2244,91 @@ impl Blackboard {
         Ok(best.into_iter().collect())
     }
 
+    fn persisted_task_documents_in_scope(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<(String, serde_json::Value)>, CoreError> {
+        if tenant_id.is_empty() || project_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tenant_pred =
+            NamedNode::new(TENANT_PREDICATE).map_err(|error| CoreError::SparqlError {
+                message: error.to_string(),
+            })?;
+        let project_pred =
+            NamedNode::new(PROJECT_PREDICATE).map_err(|error| CoreError::SparqlError {
+                message: error.to_string(),
+            })?;
+        let mut subjects = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for quad in self
+            .store
+            .quads_for_pattern(None, Some((&tenant_pred).into()), None, None)
+        {
+            let quad = quad?;
+            if !graph_holds_task_records(&quad.graph_name) {
+                continue;
+            }
+            let Term::Literal(literal) = &quad.object else {
+                continue;
+            };
+            if literal.value() != tenant_id {
+                continue;
+            }
+            let NamedOrBlankNode::NamedNode(subject) = &quad.subject else {
+                continue;
+            };
+            let iri = subject.as_str().to_string();
+            if seen.insert(iri.clone()) {
+                subjects.push(iri);
+            }
+        }
+        let mut matched = Vec::new();
+        for iri in subjects {
+            let Ok(subject) = NamedNode::new(&iri) else {
+                continue;
+            };
+            let mut project_ok = false;
+            for quad in self.store.quads_for_pattern(
+                Some((&subject).into()),
+                Some((&project_pred).into()),
+                None,
+                None,
+            ) {
+                let quad = quad?;
+                if !graph_holds_task_records(&quad.graph_name) {
+                    continue;
+                }
+                if let Term::Literal(literal) = &quad.object {
+                    if literal.value() == project_id {
+                        project_ok = true;
+                        break;
+                    }
+                }
+            }
+            if !project_ok {
+                continue;
+            }
+            let Some(doc) = self.persisted_task_document(&iri)? else {
+                continue;
+            };
+            if !document_in_scope(&doc, tenant_id, project_id) {
+                continue;
+            }
+            matched.push((iri, doc));
+            if matched.len() >= TASK_SCOPE_READ_BOUND {
+                warn!(
+                    bound = TASK_SCOPE_READ_BOUND,
+                    tenant_id,
+                    "scoped task scan hit the bound; archive retention cleanup is a follow-up"
+                );
+                break;
+            }
+        }
+        Ok(matched)
+    }
+
     fn remember_task_document(
         &self,
         task_iri: &str,
@@ -2164,43 +2337,8 @@ impl Blackboard {
         if !is_task_document(doc) {
             return Ok(None);
         }
-        let json_ld = serde_json::to_string(doc).map_err(|error| CoreError::InvalidJsonLd {
-            message: error.to_string(),
-        })?;
-        let jsonld_types = extract_jsonld_types(doc);
-        let created_at = doc
-            .get("created_at")
-            .and_then(|value| value.as_str())
-            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-            .map(|stamp| stamp.with_timezone(&chrono::Utc))
-            .unwrap_or_else(chrono::Utc::now);
-        let node = Node {
-            iri: task_iri.to_string(),
-            size: json_ld.len(),
-            json_ld,
-            created_at,
-            created_by: doc
-                .get("created_by")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned),
-            tags: doc
-                .get("tags")
-                .and_then(|value| value.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            node_type: jsonld_types.first().cloned(),
-            dirty: false,
-            mesi_state: MesiState::Shared,
-            parent_task: extract_task_iri(task_iri),
-            named_graph: None,
-            jsonld_types,
-        };
-        let node = Arc::new(node);
+        let node = Arc::new(node_from_document(task_iri, doc)?);
+        self.server_task_iris.insert(task_iri.to_string(), ());
         let mut inserted = false;
         self.node_cache
             .entry(task_iri.to_string())
@@ -2310,28 +2448,34 @@ impl Blackboard {
         }
     }
 
-    fn sync_task_archive_graph(
+    fn sync_named_task_graph(
         store: &Store,
+        graph: &str,
         task_iri: &str,
         parsed: &serde_json::Value,
     ) -> Result<(), CoreError> {
         let Some(subject) = sparql_subject(task_iri) else {
             return Err(CoreError::SparqlError {
-                message: format!("task IRI cannot be archived: {task_iri}"),
+                message: format!("task IRI cannot be stored: {task_iri}"),
             });
         };
+        if !graph_iri_is_server_task_graph(graph) {
+            return Err(CoreError::SparqlError {
+                message: "task records are stored only in the server task graphs".into(),
+            });
+        }
         let triples = Self::build_triples(task_iri, parsed);
         if triples.is_empty() {
             return Ok(());
         }
         let sparql = format!(
-            "DELETE WHERE {{ GRAPH <{TASK_ARCHIVE_GRAPH}> {{ {subject} ?p ?o . }} }}; INSERT DATA {{ GRAPH <{TASK_ARCHIVE_GRAPH}> {{ {} }} }}",
+            "DELETE WHERE {{ GRAPH <{graph}> {{ {subject} ?p ?o . }} }}; INSERT DATA {{ GRAPH <{graph}> {{ {} }} }}",
             triples.join("\n")
         );
         store
             .update(&sparql)
             .map_err(|error| CoreError::SparqlError {
-                message: format!("Failed to archive task record: {error}"),
+                message: format!("Failed to store task record: {error}"),
             })?;
         Ok(())
     }
@@ -2433,6 +2577,78 @@ fn document_is_archive(value: &serde_json::Value) -> bool {
     value.get("read_only").and_then(|item| item.as_bool()) == Some(true)
 }
 
+fn document_is_closed(value: &serde_json::Value) -> bool {
+    document_is_archive(value)
+        || value
+            .get("status")
+            .and_then(|item| item.as_str())
+            .is_some_and(is_terminal_status)
+}
+
+/// True when a task document must not be executed or written again.
+pub fn task_json_is_closed(json_ld: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json_ld).is_ok_and(|doc| document_is_closed(&doc))
+}
+
+/// Task root written by the server. A generated child (`.../node_...`) is not,
+/// even when its JSON says `@type: Task`.
+fn is_persistent_task_root(node_iri: &str, parsed: &serde_json::Value) -> bool {
+    !node_iri.contains("/node_")
+        && extract_task_iri(node_iri).as_deref() == Some(node_iri)
+        && is_task_document(parsed)
+        && document_has_scope(parsed)
+}
+
+/// Parent task of a node write. Child IRIs use the `/node_` segment the HTTP
+/// node route generates; the guard follows that segment back to the task.
+fn guarded_task_iri(node_iri: &str) -> Option<String> {
+    if let Some((task, _)) = node_iri.rsplit_once("/node_") {
+        if task.starts_with("iri://") && !task.is_empty() {
+            return Some(task.to_string());
+        }
+    }
+    extract_task_iri(node_iri)
+}
+
+fn node_from_document(task_iri: &str, doc: &serde_json::Value) -> Result<Node, CoreError> {
+    let json_ld = serde_json::to_string(doc).map_err(|error| CoreError::InvalidJsonLd {
+        message: error.to_string(),
+    })?;
+    let jsonld_types = extract_jsonld_types(doc);
+    let created_at = doc
+        .get("created_at")
+        .and_then(|value| value.as_str())
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|stamp| stamp.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    Ok(Node {
+        iri: task_iri.to_string(),
+        size: json_ld.len(),
+        json_ld,
+        created_at,
+        created_by: doc
+            .get("created_by")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        tags: doc
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        node_type: jsonld_types.first().cloned(),
+        dirty: false,
+        mesi_state: MesiState::Shared,
+        parent_task: extract_task_iri(task_iri),
+        named_graph: None,
+        jsonld_types,
+    })
+}
+
 fn is_terminal_status(status: &str) -> bool {
     matches!(
         status,
@@ -2453,11 +2669,17 @@ fn prefer_archive(
     }
 }
 
+fn graph_iri_is_server_task_graph(graph: &str) -> bool {
+    graph == TASK_ARCHIVE_GRAPH || graph == TASK_RECORD_GRAPH
+}
+
+/// Only the server task graph and the completion archive hold task records.
+/// The default graph is where client node writes land, so a child labeled
+/// `@type Task` with another scope's tenant and project is not a task record.
 fn graph_holds_task_records(graph: &GraphName) -> bool {
     match graph {
-        GraphName::DefaultGraph => true,
-        GraphName::NamedNode(name) => name.as_str() == TASK_ARCHIVE_GRAPH,
-        GraphName::BlankNode(_) => false,
+        GraphName::NamedNode(name) => graph_iri_is_server_task_graph(name.as_str()),
+        GraphName::DefaultGraph | GraphName::BlankNode(_) => false,
     }
 }
 
@@ -2879,6 +3101,25 @@ mod tests {
         assert!(bb.archive_completed_task("iri://task_quote").unwrap());
         assert!(bb.evict_subtree("iri://task_quote").unwrap() >= 1);
         assert!(bb.node_cache.get("iri://task_quote").is_none());
+        let cached_before_list = bb.node_count();
+        let own = bb.tasks_in_scope("tenant-a", "project-a").unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].iri, "iri://task_quote");
+        assert_eq!(
+            bb.node_count(),
+            cached_before_list,
+            "a scoped list must not refill the working cache"
+        );
+        assert!(bb.node_cache.get("iri://task_quote").is_none());
+        let child = bb.write_node(
+            "iri://task_quote/node_again",
+            r#"{"@type":"Note","note":"rewritten"}"#,
+            &config,
+        );
+        assert!(
+            matches!(child, Err(CoreError::TaskNotFound { .. })),
+            "a closed task rejects later node writes"
+        );
 
         let triples = bb
             .query_with_bindings(
@@ -2899,9 +3140,6 @@ mod tests {
         assert_eq!(parsed["tenant_id"], "tenant-a");
         assert_eq!(parsed["project_id"], "project-a");
 
-        let own = bb.tasks_in_scope("tenant-a", "project-a").unwrap();
-        assert_eq!(own.len(), 1);
-        assert_eq!(own[0].iri, "iri://task_quote");
         let same_tenant = bb.tasks_in_scope("tenant-a", "project-b").unwrap();
         assert!(same_tenant.is_empty());
         let foreign = bb.tasks_in_scope("tenant-b", "project-a").unwrap();
@@ -2912,6 +3150,124 @@ mod tests {
 
         assert!(bb.delete_node("iri://task_quote").unwrap());
         assert!(bb.read_node("iri://task_quote").unwrap().is_none());
+    }
+
+    /// A legacy task document with no tenant or project must not be loaded at
+    /// startup. Flipping `document_has_scope` to always return true would put
+    /// `iri://task_legacy` in the working cache.
+    #[test]
+    fn rehydrate_skips_legacy_records_without_scope() {
+        let store = Arc::new(Store::new().unwrap());
+        let unscoped = serde_json::json!({
+            "@id": "iri://task_legacy",
+            "@type": "Task",
+            "status": "pending",
+            "user_input": "legacy-prompt"
+        });
+        let scoped = serde_json::json!({
+            "@id": "iri://task_scoped",
+            "@type": "Task",
+            "status": "pending",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "user_input": "scoped-prompt",
+            "created_at": "2026-01-02T03:04:05Z"
+        });
+        let unscoped_lit = Blackboard::escape_sparql_string(&unscoped.to_string());
+        let scoped_lit = Blackboard::escape_sparql_string(&scoped.to_string());
+        let sparql = format!(
+            r#"INSERT DATA {{ GRAPH <{graph}> {{
+                <iri://task_legacy> <{json_ld}> "{unscoped_lit}" .
+                <iri://task_scoped> <{json_ld}> "{scoped_lit}" .
+                <iri://task_scoped> <{tenant}> "tenant-a" .
+                <iri://task_scoped> <{project}> "project-a" .
+            }} }}"#,
+            graph = super::TASK_RECORD_GRAPH,
+            json_ld = super::JSON_LD_PREDICATE,
+            tenant = super::TENANT_PREDICATE,
+            project = super::PROJECT_PREDICATE,
+        );
+        store.update(&sparql).unwrap();
+        let bb = Blackboard::with_store(store).unwrap();
+        let iris: Vec<String> = bb
+            .list_task_summaries()
+            .into_iter()
+            .map(|summary| summary.task_iri)
+            .collect();
+        assert!(
+            iris.contains(&"iri://task_scoped".to_string()),
+            "scoped record should rehydrate, got {iris:?}"
+        );
+        assert!(
+            !iris.contains(&"iri://task_legacy".to_string()),
+            "unscoped legacy record must stay unloaded, got {iris:?}"
+        );
+        assert!(bb.node_cache.get("iri://task_legacy").is_none());
+        assert!(bb.node_cache.get("iri://task_scoped").is_some());
+    }
+
+    /// A client child labeled Task, and a task document written into the
+    /// default graph, are not server task records and must not appear in the
+    /// other scope's list.
+    #[test]
+    fn client_child_labeled_task_is_not_a_server_task_record() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let owner = serde_json::json!({
+            "@id": "iri://task_owner",
+            "@type": "Task",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "status": "pending",
+            "user_input": "owner-prompt",
+            "created_at": "2026-01-02T03:04:05Z"
+        });
+        bb.write_node("iri://task_owner", &owner.to_string(), &config)
+            .unwrap();
+        let planted = serde_json::json!({
+            "@type": "Task",
+            "tenant_id": "tenant-b",
+            "project_id": "project-b",
+            "status": "pending",
+            "user_input": "planted-prompt",
+            "created_at": "2026-01-02T03:04:06Z"
+        });
+        bb.write_node(
+            "iri://task_owner/node_planted",
+            &planted.to_string(),
+            &config,
+        )
+        .unwrap();
+        let smuggled = serde_json::json!({
+            "@id": "iri://task_smuggled",
+            "@type": "Task",
+            "tenant_id": "tenant-b",
+            "project_id": "project-b",
+            "status": "pending",
+            "user_input": "smuggled-prompt"
+        });
+        let literal = Blackboard::escape_sparql_string(&smuggled.to_string());
+        bb.store
+            .update(&format!(
+                r#"INSERT DATA {{
+                    <iri://task_smuggled> <{json_ld}> "{literal}" .
+                    <iri://task_smuggled> <{tenant}> "tenant-b" .
+                    <iri://task_smuggled> <{project}> "project-b" .
+                }}"#,
+                json_ld = super::JSON_LD_PREDICATE,
+                tenant = super::TENANT_PREDICATE,
+                project = super::PROJECT_PREDICATE,
+            ))
+            .unwrap();
+
+        let victim = bb.tasks_in_scope("tenant-b", "project-b").unwrap();
+        let rendered = serde_json::to_string(&victim).unwrap();
+        assert!(victim.is_empty(), "{rendered}");
+        assert!(!rendered.contains("planted-prompt"));
+        assert!(!rendered.contains("smuggled-prompt"));
+        let owner_list = bb.tasks_in_scope("tenant-a", "project-a").unwrap();
+        assert_eq!(owner_list.len(), 1);
+        assert_eq!(owner_list[0].iri, "iri://task_owner");
     }
 
     #[test]

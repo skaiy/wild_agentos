@@ -243,16 +243,26 @@ pub(crate) async fn stream_task_handler(
         Err(response) => return response,
     };
     if let Some(task_iri) = req.task_iri.as_deref() {
-        // A supplied task_iri must name a Task in the caller's own
-        // tenant+project; anything else answers like a missing one (no
-        // existence oracle). There is no platform-admin exception: executing
-        // with the admin's claims against another scope's task would mix
-        // outputs across scopes. Admins inspect other tasks via read routes.
-        let in_scope = matches!(
-            state.core.read_node(task_iri).await,
-            Ok(Some(node)) if task_is_in_scope(&node.json_ld, claims)
-        );
-        if !in_scope {
+        // A supplied task_iri must name a live Task in the caller's own
+        // tenant+project. A missing task, another scope, or a terminal /
+        // read-only record all answer like a missing one (no existence
+        // oracle). There is no platform-admin exception: executing with the
+        // admin's claims against another scope's task would mix outputs
+        // across scopes. Admins inspect other tasks via read routes.
+        let closed = state
+            .core
+            .blackboard
+            .task_record_is_closed(task_iri)
+            .unwrap_or(true);
+        let runnable = match state.core.read_node(task_iri).await {
+            Ok(Some(node)) => task_is_in_scope(&node.json_ld, claims) && !closed,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(%task_iri, "failed to read task before stream: {}", error);
+                false
+            }
+        };
+        if !runnable {
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
         }
     }
@@ -869,7 +879,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
-        routing::get,
+        routing::{get, post},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -878,8 +888,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        api::http::core_ops::{emit_event_handler, write_node_handler},
         api::http::{api_gov::ApiUsageState, iam::JwtClaims, AppState, TEST_ENV_LOCK},
         config::GatewaySettings,
+        core::agent_instance::AgentRole,
         core::core_types::{CoreConfig, SemanticCore},
         gateway::unified_gateway::UnifiedGateway,
         isolation::IsolationClaims,
@@ -1875,6 +1887,233 @@ mod tests {
 
         restore_env("AGENTOS_AUTH_MODE", saved_mode);
         restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    /// Archived and other terminal records cannot be re-run or written. The
+    /// write routes answer with the same 404 they use for a missing task.
+    #[tokio::test]
+    async fn poc434_archived_record_is_not_writable_or_rerunnable() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (saved_mode, saved_secret) = hs256_env();
+
+        let state = test_state();
+        let owner = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let task_a = state
+            .core
+            .init_task_with_claims("alpha-work-product", None, None, None, None, &owner)
+            .await
+            .unwrap();
+        let task_live = state
+            .core
+            .init_task_with_claims("still-running", None, None, None, None, &owner)
+            .await
+            .unwrap();
+        let l0_dir = tempfile::tempdir().unwrap();
+        let tenant_l0 =
+            crate::memory::L0Store::new(l0_dir.path().join("tenant").to_str().unwrap()).unwrap();
+        let scheduler = scheduler_for(&state.core);
+        scheduler
+            .on_task_complete(&task_a, &tenant_l0)
+            .await
+            .expect("first completion archives the task");
+        let again = scheduler.on_task_complete(&task_a, &tenant_l0).await;
+        assert!(
+            again.is_err(),
+            "scheduler must reject a second completion of an archived task"
+        );
+        let context = scheduler
+            .on_context_request(AgentRole::Plan, &task_a, Some(&owner))
+            .await;
+        assert!(
+            context.is_err(),
+            "scheduler must not serve context for an archived task"
+        );
+
+        let router = Router::new()
+            .route("/api/v1/tasks", get(list_tasks_handler))
+            .route("/api/v1/tasks/stream", post(stream_task_handler))
+            .route("/api/v1/tasks/:task_iri", get(get_task_handler))
+            .route("/api/v1/nodes", post(write_node_handler))
+            .route("/api/v1/events", post(emit_event_handler))
+            .with_state(state.clone());
+        let token = jwt("tenant-a", "project-a");
+        let task_uri = format!("/api/v1/tasks/{}", encode_path_segment(&task_a));
+
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/tasks/stream",
+                Some(&token),
+                json!({"prompt": "run it again", "task_iri": task_a}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "not found");
+        assert!(!body.to_string().contains("started"));
+
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/nodes",
+                Some(&token),
+                json!({"task_iri": task_a, "json_ld": r#"{"@type":"Note","note":"mutated"}"#}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "task not found");
+
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/events",
+                Some(&token),
+                json!({"task_iri": task_a, "event_type": "CUSTOM", "note": "mutated"}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "task not found");
+
+        let (status, body) = get_at(&router, &task_uri, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record: Value =
+            serde_json::from_str(body["node"]["json_ld"].as_str().expect("json_ld")).unwrap();
+        assert_eq!(record["status"], "completed");
+        assert_eq!(record["read_only"], true);
+        assert_eq!(record["user_input"], "alpha-work-product");
+        assert!(!record.to_string().contains("mutated"));
+
+        let (status, live_body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/nodes",
+                Some(&token),
+                json!({"task_iri": task_live, "json_ld": r#"{"@type":"Note"}"#}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{live_body}");
+
+        let failed = serde_json::json!({
+            "@id": task_live,
+            "@type": "Task",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "status": "failed",
+            "user_input": "still-running",
+            "created_at": "2026-01-02T03:04:05Z"
+        });
+        state
+            .core
+            .blackboard
+            .write_node(&task_live, &failed.to_string(), &state.core.config)
+            .unwrap();
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/tasks/stream",
+                Some(&token),
+                json!({"prompt": "retry", "task_iri": task_live}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "not found");
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/events",
+                Some(&token),
+                json!({"task_iri": task_live, "event_type": "CUSTOM"}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "task not found");
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    /// A client node labeled Task, carrying another scope's tenant and project,
+    /// must not show up in that scope's task list.
+    #[tokio::test]
+    async fn client_written_child_task_does_not_appear_in_the_other_scope() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (saved_mode, saved_secret) = hs256_env();
+
+        let state = test_state();
+        let owner = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let task = state
+            .core
+            .init_task_with_claims("owner-prompt", None, None, None, None, &owner)
+            .await
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/tasks", get(list_tasks_handler))
+            .route("/api/v1/nodes", post(write_node_handler))
+            .with_state(state);
+        let owner_token = jwt("tenant-a", "project-a");
+        let victim_token = jwt("tenant-b", "project-b");
+        let planted = serde_json::json!({
+            "@type": "Task",
+            "tenant_id": "tenant-b",
+            "project_id": "project-b",
+            "status": "pending",
+            "user_input": "planted-prompt"
+        })
+        .to_string();
+        let (status, body) = response_json(
+            post_json(
+                &router,
+                "/api/v1/nodes",
+                Some(&owner_token),
+                json!({"task_iri": task, "json_ld": planted}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let child_iri = body["node_iri"].as_str().unwrap_or("").to_string();
+        assert!(child_iri.contains("/node_"), "{body}");
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&victim_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 0, "{body}");
+        let rendered = body.to_string();
+        assert!(!rendered.contains("planted-prompt"));
+        assert!(!rendered.contains(&child_iri));
+
+        let (status, body) = get_at(&router, "/api/v1/tasks", Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let listed = task_iris_of(&body);
+        assert_eq!(listed, vec![task]);
+        assert!(!body.to_string().contains("planted-prompt"));
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    async fn response_json(response: axum::response::Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes).into_owned()})),
+        )
     }
 
     fn restore_env(name: &str, previous: Option<std::ffi::OsString>) {

@@ -90,6 +90,7 @@ impl MemoryScheduler {
         task_iri: &str,
         claims: Option<&crate::isolation::IsolationClaims>,
     ) -> Result<String, CoreError> {
+        self.reject_closed_task(task_iri)?;
         // Context is only served within the caller's verified scope.
         let Some(claims) = claims else {
             tracing::warn!(task_iri = %task_iri, "Context request refused: no verified isolation claims");
@@ -160,11 +161,15 @@ impl MemoryScheduler {
     ///
     /// The task record stays in the persistent graph. Completion does not
     /// delete it; readers fall back to that graph when the cache misses.
+    ///
+    /// A task that is already terminal or read-only is rejected. Completion
+    /// does not run again, and the scheduler will not keep serving that task.
     pub async fn on_task_complete(
         &self,
         task_iri: &str,
         tenant_l0: &L0Store,
     ) -> Result<(), CoreError> {
+        self.reject_closed_task(task_iri)?;
         self.blackboard.flush_dirty_subtree(task_iri, tenant_l0)?;
         if let Err(e) = self.consistency.on_l2_write(task_iri, task_iri, &[]).await {
             tracing::warn!("Consistency on_l2_write failed: {}", e);
@@ -191,6 +196,7 @@ impl MemoryScheduler {
         decay_lambda: f64,
         claims: Option<&crate::isolation::IsolationClaims>,
     ) -> Result<String, CoreError> {
+        self.reject_closed_task(task_iri)?;
         self.recall_requests.fetch_add(1, Ordering::Relaxed);
         RECALL_REQUESTS.fetch_add(1, Ordering::Relaxed);
         if let Some(ref hs) = self.hyperspace {
@@ -330,6 +336,17 @@ impl MemoryScheduler {
     /// Remove and return the specified session (called by MemoryManager for synchronous shutdown)
     pub fn remove_session(&self, session_id: &str) -> Option<L1Session> {
         self.sessions.write().remove(session_id)
+    }
+
+    /// Terminal and read-only task records are not runnable. The error matches
+    /// a missing task so a closed record is not a second, writable handle.
+    fn reject_closed_task(&self, task_iri: &str) -> Result<(), CoreError> {
+        if self.blackboard.task_record_is_closed(task_iri)? {
+            return Err(CoreError::TaskNotFound {
+                iri: task_iri.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Return the current session count

@@ -361,7 +361,9 @@ Cross-scope rows never appear. Anonymous → `401`; defaulted project → `403`.
 - The same reads succeed after a process restart. Startup loads scoped task records from the persistent knowledge graph into the working cache. A cache miss reads that graph, including the read-only archive written at completion.
 - Another tenant, or another project of the same tenant, receives the same not-found response as for an unknown task. The body does not reveal that the record exists.
 - Completion evicts the working-cache subtree only. It does not delete the task record from the persistent graph.
-- The record stays until an explicit retention cleanup deletes it. That lifetime is independent of invocation retention in §7.1: sweeping an invocation does not by itself make `task_iri` unreadable. There is no silent expiry on task completion.
+- The archived record keeps the task prompt and its arguments permanently: they stay for the life of the record, and completion does not remove them.
+- A terminal or read-only record cannot be started again, and it cannot accept new nodes or events. Those routes return the same not-found response as an unknown task.
+- The record stays until an explicit retention cleanup deletes it. That lifetime is independent of invocation retention in §7.1: sweeping an invocation does not by itself make `task_iri` unreadable. There is no silent expiry on task completion. List reads of these records are capped at 1024 per tenant and project; retention cleanup past that cap is a follow-up.
 
 ## 6. Idempotency
 
