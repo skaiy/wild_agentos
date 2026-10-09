@@ -494,9 +494,10 @@ impl Blackboard {
 
     /// Flush every dirty node in the process-wide cache into `l0_store`.
     ///
-    /// The cache is shared by all tenants, so this must only be used with a
-    /// store that is allowed to receive every cached node. Task completion
-    /// uses [`Self::flush_dirty_subtree`] instead.
+    /// The cache is shared by all tenants, so production writes must not use
+    /// this. Task completion uses [`Self::flush_dirty_subtree`]; a single L2
+    /// write uses [`Self::flush_node`].
+    #[cfg(test)]
     pub fn flush_dirty_nodes(
         &self,
         l0_store: &crate::memory::l0_store::L0Store,
@@ -532,6 +533,47 @@ impl Blackboard {
             })
             .collect();
         self.flush_nodes(dirty_iris, l0_store)
+    }
+
+    /// Flush one dirty node. Nodes that belong to other tasks stay in L2.
+    pub fn flush_node(
+        &self,
+        node_iri: &str,
+        l0_store: &crate::memory::l0_store::L0Store,
+    ) -> Result<usize, CoreError> {
+        let dirty = self
+            .node_cache
+            .get(node_iri)
+            .map(|node| node.dirty)
+            .unwrap_or(false);
+        if !dirty {
+            return Ok(0);
+        }
+        self.flush_nodes(vec![node_iri.to_string()], l0_store)
+    }
+
+    /// Drop cached nodes that are not part of any `iri://task/` tree.
+    ///
+    /// Session, memory, and other task-less nodes are not tenant-scoped. They
+    /// are discarded instead of being written into whichever run happens to
+    /// finish. Returns how many nodes were removed.
+    pub fn discard_non_task_nodes(&self) -> Result<usize, CoreError> {
+        let iris: Vec<String> = self
+            .node_cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|iri| !iri.starts_with("iri://task/"))
+            .collect();
+        let mut removed = 0;
+        for iri in iris {
+            if self.delete_node(&iri).unwrap_or(false) {
+                removed += 1;
+            }
+        }
+        self.task_tree
+            .write()
+            .retain(|task_iri, _| task_iri.starts_with("iri://task/"));
+        Ok(removed)
     }
 
     /// Node IRIs registered under `task_iri` and all of its sub-tasks.

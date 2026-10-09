@@ -10,6 +10,23 @@ use super::agent::SupervisorAgent;
 use super::types::*;
 
 impl SupervisorAgent {
+    /// Persist an approval record into this run's tenant L0. Without verified
+    /// claims the write fails closed; the error is counted and not swallowed.
+    async fn store_approval_in_tenant_l0(&self, iri: &str, payload: &str, task_iri: &str) {
+        if self.isolation_claims.is_none() {
+            self.runner
+                .report_l0_write_rejected("approval", task_iri)
+                .await;
+            return;
+        }
+        if let Err(error) = self.runner.l0_store.store(iri, payload) {
+            warn!(error = %error, "L0 approval write rejected");
+            self.runner
+                .report_l0_write_rejected("approval", task_iri)
+                .await;
+        }
+    }
+
     pub(super) async fn execute_intervention(
         &mut self,
         plan: crate::perception::proactive_engine::InterventionPlan,
@@ -233,7 +250,8 @@ Notes:
         info!(request_id = %request_id, "Waiting for human confirmation");
 
         let iri = format!("iri://approval/{}", request_id);
-        let _ = self.runner.l0_store.store(&iri, &details.to_string());
+        self.store_approval_in_tenant_l0(&iri, &details.to_string(), task_iri)
+            .await;
 
         // Non-blocking wait: register pending approval request
         // External systems return confirmation via EventBus HUMAN_APPROVAL_RESULT event
@@ -301,7 +319,8 @@ Notes:
         info!(request_id = %request_id, node_id = %node_id, "HumanApprovalNode: waiting for human confirmation");
 
         let iri = format!("iri://approval/{}", request_id);
-        let _ = self.runner.l0_store.store(&iri, &details.to_string());
+        self.store_approval_in_tenant_l0(&iri, &details.to_string(), task_iri)
+            .await;
 
         self.pending_approvals
             .lock()

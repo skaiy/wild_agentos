@@ -92,6 +92,13 @@ const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entrie
 const TAG_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tag_index");
 const NAMED_GRAPH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("named_graph");
 
+/// Per-database redb page cache. redb's default is up to 1 GiB per file;
+/// tenant handles share a process, so each database is capped.
+pub const L0_REDB_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many tenant L0 databases one process will keep open.
+pub const DEFAULT_MAX_TENANT_L0_HANDLES: usize = 32;
+
 /// Process-wide registry of writable tenant L0 handles.
 ///
 /// redb takes an exclusive lock on its file, so a second `Database::create`
@@ -101,25 +108,51 @@ const NAMED_GRAPH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("na
 ///
 /// - Paths are minted only from verified claims ([`tenant_path`]), so the
 ///   registry cannot be used to reach another tenant's directory. Projects of
-///   one tenant share the tenant's L0, exactly as with
-///   [`L0Store::open_for_claims`].
-/// - The first open of a tenant path happens under the registry lock, so two
-///   concurrent first runs cannot race to open the file twice.
-/// - [`Self::release_idle`] closes handles no run is using any more. It drops
-///   them while still holding the registry lock, so the redb file lock is
-///   released before any later run can try to reopen it.
+///   one tenant share the tenant's L0. Isolation granularity is the tenant.
+/// - The registry map lock only inserts or looks up a slot. Directory creation
+///   and `Database::create` run after that lock is released, and only the
+///   slot for that path waits. One tenant's open cannot block another tenant.
+/// - [`Self::release_idle`] closes handles no run is using any more.
 /// - The lock is per process: two Core processes still cannot share one L0
 ///   root.
 pub struct TenantL0Registry {
     l0_root: PathBuf,
-    handles: std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<L0Store>>>,
+    max_handles: usize,
+    handles: std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<TenantSlot>>>,
+    #[cfg(test)]
+    before_open: std::sync::Mutex<Option<Arc<dyn Fn(&Path) + Send + Sync>>>,
+}
+
+struct TenantSlot {
+    store: std::sync::OnceLock<Arc<L0Store>>,
+    open: std::sync::Mutex<()>,
+}
+
+/// Drops idle tenant handles when the run that opened them returns, including
+/// panic and early-return paths. Declare it before the handle clone so the
+/// clone is dropped first.
+pub struct TenantL0Lease {
+    registry: Arc<TenantL0Registry>,
+}
+
+impl Drop for TenantL0Lease {
+    fn drop(&mut self) {
+        self.registry.release_idle();
+    }
 }
 
 impl TenantL0Registry {
     pub fn new(l0_root: impl Into<PathBuf>) -> Self {
+        Self::with_handle_limit(l0_root, DEFAULT_MAX_TENANT_L0_HANDLES)
+    }
+
+    pub fn with_handle_limit(l0_root: impl Into<PathBuf>, max_handles: usize) -> Self {
         Self {
             l0_root: l0_root.into(),
+            max_handles: max_handles.max(1),
             handles: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            before_open: std::sync::Mutex::new(None),
         }
     }
 
@@ -127,21 +160,109 @@ impl TenantL0Registry {
         &self.l0_root
     }
 
+    /// The largest number of tenant databases this registry will open.
+    pub fn handle_limit(&self) -> usize {
+        self.max_handles
+    }
+
+    /// A guard that closes idle handles when dropped.
+    pub fn lease(self: &Arc<Self>) -> TenantL0Lease {
+        TenantL0Lease {
+            registry: Arc::clone(self),
+        }
+    }
+
+    /// Install a hook that runs after the map lock is released and before the
+    /// database file is created. Tests use it to prove one tenant's open does
+    /// not block another.
+    #[cfg(test)]
+    pub fn set_before_open_for_test(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        *self
+            .before_open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(hook));
+    }
+
     /// The shared writable L0 handle for the tenant in `claims`, opened on
     /// first use.
     pub fn get_or_open(&self, claims: &IsolationClaims) -> Result<Arc<L0Store>, CoreError> {
         let path = tenant_path(&self.l0_root, claims)?;
+        let slot = self.prepare_slot(&path)?;
+        self.open_slot(&path, &slot, claims)
+    }
+
+    fn prepare_slot(&self, path: &Path) -> Result<Arc<TenantSlot>, CoreError> {
         let mut handles = self
             .handles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(handle) = handles.get(&path) {
+        if let Some(slot) = handles.get(path) {
+            return Ok(slot.clone());
+        }
+        evict_idle_slots(&mut handles);
+        if handles.len() >= self.max_handles {
+            return Err(CoreError::StorageError {
+                message: format!("tenant L0 handle limit reached ({})", self.max_handles),
+            });
+        }
+        let slot = Arc::new(TenantSlot {
+            store: std::sync::OnceLock::new(),
+            open: std::sync::Mutex::new(()),
+        });
+        handles.insert(path.to_path_buf(), slot.clone());
+        Ok(slot)
+    }
+
+    fn open_slot(
+        &self,
+        path: &Path,
+        slot: &Arc<TenantSlot>,
+        claims: &IsolationClaims,
+    ) -> Result<Arc<L0Store>, CoreError> {
+        if let Some(handle) = slot.store.get() {
             return Ok(handle.clone());
         }
-        info!("Initializing tenant-scoped L0 Store: {}", path.display());
-        let handle = Arc::new(L0Store::open_writable(&path)?);
-        handles.insert(path, handle.clone());
-        Ok(handle)
+        let _open = slot
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handle) = slot.store.get() {
+            return Ok(handle.clone());
+        }
+        // Copy the hook out before calling it. The lock guard must not stay
+        // alive across the hook: the hook blocks, and another tenant's open
+        // also reads this slot.
+        #[cfg(test)]
+        let before_open = self
+            .before_open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = before_open {
+            hook(path);
+        }
+        match open_database_off_worker(&self.l0_root, claims) {
+            Ok(store) => {
+                let handle = Arc::new(store);
+                let _ = slot.store.set(handle.clone());
+                Ok(handle)
+            }
+            Err(error) => {
+                drop(_open);
+                let mut handles = self
+                    .handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if handles
+                    .get(path)
+                    .is_some_and(|current| Arc::ptr_eq(current, slot) && slot.store.get().is_none())
+                {
+                    handles.remove(path);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Close every handle that only the registry still holds. Returns how many
@@ -152,13 +273,11 @@ impl TenantL0Registry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = handles.len();
-        // `strong_count == 1` means no run holds a clone; new clones are only
-        // handed out under this lock, so the count cannot grow concurrently.
-        handles.retain(|_, handle| Arc::strong_count(handle) > 1);
+        evict_idle_slots(&mut handles);
         before - handles.len()
     }
 
-    /// Number of tenant handles currently open.
+    /// Number of tenant slots currently tracked (open or opening).
     pub fn open_handles(&self) -> usize {
         self.handles
             .lock()
@@ -167,20 +286,86 @@ impl TenantL0Registry {
     }
 }
 
-fn tenant_path(l0_root: &Path, claims: &IsolationClaims) -> Result<PathBuf, CoreError> {
-    let minted_path = claims.l0_path().map_err(|e| CoreError::PermissionDenied {
+fn evict_idle_slots(handles: &mut std::collections::HashMap<PathBuf, Arc<TenantSlot>>) {
+    handles.retain(|_, slot| match slot.store.get() {
+        // `strong_count == 1` means only this slot still holds the database.
+        Some(handle) => Arc::strong_count(handle) > 1,
+        // An empty slot is an open still in progress. Keep it.
+        None => Arc::strong_count(slot) > 1,
+    });
+}
+
+fn open_database_off_worker(
+    l0_root: &Path,
+    claims: &IsolationClaims,
+) -> Result<L0Store, CoreError> {
+    let root = l0_root.to_path_buf();
+    let claims = claims.clone();
+    let open = move || L0Store::open_for_claims(&root, &claims);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    match tokio::task::spawn_blocking(open).await {
+                        Ok(opened) => opened,
+                        Err(_) => Err(CoreError::StorageError {
+                            message: "L0 open task failed".to_string(),
+                        }),
+                    }
+                })
+            });
+        }
+    }
+    open()
+}
+
+/// Count a rejected L0 write and log it. The count is the audit value; the
+/// log line does not include a filesystem path.
+pub(crate) fn note_l0_write_rejected(kind: &str) -> u64 {
+    static REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::warn!(kind, count, "L0 write rejected");
+    count
+}
+
+fn permission_denied(action: &str) -> CoreError {
+    CoreError::PermissionDenied {
         agent: "l0_store".to_string(),
-        resource: l0_root.display().to_string(),
-        action: format!("open tenant L0 path with invalid verified claims: {e}"),
-    })?;
+        resource: "l0".to_string(),
+        action: action.to_string(),
+    }
+}
+
+fn tenant_path(l0_root: &Path, claims: &IsolationClaims) -> Result<PathBuf, CoreError> {
+    let minted_path = claims
+        .l0_path()
+        .map_err(|_| permission_denied("open tenant L0 with invalid verified claims"))?;
     let tenant = minted_path
         .file_name()
-        .ok_or_else(|| CoreError::PermissionDenied {
-            agent: "l0_store".to_string(),
-            resource: l0_root.display().to_string(),
-            action: "open tenant L0 path without a tenant segment".to_string(),
-        })?;
-    Ok(l0_root.join(tenant))
+        .ok_or_else(|| permission_denied("open tenant L0 without a tenant segment"))?;
+    let tenant = tenant.to_string_lossy();
+    // Case-insensitive filesystems would otherwise map `Acme` and `acme` onto
+    // one directory. Tenant ids used for L0 must already be lowercase.
+    if tenant.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(permission_denied(
+            "open tenant L0: tenant id must be lowercase",
+        ));
+    }
+    Ok(l0_root.join(tenant.as_ref()))
+}
+
+/// `iri://tool-result/{call_id}` (and any other form that is not the
+/// five-segment owner key) is a pre-owner legacy entry. Reads refuse it.
+pub(crate) fn is_legacy_unscoped_tool_result_iri(iri: &str) -> bool {
+    const PREFIX: &str = "iri://tool-result/";
+    let Some(rest) = iri.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let segments = rest
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    segments != 5
 }
 
 /// L0 Store
@@ -276,9 +461,12 @@ impl L0Store {
 
     /// Opens a writable L0 database scoped to verified tenant claims.
     ///
+    /// Crate-private. Production callers open through [`TenantL0Registry`] so
+    /// one process does not `Database::create` the same file twice.
+    ///
     /// `l0_root` is the local representation of the `/data/l0` root from the
     /// isolation contract. Only the minted tenant path is created, on demand.
-    pub fn open_for_claims(
+    pub(crate) fn open_for_claims(
         l0_root: impl AsRef<Path>,
         claims: &IsolationClaims,
     ) -> Result<Self, CoreError> {
@@ -296,9 +484,12 @@ impl L0Store {
         })?;
 
         let db_path = path.join("l0.redb");
-        let db = Database::create(&db_path).map_err(|e| CoreError::StorageError {
-            message: format!("Failed to open database: {}", e),
-        })?;
+        let db = Database::builder()
+            .set_cache_size(L0_REDB_CACHE_BYTES)
+            .create(&db_path)
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to open database: {}", e),
+            })?;
 
         Self::from_database(db, path.to_string_lossy().into_owned(), true)
     }
@@ -324,7 +515,7 @@ impl L0Store {
             })?
         };
 
-        Ok(Self {
+        let store = Self {
             db,
             writable,
             config: L0Config {
@@ -333,7 +524,14 @@ impl L0Store {
             },
             entry_count,
             iri_registry: None,
-        })
+        };
+        if writable {
+            let purged = store.purge_legacy_unscoped_tool_results()?;
+            if purged > 0 {
+                info!(purged, "purged legacy unscoped tool-result entries from L0");
+            }
+        }
+        Ok(store)
     }
 
     fn create_tables(db: &Database) -> Result<(), CoreError> {
@@ -364,11 +562,7 @@ impl L0Store {
         if self.writable {
             return Ok(());
         }
-        Err(CoreError::PermissionDenied {
-            agent: "l0_store".to_string(),
-            resource: self.config.path.clone(),
-            action: "write L0 data without verified claims".to_string(),
-        })
+        Err(permission_denied("write L0 data without verified claims"))
     }
 
     /// Update tag index: remove old tag indexes, then insert new tag indexes
@@ -540,6 +734,9 @@ impl L0Store {
     }
 
     fn retrieve_without_update(&self, iri: &str) -> Result<Option<L0Entry>, CoreError> {
+        if is_legacy_unscoped_tool_result_iri(iri) {
+            return Ok(None);
+        }
         let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
             message: format!("Read transaction failed: {}", e),
         })?;
@@ -795,6 +992,9 @@ impl L0Store {
     }
 
     pub fn retrieve(&self, iri: &str) -> Result<Option<L0Entry>, CoreError> {
+        if is_legacy_unscoped_tool_result_iri(iri) {
+            return Ok(None);
+        }
         let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
             message: format!("Read transaction failed: {}", e),
         })?;
@@ -863,6 +1063,48 @@ impl L0Store {
         Ok(removed)
     }
 
+    /// Delete unscoped `iri://tool-result/{call_id}` entries. Owner cannot be
+    /// recovered, so they are removed rather than reassigned. Returns the
+    /// count only.
+    fn purge_legacy_unscoped_tool_results(&self) -> Result<usize, CoreError> {
+        let iris = {
+            let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
+                message: format!("Read transaction failed: {}", e),
+            })?;
+            let table =
+                read_txn
+                    .open_table(ENTRIES_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open table: {}", e),
+                    })?;
+            let mut iris = Vec::new();
+            for result in
+                table
+                    .range("iri://tool-result/"..)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Prefix scan failed: {}", e),
+                    })?
+            {
+                let (key_guard, _) = result.map_err(|e| CoreError::StorageError {
+                    message: format!("Iteration failed: {}", e),
+                })?;
+                let key = key_guard.value();
+                if !key.starts_with("iri://tool-result/") {
+                    break;
+                }
+                if is_legacy_unscoped_tool_result_iri(key) {
+                    iris.push(key.to_string());
+                }
+            }
+            iris
+        };
+        let count = iris.len();
+        for iri in iris {
+            self.delete(&iri)?;
+        }
+        Ok(count)
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<L0SearchResult>, CoreError> {
         let mut results = Vec::new();
         let query_lower = query.to_lowercase();
@@ -894,6 +1136,9 @@ impl L0Store {
                 .any(|t| t.to_lowercase().contains(&query_lower));
             let content_match = content_lower.contains(&query_lower);
 
+            if is_legacy_unscoped_tool_result_iri(&entry.iri) {
+                continue;
+            }
             if tag_match || content_match {
                 let relevance = if content_match { 0.8 } else { 0.5 };
                 results.push(L0SearchResult {
@@ -938,6 +1183,9 @@ impl L0Store {
             let key_str = key_guard.value();
             if !key_str.starts_with(prefix) {
                 break;
+            }
+            if is_legacy_unscoped_tool_result_iri(key_str) {
+                continue;
             }
             let entry: L0Entry = serde_json::from_slice(value_guard.value()).map_err(|e| {
                 CoreError::StorageError {
@@ -1029,6 +1277,9 @@ impl L0Store {
                     message: format!("Failed to deserialize entry: {}", e),
                 })?;
 
+            if is_legacy_unscoped_tool_result_iri(&entry.iri) {
+                continue;
+            }
             if tags.iter().all(|t| entry.tags.contains(t)) {
                 results.push(entry);
             }
@@ -1064,6 +1315,9 @@ impl L0Store {
                     message: format!("Failed to deserialize entry: {}", e),
                 })?;
 
+            if is_legacy_unscoped_tool_result_iri(&entry.iri) {
+                continue;
+            }
             if entry.importance >= min_importance {
                 results.push(entry);
             }
@@ -1592,6 +1846,137 @@ mod tests {
         assert_eq!(registry.release_idle(), 1);
         assert_eq!(registry.open_handles(), 0);
         drop(L0Store::open_for_claims(dir.path(), &acme).unwrap());
+    }
+
+    #[test]
+    fn one_tenant_open_does_not_block_another_tenant() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(TenantL0Registry::new(dir.path()));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_hook = release.clone();
+        let started_hook = started.clone();
+        let slow = dir.path().join("slow");
+        registry.set_before_open_for_test(move |path| {
+            if path == slow {
+                started_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                release_hook.wait();
+            }
+        });
+        let slow_claims = IsolationClaims::from_verified("slow", "p", "actor").unwrap();
+        let fast_claims = IsolationClaims::from_verified("fast", "p", "actor").unwrap();
+        let registry_slow = registry.clone();
+        let opener = std::thread::spawn(move || registry_slow.get_or_open(&slow_claims));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slow tenant open never reached the database step"
+            );
+            std::thread::yield_now();
+        }
+        let fast = registry.get_or_open(&fast_claims);
+        assert!(
+            fast.is_ok(),
+            "another tenant must open while the first tenant is still inside Database::create"
+        );
+        release.wait();
+        assert!(opener.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn tenant_handle_count_is_bounded_and_idle_handles_are_evicted() {
+        let dir = tempdir().unwrap();
+        let registry = TenantL0Registry::with_handle_limit(dir.path(), 2);
+        assert_eq!(registry.handle_limit(), 2);
+        assert!(L0_REDB_CACHE_BYTES < 1024 * 1024 * 1024);
+        let a = IsolationClaims::from_verified("a", "p", "actor").unwrap();
+        let b = IsolationClaims::from_verified("b", "p", "actor").unwrap();
+        let c = IsolationClaims::from_verified("c", "p", "actor").unwrap();
+        let hold_a = registry.get_or_open(&a).unwrap();
+        let _hold_b = registry.get_or_open(&b).unwrap();
+        let denied = match registry.get_or_open(&c) {
+            Err(error) => error,
+            Ok(_) => panic!("opening a third tenant must fail once the handle limit is reached"),
+        };
+        let text = denied.to_string();
+        assert!(text.contains("handle limit"), "{text}");
+        assert!(
+            !text.contains(&dir.path().display().to_string()),
+            "limit error must not include the L0 root: {text}"
+        );
+        drop(hold_a);
+        assert!(registry.get_or_open(&c).is_ok());
+        assert!(registry.open_handles() <= 2);
+    }
+
+    #[test]
+    fn lease_releases_the_handle_when_the_run_panics() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(TenantL0Registry::new(dir.path()));
+        let claims = IsolationClaims::from_verified("acme", "p", "actor").unwrap();
+        let registry_run = registry.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = registry_run.lease();
+            let handle = registry_run.get_or_open(&claims).unwrap();
+            let _also = handle.clone();
+            panic!("run failed");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(registry.open_handles(), 0);
+    }
+
+    #[test]
+    fn permission_errors_do_not_include_the_l0_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        let mixed = IsolationClaims::from_verified("Acme", "p", "actor").unwrap();
+        let denied = match TenantL0Registry::new(dir.path()).get_or_open(&mixed) {
+            Err(error) => error,
+            Ok(_) => panic!("a mixed-case tenant id must be rejected"),
+        };
+        let text = denied.to_string();
+        assert!(
+            !text.contains(&root) && !text.contains("Acme"),
+            "permission error leaked a path or tenant segment: {text}"
+        );
+        assert!(text.contains("lowercase"), "{text}");
+
+        let legacy = L0Store::open_legacy_readonly(dir.path().to_str().unwrap()).unwrap();
+        let write = legacy.store("iri://test/1", "x").unwrap_err();
+        let write_text = write.to_string();
+        assert!(
+            !write_text.contains(&root),
+            "no-claims write error leaked the L0 root: {write_text}"
+        );
+        assert!(
+            write_text.contains("without verified claims"),
+            "{write_text}"
+        );
+    }
+
+    #[test]
+    fn legacy_unscoped_tool_result_iris_are_unreadable_and_purged() {
+        let dir = tempdir().unwrap();
+        let legacy = "iri://tool-result/call_old";
+        let owned = "iri://tool-result/tenant/project/run/agent/call_old";
+        {
+            let store = L0Store::open_writable(dir.path()).unwrap();
+            store.store(legacy, "legacy-secret").unwrap();
+            store.store(owned, "owned").unwrap();
+            assert!(store.retrieve(legacy).unwrap().is_none());
+            assert!(store
+                .scan_iri_prefix("iri://tool-result/", 10)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.iri != legacy));
+            assert_eq!(store.retrieve(owned).unwrap().unwrap().content, "owned");
+            assert_eq!(store.count().unwrap(), 2);
+        }
+        let reopened = L0Store::open_writable(dir.path()).unwrap();
+        assert_eq!(reopened.count().unwrap(), 1);
+        assert!(reopened.retrieve(legacy).unwrap().is_none());
+        assert_eq!(reopened.retrieve(owned).unwrap().unwrap().content, "owned");
     }
 
     fn test_store(dir: &tempfile::TempDir) -> L0Store {

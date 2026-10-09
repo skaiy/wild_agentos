@@ -1,7 +1,10 @@
 pub mod graphify;
 pub mod micro_tools;
 pub mod router;
+mod run_ledger;
 pub mod summary;
+
+pub(crate) use run_ledger::GraphifyRunLedger;
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +66,9 @@ pub struct GraphifyResult {
     pub entity_types: Vec<String>,
     pub summary: String,
     pub micro_tools: Vec<MicroToolSchema>,
+    /// Quads actually written, including the run marker. Empty when the write
+    /// did not happen. The run guard deletes exactly these quads.
+    pub written_quads: Vec<crate::knowledge_graph::types::RdfQuad>,
 }
 
 #[derive(Debug, Clone)]

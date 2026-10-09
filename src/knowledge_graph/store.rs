@@ -247,6 +247,33 @@ impl KnowledgeGraphStore {
             })
     }
 
+    /// Deletes exactly `quads` from the graph minted from verified claims.
+    ///
+    /// The quad graph fields are ignored, the same way
+    /// [`Self::write_quads_for_claims`] ignores them. This does not delete by
+    /// subject, so triples this run did not write stay in the graph.
+    pub fn delete_exact_quads_for_claims(
+        &self,
+        claims: &IsolationClaims,
+        quads: &[RdfQuad],
+    ) -> Result<(), KnowledgeGraphError> {
+        let graph = claims
+            .graph_iri()
+            .map_err(|e| KnowledgeGraphError::InvalidScope {
+                message: e.to_string(),
+            })?;
+        if quads.is_empty() {
+            return Ok(());
+        }
+        let body = RdfMapper::quads_to_sparql_triples(quads);
+        let sparql = format!("DELETE DATA {{ GRAPH <{graph}> {{\n  {body}\n}} }}");
+        self.store
+            .update(&sparql)
+            .map_err(|e| KnowledgeGraphError::Update {
+                message: format!("SPARQL DELETE failed: {e}"),
+            })
+    }
+
     /// Upserts KB catalog metadata in the graph minted from verified claims.
     ///
     /// The catalog entry subject is derived from the server-generated KB id.

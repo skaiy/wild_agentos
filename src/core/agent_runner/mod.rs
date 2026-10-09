@@ -394,6 +394,8 @@ pub struct AgentRunner {
     /// This is deliberately runner-owned, never shared executor or global state.
     pub run_tool_restrictions: Arc<dashmap::DashMap<String, Vec<String>>>,
     active_tool_runs: Arc<dashmap::DashMap<String, HashSet<String>>>,
+    /// Quads graphify wrote for a live run, deleted when that run's guard drops.
+    graphify_ledger: Arc<crate::tools::result_router::GraphifyRunLedger>,
 }
 
 pub(crate) struct ToolRestrictionRunGuard {
@@ -403,6 +405,11 @@ pub(crate) struct ToolRestrictionRunGuard {
     run_id: String,
     /// Generated result readers and stored results to drop with the run (#311).
     micro_tools: crate::tools::tool_executor::MicroToolStoreHandle,
+    /// Exact quads this run graphified into the claims graph (#386).
+    graphify_ledger: Arc<crate::tools::result_router::GraphifyRunLedger>,
+    /// Shared store those quads were written to. `None` means graphify used a
+    /// private store that dies with the engine, so there is nothing to delete.
+    graph_store: Option<Arc<oxigraph::store::Store>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +436,35 @@ impl Drop for ToolRestrictionRunGuard {
             active.is_empty()
         });
         self.micro_tools.remove_run(&self.run_id);
+        self.delete_graphify_quads();
+    }
+}
+
+impl ToolRestrictionRunGuard {
+    fn delete_graphify_quads(&mut self) {
+        let Some(record) = self.graphify_ledger.take(&self.run_id) else {
+            return;
+        };
+        let Some(store) = self.graph_store.clone() else {
+            return;
+        };
+        match crate::knowledge_graph::store::KnowledgeGraphStore::with_shared_store(store) {
+            Ok(kg) => {
+                if let Err(error) = kg.delete_exact_quads_for_claims(&record.claims, &record.quads)
+                {
+                    warn!(
+                        error = %error,
+                        "failed to remove this run's graphify triples from the claims graph"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to open the graph store to remove this run's graphify triples"
+                );
+            }
+        }
     }
 }
 
@@ -512,6 +548,7 @@ impl AgentRunner {
             workspace_root: None,
             run_tool_restrictions: Arc::new(dashmap::DashMap::new()),
             active_tool_runs: Arc::new(dashmap::DashMap::new()),
+            graphify_ledger: Arc::new(crate::tools::result_router::GraphifyRunLedger::default()),
         };
         runner.init_context_compressors();
         runner
@@ -620,6 +657,20 @@ impl AgentRunner {
             task_iri: task_iri.to_string(),
             run_id,
             micro_tools: self.tool_executor.read().micro_tool_store(),
+            graphify_ledger: self.graphify_ledger.clone(),
+            graph_store: self.unified_graph_store.clone(),
+        }
+    }
+
+    /// Warn and emit `L0_WRITE_REJECTED` with a count. The payload has no
+    /// filesystem path and no error text.
+    pub(crate) async fn report_l0_write_rejected(&self, kind: &str, task_iri: &str) {
+        let count = crate::memory::l0_store::note_l0_write_rejected(kind);
+        let payload = serde_json::json!({"kind": kind, "count": count}).to_string();
+        if let Some(bus) = &self.event_bus {
+            let _ = bus
+                .emit(task_iri, "L0_WRITE_REJECTED", "L0", &payload)
+                .await;
         }
     }
 

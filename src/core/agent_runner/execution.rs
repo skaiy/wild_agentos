@@ -188,15 +188,23 @@ impl super::AgentRunner {
 
         let result = self.exec(agent, ctx.clone(), &mut session).await;
 
+        let l0 = Arc::clone(&self.l0_store);
+        let has_claims = ctx.isolation_claims.is_some();
+        let mut rejected_kinds = Vec::new();
         {
             let mut mm = self.memory_manager.lock().await;
+            let target = if has_claims { Some(l0.as_ref()) } else { None };
             if !result
                 .as_ref()
                 .map(|r| r.tracked_actions.is_empty())
                 .unwrap_or(true)
             {
                 if let Ok(ref r) = result {
-                    let _ = mm.archive_session_actions(&r.task_iri, &r.tracked_actions, &r.summary);
+                    if let Err(error) =
+                        mm.archive_session_actions(&r.task_iri, &r.tracked_actions, &r.summary)
+                    {
+                        warn!(error = %error, "L2 session-action archive rejected");
+                    }
                     if !r.tracked_actions.is_empty() {
                         let success_rate = r
                             .tracked_actions
@@ -206,16 +214,26 @@ impl super::AgentRunner {
                             })
                             .count() as f32
                             / r.tracked_actions.len().max(1) as f32;
-                        let _ = mm.archive_experience(
+                        if let Err(error) = mm.archive_experience_in(
                             &r.task_iri,
                             &agent.role.to_string(),
                             &r.summary,
                             success_rate,
-                        );
+                            target,
+                        ) {
+                            warn!(error = %error, "L0 experience archive rejected");
+                            rejected_kinds.push("experience");
+                        }
                     }
                 }
             }
-            let _ = mm.finalize_session(session, &ctx.task_iri);
+            if let Err(error) = mm.finalize_session_in(session, &ctx.task_iri, target) {
+                warn!(error = %error, "L0 session archive rejected");
+                rejected_kinds.push("archive");
+            }
+        }
+        for kind in rejected_kinds {
+            self.report_l0_write_rejected(kind, &ctx.task_iri).await;
         }
 
         // TaskEnd hook
@@ -1629,19 +1647,22 @@ Output the summary report directly, not in JSON format."#,
                     &ctx.task_iri,
                     &agent.agent_id,
                     dedup_threshold,
+                    ctx.isolation_claims.as_ref(),
                 )
                 .await;
             }
 
             // Archive to L0: save full response + thought content
-            let l0_iri = sess
-                .archive_full_to_l0(
-                    &self.l0_store,
+            let l0_iri = self
+                .archive_turn_to_tenant_l0(
+                    sess,
                     &agent.role.to_string(),
                     &parsed.thought.clone().unwrap_or_default(),
                     &parsed.content,
+                    &ctx.task_iri,
+                    ctx.isolation_claims.as_ref(),
                 )
-                .ok();
+                .await;
             debug!(
                 "[L0] archived: {:?}, has_reasoning={}, is_valid_json={}",
                 l0_iri, parsed.has_native_reasoning, parsed.is_valid_json
@@ -1866,6 +1887,7 @@ Output the summary report directly, not in JSON format."#,
                                     &ctx.task_iri,
                                     &agent.agent_id,
                                     dedup_threshold,
+                                    ctx.isolation_claims.as_ref(),
                                 )
                                 .await;
                             }

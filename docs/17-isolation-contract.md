@@ -418,7 +418,42 @@ When a task completes, its dirty L2 nodes are flushed into the run's own
 claims-verified tenant L0 handle, never into the read-only startup store. Only
 the completing task's subtree is flushed; dirty nodes of other runs, which may
 belong to other tenants, stay in L2. A run without a writable tenant handle
-still fails closed instead of dropping the write.
+still fails closed instead of dropping the write. The permission error names
+the action and the resource `l0`. It does not include a filesystem path or a
+tenant id. Session archive, experience archive, emphasis, and approval records
+use that same tenant handle. A write with no verified claims returns that
+permission error; the runner logs it and emits `L0_WRITE_REJECTED` with a kind
+and a count. The event does not include a path or the error text.
+
+L0 isolation is per tenant. Projects of one tenant share one directory and one
+open handle. Tenant ids that contain an ASCII uppercase letter are rejected
+when that directory is minted, so two ids that differ only by case cannot land
+on the same directory. The rejection is the same generic permission error.
+`open_for_claims` is crate-private. Production opens go through
+`TenantL0Registry`.
+
+The registry map lock only inserts or looks up a slot. Creating the directory
+and opening the database happen after that lock is released, and only that
+path waits, so one tenant's open or repair does not block another tenant.
+Each database cache is 64 MiB. The registry keeps at most 32 open tenant
+handles (idle handles are closed first; a further open fails with a handle
+limit and no path). A run holds a lease: when the run returns, panics, or
+returns early, idle handles are released.
+
+A node written once has `dirty=false`. Flush writes only dirty nodes, so that
+node is not persisted. `release_subtree` then removes it from L2, including
+the clean node. A later update sets `dirty=true`, and the next flush of that
+node persists the update. Write-through consistency flushes only the node that
+was just written, into the caller-supplied tenant handle. It does not flush
+every dirty node in the process.
+
+Nodes whose IRI is not under `iri://task/` (session and memory records, and
+any other non-task IRI) are not part of a tenant's task subtree. They are
+discarded at the end of a run and are not written into a tenant L0. A run that
+fails, times out, or is cancelled still flushes its own dirty task subtree
+into its tenant L0 and then releases that subtree, including when the flush
+itself fails, so L2 does not keep the subtree. The shared startup store stays
+read-only.
 
 ## Graph interface
 

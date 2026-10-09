@@ -162,13 +162,43 @@ impl MemoryScheduler {
         tenant_l0: &L0Store,
     ) -> Result<(), CoreError> {
         self.blackboard.flush_dirty_subtree(task_iri, tenant_l0)?;
-        if let Err(e) = self.consistency.on_l2_write(task_iri, task_iri, &[]).await {
-            tracing::warn!("Consistency on_l2_write failed: {}", e);
+        if let Err(_error) = self
+            .consistency
+            .on_l2_write_for(task_iri, task_iri, &[], Some(tenant_l0))
+            .await
+        {
+            let count = crate::memory::l0_store::note_l0_write_rejected("consistency");
+            self.memory_bus
+                .publish(
+                    "L0_WRITE_REJECTED",
+                    task_iri,
+                    &serde_json::json!({"kind": "consistency", "count": count}).to_string(),
+                )
+                .await;
         }
         self.blackboard.release_subtree(task_iri)?;
         self.memory_bus
             .publish("TASK_COMPLETED", task_iri, "{}")
             .await;
+        let _ = self.blackboard.discard_non_task_nodes()?;
+        Ok(())
+    }
+
+    /// Settle a run that did not reach `on_task_complete` (failure, timeout,
+    /// or cancellation).
+    ///
+    /// The task's dirty subtree is flushed into `tenant_l0` and then released.
+    /// If the flush fails, the subtree is still released so L2 does not grow;
+    /// the error is returned after that release. Task-less nodes (session,
+    /// memory, and any IRI outside `iri://task/`) are discarded and are not
+    /// written into a tenant store.
+    pub fn on_run_end(&self, task_iri: &str, tenant_l0: &L0Store) -> Result<(), CoreError> {
+        let flushed = self.blackboard.flush_dirty_subtree(task_iri, tenant_l0);
+        let released = self.blackboard.release_subtree(task_iri);
+        let discarded = self.blackboard.discard_non_task_nodes();
+        flushed?;
+        released?;
+        discarded?;
         Ok(())
     }
 
@@ -513,5 +543,84 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CoreError::PermissionDenied { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            !text.contains(dir.path().to_str().unwrap_or("")),
+            "permission error must not include the L0 root: {text}"
+        );
+    }
+
+    /// Timeout, cancel, and failure never reach `on_task_complete`. `on_run_end`
+    /// still flushes that task and discards task-less nodes instead of leaving
+    /// them in L2. A node written once (`dirty == false`) is released without
+    /// being persisted.
+    #[test]
+    fn stopped_run_flushes_its_subtree_and_discards_taskless_nodes() {
+        let dir = tempdir().unwrap();
+        let legacy = Arc::new(
+            L0Store::open_legacy_readonly(dir.path().join("legacy").to_str().unwrap()).unwrap(),
+        );
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), 1024));
+        let memory_bus = Arc::new(MemoryBus::new(Arc::new(EventBus::new(100))));
+        let consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            legacy.clone(),
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let scheduler = MemoryScheduler::new(
+            legacy.clone(),
+            blackboard.clone(),
+            projection,
+            consistency,
+            memory_bus,
+        );
+        let tenant =
+            crate::isolation::IsolationClaims::from_verified("tenant-a", "p", "u").unwrap();
+        let tenant_l0 = L0Store::open_for_claims(dir.path(), &tenant).unwrap();
+        let config = crate::CoreConfig::default();
+
+        let dirty = "iri://task/stopped/result";
+        blackboard.write_node(dirty, r#"{"v":1}"#, &config).unwrap();
+        blackboard.write_node(dirty, r#"{"v":2}"#, &config).unwrap();
+        let clean = "iri://task/stopped/once";
+        blackboard.write_node(clean, r#"{"v":1}"#, &config).unwrap();
+        assert!(!blackboard.read_node(clean).unwrap().unwrap().dirty);
+        let session = "iri://session/s1";
+        blackboard
+            .write_node(session, r#"{"v":1}"#, &config)
+            .unwrap();
+        blackboard
+            .write_node(session, r#"{"v":2}"#, &config)
+            .unwrap();
+        let memory = "iri://memory/m1";
+        blackboard
+            .write_node(memory, r#"{"v":1}"#, &config)
+            .unwrap();
+        let other = "iri://task/other/result";
+        blackboard.write_node(other, r#"{"v":1}"#, &config).unwrap();
+        blackboard.write_node(other, r#"{"v":2}"#, &config).unwrap();
+
+        scheduler
+            .on_run_end("iri://task/stopped", &tenant_l0)
+            .unwrap();
+
+        assert!(tenant_l0.retrieve(dirty).unwrap().is_some());
+        assert!(
+            tenant_l0.retrieve(clean).unwrap().is_none(),
+            "a node written once is not persisted"
+        );
+        assert!(blackboard.read_node(clean).unwrap().is_none());
+        assert!(blackboard.read_node(dirty).unwrap().is_none());
+        for iri in [session, memory] {
+            assert!(
+                tenant_l0.retrieve(iri).unwrap().is_none(),
+                "{iri} must not be written into the tenant L0"
+            );
+            assert!(blackboard.read_node(iri).unwrap().is_none(), "{iri}");
+        }
+        assert!(blackboard.read_node(other).unwrap().unwrap().dirty);
+        assert_eq!(legacy.count().unwrap(), 0);
     }
 }
