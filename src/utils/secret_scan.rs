@@ -47,8 +47,8 @@ const RULES: &[(&str, &str)] = &[
     // `disk-` / `ask-` (or after `_` / `-`) is not a key prefix. Other prefix
     // rules match the issued prefix as a substring, so they do not need this
     // boundary. A lowercase hyphenated name whose every segment is letters
-    // (final segment may be `v` plus digits) is dropped later; see
-    // [`is_kebab_sk_token`].
+    // (final segment may be `v` plus 1 to 4 digits) is dropped later; see
+    // [`is_kebab_sk_token`]. An all-letter key meets that exemption.
     ("sk_api_key", SK_API_KEY_PATTERN),
 ];
 
@@ -93,8 +93,8 @@ fn matching_rule_indexes(text: &str) -> Vec<usize> {
 /// True when some `sk-` match is a credential rather than a kebab identifier.
 ///
 /// A digit in any segment is a credential. The only name shape with a digit is
-/// a trailing `v` plus digits (`…-v2`). If the set matched but no token could
-/// be read, the hit stays (fail closed).
+/// a trailing `v` plus 1 to 4 digits (`…-v2`). If the set matched but no token
+/// could be read, the hit stays (fail closed).
 fn sk_match_is_credential(text: &str) -> bool {
     let mut saw_token = false;
     for captures in SK_TOKEN.captures_iter(text) {
@@ -111,9 +111,11 @@ fn sk_match_is_credential(text: &str) -> bool {
 ///
 /// After `sk-`, split on `-`. There must be at least three segments and at
 /// least two segments of one or more `[a-z]`. Every segment must be `[a-z]+`,
-/// except the final segment may be `v` plus one or more digits
+/// except the final segment may be `v` plus 1 to 4 digits
 /// (`sk-learn-classification-examples-v2`). `proj` and `ant` are ordinary
 /// segments. Any other digit, an uppercase letter, or `_` is a credential.
+/// An all-letter key meets this exemption and is let through; that is an
+/// accepted risk.
 fn is_kebab_sk_token(token: &str) -> bool {
     let Some(body) = token.strip_prefix("sk-") else {
         return false;
@@ -139,12 +141,12 @@ fn is_letter_segment(segment: &str) -> bool {
     !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_lowercase())
 }
 
-/// Trailing version on a kebab name, such as `v2`.
+/// Trailing version on a kebab name: `v` plus 1 to 4 digits, such as `v2`.
 fn is_version_segment(segment: &str) -> bool {
     let Some(digits) = segment.strip_prefix('v') else {
         return false;
     };
-    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    (1..=4).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Names of all rules that match `text`; diagnostics for tests only.

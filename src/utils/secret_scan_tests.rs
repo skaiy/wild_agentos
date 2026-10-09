@@ -276,6 +276,8 @@ fn kebab_identifiers_are_not_secrets_and_mutations_stay_rejected() {
         cat(&["s", "k-learn-classification-examples-v2"]),
         cat(&["s", "k-my-long-running-service-name"]),
         cat(&["s", "k-ant-learn-classification-examples-v2"]),
+        // Four digits is still a version suffix.
+        cat(&["s", "k-learn-classification-examples-v1234"]),
     ];
     for sample in &samples {
         assert_eq!(
@@ -301,6 +303,15 @@ fn kebab_identifiers_are_not_secrets_and_mutations_stay_rejected() {
         // Lowercase keys with a digit in a segment. Main blocked both.
         cat(&["s", "k-q7xk2mzp9w-abtrvnqe-hzkwplms-x83kd0q2a1"]),
         cat(&["s", "k-proj-abcdefgh-ijklmnop-q1w2e3r4t5y6u7i"]),
+        // Version longer than 4 digits. Five digits, and `v` plus 40 digits.
+        cat(&["s", "k-abcdefgh-ijklmnop-v12345"]),
+        cat(&["s", "k-ab-cd-v", &"1234567890".repeat(4)]),
+        // K2: fewer than 3 segments.
+        cat(&["s", "k-abcdefghijklmnopqrst-uvwxyzabcd"]),
+        // K3: only one pure-letter segment.
+        cat(&["s", "k-v1-v2-abcdefghijklmnopqrst"]),
+        // K4: `vN` is not the final segment.
+        cat(&["s", "k-v1-abcdefghij-klmnopqrst"]),
     ];
     for sample in &mutations {
         assert_eq!(
