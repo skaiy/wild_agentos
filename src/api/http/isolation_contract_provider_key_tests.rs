@@ -1001,3 +1001,56 @@ async fn isolation_contract_config_persist_failure_does_not_leak_paths() {
     }
     assert!(!read_only.join("config_override.json").exists());
 }
+
+/// #400: an embedding hot-reload failure is copied into the PUT config body.
+/// The body carries a fixed phrase plus the I/O kind (or `open_failed`),
+/// never the data-directory path, `/tmp`, or `os error`.
+#[cfg(unix)]
+#[tokio::test]
+async fn isolation_contract_embedding_reload_failure_does_not_leak_paths() {
+    use std::os::unix::fs::symlink;
+
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let router = app(test_state(dir.path()));
+    // A broken symlink: `create_dir_all` fails with an error whose Display
+    // includes `os error` and, on some platforms, the absolute path.
+    symlink(
+        "/no/such/vector-store-target",
+        dir.path().join("vector_store"),
+    )
+    .unwrap();
+
+    let (status, text) = send(
+        &router,
+        Method::PUT,
+        "/api/v1/config",
+        json!({ "embedding": { "enabled": false, "fallback": { "dimension": 8 } } }),
+        Some(&admin_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["persisted"], json!(true));
+    assert_eq!(body["embedding_reloaded"], json!(false));
+    assert_eq!(
+        body["message"],
+        json!(format!(
+            "配置已持久化，但向量库热切换失败：{}（重启后仍会按新配置生效）",
+            std::io::ErrorKind::AlreadyExists
+        ))
+    );
+    for leaked in [
+        dir.path().to_string_lossy().as_ref(),
+        "/tmp",
+        "os error",
+        "vector_store",
+        "no/such",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "reload body leaks {leaked:?}: {text}"
+        );
+    }
+}

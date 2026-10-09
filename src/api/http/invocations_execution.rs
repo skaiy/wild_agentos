@@ -298,10 +298,11 @@ pub(crate) const INPUT_REF_UNTRUSTED_NOTICE: &str =
 /// `<input_ref uri="…" sha256="…">\n{text}\n</input_ref>`.
 ///
 /// The block is part of the task prompt (task goal / user turn), never a
-/// system prompt. The uri attribute is XML-escaped (`&`, `"`, `'`, `<`,
-/// `>`), and every `</input_ref` in the content (any case) becomes
-/// `<\/input_ref`, so the content cannot close the block early and pose as
-/// the caller's own instructions.
+/// system prompt. The notice line and the outer tags are unchanged. The uri
+/// attribute is XML-escaped (`&`, `"`, `'`, `<`, `>`). The content escapes
+/// every `&` to `&amp;` and every `<` and fullwidth `＜` (U+FF1C) to `&lt;`
+/// (`&` first, so the result is unambiguous), so the content cannot open or
+/// close an `input_ref` tag.
 pub(crate) fn input_ref_block(uri: &str, sha256: &str, text: &str) -> String {
     let uri = uri
         .replace('&', "&amp;")
@@ -309,27 +310,23 @@ pub(crate) fn input_ref_block(uri: &str, sha256: &str, text: &str) -> String {
         .replace('\'', "&#39;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
-    let text = neutralize_input_ref_close(text);
+    let text = escape_input_ref_content(text);
     format!(
         "{INPUT_REF_UNTRUSTED_NOTICE}\n<input_ref uri=\"{uri}\" sha256=\"{sha256}\">\n{text}\n</input_ref>"
     )
 }
 
-/// Rewrites every ASCII-case-insensitive `</input_ref` as `<\/input_ref`
-/// (original letter case kept).
-fn neutralize_input_ref_close(text: &str) -> String {
-    const CLOSE: &str = "</input_ref";
-    // ASCII lowercasing keeps byte offsets, so indices map back to `text`.
-    let lower = text.to_ascii_lowercase();
+/// Escapes `input_ref` content so it cannot introduce a tag. `&` is escaped
+/// first, then `<` and fullwidth less-than (U+FF1C).
+fn escape_input_ref_content(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for (index, _) in lower.match_indices(CLOSE) {
-        out.push_str(&text[last..index]);
-        out.push_str("<\\/");
-        out.push_str(&text[index + 2..index + CLOSE.len()]);
-        last = index + CLOSE.len();
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' | '\u{FF1C}' => out.push_str("&lt;"),
+            other => out.push(other),
+        }
     }
-    out.push_str(&text[last..]);
     out
 }
 

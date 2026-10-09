@@ -74,7 +74,7 @@ scope and server fields → `400 field_not_allowed` (§3).
 | `prompt` / `input` / `input_ref` | At least one must be present | `400 invalid_request` |
 | `agent_revision` | Not supported in this version (§4.3). Syntax is still checked: needs `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Floating word or missing `agent_id` → `400 invalid_request`; otherwise any value → `422 agent_revision_unsupported` (after the `agent_id` check, so an unknown `agent_id` is `422 agent_not_found` first) |
 | `input` | Any JSON value, ≤ 8192 bytes as compact JSON | Over limit → `413 payload_too_large` |
-| `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…` with a lowercase scheme and passes the shape check (§4.2); `sha256` is 64 lowercase hex; a registered resolver must match and accept the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` that fails the shape check (no `<scheme>://`, uppercase scheme, control characters, dot / empty segments, backslash, `%2e` / `%2f` / `%5c`) → `400 invalid_request`; no matching resolver, or the resolver rejects the `uri` → `422 input_ref_unresolvable`; `uri` names another project → `422 input_ref_scope_mismatch` |
+| `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…` with a lowercase scheme and passes the shape check (§4.2); `sha256` is 64 lowercase hex; a registered resolver must match and accept the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` that fails the shape check (no `<scheme>://`, uppercase scheme, any character outside printable ASCII `0x21`–`0x7E`, `?` / `#` / `;` / `%25`, dot / empty segments including a missing project segment such as `scheme:///…`, backslash, `%2e` / `%2f` / `%5c`) → `400 invalid_request` (a missing project segment is `400`, not `422`); no matching resolver, or the resolver rejects the `uri` → `422 input_ref_unresolvable`; `uri` names another project → `422 input_ref_scope_mismatch` |
 | `budget.*` | Positive integers (≥ 1); `max_cost` is micro-USD; unknown members rejected | `400 invalid_request` |
 | `deadline` | RFC 3339 with offset, later than server time at create | `400 invalid_request` |
 | `metadata` | JSON object, ≤ 16 KiB compact JSON, ≤ 64 top-level keys | `413 payload_too_large` |
@@ -140,9 +140,14 @@ scope and server fields → `400 field_not_allowed` (§3).
 - Create checks, in order, with nothing persisted on failure. First the
   server checks the `uri` shape, before any resolver routing, and answers
   `400 invalid_request` for: no `<scheme>://`; a scheme with uppercase
-  letters; any control character or line break; an empty, `.` or `..` path
-  segment (including a trailing `/`); a backslash; or `%2e`, `%2f`, `%5c` in
-  any case. Then: no registered resolver matches →
+  letters; any character outside printable ASCII (`0x21`–`0x7E`), including
+  spaces, non-ASCII letters, line/paragraph separators (U+2028, U+2029),
+  zero-width characters and bidi controls; `?`, `#`, `;` or `%25` (any case);
+  an empty, `.` or `..` path segment (including a trailing `/` and a missing
+  project segment such as `scheme:///…`, which is `400`, not `422`); a
+  backslash; or `%2e`, `%2f`, `%5c` in any case. `?`, `#` and `;` are rejected
+  before prefix routing, so a segment such as `..?x` cannot be matched as a
+  prefix. Then: no registered resolver matches →
   `422 input_ref_unresolvable`; the resolver's create-time check (no I/O)
   rejects the `uri` → `422 input_ref_unresolvable`, or finds that it names
   another project than the caller's → `422 input_ref_scope_mismatch`. With
@@ -156,7 +161,8 @@ scope and server fields → `400 field_not_allowed` (§3).
 - The server, not the resolver, enforces the limits and checks the
   content: at most `AGENTOS_INVOCATION_INPUT_REF_MAX_BYTES` bytes (default
   65536 = 64 KiB, hard ceiling 1048576 = 1 MiB; invalid values fall back to
-  the default); a timeout of
+  the default). A 1 MiB body can be larger than the context window of the
+  model that will read it; set the cap for the model you deploy. A timeout of
   `AGENTOS_INVOCATION_INPUT_REF_TIMEOUT_MS` (default 10000, 1–60000; invalid
   values fall back to the default), cut short by the invocation `deadline`;
   the SHA-256 is computed by the server and compared with
@@ -177,10 +183,11 @@ scope and server fields → `400 field_not_allowed` (§3).
   then `<input_ref uri="…" sha256="…">` + newline + content + newline +
   `</input_ref>`; without a prompt the block alone is the prompt, so the
   prompt is never empty. The `uri` attribute is XML-escaped (`&`, `"`, `'`,
-  `<`, `>`), and every `</input_ref` in the content (any letter case) is
-  rewritten as `<\/input_ref`, so the content cannot close the block early.
-  The block goes only into the task prompt (task goal / user turn), never
-  into a system prompt.
+  `<`, `>`). In the content, every `&` becomes `&amp;` and every `<` and
+  fullwidth `＜` (U+FF1C) becomes `&lt;` (`&` first), so the content cannot
+  open or close an `input_ref` tag. The notice line and the outer tags are
+  left as written. The block goes only into the task prompt (task goal /
+  user turn), never into a system prompt.
 - **Referenced content is untrusted.** Whoever can write to the source can
   shape what the task reads; for the built-in resolver that is any actor in
   the same tenant and project. `input_ref.sha256` pins the bytes, not their
@@ -188,15 +195,25 @@ scope and server fields → `400 field_not_allowed` (§3).
   not that it is safe to follow. Treat it like user-supplied text.
 - **Built-in resolver `wao-artifact://<project_id>/<artifact-id>` (off by
   default).** It reads coding artifacts uploaded through `/api/v1/artifacts`
-  from the platform's own claims-scoped storage, and makes no outbound
+  from the server's own claims-scoped storage, and makes no outbound
   network request. `<project_id>` must equal the caller's project (otherwise
   create returns `422 input_ref_scope_mismatch`); `<artifact-id>` is the
-  lowercase hyphenated UUID returned by the upload. Any actor in the same
-  tenant and project can reference an artifact; another project or tenant
-  gets the same `input_ref_fetch_failed` as an unknown id. It is registered
-  only when `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` is truthy (`1`,
+  lowercase hyphenated UUID returned by the upload. Resolve loads metadata
+  with the caller's claims and accepts only kind `input_snapshot`; any other
+  kind is the same failure as an unknown id. The fetched bytes' SHA-256 must
+  equal both the digest stored on that metadata and the caller-pinned
+  `input_ref.sha256`. Either mismatch ends `failed` / `input_digest_mismatch`
+  with the same fixed message, which does not say which digest differed.
+  Any actor in the same tenant and project can reference an `input_snapshot`;
+  another project in the same tenant, or another tenant, gets the same
+  `input_ref_fetch_failed` as an unknown id. The resolver is registered only
+  when `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` is truthy (`1`,
   `true`, `yes`, `on`) and a blob store is configured; it is read at startup.
-  Turning it on in production is a separate decision.
+  **Leave the variable unset.** Do not enable it on a build that lacks the
+  `input_snapshot` kind check and the dual digest check. This API includes
+  both, and the switch still defaults to off. Turning it on is a separate
+  decision. Invocation execution (`AGENTOS_INVOCATION_EXECUTION_ENABLED`)
+  also stays off by default.
 - Configuration can only switch on resolvers compiled into the server; it
   never loads code. Deployments that embed the server register their own
   resolvers in code (by scheme or prefix) before startup; see

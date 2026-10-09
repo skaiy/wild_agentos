@@ -694,7 +694,7 @@ pub(crate) async fn update_config_handler(
                     emb.insert("active_dimension".into(), json!(new_dim));
                 }
             }
-            Err(e) => reload_err = Some(e),
+            Err(error) => reload_err = Some(error.to_string()),
         }
     }
 
@@ -802,16 +802,36 @@ fn vector_store_backup_name() -> String {
     )
 }
 
+/// Hot-reload failure safe to put in an HTTP body: an I/O kind, or a fixed
+/// code when opening the vector store fails. Never a path, `os error`, or
+/// the underlying display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbeddingReloadError {
+    Io(std::io::ErrorKind),
+    Open,
+}
+
+impl std::fmt::Display for EmbeddingReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(kind) => write!(f, "{kind}"),
+            Self::Open => f.write_str("open_failed"),
+        }
+    }
+}
+
 /// Embedding 配置热切换：按最新持久化配置重建 embedding 服务，原子换入新维度向量库，
 /// 并后台重建所有向量 KB 索引（从原文台账重嵌入）。免进程重启即时生效。
 /// 返回 (old_dim, new_dim, dim_changed, reindex_queued)。
 ///
 /// Reloads are serialized (one at a time per process), and each reload reads
 /// the configuration (and `config_override.json`) exactly once: the endpoint
-/// and the key it uses come from that single read (#303 review).
+/// and the key it uses come from that single read (#303 review). Failures
+/// that can name a filesystem path are logged; the returned error is only an
+/// I/O kind or `open_failed`.
 pub(crate) async fn hot_reload_embedding(
     state: &Arc<AppState>,
-) -> Result<(usize, usize, bool, usize), String> {
+) -> Result<(usize, usize, bool, usize), EmbeddingReloadError> {
     let _serialized = EMBEDDING_RELOAD_LOCK.lock().await;
     #[cfg(test)]
     let _probe = embedding_reload_probe::enter();
@@ -830,12 +850,26 @@ pub(crate) async fn hot_reload_embedding(
     // 用全新目录打开，旧库整体移为 .bak-<ts> 便于回滚，同时避免与仍被引用的旧句柄争用同一文件。
     if vdir.exists() {
         let bak = data_dir().join(vector_store_backup_name());
-        std::fs::rename(&vdir, &bak).map_err(|e| format!("轮换旧向量目录失败: {e}"))?;
+        if let Err(error) = std::fs::rename(&vdir, &bak) {
+            // The I/O error can name the data directory. Log it; the HTTP
+            // body gets only the error kind.
+            tracing::error!(error = %error, "embedding hot reload failed to rotate the vector store");
+            return Err(EmbeddingReloadError::Io(error.kind()));
+        }
         tracing::info!("embedding 热切换：旧向量库已移至 {}", bak.display());
     }
-    std::fs::create_dir_all(&vdir).map_err(|e| format!("创建向量目录失败: {e}"))?;
-    let new_store =
-        HyperspaceStore::open(&vdir, new_embed).map_err(|e| format!("打开新向量库失败: {e}"))?;
+    if let Err(error) = std::fs::create_dir_all(&vdir) {
+        tracing::error!(error = %error, "embedding hot reload failed to create the vector store directory");
+        return Err(EmbeddingReloadError::Io(error.kind()));
+    }
+    let new_store = match HyperspaceStore::open(&vdir, new_embed) {
+        Ok(store) => store,
+        Err(error) => {
+            // Open failures can include the vector store's filesystem path.
+            tracing::error!(error = %error, "embedding hot reload failed to open the vector store");
+            return Err(EmbeddingReloadError::Open);
+        }
+    };
     state.vector_store.store(Some(Arc::new(new_store)));
     tracing::info!(old_dim = ?old_dim, new_dim, dim_changed, "embedding 已热切换，向量库原子换入");
     let reindex_queued = spawn_reindex_all_vector_kbs(state.clone()).await;

@@ -37,6 +37,9 @@ pub enum ArtifactKind {
     Patch,
     RunTranscript,
     ReproduceScript,
+    /// Bytes pinned for later replay. The built-in `input_ref` resolver
+    /// accepts only this kind; every other kind is not found.
+    InputSnapshot,
 }
 
 impl ArtifactKind {
@@ -45,6 +48,7 @@ impl ArtifactKind {
             Self::Patch => "text/x-diff; charset=utf-8",
             Self::RunTranscript => "text/plain; charset=utf-8",
             Self::ReproduceScript => "text/x-shellscript; charset=utf-8",
+            Self::InputSnapshot => "application/json",
         }
     }
 
@@ -53,6 +57,7 @@ impl ArtifactKind {
             Self::Patch => "patch",
             Self::RunTranscript => "log",
             Self::ReproduceScript => "sh",
+            Self::InputSnapshot => "json",
         }
     }
 }

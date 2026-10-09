@@ -3,7 +3,9 @@
 # 20. Claims 作用域 Coding 制品
 
 Coding agent 的可重放产物经 claims-scoped artifact API 存储，支持 `patch`、
-`run_transcript` 与 `reproduce_script`。每次上传必须具有 JWT 验证的
+`run_transcript`、`reproduce_script` 与 `input_snapshot`。内置的调用
+`input_ref` 解析器只读取 `input_snapshot`，且该解析器默认关闭（见
+[29-invocations-api.zh.md](29-invocations-api.zh.md)）。每次上传必须具有 JWT 验证的
 `IsolationClaims`；开发用 `X-Identity`、API key 和匿名请求均返回 `401`。
 
 ## API
