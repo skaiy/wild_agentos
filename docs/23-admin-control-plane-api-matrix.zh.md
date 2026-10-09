@@ -72,7 +72,9 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
   没有 `project_id`、或 `project_id` 为空的已存技能暴露不可列出、不可调用、不可删除。
   再次创建只会新增一行，旧行仍留在暴露文件里。进程每次启动并加载到这些行时都会记一条
   警告；操作者通过编辑该文件删除它们。`POST /mcp` 会拒绝没有 project claim 的已验证
-  token（`403 mcp_claims_incomplete`）。
+  token（`403 mcp_claims_incomplete`）。租户准入运行记录发布者已验证的 tenant 和
+project。只有该 tenant 能暴露该 Skill。没有发布者 tenant 的运行不授权任何暴露，
+拒绝响应不含 Skill 的 description 和 input schema。
 
 ### API client id 冲突与恢复
 

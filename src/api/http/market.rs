@@ -275,6 +275,7 @@ pub(crate) async fn publish_package_handler(
     // no package is persisted if any embedded Skill fails its gate.
     for skill in &request.skills {
         let mut ctx = PipelineContext::local(PipelineSource::Market, identity.user_id.clone());
+        ctx.record_publisher(claims.tenant_id(), claims.project_id());
         ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Tenant;
         ctx.tenant_promotion_review = Some(
             crate::tools::skill_pipeline::TenantPromotionReview::completed(

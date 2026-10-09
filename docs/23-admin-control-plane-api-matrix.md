@@ -85,7 +85,10 @@ the same two gates:
   and leaves the old one in the exposure file. Each process start logs a
   warning when those rows are loaded; an operator removes them by editing
   the file. `POST /mcp` rejects a verified token with no project claim
-  (`403 mcp_claims_incomplete`).
+  (`403 mcp_claims_incomplete`). The tenant admission run records the
+  publisher's verified tenant and project. Only that tenant can expose the
+  Skill. A run with no publisher tenant authorizes none, and the refusal
+  omits the Skill description and input schema.
 
 ### API client id collisions and recovery
 

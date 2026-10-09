@@ -178,7 +178,7 @@ fn exposed_skill(
         (exposure.enabled
             && exposure_in_scope(exposure, tenant_id, project_id)
             && exposure.tool_name == tool_name
-            && is_tenant_published_skill(&exposure.skill_iri)
+            && is_tenant_published_skill(&exposure.skill_iri, tenant_id, project_id)
             && !exposure.skill_iri.starts_with("iri://"))
         .then(|| {
             state
@@ -261,7 +261,7 @@ pub(crate) async fn skill_mcp_handler(
                 .filter(|exposure| {
                     exposure.enabled
                         && exposure_in_scope(exposure, &tenant_id, &project_id)
-                        && is_tenant_published_skill(&exposure.skill_iri)
+                        && is_tenant_published_skill(&exposure.skill_iri, &tenant_id, &project_id)
                         && !exposure.skill_iri.starts_with("iri://")
                 })
                 .filter_map(|exposure| {
@@ -417,7 +417,7 @@ pub(crate) async fn upsert_skill_exposure_handler(
         )
             .into_response();
     }
-    if !is_tenant_published_skill(&request.skill_iri) {
+    if !is_tenant_published_skill(&request.skill_iri, &tenant_id, &project_id) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error": "Skill must pass the tenant publish gate before MCP exposure"})),

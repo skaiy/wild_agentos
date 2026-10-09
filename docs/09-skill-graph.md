@@ -156,7 +156,12 @@ entry through `POST /api/v1/mcp/skill-exposures`. The exposure configuration is
 scoped to the verified tenant and project and defaults to deny; `iri://`
 kernel Skills are never eligible. List, create, and delete all require a
 control-plane DA (verified JWT, explicit project, `DA`). `POST /mcp` returns
-only exposures for that same verified tenant and project. A verified token
+only exposures for that same verified tenant and project. The tenant admission
+run records the publisher's verified tenant and project. A DA can expose that
+Skill only when their verified tenant is the publisher's tenant. Another
+project in the same tenant may still create its own exposure. A run with no
+publisher tenant or project authorizes none. The refusal does not include the
+Skill description or input schema. A verified token
 with no project claim is rejected with `403` and `mcp_claims_incomplete`; a
 project whose id is the literal `default` is still valid when the claim names
 it. A stored exposure with no `project_id`, or with `project_id` empty, is

@@ -572,19 +572,37 @@ async fn isolation_contract_skill_exposure_writes_use_verified_tenant() {
     assert_ne!(stored(), before);
 }
 
-fn publish_exposed_skill(state: &AppState, iri: &str) {
+fn publish_exposed_skill(state: &AppState, iri: &str, tenant_id: &str, project_id: &str) {
+    publish_exposed_skill_meta(
+        state,
+        iri,
+        tenant_id,
+        project_id,
+        "Read weather",
+        json!({"type": "object"}),
+    );
+}
+
+fn publish_exposed_skill_meta(
+    state: &AppState,
+    iri: &str,
+    tenant_id: &str,
+    project_id: &str,
+    description: &str,
+    input_schema: Value,
+) {
     use crate::tools::skill_pipeline::{PipelineRun, PipelineSource, SkillVisibility};
     use crate::tools::skill_registry::SkillMeta;
 
     state.core.skills.register_skill(SkillMeta {
         skill_iri: iri.into(),
         name: "weather".into(),
-        description: "Read weather".into(),
+        description: description.into(),
         version: "1.0.0".into(),
         category: "weather".into(),
         security_level: "normal".into(),
         allowed_roles: vec!["DA".into()],
-        input_schema: json!({"type": "object"}),
+        input_schema,
         output_schema: json!({"type": "object"}),
         compiled_template: "{}".into(),
         signature: None,
@@ -609,6 +627,8 @@ fn publish_exposed_skill(state: &AppState, iri: &str) {
         gate_passed: true,
         published: true,
         summary: "published".into(),
+        publisher_tenant_id: Some(tenant_id.into()),
+        publisher_project_id: Some(project_id.into()),
     })
     .unwrap();
 }
@@ -629,7 +649,7 @@ async fn isolation_contract_skill_exposure_is_isolated_per_project() {
     let _env = env(dir.path(), false);
     let state = test_state(dir.path());
     let iri = "skill://acme/weather";
-    publish_exposed_skill(&state, iri);
+    publish_exposed_skill(&state, iri, "tenant-a", "project-a");
     let app = router(state);
     let da_a = token("tenant-a", &["DA"], Some("project-a"));
     let da_b = token("tenant-a", &["DA"], Some("project-b"));
@@ -798,7 +818,7 @@ async fn isolation_contract_skill_exposure_legacy_rows_fail_closed() {
     let _env = env(dir.path(), false);
     let state = test_state(dir.path());
     let iri = "skill://tenant-b/legacy";
-    publish_exposed_skill(&state, iri);
+    publish_exposed_skill(&state, iri, "tenant-b", "project-b");
     let path = dir.path().join("mcp_skill_exposures.json");
     std::fs::write(
         &path,
@@ -909,7 +929,7 @@ async fn isolation_contract_skill_exposure_mcp_rejects_defaulted_project() {
     let _env = env(dir.path(), false);
     let state = test_state(dir.path());
     let iri = "skill://acme/default-project";
-    publish_exposed_skill(&state, iri);
+    publish_exposed_skill(&state, iri, "tenant-a", "default");
     let app = router(state);
     let explicit_default = token("tenant-a", &["DA"], Some("default"));
     let defaulted = token("tenant-a", &["DA"], None);
@@ -970,7 +990,7 @@ async fn isolation_contract_skill_exposure_ignores_body_project_id() {
     let _env = env(dir.path(), false);
     let state = test_state(dir.path());
     let iri = "skill://acme/body-project";
-    publish_exposed_skill(&state, iri);
+    publish_exposed_skill(&state, iri, "tenant-a", "project-b");
     let app = router(state);
     let da_b = token("tenant-a", &["DA"], Some("project-b"));
 
@@ -1004,7 +1024,7 @@ async fn isolation_contract_skill_exposure_blank_project_id_fails_closed() {
     let _env = env(dir.path(), false);
     let state = test_state(dir.path());
     let iri = "skill://tenant-b/blank";
-    publish_exposed_skill(&state, iri);
+    publish_exposed_skill(&state, iri, "tenant-b", "project-b");
     let path = dir.path().join("mcp_skill_exposures.json");
     std::fs::write(
         &path,
@@ -1092,7 +1112,12 @@ async fn isolation_contract_skill_exposure_concurrent_creates_keep_every_row() {
     let state = test_state(dir.path());
     const N: usize = 40;
     for i in 0..N {
-        publish_exposed_skill(&state, &format!("skill://acme/parallel-{i}"));
+        publish_exposed_skill(
+            &state,
+            &format!("skill://acme/parallel-{i}"),
+            "tenant-a",
+            "project-a",
+        );
     }
     let app = router(state);
     let da = token("tenant-a", &["DA"], Some("project-a"));
@@ -1149,7 +1174,7 @@ async fn isolation_contract_skill_exposure_corrupt_file_is_not_rewritten() {
     let _env = env(dir.path(), false);
     let state = test_state(dir.path());
     let iri = "skill://acme/corrupt";
-    publish_exposed_skill(&state, iri);
+    publish_exposed_skill(&state, iri, "tenant-a", "project-a");
     let path = dir.path().join("mcp_skill_exposures.json");
     let garbage = b"[{";
     std::fs::write(&path, garbage).unwrap();
@@ -1179,6 +1204,151 @@ async fn isolation_contract_skill_exposure_corrupt_file_is_not_rewritten() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"], "skill_exposure_store_failed");
     assert_eq!(std::fs::read(&path).unwrap(), garbage);
+}
+
+/// #431: a skill published by tenant A cannot be exposed by tenant B. The
+/// rejection and tenant B's tool list omit the skill description and input schema.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_rejects_other_tenants_publish() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-a/secret-skill";
+    let description = "tenant-a classified briefing";
+    let schema = json!({"type": "object", "properties": {"classifiedCode": {"type": "string"}}});
+    publish_exposed_skill_meta(&state, iri, "tenant-a", "project-a", description, schema);
+    let app = router(state.clone());
+    let da_b = token("tenant-b", &["DA"], Some("project-b"));
+    let da_a_other_project = token("tenant-a", &["DA"], Some("project-b"));
+
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_b),
+        json!({"skill_iri": iri, "tool_name": "secret.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    assert_eq!(
+        rejected["error"],
+        "Skill must pass the tenant publish gate before MCP exposure"
+    );
+    let rejected_text = rejected.to_string();
+    assert!(!rejected_text.contains(description), "{rejected}");
+    assert!(!rejected_text.contains("classifiedCode"), "{rejected}");
+    assert!(rejected.get("description").is_none());
+    assert!(rejected.get("inputSchema").is_none());
+    assert!(exposure_rows(dir.path()).is_empty());
+
+    std::fs::write(
+        dir.path().join("mcp_skill_exposures.json"),
+        serde_json::to_string_pretty(&json!([{
+            "tenant_id": "tenant-b",
+            "project_id": "project-b",
+            "skill_iri": iri,
+            "tool_name": "secret.lookup",
+            "enabled": true
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let list_rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let (status, tools) = call(&app, Method::POST, "/mcp", Caller::Bearer(&da_b), list_rpc).await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 0);
+    let tools_text = tools.to_string();
+    assert!(!tools_text.contains(description), "{tools}");
+    assert!(!tools_text.contains("classifiedCode"), "{tools}");
+    assert!(tools.get("description").is_none());
+    assert!(tools.get("inputSchema").is_none());
+
+    let (status, called) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da_b),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "secret.lookup", "arguments": {}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{called}");
+    let called_text = called.to_string();
+    assert!(!called_text.contains(description), "{called}");
+    assert!(!called_text.contains("classifiedCode"), "{called}");
+
+    let (status, created) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_a_other_project),
+        json!({"skill_iri": iri, "tool_name": "secret.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let (status, owned) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da_a_other_project),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{owned}");
+    let owned_text = owned.to_string();
+    assert!(owned_text.contains(description), "{owned}");
+    assert!(owned_text.contains("classifiedCode"), "{owned}");
+}
+
+/// #431: an admission run with no publisher tenant authorizes no exposure.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_legacy_publish_has_no_tenant() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-a/unscoped";
+    publish_exposed_skill_meta(
+        &state,
+        iri,
+        "tenant-a",
+        "project-a",
+        "unscoped briefing",
+        json!({"type": "object", "properties": {"unscopedCode": {"type": "string"}}}),
+    );
+    let path = dir.path().join("pipeline_runs.json");
+    let mut runs: Vec<Value> =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    runs[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("publisher_tenant_id");
+    runs[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("publisher_project_id");
+    std::fs::write(&path, serde_json::to_string_pretty(&runs).unwrap()).unwrap();
+
+    let app = router(state);
+    let da = token("tenant-a", &["DA"], Some("project-a"));
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da),
+        json!({"skill_iri": iri, "tool_name": "unscoped.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    let text = rejected.to_string();
+    assert!(!text.contains("unscoped briefing"), "{rejected}");
+    assert!(!text.contains("unscopedCode"), "{rejected}");
+    assert!(exposure_rows(dir.path()).is_empty());
 }
 
 /// KB reindex: another tenant's knowledge base answers 404 (as if missing)

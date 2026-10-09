@@ -101,9 +101,21 @@ fn load_pipeline_runs_unlocked() -> std::io::Result<Vec<crate::tools::skill_pipe
 }
 
 /// A Skill is externally publishable only when its most recent admission run
-/// succeeded with tenant visibility. This makes an MCP exposure fail closed if
-/// the Skill is later replaced by session-scoped authoring or a failed rerun.
-pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
+/// succeeded with tenant visibility for this caller's verified tenant.
+///
+/// The run records the publisher's verified tenant and project. Exposure is
+/// allowed for that tenant only. Another project in the same tenant may still
+/// create its own exposure. A run with no publisher tenant or project fails
+/// closed, as does a later session-scoped or failed run.
+pub(crate) fn is_tenant_published_skill(
+    skill_iri: &str,
+    tenant_id: &str,
+    project_id: &str,
+) -> bool {
+    let tenant_id = tenant_id.trim();
+    if tenant_id.is_empty() || project_id.trim().is_empty() {
+        return false;
+    }
     let _guard = lock_pipeline_runs();
     let Ok(runs) = load_pipeline_runs_unlocked() else {
         return false;
@@ -111,10 +123,39 @@ pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
     runs.into_iter()
         .find(|run| run.skill_iri == skill_iri)
         .is_some_and(|run| {
+            let publisher_tenant = run
+                .publisher_tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let publisher_project = run
+                .publisher_project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
             run.published
                 && run.gate_passed
                 && run.visibility == crate::tools::skill_pipeline::SkillVisibility::Tenant
+                && publisher_tenant == Some(tenant_id)
+                && publisher_project.is_some()
         })
+}
+
+/// Copy an explicit verified publisher onto a pipeline context. A defaulted
+/// or missing project is left unset so the run cannot authorize exposure.
+fn record_publisher_from_identity(
+    ctx: &mut crate::tools::skill_pipeline::PipelineContext,
+    identity: &UserIdentity,
+) {
+    use crate::isolation::IsolationScopeProvenance;
+
+    let Some(claims) = identity.isolation_claims() else {
+        return;
+    };
+    if claims.provenance() != IsolationScopeProvenance::VerifiedExplicit {
+        return;
+    }
+    ctx.record_publisher(claims.tenant_id(), claims.project_id());
 }
 
 /// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。
@@ -292,7 +333,8 @@ pub(crate) async fn register_skill_handler(
     // 仅当门禁放行时 publish 回调才会真正持久化并注册技能。
     use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
     let iri = skill.skill_iri.clone();
-    let ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
+    let mut ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
+    record_publisher_from_identity(&mut ctx, &identity);
     let registry = state.core.skills.clone();
     let run = run_pipeline(
         &state.core.skills,
@@ -803,7 +845,7 @@ pub(crate) async fn import_git_skill_handler(
     // 走技能准入流水线（Git 来源）：Security/Test 阶段会对克隆目录做敏感扫描与示例夹具校验，
     // 因此流水线必须在 cleanup 清理克隆目录之前执行。
     use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
-    let ctx = PipelineContext {
+    let mut ctx = PipelineContext {
         source: PipelineSource::Git,
         triggered_by: identity.user_id.clone(),
         repo_url: Some(req.repo_url.trim().to_string()),
@@ -814,7 +856,10 @@ pub(crate) async fn import_git_skill_handler(
         // pipeline refuses system visibility and persists only after all gates.
         visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
         tenant_promotion_review: Some(TenantPromotionReview::completed(identity.user_id.clone())),
+        publisher_tenant_id: None,
+        publisher_project_id: None,
     };
+    record_publisher_from_identity(&mut ctx, &identity);
     let registry = state.core.skills.clone();
     let run = run_pipeline(
         &state.core.skills,
@@ -951,7 +996,8 @@ pub(crate) async fn pipeline_rerun_handler(
     };
 
     use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
-    let ctx = PipelineContext::local(PipelineSource::Rerun, identity.user_id.clone());
+    let mut ctx = PipelineContext::local(PipelineSource::Rerun, identity.user_id.clone());
+    record_publisher_from_identity(&mut ctx, &identity);
     let registry = state.core.skills.clone();
     let run = run_pipeline(
         &state.core.skills,
@@ -1093,6 +1139,8 @@ mod tests {
             require_package: true,
             visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
             tenant_promotion_review: Some(TenantPromotionReview::completed("reviewer:tester")),
+            publisher_tenant_id: Some("tenant-a".into()),
+            publisher_project_id: Some("project-a".into()),
         };
         let published = crate::tools::skill_pipeline::run_pipeline(
             &registry,
@@ -1101,7 +1149,15 @@ mod tests {
             Box::new(|_| Ok("published".into())),
         );
         append_pipeline_run(&published).unwrap();
-        assert!(is_tenant_published_skill(&skill.skill_iri));
+        assert!(is_tenant_published_skill(
+            &skill.skill_iri,
+            "tenant-a",
+            "project-b"
+        ));
+        assert!(
+            !is_tenant_published_skill(&skill.skill_iri, "tenant-b", "project-b"),
+            "another tenant must not inherit this publication"
+        );
 
         ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Session;
         ctx.require_package = false;
@@ -1115,7 +1171,7 @@ mod tests {
         );
         append_pipeline_run(&session_update).unwrap();
         assert!(
-            !is_tenant_published_skill(&skill.skill_iri),
+            !is_tenant_published_skill(&skill.skill_iri, "tenant-a", "project-a"),
             "a later session update must revoke external publication"
         );
 
@@ -1141,6 +1197,8 @@ mod tests {
             gate_passed: true,
             published: true,
             summary: "published".into(),
+            publisher_tenant_id: Some("tenant-a".into()),
+            publisher_project_id: Some("project-a".into()),
         }
     }
 
@@ -1188,7 +1246,11 @@ mod tests {
         std::fs::write(&path, garbage).unwrap();
         assert!(append_pipeline_run(&sample_pipeline_run(99)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), garbage);
-        assert!(!is_tenant_published_skill("skill://test/parallel-0"));
+        assert!(!is_tenant_published_skill(
+            "skill://test/parallel-0",
+            "tenant-a",
+            "project-a"
+        ));
     }
 
     // ── 纯函数单元测试 ────────────────────────────────────────────────────────

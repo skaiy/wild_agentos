@@ -166,6 +166,15 @@ pub struct PipelineRun {
     pub published: bool,
     /// 综合结论文案。
     pub summary: String,
+    /// Verified tenant of the publisher. Missing or empty on older rows, which
+    /// fail closed for MCP exposure instead of becoming visible to every tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_tenant_id: Option<String>,
+    /// Verified project of the publisher. Recorded with the tenant. Exposure
+    /// stays tenant-scoped: another project in this tenant may still create
+    /// its own exposure. A missing project fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_project_id: Option<String>,
 }
 
 /// Publication scope encoded by a Skill package manifest.
@@ -337,6 +346,10 @@ pub struct PipelineContext {
     pub visibility: SkillVisibility,
     /// Required for tenant publication, and persisted with the pipeline run.
     pub tenant_promotion_review: Option<TenantPromotionReview>,
+    /// Verified publisher scope copied onto the pipeline run. Both must be
+    /// non-empty or the run cannot authorize an MCP exposure.
+    pub publisher_tenant_id: Option<String>,
+    pub publisher_project_id: Option<String>,
 }
 
 impl PipelineContext {
@@ -351,7 +364,23 @@ impl PipelineContext {
             require_package: false,
             visibility: SkillVisibility::Session,
             tenant_promotion_review: None,
+            publisher_tenant_id: None,
+            publisher_project_id: None,
         }
+    }
+
+    /// Record the verified publisher. Empty values are dropped so a later
+    /// exposure check fails closed instead of matching a blank tenant.
+    pub fn record_publisher(&mut self, tenant_id: &str, project_id: &str) {
+        let tenant_id = tenant_id.trim();
+        let project_id = project_id.trim();
+        if tenant_id.is_empty() || project_id.is_empty() {
+            self.publisher_tenant_id = None;
+            self.publisher_project_id = None;
+            return;
+        }
+        self.publisher_tenant_id = Some(tenant_id.to_string());
+        self.publisher_project_id = Some(project_id.to_string());
     }
 
     /// 定位技能目录（clone_dir + sub_path）。
@@ -1019,6 +1048,8 @@ pub fn run_pipeline(
         gate_passed,
         published,
         summary,
+        publisher_tenant_id: ctx.publisher_tenant_id.clone(),
+        publisher_project_id: ctx.publisher_project_id.clone(),
     }
 }
 
@@ -1102,6 +1133,8 @@ mod tests {
             require_package: true,
             visibility: SkillVisibility::Tenant,
             tenant_promotion_review: Some(TenantPromotionReview::completed("reviewer:ci")),
+            publisher_tenant_id: None,
+            publisher_project_id: None,
         }
     }
 
