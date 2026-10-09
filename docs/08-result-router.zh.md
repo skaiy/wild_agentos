@@ -178,12 +178,20 @@ sequenceDiagram
   （包括同一 run 里的另一个 agent）得到的响应与调用一个从未存在的工具完全相同。
 - **图谱化。** 只有带已验证 claims 时才做，写进由这些 claims 生成的图
   （`graphify_json_for_claims`）。没有 claims 时不做图谱化，改为截断，并注册
-  `read_full_result_{call_id}` 读取器。
+  `read_full_result_{call_id}` 读取器。本次写入的每条 quad 都按 run 记在内存里，
+  其中包含 `prov/generatedByRun` 标记。run 结束时，只从 claims 图删除仅该 run
+  登记过的 quad。同一项目里另一个仍在运行的 run 也写入了相同主语、谓语和宾语时，
+  这条三元组会保留到那个 run 也结束。其他来源写入的三元组保留。记录在内存中，进程
+  崩溃后这些三元组会留下，直到没有后续逻辑把它们当成自己的写入。
 - **生命周期。** 完整结果只保存在内存中，不再写入 L0。run 结束时删除该 run 的
-  读取器和结果。另有 TTL（默认 1 小时，`AGENTOS_MICRO_TOOL_TTL_SECS`）和总量上限
-  （读取器、结果各 1024 条，超限淘汰最旧的），内存不随 run 数增长。
-- 旧版本曾把完整结果以 `iri://tool-result/{call_id}` 写入 L0。现在已没有代码读取这些条目，
-  可以等其自然过期，或由运维删除。
+  读取器和结果。另有 TTL（默认 1 小时，`AGENTOS_MICRO_TOOL_TTL_SECS`）、按租户配额
+  （读取器、结果各默认 256 条，`AGENTOS_MICRO_TOOL_TENANT_QUOTA`，硬上限 1024）和总量上限
+  （读取器、结果各 1024 条）。超过该租户配额时，只淘汰该租户最旧的条目。总量上限是兜底，
+  可能淘汰任意租户最旧的条目。
+- 旧版本曾把完整结果以 `iri://tool-result/{call_id}` 写入 L0。读取会拒绝任何不是归属 key
+  `iri://tool-result/{tenant}/{project}/{run}/{agent}/{call_id}` 的 tool-result IRI。
+  可写打开时一次性删除这些无归属条目，并且只记录删除条数。无法判断归属，因此删除而不是改派。
+  只读的历史库不会被改写；对它的读取同样拒绝该 key。
 
 ## UTF-8 安全处理
 

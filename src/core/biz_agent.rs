@@ -90,6 +90,8 @@ impl BizAgent {
         info!(agent = %self.agent_id(), role = %self.role(), "BizAgent start");
 
         let task_iri = context.task_iri.clone();
+        let has_claims = context.isolation_claims.is_some();
+        let l0 = Arc::clone(&self.runner.l0_store);
         let mut session = {
             let mut mm = self.runner.memory_manager.lock().await;
             mm.create_session_with_identity(
@@ -107,9 +109,16 @@ impl BizAgent {
             self.execute_mono(context).await
         };
 
-        {
+        let rejected = {
             let mut mm = self.runner.memory_manager.lock().await;
-            let _ = mm.finalize_session(session, &task_iri);
+            let target = if has_claims { Some(l0.as_ref()) } else { None };
+            mm.finalize_session_in(session, &task_iri, target)
+        };
+        if let Err(error) = rejected {
+            warn!(error = %error, "L0 session archive rejected");
+            self.runner
+                .report_l0_write_rejected("archive", &task_iri)
+                .await;
         }
 
         self.instance.status = AgentStatus::Completed;

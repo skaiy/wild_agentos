@@ -770,6 +770,9 @@ pub struct HttpTaskExecutor {
 impl crate::api::http::TaskExecutor for HttpTaskExecutor {
     async fn execute(&self, spec: crate::api::http::TaskExecSpec) -> crate::api::http::TaskOutcome {
         use crate::api::http::TaskOutcome;
+        // Declared before the handle clone so a panic or early return drops
+        // the clone first and then releases the idle tenant handle.
+        let _lease = self.tenant_l0.lease();
         let l0 = match self.tenant_l0.get_or_open(&spec.isolation_claims) {
             Ok(l0) => l0,
             Err(error) => {
@@ -801,7 +804,7 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             run_gateway,
             self.skills.clone(),
             self.blackboard.clone(),
-            l0,
+            Arc::clone(&l0),
             self.memory_manager.clone(),
             self.templates.clone(),
             self.scheduler.clone(),
@@ -847,32 +850,38 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
         let cancellation = spec.cancellation.clone();
         // Set only when the caller's token (not our own timeout) stopped the run.
         let mut cancelled_by_caller = false;
+        // `biased` is intentional. Branches are polled in source order, so a
+        // caller cancellation that is ready in the same turn as a result (or
+        // the timeout) wins. The run is reported as cancelled rather than
+        // completed when those two arrive together.
         let execution = if self.settings.agents.timeout_seconds > 0 {
             let timeout = std::time::Duration::from_secs(self.settings.agents.timeout_seconds);
             tokio::select! {
-                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
+                biased;
+                _ = cancellation.cancelled() => {
+                    cancelled_by_caller = true;
+                    Err(crate::CoreError::Internal {
+                        message: "task execution cancelled".to_string(),
+                    })
+                }
                 _ = tokio::time::sleep(timeout) => {
                     cancellation.cancel();
                     Err(crate::CoreError::Internal {
                         message: format!("task execution timed out after {} seconds", timeout.as_secs()),
                     })
                 }
-                _ = cancellation.cancelled() => {
-                    cancelled_by_caller = true;
-                    Err(crate::CoreError::Internal {
-                        message: "task execution cancelled".to_string(),
-                    })
-                }
+                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
             }
         } else {
             tokio::select! {
-                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
+                biased;
                 _ = cancellation.cancelled() => {
                     cancelled_by_caller = true;
                     Err(crate::CoreError::Internal {
                         message: "task execution cancelled".to_string(),
                     })
                 }
+                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
             }
         };
 
@@ -938,10 +947,27 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             }
         };
 
-        // Release this run's clone of the tenant handle, then close tenant
-        // handles no other run is still using.
+        // process_task is dropped on timeout or cancellation, so its completion
+        // hook never runs. Settle only this task's subtree here on every exit,
+        // including success (a second subtree flush is empty). Other runs' nodes
+        // stay in the shared blackboard.
+        if let Err(error) = self.scheduler.on_run_end(&spec.task_iri, l0.as_ref()) {
+            let count = crate::memory::l0_store::note_l0_write_rejected("run_end");
+            tracing::warn!(error = %error, count, "L0 run-end flush rejected");
+            self.event_bus
+                .emit(
+                    &spec.task_iri,
+                    "L0_WRITE_REJECTED",
+                    "L0",
+                    &serde_json::json!({"kind": "run_end", "count": count}).to_string(),
+                )
+                .await;
+        }
+
+        // Drop the supervisor (and its L0 clone) before the lease releases
+        // idle handles.
         drop(sa);
-        self.tenant_l0.release_idle();
+        drop(l0);
         outcome
     }
 }
@@ -1730,6 +1756,10 @@ fn clean_content(text: &str) -> String {
         cleaned
     }
 }
+
+#[cfg(test)]
+#[path = "executor_l0_test_support.rs"]
+mod executor_l0_test_support;
 
 #[cfg(test)]
 #[path = "executor_l0_completion_tests.rs"]

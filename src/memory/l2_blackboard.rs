@@ -494,9 +494,10 @@ impl Blackboard {
 
     /// Flush every dirty node in the process-wide cache into `l0_store`.
     ///
-    /// The cache is shared by all tenants, so this must only be used with a
-    /// store that is allowed to receive every cached node. Task completion
-    /// uses [`Self::flush_dirty_subtree`] instead.
+    /// The cache is shared by all tenants, so production writes must not use
+    /// this. Task completion uses [`Self::flush_dirty_subtree`]; a single L2
+    /// write uses [`Self::flush_node`].
+    #[cfg(test)]
     pub fn flush_dirty_nodes(
         &self,
         l0_store: &crate::memory::l0_store::L0Store,
@@ -532,6 +533,46 @@ impl Blackboard {
             })
             .collect();
         self.flush_nodes(dirty_iris, l0_store)
+    }
+
+    /// Flush one dirty node. Nodes that belong to other tasks stay in L2.
+    pub fn flush_node(
+        &self,
+        node_iri: &str,
+        l0_store: &crate::memory::l0_store::L0Store,
+    ) -> Result<usize, CoreError> {
+        let dirty = self
+            .node_cache
+            .get(node_iri)
+            .map(|node| node.dirty)
+            .unwrap_or(false);
+        if !dirty {
+            return Ok(0);
+        }
+        self.flush_nodes(vec![node_iri.to_string()], l0_store)
+    }
+
+    /// Remove only node IRIs this caller recorded.
+    ///
+    /// Does not scan the shared cache and does not keep or drop entries by IRI
+    /// prefix. Production task IRIs are `iri://task_<uuid>`, so a prefix sweep
+    /// of everything that does not start with `iri://task/` would delete other
+    /// in-flight runs. IRIs absent from `recorded` stay. Exact `task_tree` keys
+    /// in `recorded` are removed; every other task stays.
+    pub fn discard_recorded_nodes(&self, recorded: &[String]) -> Result<usize, CoreError> {
+        let mut removed = 0;
+        for iri in recorded {
+            if self.delete_node(iri).unwrap_or(false) {
+                removed += 1;
+            }
+        }
+        if !recorded.is_empty() {
+            let mut tree = self.task_tree.write();
+            for iri in recorded {
+                tree.remove(iri);
+            }
+        }
+        Ok(removed)
     }
 
     /// Node IRIs registered under `task_iri` and all of its sub-tasks.
