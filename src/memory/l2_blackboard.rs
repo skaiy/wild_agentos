@@ -492,19 +492,79 @@ impl Blackboard {
         }
     }
 
+    /// Flush every dirty node in the process-wide cache into `l0_store`.
+    ///
+    /// The cache is shared by all tenants, so this must only be used with a
+    /// store that is allowed to receive every cached node. Task completion
+    /// uses [`Self::flush_dirty_subtree`] instead.
     pub fn flush_dirty_nodes(
         &self,
         l0_store: &crate::memory::l0_store::L0Store,
     ) -> Result<usize, CoreError> {
-        let mut flushed = 0;
         let dirty_iris: Vec<String> = self
             .node_cache
             .iter()
             .filter(|e| e.value().dirty)
             .map(|e| e.key().clone())
             .collect();
+        self.flush_nodes(dirty_iris, l0_store)
+    }
 
-        for iri in dirty_iris {
+    /// Flush only the dirty nodes owned by `task_iri` and its sub-tasks into
+    /// `l0_store`.
+    ///
+    /// A completing run writes into its own tenant L0 handle; nodes that
+    /// belong to other tasks (and therefore possibly to other tenants) stay
+    /// dirty in L2 and are never written into this store.
+    pub fn flush_dirty_subtree(
+        &self,
+        task_iri: &str,
+        l0_store: &crate::memory::l0_store::L0Store,
+    ) -> Result<usize, CoreError> {
+        let dirty_iris: Vec<String> = self
+            .subtree_node_iris(task_iri)
+            .into_iter()
+            .filter(|iri| {
+                self.node_cache
+                    .get(iri)
+                    .map(|node| node.dirty)
+                    .unwrap_or(false)
+            })
+            .collect();
+        self.flush_nodes(dirty_iris, l0_store)
+    }
+
+    /// Node IRIs registered under `task_iri` and all of its sub-tasks.
+    fn subtree_node_iris(&self, task_iri: &str) -> Vec<String> {
+        let tree = self.task_tree.read();
+        let mut node_iris = Vec::new();
+        let mut tasks = vec![task_iri.to_string()];
+        let mut idx = 0;
+        while idx < tasks.len() {
+            if let Some(node) = tree.get(&tasks[idx]) {
+                for iri in &node.node_iris {
+                    if !node_iris.contains(iri) {
+                        node_iris.push(iri.clone());
+                    }
+                }
+                for child in &node.children {
+                    if !tasks.contains(child) {
+                        tasks.push(child.clone());
+                    }
+                }
+            }
+            idx += 1;
+        }
+        node_iris
+    }
+
+    fn flush_nodes(
+        &self,
+        iris: Vec<String>,
+        l0_store: &crate::memory::l0_store::L0Store,
+    ) -> Result<usize, CoreError> {
+        let mut flushed = 0;
+        for iri in iris {
             if let Some(mut arc_node) = self.node_cache.get_mut(&iri) {
                 let entry = crate::memory::l0_store::L0Entry {
                     iri: arc_node.iri.clone(),

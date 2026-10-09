@@ -277,6 +277,10 @@ read-only legacy 视图，不在该路径创建任何文件；无 claims 的写�
 写入仍只经 `open_for_claims`。已存在但无法打开的 `l0.redb`（零字节或损坏）会让启动失败，
 错误信息给出文件路径和处理办法；该文件不会被覆盖。
 
+任务完成时，其 L2 脏节点刷入该 run 自己的 claims-verified tenant L0 句柄，不会刷入只读的
+startup store。只刷完成任务自身子树的节点；其他 run（可能属于其他 tenant）的脏节点留在
+L2。没有可写 tenant 句柄的 run 仍 fail closed，而不是静默丢弃写入。
+
 Coding 制品的上传、列出与下载同样要求 JWT-verified claims。制品字节使用 mint 的
 `{tenant}/artifacts/` blob 前缀；用于重放的元数据写入 mint 的 claims graph。每个
 patch、运行轨迹或复现脚本以 task IRI 关联 checkpoint 执行。参见

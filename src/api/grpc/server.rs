@@ -1632,5 +1632,9 @@ fn clean_content(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "executor_l0_completion_tests.rs"]
+mod executor_l0_completion_tests;
+
+#[cfg(test)]
 #[path = "executor_l0_concurrency_tests.rs"]
 mod executor_l0_concurrency_tests;
