@@ -414,6 +414,12 @@ go through `open_for_claims`. An existing `l0.redb` that cannot be opened
 (zero bytes or corrupt) stops startup with an error that names the file and how
 to recover; the file is never overwritten.
 
+When a task completes, its dirty L2 nodes are flushed into the run's own
+claims-verified tenant L0 handle, never into the read-only startup store. Only
+the completing task's subtree is flushed; dirty nodes of other runs, which may
+belong to other tenants, stay in L2. A run without a writable tenant handle
+still fails closed instead of dropping the write.
+
 ## Graph interface
 
 Wild AgentOS graph queries remain **SPARQL 1.1** queries against Oxigraph.
