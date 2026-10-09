@@ -135,6 +135,14 @@ fn skill_iri_owners_path() -> std::path::PathBuf {
     data_dir().join("skill_iri_owners.json")
 }
 
+/// Written once, beside the owner file. Deleting the owner file does not
+/// clear it, so a later load cannot rebuild owners from truncated runs.
+pub(crate) const SKILL_IRI_OWNERS_MIGRATED_FILE: &str = "skill_iri_owners.migrated";
+
+fn owners_migration_marker_path() -> std::path::PathBuf {
+    data_dir().join(SKILL_IRI_OWNERS_MIGRATED_FILE)
+}
+
 /// Durable owner of one skill IRI. Run history is capped; this record is not.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SkillIriOwnerRecord {
@@ -220,26 +228,79 @@ fn save_owners_unlocked(owners: &HashMap<String, SkillIriOwnerRecord>) -> std::i
     super::config::write_file_atomically(&path, &bytes)
 }
 
-/// Load the owner file. A missing file is seeded from the current runs and
-/// then stored, so a later truncation cannot drop those owners. A file that
-/// will not parse is an error and is not replaced.
+fn path_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_owners_migration_marker() -> std::io::Result<()> {
+    let path = owners_migration_marker_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::config::write_file_atomically(&path, br#"{"version":1}"#)
+}
+
+fn ensure_owners_migrated() -> std::io::Result<()> {
+    if path_exists(&owners_migration_marker_path())? {
+        return Ok(());
+    }
+    write_owners_migration_marker()
+}
+
+/// Copy admission history into the owner file a single time.
+///
+/// After the marker exists, a missing owner file while `pipeline_runs.json`
+/// is still present is an error. Rebuilding from that file would trust a
+/// history that has already been truncated to the latest 200 runs.
+fn migrate_owners_from_runs(
+    runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
+    let owners = owners_from_runs(runs);
+    // A rejected request on an empty data dir must not create the owner file.
+    // A runs file with nothing to own still gets an empty owner file, so a
+    // later deletion is distinguishable from "never migrated".
+    if !owners.is_empty() || path_exists(&pipeline_runs_path())? {
+        save_owners_unlocked(&owners)?;
+    }
+    write_owners_migration_marker()?;
+    Ok(owners)
+}
+
+fn load_missing_owner_file(
+    runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
+    if path_exists(&owners_migration_marker_path())? {
+        if path_exists(&pipeline_runs_path())? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "skill owner file is missing after migration",
+            ));
+        }
+        return Ok(HashMap::new());
+    }
+    migrate_owners_from_runs(runs)
+}
+
+/// Load the owner file. The first load migrates whatever runs are still on
+/// disk and records that migration. A file that will not parse is an error
+/// and is not replaced. After migration, a missing owner file is not rebuilt
+/// from run history.
 fn load_owners_unlocked(
     runs: &[crate::tools::skill_pipeline::PipelineRun],
 ) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
     match std::fs::read_to_string(skill_iri_owners_path()) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let owners = owners_from_runs(runs);
-            if !owners.is_empty() {
-                save_owners_unlocked(&owners)?;
-            }
-            Ok(owners)
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => load_missing_owner_file(runs),
         Err(error) => Err(error),
         Ok(content) => {
             let records: Vec<SkillIriOwnerRecord> =
                 serde_json::from_str(&content).map_err(|error| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
                 })?;
+            ensure_owners_migrated()?;
             let mut owners = HashMap::new();
             for record in records {
                 owners.insert(record.skill_iri.clone(), record);
@@ -1750,6 +1811,56 @@ mod tests {
             owner["skill_iri"] == "skill://tenant-a/secret-skill"
                 && owner["tenant_id"] == "tenant-a"
         }));
+    }
+
+    /// Migration from admission history happens once. Deleting the owner file
+    /// afterwards must not rebuild it from the remaining runs.
+    #[test]
+    fn owner_file_is_not_rebuilt_after_migration() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let mut owned = sample_pipeline_run(0);
+        owned.skill_iri = "skill://tenant-a/secret-skill".into();
+        let path = pipeline_runs_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&[owned]).unwrap()).unwrap();
+        assert!(!skill_iri_owners_path().exists());
+        assert!(!owners_migration_marker_path().exists());
+
+        let migrated = admission_snapshot().unwrap();
+        assert_eq!(
+            migrated.owners["skill://tenant-a/secret-skill"].tenant_id,
+            "tenant-a"
+        );
+        assert!(owners_migration_marker_path().exists());
+
+        std::fs::remove_file(skill_iri_owners_path()).unwrap();
+        std::fs::write(&path, b"[]").unwrap();
+        assert!(admission_snapshot().is_err());
+        let mut claim = sample_pipeline_run(1);
+        claim.skill_iri = "skill://tenant-a/secret-skill".into();
+        claim.publisher_tenant_id = Some("platform".into());
+        claim.publisher_project_id = Some("ops".into());
+        assert!(append_pipeline_run(&claim).is_err());
+        assert!(!skill_iri_owners_path().exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
     }
 
     #[test]

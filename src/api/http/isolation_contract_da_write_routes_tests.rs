@@ -1335,9 +1335,15 @@ async fn isolation_contract_skill_exposure_legacy_publish_has_no_tenant() {
         .unwrap()
         .remove("publisher_project_id");
     std::fs::write(&path, serde_json::to_string_pretty(&runs).unwrap()).unwrap();
-    // Legacy history predates the owner file. Seeding from these runs must
-    // not invent an owner when the publisher tenant was never recorded.
+    // History written before the owner file existed. Drop the migrated file
+    // and its marker so this load is the one-time copy. A run with no
+    // publisher must not become an owner.
     std::fs::remove_file(dir.path().join("skill_iri_owners.json")).unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join(super::skills::SKILL_IRI_OWNERS_MIGRATED_FILE),
+    )
+    .unwrap();
 
     let app = router(state);
     let da = token("tenant-a", &["DA"], Some("project-a"));
@@ -1354,6 +1360,11 @@ async fn isolation_contract_skill_exposure_legacy_publish_has_no_tenant() {
     assert!(!text.contains("unscoped briefing"), "{rejected}");
     assert!(!text.contains("unscopedCode"), "{rejected}");
     assert!(exposure_rows(dir.path()).is_empty());
+    let owners: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("skill_iri_owners.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(owners.iter().all(|owner| owner["skill_iri"] != iri));
 }
 
 /// #431: another tenant cannot take a skill IRI by publishing it again.
@@ -1864,6 +1875,150 @@ async fn isolation_contract_import_git_rejects_foreign_skill_iri() {
         state.core.skills.get_skill(iri).unwrap().description,
         description
     );
+}
+
+/// After the one-time migration, deleting the owner file must not let an
+/// admin rebuild ownership from the truncated run history.
+#[tokio::test]
+async fn isolation_contract_deleted_owner_file_is_not_rebuilt_from_runs() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-a/secret-skill";
+    let description = "tenant-a classified briefing";
+    publish_exposed_skill_meta(
+        &state,
+        iri,
+        "tenant-a",
+        "project-a",
+        description,
+        json!({"type": "object"}),
+    );
+    assert!(dir
+        .path()
+        .join(super::skills::SKILL_IRI_OWNERS_MIGRATED_FILE)
+        .exists());
+    let runs_path = dir.path().join("pipeline_runs.json");
+    let truncated = b"[]";
+    std::fs::write(&runs_path, truncated).unwrap();
+    std::fs::remove_file(dir.path().join("skill_iri_owners.json")).unwrap();
+
+    let app = router(state.clone());
+    let platform_admin = token("platform", &[PLATFORM_ADMIN_ROLE], Some("ops"));
+    let overwrite = "platform claim";
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        Caller::Bearer(&platform_admin),
+        json!({
+            "skill_iri": iri,
+            "name": "weather",
+            "description": overwrite,
+            "version": "9.9.9",
+            "category": "weather",
+            "security_level": "normal",
+            "allowed_roles": ["DA"],
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "compiled_template": "{}"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{rejected}");
+    assert_eq!(rejected["error"], "pipeline_run_store_failed");
+    assert_eq!(
+        state.core.skills.get_skill(iri).unwrap().description,
+        description
+    );
+    assert!(!dir.path().join("skill_iri_owners.json").exists());
+    assert_eq!(std::fs::read(&runs_path).unwrap(), truncated);
+    let text = rejected.to_string();
+    assert!(!text.contains(overwrite));
+    assert!(!text.contains(description));
+}
+
+/// Register and a first market publish of the same IRI race. The registry
+/// changes only after the run is recorded, so the skill description belongs
+/// to whichever caller owns the IRI. Writing the registry first lets the
+/// loser replace that description.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn isolation_contract_register_records_the_run_before_the_registry() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let app = router(state.clone());
+    let platform_admin = token("platform", &[PLATFORM_ADMIN_ROLE], Some("ops"));
+    let da_a = token("tenant-a", &["DA"], Some("project-a"));
+
+    for index in 0..8 {
+        let iri = format!("skill://tenant-a/race-{index}");
+        let overwrite = format!("platform overwrite {index}");
+        let (registered, published) = tokio::join!(
+            call(
+                &app,
+                Method::POST,
+                "/api/v1/skills",
+                Caller::Bearer(&platform_admin),
+                json!({
+                    "skill_iri": iri,
+                    "name": "weather",
+                    "description": overwrite,
+                    "version": "1.0.0",
+                    "category": "weather",
+                    "security_level": "normal",
+                    "allowed_roles": ["DA"],
+                    "input_schema": {"type": "object"},
+                    "output_schema": {"type": "object"},
+                    "compiled_template": "{}"
+                }),
+            ),
+            call(
+                &app,
+                Method::POST,
+                "/api/v1/market/packages",
+                Caller::Bearer(&da_a),
+                json!({
+                    "name": format!("race-{index}"),
+                    "version": "1.0.0",
+                    "input_schema": {"type": "object"},
+                    "output_schema": {"type": "object"},
+                    "side_effect_level": "none",
+                    "visibility": "private",
+                    "skills": [market_skill(&iri, "tenant skill", json!({"type": "object"}))]
+                }),
+            ),
+        );
+        let register_won = registered.0 == StatusCode::CREATED;
+        let market_won = published.0 == StatusCode::CREATED;
+        assert!(
+            register_won ^ market_won,
+            "register={registered:?} market={published:?}"
+        );
+        let owners: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("skill_iri_owners.json")).unwrap(),
+        )
+        .unwrap();
+        let owner = owners
+            .iter()
+            .find(|owner| owner["skill_iri"] == iri)
+            .unwrap_or_else(|| panic!("missing owner for {iri}: {owners:?}"));
+        let stored = state.core.skills.get_skill(&iri);
+        if market_won {
+            assert_eq!(registered.0, StatusCode::CONFLICT, "{registered:?}");
+            assert_eq!(owner["tenant_id"], "tenant-a");
+            assert!(
+                stored.is_none(),
+                "register wrote the registry before the run was recorded: {stored:?}"
+            );
+        } else {
+            assert_eq!(published.0, StatusCode::CONFLICT, "{published:?}");
+            assert_eq!(owner["tenant_id"], "platform");
+            assert_eq!(stored.unwrap().description, overwrite);
+        }
+    }
 }
 
 /// KB reindex: another tenant's knowledge base answers 404 (as if missing)

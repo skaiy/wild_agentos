@@ -88,7 +88,9 @@ the same two gates:
   (`403 mcp_claims_incomplete`). The first successful admission run that
   records a publisher tenant and project owns the skill IRI. That owner is
   kept in `skill_iri_owners.json` and is not dropped when admission history
-  is truncated to 200 runs. Another tenant republishing it, including
+  is truncated to 200 runs. That copy from admission history runs once. After
+  it, a missing owner file while `pipeline_runs.json` remains is an error and
+  is not rebuilt. Another tenant republishing it, including
   `POST /api/v1/market/packages`, receives `409
   skill_iri_owned_by_another_tenant` and does not replace that owner. A
   market publish requires the `skill://` tenant segment to equal the
