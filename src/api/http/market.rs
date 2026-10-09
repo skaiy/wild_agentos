@@ -299,7 +299,9 @@ pub(crate) async fn publish_package_handler(
         }
     }
 
-    let mut runs = Vec::with_capacity(request.skills.len());
+    // Capacity is the package cap, not the request length. The length was
+    // already rejected above; using it here is an unbounded allocation.
+    let mut runs = Vec::with_capacity(MARKET_PACKAGE_SKILL_CAP);
     for skill in &request.skills {
         let mut ctx = PipelineContext::local(PipelineSource::Market, identity.user_id.clone());
         ctx.record_publisher(claims.tenant_id(), claims.project_id());
