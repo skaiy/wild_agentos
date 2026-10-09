@@ -334,14 +334,21 @@ cargo test --lib skill_package_gate_ --verbose
 ### 已发布 Skill 的 MCP 工具
 
 外部 MCP 客户端通过 `POST /mcp` 使用 JSON-RPC（`initialize`、`tools/list`、
-`tools/call`）。租户 Skill 只有在最近一次准入运行以 `visibility: tenant` 通过，
+`tools/call`）。租户 Skill 只有在 owner 自己的最新准入运行以 `visibility: tenant` 通过，
 并且 DA 通过 `POST /api/v1/mcp/skill-exposures` 明确添加记录之后才会出现。
 暴露配置按已验证的 tenant 和 project 隔离，默认拒绝；`iri://` 内核 Skill 永远不能暴露。
 列出、创建和删除都要求 control-plane DA（已验证 JWT、显式 project、`DA`）。
-`POST /mcp` 只返回同一已验证 tenant 和 project 的暴露。租户准入运行会记录发布者已验证的
-tenant 和 project。只有已验证 tenant 与发布者 tenant 相同的 DA 才能暴露该 Skill。
-同一 tenant 的其他 project 仍可自行创建暴露。没有发布者 tenant 或 project 的运行
-不授权任何暴露。拒绝响应不包含 Skill 的 description 或 input schema。没有 project claim 的已验证
+`POST /mcp` 只返回同一已验证 tenant 和 project 的暴露。第一条成功且记录了发布者
+tenant 和 project 的准入运行拥有该 skill IRI。其他 tenant 之后的运行，包括
+`POST /api/v1/market/packages`，返回 `409` 和 `skill_iri_owned_by_another_tenant`，
+不会替换 owner，也不会清空 owner 的工具列表。暴露门禁使用这个 owner：只有 owner
+自己的最新运行仍是一次通过的租户可见发布时才允许暴露，因此别人写入的更新运行
+不会移动门禁。同一 tenant 的其他 project 仍可自行创建暴露。没有发布者 tenant
+或 project 的运行不授权任何暴露；每次加载发现这类运行都会记一条警告并更新计数，
+这些行留在磁盘上。平台管理员注册的技能记录在平台 tenant 下，客户 tenant 目前
+不能暴露这些技能。`GET /api/v1/skills/pipeline-runs` 不需要鉴权，响应中不含
+`publisher_tenant_id` 和 `publisher_project_id`。拒绝响应不包含 Skill 的
+description 或 input schema。没有 project claim 的已验证
 token 会被拒绝，返回 `403` 和 `mcp_claims_incomplete`；claim 里明确写出 id 为
 `default` 的 project 仍然有效。没有 `project_id`、或 `project_id` 为空的已存记录
 不可列出、不可调用、不可更新、不可删除。再次创建只会新增一行，旧行仍留在

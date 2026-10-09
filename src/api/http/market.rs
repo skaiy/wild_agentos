@@ -23,7 +23,14 @@ use crate::{
     },
 };
 
-use super::{iam::UserIdentity, skills::append_pipeline_run, AppState};
+use super::{
+    iam::UserIdentity,
+    skills::{
+        append_pipeline_run_async, pipeline_write_response, skill_iri_blocked_for_tenant,
+        skill_iri_conflict_response,
+    },
+    AppState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -271,8 +278,20 @@ pub(crate) async fn publish_package_handler(
         return (StatusCode::CONFLICT, Json(json!({"error": "package version already exists; published versions are immutable"}))).into_response();
     }
 
+    // The first tenant that admitted a skill IRI owns it. Check every embedded
+    // skill before running the pipeline so a foreign IRI cannot replace the
+    // registered skill or be recorded under this caller.
+    for skill in &request.skills {
+        match skill_iri_blocked_for_tenant(&skill.skill_iri, claims.tenant_id()).await {
+            Ok(true) => return skill_iri_conflict_response(),
+            Ok(false) => {}
+            Err(response) => return response,
+        }
+    }
+
     // Use the same admission gate as standalone Skills. Publication is atomic:
-    // no package is persisted if any embedded Skill fails its gate.
+    // no package is persisted if any embedded Skill fails its gate or if the
+    // admission record is rejected because another tenant already owns the IRI.
     for skill in &request.skills {
         let mut ctx = PipelineContext::local(PipelineSource::Market, identity.user_id.clone());
         ctx.record_publisher(claims.tenant_id(), claims.project_id());
@@ -289,7 +308,9 @@ pub(crate) async fn publish_package_handler(
             Box::new(|_| Ok("market package admission".into())),
         );
         let permitted = run.gate_passed;
-        let _ = append_pipeline_run(&run);
+        if let Err(error) = append_pipeline_run_async(run.clone()).await {
+            return pipeline_write_response(error);
+        }
         if !permitted {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,

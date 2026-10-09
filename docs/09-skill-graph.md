@@ -150,18 +150,26 @@ cargo test --lib skill_package_gate_ --verbose
 ### Published Skill MCP tools
 
 An external MCP client uses `POST /mcp` for JSON-RPC (`initialize`,
-`tools/list`, and `tools/call`). A tenant Skill appears only after its latest
+`tools/list`, and `tools/call`). A tenant Skill appears only after the owning tenant's own latest
 admission run passed with `visibility: tenant` and a DA explicitly adds an
 entry through `POST /api/v1/mcp/skill-exposures`. The exposure configuration is
 scoped to the verified tenant and project and defaults to deny; `iri://`
 kernel Skills are never eligible. List, create, and delete all require a
 control-plane DA (verified JWT, explicit project, `DA`). `POST /mcp` returns
-only exposures for that same verified tenant and project. The tenant admission
-run records the publisher's verified tenant and project. A DA can expose that
-Skill only when their verified tenant is the publisher's tenant. Another
-project in the same tenant may still create its own exposure. A run with no
-publisher tenant or project authorizes none. The refusal does not include the
-Skill description or input schema. A verified token
+only exposures for that same verified tenant and project. The first successful admission run that records a publisher tenant and project
+owns that skill IRI. A later run by another tenant, including
+`POST /api/v1/market/packages`, is rejected with `409` and
+`skill_iri_owned_by_another_tenant` and does not replace the owner or clear
+the owner's tools. The exposure gate uses that owner. It allows an exposure
+only while the owner's own latest run is still a passing tenant-visibility
+publish, so a newer run written by someone else does not move the gate.
+Another project in the same tenant may still create its own exposure. A run
+with no publisher tenant or project authorizes none; each load that finds
+such runs logs a warning and updates a counter, and those rows stay on disk.
+Platform-admin registration is recorded under the platform tenant. A customer
+tenant cannot currently expose those skills. `GET /api/v1/skills/pipeline-runs`
+is unauthenticated and omits `publisher_tenant_id` and `publisher_project_id`.
+The refusal does not include the Skill description or input schema. A verified token
 with no project claim is rejected with `403` and `mcp_claims_incomplete`; a
 project whose id is the literal `default` is still valid when the claim names
 it. A stored exposure with no `project_id`, or with `project_id` empty, is

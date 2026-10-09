@@ -24,13 +24,18 @@ use serde_json::{json, Value};
 
 use crate::isolation::IsolationScopeProvenance;
 use crate::tools::mcp::{MCPError, MCPMessage};
+use crate::tools::skill_pipeline::PipelineRun;
 use crate::tools::skill_registry::SkillMeta;
 
 use super::iam::{AuthMethod, UserIdentity};
-use super::{data_dir, skills::is_tenant_published_skill, AppState};
+use super::{
+    data_dir,
+    skills::{is_tenant_published_skill_async, pipeline_runs_snapshot, skill_published_for_tenant},
+    AppState,
+};
 
-/// Serializes exposure read-modify-write in this process. The guard is never
-/// held across `.await`.
+/// Serializes exposure read-modify-write in this process. Taken only inside
+/// `spawn_blocking`, never on an async worker and never across `.await`.
 static EXPOSURE_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,9 +103,68 @@ fn load_exposures_unlocked() -> std::io::Result<Vec<McpSkillExposure>> {
     Ok(exposures)
 }
 
-fn load_exposures() -> Result<Vec<McpSkillExposure>, (StatusCode, Json<Value>)> {
+enum ExposureStoreFailure {
+    Io(std::io::Error),
+    ToolNameTaken,
+    NotFound,
+}
+
+fn exposure_failure_response(error: ExposureStoreFailure) -> axum::response::Response {
+    match error {
+        ExposureStoreFailure::Io(error) => exposure_store_error(error).into_response(),
+        ExposureStoreFailure::ToolNameTaken => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "tool_name is already used by another exposed Skill"})),
+        )
+            .into_response(),
+        ExposureStoreFailure::NotFound => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn run_exposure_blocking<T>(
+    job: impl FnOnce() -> Result<T, ExposureStoreFailure> + Send + 'static,
+) -> Result<T, ExposureStoreFailure>
+where
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(job).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(error = %error, "skill exposure task failed");
+            Err(ExposureStoreFailure::Io(std::io::Error::other(
+                "skill exposure task failed",
+            )))
+        }
+    }
+}
+
+/// One pipeline snapshot for every exposure in this request. The pipeline
+/// lock is released before the exposure lock is taken.
+fn load_mcp_view() -> std::io::Result<(Vec<PipelineRun>, Vec<McpSkillExposure>)> {
+    let runs = match pipeline_runs_snapshot() {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::error!(error = %error, "pipeline run store is unreadable");
+            Vec::new()
+        }
+    };
     let _guard = lock_exposure_store();
-    load_exposures_unlocked().map_err(exposure_store_error)
+    let exposures = load_exposures_unlocked()?;
+    Ok((runs, exposures))
+}
+
+async fn load_mcp_view_async(
+) -> Result<(Vec<PipelineRun>, Vec<McpSkillExposure>), (StatusCode, Json<Value>)> {
+    match tokio::task::spawn_blocking(load_mcp_view).await {
+        Ok(Ok(view)) => Ok(view),
+        Ok(Err(error)) => Err(exposure_store_error(error)),
+        Err(error) => {
+            tracing::error!(error = %error, "skill exposure reader task failed");
+            Err(exposure_store_error(std::io::Error::other(
+                "skill exposure reader failed",
+            )))
+        }
+    }
 }
 
 fn save_exposures_unlocked(exposures: &[McpSkillExposure]) -> std::io::Result<()> {
@@ -168,6 +232,7 @@ fn mcp_tool(skill: &SkillMeta, exposure: &McpSkillExposure) -> Value {
 }
 
 fn exposed_skill(
+    runs: &[PipelineRun],
     exposures: &[McpSkillExposure],
     state: &AppState,
     tenant_id: &str,
@@ -178,7 +243,7 @@ fn exposed_skill(
         (exposure.enabled
             && exposure_in_scope(exposure, tenant_id, project_id)
             && exposure.tool_name == tool_name
-            && is_tenant_published_skill(&exposure.skill_iri, tenant_id, project_id)
+            && skill_published_for_tenant(runs, &exposure.skill_iri, tenant_id, project_id)
             && !exposure.skill_iri.starts_with("iri://"))
         .then(|| {
             state
@@ -252,8 +317,8 @@ pub(crate) async fn skill_mcp_handler(
             message.id.unwrap_or(Value::Null),
         ),
         Some("tools/list") => {
-            let exposures = match load_exposures() {
-                Ok(exposures) => exposures,
+            let (runs, exposures) = match load_mcp_view_async().await {
+                Ok(view) => view,
                 Err(error) => return error.into_response(),
             };
             let tools: Vec<Value> = exposures
@@ -261,7 +326,12 @@ pub(crate) async fn skill_mcp_handler(
                 .filter(|exposure| {
                     exposure.enabled
                         && exposure_in_scope(exposure, &tenant_id, &project_id)
-                        && is_tenant_published_skill(&exposure.skill_iri, &tenant_id, &project_id)
+                        && skill_published_for_tenant(
+                            &runs,
+                            &exposure.skill_iri,
+                            &tenant_id,
+                            &project_id,
+                        )
                         && !exposure.skill_iri.starts_with("iri://")
                 })
                 .filter_map(|exposure| {
@@ -282,13 +352,18 @@ pub(crate) async fn skill_mcp_handler(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let exposures = match load_exposures() {
-                Ok(exposures) => exposures,
+            let (runs, exposures) = match load_mcp_view_async().await {
+                Ok(view) => view,
                 Err(error) => return error.into_response(),
             };
-            let Some((exposure, skill)) =
-                exposed_skill(&exposures, &state, &tenant_id, &project_id, tool_name)
-            else {
+            let Some((exposure, skill)) = exposed_skill(
+                &runs,
+                &exposures,
+                &state,
+                &tenant_id,
+                &project_id,
+                tool_name,
+            ) else {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(mcp_error(-32601, "Skill MCP tool not found", message.id)),
@@ -386,9 +461,14 @@ pub(crate) async fn list_skill_exposures_handler(identity: UserIdentity) -> impl
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
-    let exposures = match load_exposures() {
+    let exposures = match run_exposure_blocking(|| {
+        let _guard = lock_exposure_store();
+        load_exposures_unlocked().map_err(ExposureStoreFailure::Io)
+    })
+    .await
+    {
         Ok(exposures) => exposures,
-        Err(error) => return error.into_response(),
+        Err(error) => return exposure_failure_response(error),
     };
     let exposures: Vec<_> = exposures
         .into_iter()
@@ -417,7 +497,13 @@ pub(crate) async fn upsert_skill_exposure_handler(
         )
             .into_response();
     }
-    if !is_tenant_published_skill(&request.skill_iri, &tenant_id, &project_id) {
+    if !is_tenant_published_skill_async(
+        request.skill_iri.clone(),
+        tenant_id.clone(),
+        project_id.clone(),
+    )
+    .await
+    {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error": "Skill must pass the tenant publish gate before MCP exposure"})),
@@ -456,36 +542,44 @@ pub(crate) async fn upsert_skill_exposure_handler(
         tool_name: request.tool_name,
         enabled: request.enabled,
     };
-    let _guard = lock_exposure_store();
-    let mut exposures = match load_exposures_unlocked() {
-        Ok(exposures) => exposures,
-        Err(error) => return exposure_store_error(error).into_response(),
-    };
-    if let Some(existing) = exposures.iter_mut().find(|existing| {
-        exposure_in_scope(existing, &tenant_id, &project_id)
-            && existing.skill_iri == exposure.skill_iri
-    }) {
-        *existing = exposure.clone();
-    } else if exposures.iter().any(|existing| {
-        exposure_in_scope(existing, &tenant_id, &project_id)
-            && existing.tool_name == exposure.tool_name
-    }) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "tool_name is already used by another exposed Skill"})),
-        )
-            .into_response();
-    } else {
-        exposures.push(exposure.clone());
-    }
-    match save_exposures_unlocked(&exposures) {
-        Ok(()) => (
+    let write_tenant = tenant_id.clone();
+    let write_project = project_id.clone();
+    match run_exposure_blocking(move || {
+        upsert_exposure_sync(exposure, &write_tenant, &write_project)
+    })
+    .await
+    {
+        Ok(exposure) => (
             StatusCode::CREATED,
             Json(json!({"status": "ok", "exposure": exposure})),
         )
             .into_response(),
-        Err(error) => exposure_store_error(error).into_response(),
+        Err(error) => exposure_failure_response(error),
     }
+}
+
+fn upsert_exposure_sync(
+    exposure: McpSkillExposure,
+    tenant_id: &str,
+    project_id: &str,
+) -> Result<McpSkillExposure, ExposureStoreFailure> {
+    let _guard = lock_exposure_store();
+    let mut exposures = load_exposures_unlocked().map_err(ExposureStoreFailure::Io)?;
+    if let Some(existing) = exposures.iter_mut().find(|existing| {
+        exposure_in_scope(existing, tenant_id, project_id)
+            && existing.skill_iri == exposure.skill_iri
+    }) {
+        *existing = exposure.clone();
+    } else if exposures.iter().any(|existing| {
+        exposure_in_scope(existing, tenant_id, project_id)
+            && existing.tool_name == exposure.tool_name
+    }) {
+        return Err(ExposureStoreFailure::ToolNameTaken);
+    } else {
+        exposures.push(exposure.clone());
+    }
+    save_exposures_unlocked(&exposures).map_err(ExposureStoreFailure::Io)?;
+    Ok(exposure)
 }
 
 #[derive(Debug, Deserialize)]
@@ -503,23 +597,31 @@ pub(crate) async fn delete_skill_exposure_handler(
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
+    let skill_iri = query.skill_iri;
+    match run_exposure_blocking(move || delete_exposure_sync(tenant_id, project_id, skill_iri))
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => exposure_failure_response(error),
+    }
+}
+
+fn delete_exposure_sync(
+    tenant_id: String,
+    project_id: String,
+    skill_iri: String,
+) -> Result<(), ExposureStoreFailure> {
     let _guard = lock_exposure_store();
-    let mut exposures = match load_exposures_unlocked() {
-        Ok(exposures) => exposures,
-        Err(error) => return exposure_store_error(error).into_response(),
-    };
+    let mut exposures = load_exposures_unlocked().map_err(ExposureStoreFailure::Io)?;
     let before = exposures.len();
     exposures.retain(|exposure| {
-        !(exposure_in_scope(exposure, &tenant_id, &project_id)
-            && exposure.skill_iri == query.skill_iri)
+        !(exposure_in_scope(exposure, &tenant_id, &project_id) && exposure.skill_iri == skill_iri)
     });
     if exposures.len() == before {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ExposureStoreFailure::NotFound);
     }
-    match save_exposures_unlocked(&exposures) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => exposure_store_error(error).into_response(),
-    }
+    save_exposures_unlocked(&exposures).map_err(ExposureStoreFailure::Io)?;
+    Ok(())
 }
 
 #[cfg(test)]

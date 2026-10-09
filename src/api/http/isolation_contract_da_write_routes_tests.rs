@@ -1103,8 +1103,10 @@ async fn isolation_contract_skill_exposure_blank_project_id_fails_closed() {
     );
 }
 
-/// #430: concurrent creates must not drop rows.
-#[tokio::test]
+/// #430: concurrent creates must not drop rows. The multi-thread runtime is
+/// required: without the exposure lock, these workers interleave the
+/// read-modify-write and this test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn isolation_contract_skill_exposure_concurrent_creates_keep_every_row() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
@@ -1349,6 +1351,205 @@ async fn isolation_contract_skill_exposure_legacy_publish_has_no_tenant() {
     assert!(!text.contains("unscoped briefing"), "{rejected}");
     assert!(!text.contains("unscopedCode"), "{rejected}");
     assert!(exposure_rows(dir.path()).is_empty());
+}
+
+/// #431: another tenant cannot take a skill IRI by publishing it again.
+/// Market republish is rejected, exposure is rejected, and tenant A's tool
+/// list still shows the original description and input schema.
+#[tokio::test]
+async fn isolation_contract_market_republish_cannot_steal_skill_iri() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-a/secret-skill";
+    let description = "tenant-a classified briefing";
+    let schema = json!({"type": "object", "properties": {"classifiedCode": {"type": "string"}}});
+    publish_exposed_skill_meta(
+        &state,
+        iri,
+        "tenant-a",
+        "project-a",
+        description,
+        schema.clone(),
+    );
+    let app = router(state.clone());
+    let da_a = token("tenant-a", &["DA"], Some("project-a"));
+    let da_b = token("tenant-b", &["DA"], Some("project-b"));
+    let platform_admin = token("platform", &[PLATFORM_ADMIN_ROLE], Some("ops"));
+
+    let (status, created) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_a),
+        json!({"skill_iri": iri, "tool_name": "secret.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let list_rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let (status, tools) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da_a),
+        list_rpc.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    let owned_text = tools.to_string();
+    assert!(owned_text.contains(description), "{tools}");
+    assert!(owned_text.contains("classifiedCode"), "{tools}");
+
+    let stolen = json!({
+        "name": "stolen",
+        "version": "1.0.0",
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object"},
+        "side_effect_level": "none",
+        "visibility": "tenant",
+        "skills": [{
+            "skill_iri": iri,
+            "name": "weather",
+            "description": description,
+            "version": "1.0.0",
+            "category": "weather",
+            "security_level": "normal",
+            "allowed_roles": ["DA"],
+            "input_schema": schema,
+            "output_schema": {"type": "object"},
+            "compiled_template": "{}"
+        }]
+    });
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_b),
+        stolen,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["error"], "skill_iri_owned_by_another_tenant");
+    let rejected_text = rejected.to_string();
+    assert!(!rejected_text.contains(description), "{rejected}");
+    assert!(!rejected_text.contains("classifiedCode"), "{rejected}");
+    assert!(rejected.get("description").is_none());
+    assert!(rejected.get("inputSchema").is_none());
+    assert!(!dir.path().join("market_packages.json").exists());
+
+    let (status, exposure) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_b),
+        json!({"skill_iri": iri, "tool_name": "secret.lookup", "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{exposure}");
+    let exposure_text = exposure.to_string();
+    assert!(!exposure_text.contains(description), "{exposure}");
+    assert!(!exposure_text.contains("classifiedCode"), "{exposure}");
+    assert_eq!(exposure_rows(dir.path()).len(), 1);
+
+    let (status, tools) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da_a),
+        list_rpc.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 1);
+    let still_owned = tools.to_string();
+    assert!(still_owned.contains(description), "{tools}");
+    assert!(still_owned.contains("classifiedCode"), "{tools}");
+
+    let runs: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("pipeline_runs.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        runs.iter()
+            .all(|run| run["publisher_tenant_id"] != "tenant-b"),
+        "foreign republish was recorded: {runs:?}"
+    );
+
+    let (status, republished) = call(
+        &app,
+        Method::POST,
+        "/api/v1/market/packages",
+        Caller::Bearer(&da_a),
+        json!({
+            "name": "owned",
+            "version": "1.0.0",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "side_effect_level": "none",
+            "visibility": "private",
+            "skills": [{
+                "skill_iri": iri,
+                "name": "weather",
+                "description": description,
+                "version": "1.0.0",
+                "category": "weather",
+                "security_level": "normal",
+                "allowed_roles": ["DA"],
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+                "compiled_template": "{}"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{republished}");
+
+    let overwrite = "platform overwrite briefing";
+    let (status, blocked) = call(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        Caller::Bearer(&platform_admin),
+        json!({
+            "skill_iri": iri,
+            "name": "weather",
+            "description": overwrite,
+            "version": "9.9.9",
+            "category": "weather",
+            "security_level": "normal",
+            "allowed_roles": ["DA"],
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "compiled_template": "{}"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{blocked}");
+    assert_eq!(blocked["error"], "skill_iri_owned_by_another_tenant");
+    assert_eq!(
+        state.core.skills.get_skill(iri).unwrap().description,
+        description
+    );
+
+    let (status, rerun) = call(
+        &app,
+        Method::POST,
+        "/api/v1/skills/pipeline-rerun",
+        Caller::Bearer(&platform_admin),
+        json!({"skill_iri": iri}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rerun}");
+    assert_ne!(status, StatusCode::NOT_FOUND);
+
+    let (status, tools) = call(&app, Method::POST, "/mcp", Caller::Bearer(&da_a), list_rpc).await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    let final_text = tools.to_string();
+    assert!(final_text.contains(description), "{tools}");
+    assert!(final_text.contains("classifiedCode"), "{tools}");
+    assert!(!final_text.contains(overwrite), "{tools}");
 }
 
 /// KB reindex: another tenant's knowledge base answers 404 (as if missing)

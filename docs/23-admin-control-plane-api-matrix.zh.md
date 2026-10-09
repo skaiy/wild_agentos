@@ -72,9 +72,14 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
   没有 `project_id`、或 `project_id` 为空的已存技能暴露不可列出、不可调用、不可删除。
   再次创建只会新增一行，旧行仍留在暴露文件里。进程每次启动并加载到这些行时都会记一条
   警告；操作者通过编辑该文件删除它们。`POST /mcp` 会拒绝没有 project claim 的已验证
-  token（`403 mcp_claims_incomplete`）。租户准入运行记录发布者已验证的 tenant 和
-project。只有该 tenant 能暴露该 Skill。没有发布者 tenant 的运行不授权任何暴露，
-拒绝响应不含 Skill 的 description 和 input schema。
+  token（`403 mcp_claims_incomplete`）。第一条成功且记录了发布者 tenant 和 project
+  的准入运行拥有该 skill IRI。其他 tenant 再次发布（包括 `POST /api/v1/market/packages`）
+  得到 `409 skill_iri_owned_by_another_tenant`，不会替换该 owner。只有 owner 能暴露
+  该 Skill，且仅当 owner 自己的最新运行仍是一次通过的租户可见发布。没有发布者 tenant
+  的运行不授权任何暴露；加载时若发现这类运行会记一条警告并更新计数。平台管理员注册的
+  技能记录在平台 tenant 下，客户 tenant 目前不能暴露这些技能。无需鉴权的
+  `GET /api/v1/skills/pipeline-runs` 不返回发布者 tenant 和 project。拒绝响应不含
+  Skill 的 description 和 input schema。
 
 ### API client id 冲突与恢复
 

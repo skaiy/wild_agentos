@@ -85,10 +85,17 @@ the same two gates:
   and leaves the old one in the exposure file. Each process start logs a
   warning when those rows are loaded; an operator removes them by editing
   the file. `POST /mcp` rejects a verified token with no project claim
-  (`403 mcp_claims_incomplete`). The tenant admission run records the
-  publisher's verified tenant and project. Only that tenant can expose the
-  Skill. A run with no publisher tenant authorizes none, and the refusal
-  omits the Skill description and input schema.
+  (`403 mcp_claims_incomplete`). The first successful admission run that
+  records a publisher tenant and project owns the skill IRI. Another tenant
+  republishing it, including `POST /api/v1/market/packages`, receives `409
+  skill_iri_owned_by_another_tenant` and does not replace that owner. Only
+  the owner can expose the Skill, and only while that owner's own latest run
+  is still a passing tenant-visibility publish. A run with no publisher
+  tenant authorizes none; loads that find such runs log a warning and update
+  a counter. Platform-admin registration is recorded under the platform
+  tenant, and a customer tenant cannot currently expose those skills.
+  Unauthenticated `GET /api/v1/skills/pipeline-runs` omits the publisher
+  tenant and project. The refusal omits the Skill description and input schema.
 
 ### API client id collisions and recovery
 
