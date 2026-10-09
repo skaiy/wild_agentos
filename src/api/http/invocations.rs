@@ -1054,15 +1054,17 @@ pub(crate) async fn events_invocation_handler(
                             if event.task_iri != iri {
                                 continue;
                             }
-                            // Progress is not persisted; surface a lightweight hint.
-                            if event.event_type != "TASK_COMPLETED"
-                                && event.event_type != "TASK_FAILED"
-                            {
+                            // Progress is not persisted. External sources are
+                            // caller-posted display events and are not relayed
+                            // (#399). Terminal task events are not progress;
+                            // the store poll owns terminal state.
+                            if let Some(message) = invocation_progress_message(&event) {
                                 let data = json!({
                                     "invocation_id": id,
                                     "revision": last_revision,
                                     "at": chrono::Utc::now().to_rfc3339(),
-                                    "message": event.event_type,
+                                    "message": message,
+                                    "source": event.source_agent_iri,
                                 });
                                 yield Ok(Event::default()
                                     .event("progress")
@@ -1117,6 +1119,18 @@ pub(crate) async fn events_invocation_handler(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Event types relayed as invocation `progress`. `None` for terminal task
+/// events and for caller-posted `external:*` sources (#399).
+fn invocation_progress_message(event: &crate::core::event_bus::Event) -> Option<&str> {
+    if event.source_agent_iri.starts_with("external:") {
+        return None;
+    }
+    if event.event_type == "TASK_COMPLETED" || event.event_type == "TASK_FAILED" {
+        return None;
+    }
+    Some(event.event_type.as_str())
 }
 
 fn sse_event_id(revision: u64, seq: &mut u64) -> String {
@@ -1183,6 +1197,47 @@ fn sse_terminal_payload(invocation: &Invocation, seq: &mut u64) -> Option<Event>
         }
         InvocationState::Cancelled => None,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod progress_filter_tests {
+    use super::invocation_progress_message;
+    use crate::core::event_bus::{Event, EventPriority};
+
+    fn bus_event(event_type: &str, source: &str) -> Event {
+        Event {
+            event_id: "evt".into(),
+            task_iri: "iri://task/t".into(),
+            event_type: event_type.into(),
+            source_agent_iri: source.into(),
+            payload: "{}".into(),
+            payload_json_ld: String::new(),
+            timestamp: chrono::Utc::now(),
+            sequence: 1,
+            type_mask: 0,
+            priority: EventPriority::Normal,
+        }
+    }
+
+    #[test]
+    fn external_display_events_are_not_invocation_progress() {
+        assert_eq!(
+            invocation_progress_message(&bus_event("ACT_COMPLETED", "external:http:mallory")),
+            None
+        );
+        assert_eq!(
+            invocation_progress_message(&bus_event("LLM_CONTENT", "external:http:mallory")),
+            None
+        );
+        assert_eq!(
+            invocation_progress_message(&bus_event("TASK_COMPLETED", "executor")),
+            None
+        );
+        assert_eq!(
+            invocation_progress_message(&bus_event("PLAN_STARTED", "PA")),
+            Some("PLAN_STARTED")
+        );
     }
 }
 

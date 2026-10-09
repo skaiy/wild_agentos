@@ -5,6 +5,10 @@ use crate::llm::stream_types::{
     MessageDeltaEvent, MessageStartEvent, StreamEvent, Usage,
 };
 
+/// Incomplete SSE data is capped so an upstream that never sends a frame
+/// separator cannot grow the buffer without bound (#396).
+pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
@@ -16,13 +20,29 @@ impl SseParser {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, SseError> {
+        if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER_BYTES {
+            self.buffer.clear();
+            return Err(SseError(format!(
+                "SSE buffer exceeded {MAX_SSE_BUFFER_BYTES} bytes"
+            )));
+        }
         self.buffer.extend_from_slice(chunk);
+        // Mixed LF and CRLF separators in one stream must not glue two frames
+        // into a single invalid payload (#396).
+        normalize_crlf(&mut self.buffer);
         let mut events = Vec::new();
 
         while let Some(frame) = self.next_frame() {
             if let Some(event) = parse_frame(&frame)? {
                 events.push(event);
             }
+        }
+
+        if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
+            self.buffer.clear();
+            return Err(SseError(format!(
+                "SSE buffer exceeded {MAX_SSE_BUFFER_BYTES} bytes"
+            )));
         }
 
         Ok(events)
@@ -41,26 +61,62 @@ impl SseParser {
     }
 
     fn next_frame(&mut self) -> Option<String> {
-        let separator = self
+        let position = self
             .buffer
             .windows(2)
-            .position(|window| window == b"\n\n")
-            .map(|position| (position, 2))
-            .or_else(|| {
-                self.buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|position| (position, 4))
-            })?;
-
-        let (position, separator_len) = separator;
-        let frame = self
-            .buffer
-            .drain(..position + separator_len)
-            .collect::<Vec<_>>();
-        let frame_len = frame.len().saturating_sub(separator_len);
+            .position(|window| window == b"\n\n")?;
+        let frame: Vec<u8> = self.buffer.drain(..position + 2).collect();
+        let frame_len = frame.len() - 2;
         Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
     }
+}
+
+/// Turn CRLF into LF so a stream that mixes the two separators splits on `\n\n`.
+/// A trailing CR is left in place: it may be the first byte of a CRLF that the
+/// next chunk completes.
+fn normalize_crlf(buffer: &mut Vec<u8>) {
+    let limit = if buffer.last() == Some(&b'\r') {
+        buffer.len().saturating_sub(1)
+    } else {
+        buffer.len()
+    };
+    if limit == 0 {
+        return;
+    }
+    let mut read = 0;
+    let mut write = 0;
+    while read < limit {
+        if buffer[read] == b'\r' && read + 1 < limit && buffer[read + 1] == b'\n' {
+            buffer[write] = b'\n';
+            write += 1;
+            read += 2;
+            continue;
+        }
+        if write != read {
+            buffer[write] = buffer[read];
+        }
+        write += 1;
+        read += 1;
+    }
+    if write != limit {
+        let tail = buffer.len() - limit;
+        buffer.copy_within(limit.., write);
+        buffer.truncate(write + tail);
+    }
+}
+
+/// Byte-safe prefix for debug logs. Slicing at a fixed byte index panics when
+/// that index is inside a non-ASCII character (#396).
+fn sse_payload_preview(payload: &str) -> &str {
+    const MAX_BYTES: usize = 200;
+    if payload.len() <= MAX_BYTES {
+        return payload;
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !payload.is_char_boundary(end) {
+        end -= 1;
+    }
+    &payload[..end]
 }
 
 #[derive(Debug, Clone)]
@@ -112,10 +168,11 @@ pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, SseError> {
     let json: Value = match serde_json::from_str(&payload) {
         Ok(v) => v,
         Err(e) => {
+            let preview = sse_payload_preview(&payload);
             tracing::debug!(
-                "Failed to parse SSE payload as JSON: {} - payload: {}",
-                e,
-                &payload[..payload.len().min(200)]
+                error = %e,
+                payload_preview = %preview,
+                "Failed to parse SSE payload as JSON"
             );
             return Ok(None);
         }
@@ -924,5 +981,82 @@ mod tests {
     fn chat_usage_above_u32_is_no_usage() {
         let frame = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1099511627776,\"completion_tokens\":1}}\n\n";
         assert_eq!(usage_of(parse_frame(frame).unwrap()), None);
+    }
+
+    fn text_of(event: &StreamEvent) -> Option<&str> {
+        match event {
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// #396: a stream that mixes LF and CRLF frame separators must yield both
+    /// frames. Before the fix the two frames were merged and dropped.
+    #[test]
+    fn mixed_lf_and_crlf_separators_yield_both_frames() {
+        let mut parser = SseParser::new();
+        let stream = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"B\"}}]}\r\n\r\n",
+        );
+        let events = parser.push(stream.as_bytes()).unwrap();
+        assert_eq!(events.len(), 2, "mixed separators merged the frames");
+        assert_eq!(text_of(&events[0]), Some("A"));
+        assert_eq!(text_of(&events[1]), Some("B"));
+    }
+
+    /// The separator itself may be split across chunks (`\n\r` then `\n`).
+    #[test]
+    fn mixed_separator_split_across_chunks_is_not_merged() {
+        let mut parser = SseParser::new();
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\r";
+        assert!(parser.push(first).unwrap().is_empty());
+        let second = b"\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"B\"}}]}\n\n";
+        let events = parser.push(second).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(text_of(&events[0]), Some("A"));
+        assert_eq!(text_of(&events[1]), Some("B"));
+    }
+
+    /// #396: no frame separator must not grow the buffer without bound.
+    #[test]
+    fn sse_buffer_over_the_cap_fails_the_stream() {
+        let mut parser = SseParser::new();
+        let chunk = vec![b'x'; MAX_SSE_BUFFER_BYTES + 1];
+        let error = parser.push(&chunk).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded"),
+            "uncapped buffer accepted {MAX_SSE_BUFFER_BYTES} + 1 bytes: {error}"
+        );
+        assert!(
+            parser.buffer.is_empty(),
+            "a failed push must drop the buffer"
+        );
+    }
+
+    /// #396: the debug preview used to slice at byte 200 and panic when that
+    /// index sat inside a multibyte character.
+    #[test]
+    fn invalid_json_preview_does_not_panic_on_char_boundary() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut payload = "x".repeat(199);
+            payload.push('你');
+            assert!(
+                !payload.is_char_boundary(200),
+                "fixture must straddle byte 200"
+            );
+            payload.push_str(" not-json");
+            let frame = format!("data: {payload}\n\n");
+            let parsed = parse_frame(&frame).expect("preview must not panic");
+            assert!(parsed.is_none());
+        });
     }
 }

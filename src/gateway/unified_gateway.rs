@@ -578,17 +578,20 @@ impl UnifiedGateway {
                             }
                         }
                     } else {
-                        let text = resp.text().await.unwrap_or_default();
-                        // Embed a preview of the request body into the error message
-                        // for debugging 4xx errors directly from the TUI / result display.
-                        let req_body_str =
-                            serde_json::to_string_pretty(&req_body).unwrap_or_default();
-                        let req_preview: String = req_body_str.chars().take(8000).collect();
-                        warn!(status = %status, body = %text, req_preview = %req_preview, "LLM API error");
+                        // Consume the body so the connection can be reused, but do
+                        // not log it or the request: both can carry the prompt (#396).
+                        let _consumed = resp.text().await;
+                        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+                        let request_id = uuid::Uuid::new_v4().simple().to_string();
+                        warn!(
+                            status = %status,
+                            model = %model,
+                            request_id = %request_id,
+                            "LLM API error"
+                        );
                         last_error = Some(CoreError::Internal {
                             message: format!(
-                                "LLM API error ({}): {}\nrequest_preview(8k)={}",
-                                status, text, req_preview
+                                "LLM API error ({status}); model={model}; request_id={request_id}"
                             ),
                         });
                         if status.is_client_error() {
@@ -1721,6 +1724,76 @@ mod tests {
         assert_eq!(run.calls_without_usage, 1, "the non-JSON 2xx");
         assert_eq!(run.input_tokens, 12);
         assert!(!run.tokens_complete());
+        server.abort();
+    }
+
+    /// #396: a 4xx must not put the request body (the prompt) into the log or
+    /// the error. Only status, model and a request id are recorded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_error_omits_prompt_from_log_and_error() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let prompt = "SECRET_PROMPT_DO_NOT_LOG_9f3c";
+        let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let logs_for_writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || SharedWriter(logs_for_writer.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "upstream rejected the call",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let gateway = gateway_with(&base, "test-key", 0);
+        let err = gateway
+            .chat_with_model("test-model", vec![user_msg(prompt)])
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            !message.contains(prompt),
+            "error message leaked the prompt: {message}"
+        );
+        assert!(
+            !message.contains("request_preview"),
+            "error message still embeds the request body: {message}"
+        );
+        assert!(message.contains("LLM API error"), "{message}");
+        assert!(message.contains("model=test-model"), "{message}");
+        assert!(message.contains("request_id="), "{message}");
+        let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logged.contains(prompt),
+            "warn log leaked the prompt: {logged}"
+        );
+        assert!(logged.contains("request_id"), "{logged}");
+        assert!(logged.contains("test-model"), "{logged}");
+        assert!(logged.contains("400"), "{logged}");
         server.abort();
     }
 

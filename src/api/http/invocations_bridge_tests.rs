@@ -629,8 +629,8 @@ async fn forged_terminal_event_from_same_scope_member_is_rejected() {
     assert_not_closed_by_forgery(&h, &id).await;
 }
 
-/// B1 layer 1: a DA of another tenant (which `authorize_core_write` still lets
-/// through, #395) cannot post a terminal event either.
+/// B1 layer 1: a DA of another tenant cannot post a terminal event.
+/// Cross-tenant core writes are denied (#395), and `TASK_*` is reserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forged_terminal_event_from_cross_tenant_da_is_rejected() {
     let h = make_bridge_harness(MockMode::HangUntilCancel, Arc::new(ScopedProjectionGate));

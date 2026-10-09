@@ -503,10 +503,22 @@ entered the executor path).
   server when the run ends, never from task events. Events on the shared task
   event bus (including `TASK_COMPLETED` / `TASK_FAILED`) feed SSE streams only;
   other components and callers can publish there, so they never end an
-  invocation. `POST /api/v1/events` rejects every `TASK_*` event type
-  (case-insensitive) with `403 reserved_event_type` for every role, and sets
-  the event source to `external:http:<sub>` itself; a `source` member in the
-  body is ignored and dropped from the stored payload. The executor reports a terminal status: only an explicit success (`completed`, `success`,
+  invocation. `POST /api/v1/events` accepts only `CUSTOM` and types that start
+  with `EXT_`. Every other type is `403`: `TASK_*` (case-insensitive) is
+  `reserved_event_type`, and the rest — including `BATCH_*` and run-control
+  types — is `event_type_not_allowed`. Run-control events are posted on
+  dedicated routes (`POST /api/v1/control-events/intervention-required`,
+  `.../user-supplementary-input`, `.../human-approval-result`,
+  `.../threshold-exceeded`, `.../cycle-iteration`) and only by the task
+  `user_id` or a DA in the task's tenant and project; a missing or
+  out-of-scope task is `404`, and a same-scope non-owner is `403`. The server
+  sets the source to `external:http:<sub>`; a `source` member in the body is
+  ignored and dropped from the stored payload. Task console SSE and invocation
+  `progress` events drop any bus event whose source starts with `external:`,
+  so a caller cannot change the displayed phase or inject display text.
+  `GET /api/v1/batch/events` delivers a `BATCH_*` event only when its task
+  node — or, if that node is absent, `tenant_id` and `project_id` on the
+  payload — matches the subscriber's verified tenant and project. The executor reports a terminal status: only an explicit success (`completed`, `success`,
   `succeeded`) can become `succeeded`; any other status (for example `timeout`
   or `partial_failure`) ends `failed` / `task_failed`, with the actual usage
   attached. A lagging SSE subscriber receives a `resync` event and should
@@ -540,7 +552,7 @@ entered the executor path).
 | `event` | When | Extra `data` members |
 | --- | --- | --- |
 | `state` | First event (snapshot), then every state transition | `state`, `previous_state` (null in the snapshot), `snapshot` (true only on the first event), `invocation` (full resource, snapshot only) |
-| `progress` | Execution progress; not persisted, `revision` unchanged | `phase` (optional), `message` (optional, safe text) |
+| `progress` | Execution progress; not persisted, `revision` unchanged. Events whose source starts with `external:` are not sent | `phase` (optional), `message` (optional, safe text), `source` |
 | `result` | Once, on `succeeded` | `state`, `result` (with `usage`) |
 | `error` | Once, on `failed` | `state`, `error` (`{code, message}`), `usage` (optional) |
 | `resync` | Subscriber lagged and events were dropped | none; re-read the resource |
