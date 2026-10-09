@@ -292,7 +292,9 @@ pub(crate) async fn publish_package_handler(
     // Check every embedded skill before running the pipeline. A later 409
     // must not leave earlier skills from this package in the admission file.
     for skill in &request.skills {
-        if let Err(response) = reject_skill_iri_write(&skill.skill_iri, claims.tenant_id()).await {
+        if let Err(response) =
+            reject_skill_iri_write(&skill.skill_iri, claims.tenant_id(), true).await
+        {
             return response;
         }
     }

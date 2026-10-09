@@ -75,8 +75,9 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
   token（`403 mcp_claims_incomplete`）。第一条成功且记录了发布者 tenant 和 project
   的准入运行拥有该 skill IRI。该 owner 保存在 `skill_iri_owners.json`，准入历史截断到
   200 条时不会丢掉。其他 tenant 再次发布（包括 `POST /api/v1/market/packages`）
-  得到 `409 skill_iri_owned_by_another_tenant`，不会替换该 owner。`skill://` 的 tenant
-  段必须等于发布者已验证的 tenant。一个市场包最多 32 个技能，任一技能未通过则这个包
+  得到 `409 skill_iri_owned_by_another_tenant`，不会替换该 owner。市场发布要求
+  `skill://` 的 tenant 段等于发布者已验证的 tenant。平台管理员注册可以使用其他段，
+  该 IRI 仍归平台 tenant 所有。一个市场包最多 32 个技能，任一技能未通过则这个包
   的运行记录都不写入。只有 owner 能暴露该 Skill，且仅当 owner 自己的最新准入仍是一次
   通过的租户可见发布。没有发布者 tenant 的运行不授权任何暴露。一个进程里第一次加载
   发现这类运行时记一条警告并更新计数。平台管理员注册的

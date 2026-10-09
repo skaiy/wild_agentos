@@ -342,8 +342,9 @@ cargo test --lib skill_package_gate_ --verbose
 tenant 和 project 的准入运行拥有该 skill IRI。owner 存在 `skill_iri_owners.json`，
 准入历史截断到最近 200 条时不会删掉它。其他 tenant 之后的运行，包括
 `POST /api/v1/market/packages`，返回 `409` 和 `skill_iri_owned_by_another_tenant`，
-不会替换 owner，也不会清空 owner 的工具列表。`skill://` 的 tenant 段必须等于
-发布者已验证的 tenant，因此一个 tenant 不能预先占用另一个 tenant 的命名空间。
+不会替换 owner，也不会清空 owner 的工具列表。市场发布要求 `skill://` 的 tenant 段等于发布者已验证的 tenant，因此一个
+tenant 不能预先占用另一个 tenant 的命名空间。平台管理员注册可以使用其他段；
+该准入仍由平台 tenant 拥有。
 一个市场包最多包含 32 个技能，并且只有每个嵌入技能都通过后才写入；发生冲突时
 这个包的运行记录一条都不写。暴露门禁使用这份 owner 记录：只有 owner 自己的最新
 准入仍是一次通过的租户可见发布时才允许暴露。同一 tenant 的其他 project 仍可自行

@@ -161,9 +161,10 @@ owns that skill IRI. The owner is stored in `skill_iri_owners.json` and is
 not removed when admission history is truncated to the latest 200 runs. A
 later run by another tenant, including `POST /api/v1/market/packages`, is
 rejected with `409` and `skill_iri_owned_by_another_tenant` and does not
-replace the owner or clear the owner's tools. The `skill://` tenant segment
-must equal the publisher's verified tenant, so one tenant cannot pre-claim
-another's namespace. One market package contains at most 32 skills and is
+replace the owner or clear the owner's tools. A market publish requires the `skill://` tenant segment to equal the
+publisher's verified tenant, so one tenant cannot pre-claim another's
+namespace. Platform-admin registration may use another segment; that
+admission is still owned by the platform tenant. One market package contains at most 32 skills and is
 written only after every embedded skill passes; a conflict writes none of
 that package's runs. The exposure gate uses the stored owner. It allows an
 exposure only while that owner's own latest admission is still a passing

@@ -381,13 +381,21 @@ pub(crate) fn skill_iri_mismatch_response() -> axum::response::Response {
 
 /// Ownership wins over the namespace check, so a foreign republish of an
 /// owned IRI is 409. An unowned IRI outside the caller's namespace is 403.
+///
+/// Platform-admin register, import, and rerun pass `require_tenant_segment:
+/// false`. Those routes already require the platform tenant, and they register
+/// product namespaces such as `skill://battery/...`. The run is still owned by
+/// the platform tenant, so a customer tenant cannot republish or expose it.
+/// Market publish passes `true`: a customer tenant cannot pre-claim
+/// `skill://other-tenant/...`.
 pub(crate) async fn reject_skill_iri_write(
     skill_iri: &str,
     tenant_id: &str,
+    require_tenant_segment: bool,
 ) -> Result<(), axum::response::Response> {
     match skill_iri_blocked_for_tenant(skill_iri, tenant_id).await? {
         true => Err(skill_iri_conflict_response()),
-        false if !skill_iri_matches_publisher(skill_iri, tenant_id) => {
+        false if require_tenant_segment && !skill_iri_matches_publisher(skill_iri, tenant_id) => {
             Err(skill_iri_mismatch_response())
         }
         false => Ok(()),
@@ -700,7 +708,7 @@ pub(crate) async fn register_skill_handler(
     let mut ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
     record_publisher_from_identity(&mut ctx, &identity);
     let publisher = verified_publisher_tenant(&identity);
-    if let Err(response) = reject_skill_iri_write(&iri, &publisher).await {
+    if let Err(response) = reject_skill_iri_write(&iri, &publisher, false).await {
         return response;
     }
     // Claim the owner record before touching the registry. A losing racer
@@ -993,7 +1001,7 @@ pub(crate) async fn import_git_skill_handler(
         .filter(|skill_iri| !skill_iri.is_empty())
     {
         if let Err(response) =
-            reject_skill_iri_write(skill_iri, &verified_publisher_tenant(&identity)).await
+            reject_skill_iri_write(skill_iri, &verified_publisher_tenant(&identity), false).await
         {
             return response;
         }
@@ -1247,7 +1255,7 @@ pub(crate) async fn import_git_skill_handler(
     };
     record_publisher_from_identity(&mut ctx, &identity);
     if let Err(response) =
-        reject_skill_iri_write(&skill_iri, &verified_publisher_tenant(&identity)).await
+        reject_skill_iri_write(&skill_iri, &verified_publisher_tenant(&identity), false).await
     {
         cleanup(&clone_dir);
         return response;
@@ -1378,7 +1386,7 @@ pub(crate) async fn pipeline_rerun_handler(
             .into_response();
     }
     if let Err(response) =
-        reject_skill_iri_write(&req.skill_iri, &verified_publisher_tenant(&identity)).await
+        reject_skill_iri_write(&req.skill_iri, &verified_publisher_tenant(&identity), false).await
     {
         return response;
     }

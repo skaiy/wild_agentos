@@ -90,8 +90,10 @@ the same two gates:
   kept in `skill_iri_owners.json` and is not dropped when admission history
   is truncated to 200 runs. Another tenant republishing it, including
   `POST /api/v1/market/packages`, receives `409
-  skill_iri_owned_by_another_tenant` and does not replace that owner. The
-  `skill://` tenant segment must equal the publisher's verified tenant. A
+  skill_iri_owned_by_another_tenant` and does not replace that owner. A
+  market publish requires the `skill://` tenant segment to equal the
+  publisher's verified tenant. Platform-admin registration may use another
+  segment and still owns the IRI under the platform tenant. A
   market package holds at most 32 skills and writes no runs unless every
   embedded skill passes. Only the owner can expose the Skill, and only while
   that owner's own latest admission is still a passing tenant-visibility
