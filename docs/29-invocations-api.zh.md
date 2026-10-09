@@ -39,7 +39,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 {
   "prompt": "…",                 // 没有 `input` 和 `input_ref` 时必填
   "agent_id": "…",               // 可选，服务端的 agent 定义（§4.1）
-  "agent_revision": "…",         // 可选，精确钉住该定义的修订；需同时带 agent_id
+  "agent_revision": "…",         // 保留字段；当前不支持，带任何值 → 422（§4.3）
   "input": { … },                // 可选，内联 JSON，序列化后 ≤ 8192 字节
   "input_ref": {                 // 可选，不可变引用；与 `input` 互斥
     "uri": "<scheme>://…",       // scheme 选择已注册的解析器（§4.2）
@@ -58,7 +58,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | 字段 | 规则 | 错误 |
 | --- | --- | --- |
 | `prompt` / `input` / `input_ref` | 至少出现一个 | `400 invalid_request` |
-| `agent_revision` | 必须等于 `agent_id` 当前修订；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析 | agent 定义修订（[#317](https://github.com/skaiy/wild_agentos/issues/317)）落地之前：带任何值 → `422 agent_revision_unsupported`。#317 之后：不一致 → `409 agent_revision_mismatch`。浮动词或缺 `agent_id` → `400 invalid_request` |
+| `agent_revision` | 当前版本不支持（§4.3）。仍做格式检查：需同时带 `agent_id`；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析 | 浮动词或缺 `agent_id` → `400 invalid_request`；其余任何值 → `422 agent_revision_unsupported`（在 `agent_id` 检查之后，所以 `agent_id` 不存在时先返回 `422 agent_not_found`） |
 | `input` | 任意 JSON 值，紧凑序列化 ≤ 8192 字节 | 超限 → `413 payload_too_large` |
 | `input_ref` | `uri` 与 `sha256` 都必填；`uri` 形如 `<scheme>://…`，scheme 小写，并通过形状检查（§4.2）；`sha256` 为 64 位小写十六进制；必须有已注册的解析器匹配并接受该 `uri`（§4.2） | 同时带 `input` 和 `input_ref`，或 `uri` 未通过形状检查（没有 `<scheme>://`、scheme 含大写、含控制字符、有点段或空段、含反斜杠、含 `%2e` / `%2f` / `%5c`）→ `400 invalid_request`；没有匹配的解析器，或解析器不接受该 `uri` → `422 input_ref_unresolvable`；`uri` 指向别的项目 → `422 input_ref_scope_mismatch` |
 | `budget.*` | 正整数（≥ 1）；`max_cost` 单位为微美元；未知成员拒绝 | `400 invalid_request` |
@@ -67,7 +67,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | 整个请求体 | ≤ 64 KiB | `413 payload_too_large` |
 
 - `agent_id` 在调用方 scope 内找不到对应定义 → `422 agent_not_found`，不存在的 id 与其他 scope 的 id 返回相同。
-- 当前 `main` 上的 agent 定义没有修订号。在 #317 补上定义修订之前，凡是带 `agent_revision` 的创建一律返回 `422 agent_revision_unsupported`，不持久化任何东西。这个字段绝不会被静默忽略，调用方不会误以为钉住了一个服务端根本没校验的修订。
+- agent 定义没有修订号，凡是带 `agent_revision` 的创建一律返回 `422 agent_revision_unsupported`，不持久化任何东西。这个字段绝不会被静默忽略，调用方不会误以为钉住了一个服务端根本没校验的修订。见 §4.3。
 - `input_ref` 的内容只由执行桥用创建者的 claims 拉取；SHA-256 由服务端自己核对，不一致时调用以 `failed` 结束，`error.code = "input_digest_mismatch"`（§4.2）。取到的文本和 prompt 一起交给任务。
 - 触达预算上限时停止执行，调用以 `failed` 结束，`error.code = "budget_exceeded"`。
 - 到达 `deadline` 时停止执行，调用以 `failed` 结束，`error.code = "deadline_exceeded"`。仍在 `queued` 的调用同样处理：`queued → failed` 是条件边，只有到期（`error.code = "deadline_exceeded"`）才能走；其他原因的 `queued → failed` 请求一律 `409 illegal_transition`。
@@ -77,11 +77,10 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 ### 4.1 Agent 目标与拓扑
 
 - `agent_id` 指向调用方 tenant/project scope 内的一个服务端 agent 定义。它可以是编排型定义，即由 Supervisor Agent 按多 agent 计划执行（拆解、运行子 agent、汇总）的定义，不限于单个 agent。
-- 拓扑（单 agent 还是编排计划、子 agent 上限、是否并行）是服务端定义的属性。`agent_revision` 钉住定义，也就钉住了拓扑；调用方不能在请求里选择或覆盖拓扑。请求体里的 `topology` 等字段属于未知字段 → `400 invalid_request`。
-- 不带 `agent_id` 时走服务端默认执行路径。
+- 拓扑（单 agent 还是编排计划、子 agent 上限、是否并行）是服务端定义的属性；调用方不能在请求里选择或覆盖拓扑。请求体里的 `topology` 等字段属于未知字段 → `400 invalid_request`。
+- 当前版本只在创建时检查 `agent_id`（必须是调用方 scope 内的定义）。执行桥还不读取 agent 定义：无论带不带 `agent_id`，调用都走服务端默认执行路径。
 - `agent_id` 填 agent 注册接口返回的服务端生成 UUID；注册时调用方不能自己指定 id。
-- 编排型 agent 的注册字段和拓扑归 [#317](https://github.com/skaiy/wild_agentos/issues/317)。
-- 让编排型定义可以按 id 和修订寻址，属于执行桥（[#317](https://github.com/skaiy/wild_agentos/issues/317)）的工作。在那之前，存储的定义既没有修订也没有拓扑，见 §11。
+- 存储的定义既没有修订也没有拓扑。编排型 agent 的注册字段和拓扑，以及按调用指定的定义去执行，都是以后的工作，见 §4.3 和 §11。
 
 ### 4.2 `input_ref` 解析器
 
@@ -94,6 +93,13 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 - **引用内容不可信。** 能写数据源的人就能左右任务读到什么；对内置解析器来说，同一租户、同一项目内的任何 actor 都能写。`input_ref.sha256` 只固定字节，管不了内容意图：摘要一致只能证明内容就是调用方选定的那份，不能证明照着做是安全的。请把它当作用户提供的文本对待。
 - **内置解析器 `wao-artifact://<project_id>/<artifact-id>`（默认关）。** 它从平台自己的、按 claims 隔离的存储里读取通过 `/api/v1/artifacts` 上传的制品，不发起任何对外网络请求。`<project_id>` 必须等于调用方的项目（否则创建返回 `422 input_ref_scope_mismatch`）；`<artifact-id>` 是上传接口返回的小写带连字符 UUID。同一租户、同一项目内的任何 actor 都能引用；别的项目或租户拿到的结果与 id 不存在相同，都是 `input_ref_fetch_failed`。只有 `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` 为真值（`1`、`true`、`yes`、`on`）且配置了 blob 存储时才注册；启动时读取。生产环境是否开启另行决定。
 - 配置只能开启已编译进服务端的解析器，不会加载任何代码。嵌入本服务的部署方在启动前用代码按 scheme 或前缀注册自己的解析器，见 `src/api/http/invocations_input_ref.rs`。在注册解析器或开启内置解析器之前，首批集成应使用内联 `input`（≤ 8192 字节）。
+
+### 4.3 不支持 `agent_revision`
+
+- agent 定义存储时没有修订号：更新是原地覆盖（只改 `updated_at`），不保留旧版本；删除就直接删掉。钉住无从匹配；而且执行桥不读取定义（§4.1），钉住了也改变不了实际执行的内容。
+- 因此凡是带 `agent_revision` 的创建一律返回 `422 agent_revision_unsupported`，不持久化任何东西。这是当前版本的既定行为，不是临时故障。请不要传这个字段；不传即使用当前定义。
+- 服务端不会出现"校验了一个修订、实际却跑另一个"的情况：没有"只在提交时校验"的模式，也不会返回 `409 agent_revision_mismatch`。
+- 真正的钉住需要给定义保存不可变的逐版本快照，并让执行路径按钉住的快照运行。这计划作为单独的里程碑；落地之前，本节就是契约。需要 agent 行为可复现的集成，不要假定 `agent_revision` 会生效再切换。
 
 ## 5. 资源（草案）
 
@@ -230,7 +236,7 @@ queued ──► running ──► succeeded
 - 创建成功（且不是幂等重放）后，服务端按 §7.3 运行中上限准入（或保持 `queued`），再用调用方 claims 建任务，交给现有 `TaskExecutor` 执行。执行与 HTTP 连接解耦。
 - `request.budget` 在执行路径上强制：已计量 usage 超过任一给出的 `max_tokens` / `max_tool_calls` / `max_cost`（micro-USD）时，调用以 `failed` / `budget_exceeded` 结束，并尽量带回 `result.usage`。落到 `succeeded` 仍须完整 usage（VAL-016）。
 - `input_ref` 使用可插拔的解析器注册表（按前缀或 scheme，§4.2）。默认什么都没注册（创建 → `422 input_ref_unresolvable`），内置的 `wao-artifact://` 解析器默认关。匹配的解析器在执行路径用创建者的 claims 拉取字节，超时和大小上限由服务端强制；服务端核对 SHA-256 后把文本和 prompt 一起交给任务。取数失败 → `failed` / `input_ref_fetch_failed`，SHA-256 不符 → `failed` / `input_digest_mismatch`，两者都是固定文案。不提供默认外网 resolver。
-- `agent_revision`：在仓库内尚无 agent 定义修订字段前，创建仍返回 `422 agent_revision_unsupported`（不得静默忽略；不假装已 pin）。
+- 不支持 `agent_revision`：创建返回 `422 agent_revision_unsupported`（不得静默忽略；不假装已 pin），执行也不读取 agent 定义（§4.1、§4.3）。
 - 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
 - 每次运行都计量，用量随终态迁移写入 `result.usage`。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。
 - 执行受配置开关控制，默认**关闭**（`AGENTOS_INVOCATION_EXECUTION_ENABLED`）。生产仅在明确启用 TaskExecutor 桥时打开。桥运行时强制投影按 scope 绑定（#310/#322）与 VAL-PROJ-CTX fail-closed（缺 claims / 空投影 → `failed` / `projection_context_missing`）。
@@ -273,9 +279,9 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 | 401 | `verified_isolation_claims_required` | 没有已校验 claims |
 | 403 | `claims_incomplete`、`cancel_not_permitted` | project 为默认值（body 可带 `missing_field`）；既不是创建者也不是 DA 的 actor 发起取消 |
 | 404 | `not_found` | id 不存在或属于其他 scope（body 相同） |
-| 409 | `idempotency_key_conflict`、`idempotency_key_in_progress`、`revision_conflict`、`illegal_transition`、`agent_revision_mismatch` | 见 §4、§6、§7；`revision_conflict` 的 body 可带 `current_revision` |
+| 409 | `idempotency_key_conflict`、`idempotency_key_in_progress`、`revision_conflict`、`illegal_transition` | 见 §6、§7；`revision_conflict` 的 body 可带 `current_revision`。不会返回 `agent_revision_mismatch`（§4.3） |
 | 413 | `payload_too_large` | 请求体 > 64 KiB、`input` > 8192 字节或 `metadata` > 16 KiB / 64 个键 |
-| 422 | `input_ref_unresolvable`、`input_ref_scope_mismatch`、`agent_not_found`、`agent_revision_unsupported` | 没有已注册的解析器匹配或接受 `input_ref.uri`；`input_ref.uri` 指向调用方之外的项目；`agent_id` 在 scope 内不存在；agent 定义修订（#317）落地前请求带了 `agent_revision`（§4） |
+| 422 | `input_ref_unresolvable`、`input_ref_scope_mismatch`、`agent_not_found`、`agent_revision_unsupported` | 没有已注册的解析器匹配或接受 `input_ref.uri`；`input_ref.uri` 指向调用方之外的项目；`agent_id` 在 scope 内不存在；请求带了 `agent_revision`（不支持，§4.3） |
 | 429 | `too_many_active` | 达到 scope 内活跃调用上限（§7.2）；带 `Retry-After: 5` |
 | 500 | `persistence_failed` | 存储写入失败，状态未改变 |
 | 503 | `execution_disabled`、`invocation_store_full`、`invocation_store_unavailable` | 执行开关关闭（§8）；保留期清理后存储仍满（§7.1）；调用存储未配置或不可用 |
@@ -289,17 +295,17 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 - v0.12.0 不接受 API client key 作为凭证。
 - 现有 `/api/v1/tasks*` 和 OpenAI 兼容路由不变。
 - 仓库内不提供对外取数的 `input_ref` 解析器（S3、HTTP 等）；唯一的内置解析器读取平台制品，且默认关（§4.2）。
-- 只钉住 agent 定义（`agent_revision`）。provider、model、工具、策略和上下文的修订在 v0.12.0 有意不在服务端钉住，以后可另开 follow-up。
+- v0.12.0 服务端不做任何钉住：`agent_revision` 会被拒绝（§4.3），provider、model、工具、策略和上下文的修订也不钉住。以后可另开 follow-up。
 - `usage` 不含合作方或来源归因。
 
 ## 11. 集成方前提
 
-- **精确钉住 agent 和以编排型 agent 为目标，都依赖 [#317](https://github.com/skaiy/wild_agentos/issues/317)。** 两者都需要 agent 定义修订和存储在定义上的拓扑，这由 #317 补上。#317 之前，`agent_revision` 返回 `422 agent_revision_unsupported`（§4），编排计划也不能作为存储的定义来寻址（§4.1）。依赖其中任一项的集成应等 #317 合入后再切换。
+- **精确钉住 agent 和以编排型 agent 为目标，目前都不可用。** 两者都需要 agent 定义修订和存储在定义上的拓扑，目前都还没有。`agent_revision` 返回 `422 agent_revision_unsupported`（§4.3），`agent_id` 不改变实际执行的内容（§4.1），编排计划也不能作为存储的定义来寻址。依赖其中任一项的集成，在后续里程碑落地前不要切换。
 - **执行开关。** 执行默认关闭，在 [#317](https://github.com/skaiy/wild_agentos/issues/317) 执行桥落地前生产环境保持关闭；在此之前创建返回 `503 execution_disabled`（§8）。投影按 scope 绑定（#310/#322）已在 main。
 - **输入。** 默认没有注册任何 `input_ref` 解析器；除非部署方注册了解析器或开启了内置的 `wao-artifact://`，请使用内联 `input`（≤ 8192 字节）（§4.2）。
 - **幂等依赖 [#315](https://github.com/skaiy/wild_agentos/issues/315)。** #315 之前，带 `Idempotency-Key` 的创建请求返回 `400 idempotency_unsupported`（临时码），而不是静默忽略该 key。依赖幂等重试的集成应等 #315 合入。
 - **切换前提：** #315 + #317（投影按 scope 绑定 #310/#322 已在 main）。
-- **Agent id。** `agent_id` 使用 agent 注册接口返回的服务端生成 UUID，注册时不能自指定 id。编排型 agent 的注册字段和拓扑随 #317 提供（§4.1）。
+- **Agent id。** `agent_id` 使用 agent 注册接口返回的服务端生成 UUID，注册时不能自指定 id。编排型 agent 的注册字段和拓扑是以后的工作（§4.1）。
 - **已知不一致（agent 注册）。** `POST /api/v1/agents` 仍接受 project 为默认补全值的令牌。用这种令牌注册的 agent 会落到 `default` project。**同一张 defaulted 令牌**访问任意 `/v1/invocations` 路由一律返回 **`403 claims_incomplete`**（body 可带 `missing_field: "project_id"`）。换成带显式 project 的令牌后再查那个落在 `default` 的 agent，会得到 **`422 agent_not_found`**。注册 agent 时请直接使用带显式 project 的令牌。
 
 ## 12. 文档与矩阵收尾（#318）
