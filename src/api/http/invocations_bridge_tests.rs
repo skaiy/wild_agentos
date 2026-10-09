@@ -630,14 +630,15 @@ async fn forged_terminal_event_from_same_scope_member_is_rejected() {
 }
 
 /// B1 layer 1: a DA of another tenant cannot post a terminal event.
-/// Cross-tenant core writes are denied (#395), and `TASK_*` is reserved.
+/// Out-of-scope core writes return the same 404 as a missing task (#395),
+/// so the reserved `TASK_*` check is never reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forged_terminal_event_from_cross_tenant_da_is_rejected() {
     let h = make_bridge_harness(MockMode::HangUntilCancel, Arc::new(ScopedProjectionGate));
     let (id, task_iri) = running_invocation(&h).await;
     let mallory = super::tests::token("mallory", "tenant-b", Some("project-z"), &["DA"]);
     let status = post_event(&h, &mallory, forged_terminal_body(&task_iri)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_not_closed_by_forgery(&h, &id).await;
 }
 

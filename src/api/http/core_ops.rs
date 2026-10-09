@@ -1181,21 +1181,21 @@ mod tests {
         };
         let mut rx = state.core.events.subscribe();
 
+        let reserved_types = [
+            "TASK_COMPLETED",
+            "TASK_FAILED",
+            "TASK_STARTED",
+            "TASK_CREATED",
+            "TASK_CANCELLED",
+            "task_completed",
+            " TASK_COMPLETED ",
+            "Task_Failed",
+        ];
         for token in [
             jwt("tenant-a", "project-a", vec![]),
             jwt("tenant-a", "project-a", vec!["DA"]),
-            jwt("tenant-b", "project-z", vec!["DA"]),
         ] {
-            for event_type in [
-                "TASK_COMPLETED",
-                "TASK_FAILED",
-                "TASK_STARTED",
-                "TASK_CREATED",
-                "TASK_CANCELLED",
-                "task_completed",
-                " TASK_COMPLETED ",
-                "Task_Failed",
-            ] {
+            for event_type in reserved_types {
                 let request = post_event(
                     token.clone(),
                     json!({
@@ -1211,6 +1211,24 @@ mod tests {
                     "{event_type}"
                 );
             }
+        }
+        // An out-of-scope caller, including a DA in another tenant, gets the
+        // same 404 as a missing task. The reserved type is never reached.
+        for event_type in reserved_types {
+            let request = post_event(
+                jwt("tenant-b", "project-z", vec!["DA"]),
+                json!({
+                    "task_iri": task_iri,
+                    "event_type": event_type,
+                    "source": "SA",
+                    "status": "completed",
+                }),
+            );
+            assert_eq!(
+                response_status(&router, request).await,
+                StatusCode::NOT_FOUND,
+                "{event_type}"
+            );
         }
         assert!(rx.try_recv().is_err(), "no reserved event reached the bus");
 
