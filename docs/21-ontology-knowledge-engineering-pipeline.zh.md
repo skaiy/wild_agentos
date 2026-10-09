@@ -412,7 +412,12 @@ online_corpus_watchers:
 - stale 和 expired 的 type draft，且不会在读取时清理它们。
 
 接口可选接受 `sparse_type_threshold`（默认 `1`）和
-`stale_draft_hours`（默认 `24`）查询参数。证据范围仅限有已持久化
+`stale_draft_hours`（默认 `24`）查询参数。认证发生在解析查询字符串之前。
+匿名请求（包括 `?kind=a&kind=b`）返回 `401`。已验证调用方的查询若与这两个字段不匹配，
+返回 `400`，响应体为 `{"error": "invalid query string"}`，且不会写出字段名。
+`GET /api/v1/ontology/constrained-extractions/:extraction_id` 对其 `sparql` 参数使用同样的顺序：
+匿名的 `?kind=a&kind=b` 为 `401`，已验证调用方在查询不匹配时得到同样的固定 `400`。
+该报告的证据范围仅限有已持久化
 review/gate record 的 extraction ID，因为只有这些 claims-scoped record 能被安全枚举；
 它不会列出或检查其他 tenant/project 的图。
 

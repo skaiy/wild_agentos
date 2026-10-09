@@ -39,13 +39,15 @@ forbidden in coding artifacts", "code": "artifact_plaintext_secret"}`。不回�
 
 | 规则 | 匹配 |
 | --- | --- |
-| `private_key` | `-----BEGIN [A-Z ]*PRIVATE KEY-----` 或 `… PRIVATE KEY BLOCK-----`（证书、公钥不拦） |
+| `private_key` | `-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----` 或 `… PRIVATE KEY BLOCK-----`（证书、公钥不拦） |
 | `aws_access_key_id` | `AKIA` + 16 个 `[0-9A-Z]` |
-| `aws_secret_access_key` | `aws_secret_access_key`（不分大小写），可选引号，`:`/`=`，再跟 40 位 `[A-Za-z0-9/+=]` 值 |
+| `aws_secret_access_key` | `aws_secret_access_key`（不分大小写），可选引号，转义形式（`\"`、`\'`）或未转义形式（`"`、`'`）均可，可选空白，分隔符 `=>`、`:` 或 `=`，再可选空白，以及可选的转义或未转义引号，然后是 40 位 `[A-Za-z0-9/+=]` 值 |
 | `github_classic_pat` | `ghp_` + 36 个 `[A-Za-z0-9]` |
 | `github_fine_grained_pat` | `github_pat_` + 82 个 `[A-Za-z0-9_]` |
 | `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + 至少 10 个 `[A-Za-z0-9-]` |
-| `sk_api_key` | 前面不是 `[A-Za-z0-9_-]` 的 `sk-`，后跟至少 20 个 `[A-Za-z0-9_-]`（覆盖 `sk-proj-…`、`sk-ant-…`、`sk-<slug>-<hex>`） |
+| `sk_api_key` | 左边界为文本开头、`[A-Za-z0-9_-]` 以外的字符、转义的 `\n`、`\r`、`\t`、`\b`、`\f`、`\u` 加四位十六进制，或 `%` 加两位十六进制。随后是 `sk-`、可选的 `proj-` 或 `ant-`，以及至少 20 个 `[A-Za-z0-9_-]`。仅当 `sk-` 之后按 `-` 分成至少三段、其中至少两段是一个或多个 `[a-z]`、且每一段都是一个或多个 `[a-z]`（最后一段也可以是 `v` 加 1 到 4 位数字）时，该命中才是名称而不是密钥。`sk-learn-classification-examples-v2` 和 `sk-my-long-running-service-name` 是名称。其他位置出现数字、更长的数字串、大写字母或 `_` 时仍是密钥。全字母的 key 会放行，这是已接受的风险 |
+
+全字母的 key 会放行：当 `sk-` 之后每一段都是 `[a-z]+` 且满足上面的段数要求时，命中按名称处理。这是已接受的风险。
 
 `task-`、`risk-`、`disk-`、`ask-`、`Slovakia` 等普通文本不会命中；按名字引用凭据
 （`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`、`TOKEN="$TOKEN_FROM_ENV"`）是允许的。

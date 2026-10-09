@@ -506,7 +506,14 @@ for this slow loop. It reports:
 - stale and expired type drafts, without cleaning them up.
 
 The endpoint accepts optional `sparse_type_threshold` (default `1`) and
-`stale_draft_hours` (default `24`) query parameters. Its evidence scope is
+`stale_draft_hours` (default `24`) query parameters. Authentication runs before
+that query string is parsed. An anonymous request, including
+`?kind=a&kind=b`, is `401`. A verified caller whose query does not match those
+two fields receives `400` with `{"error": "invalid query string"}`; the body
+does not name the fields. `GET /api/v1/ontology/constrained-extractions/:extraction_id`
+uses the same order for its `sparql` parameter: an anonymous
+`?kind=a&kind=b` is `401`, and a verified caller with a non-matching query
+receives the same fixed `400`. The health report's evidence scope is
 limited to extraction IDs that have a persisted review/gate record, since those
 are the claims-scoped records that can be enumerated safely. It does not list
 or inspect another tenant/project's graphs.

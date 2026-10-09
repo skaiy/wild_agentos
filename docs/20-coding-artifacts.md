@@ -45,13 +45,17 @@ keys fail the gate and other formats warn.
 
 | Rule | Matches |
 | --- | --- |
-| `private_key` | `-----BEGIN [A-Z ]*PRIVATE KEY-----` or `… PRIVATE KEY BLOCK-----` (certificates and public keys pass) |
+| `private_key` | `-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----` or `… PRIVATE KEY BLOCK-----` (certificates and public keys pass) |
 | `aws_access_key_id` | `AKIA` + 16 `[0-9A-Z]` |
-| `aws_secret_access_key` | `aws_secret_access_key` (any case), optional quote, `:`/`=`, then a 40-character `[A-Za-z0-9/+=]` value |
+| `aws_secret_access_key` | `aws_secret_access_key` (any case), optional quote, escaped (`\"`, `\'`) or unescaped (`"`, `'`), optional whitespace, separator `=>`, `:`, or `=`, optional whitespace, optional escaped or unescaped quote, then a 40-character `[A-Za-z0-9/+=]` value |
 | `github_classic_pat` | `ghp_` + 36 `[A-Za-z0-9]` |
 | `github_fine_grained_pat` | `github_pat_` + 82 `[A-Za-z0-9_]` |
 | `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + at least 10 `[A-Za-z0-9-]` |
-| `sk_api_key` | `sk-` not preceded by `[A-Za-z0-9_-]`, + at least 20 `[A-Za-z0-9_-]` (covers `sk-proj-…`, `sk-ant-…`, `sk-<slug>-<hex>`) |
+| `sk_api_key` | Left boundary is the start of text, a character outside `[A-Za-z0-9_-]`, an escaped `\n`, `\r`, `\t`, `\b`, or `\f`, a `\u` plus four hex digits, or `%` plus two hex digits. Then `sk-`, optional `proj-` or `ant-`, and at least 20 `[A-Za-z0-9_-]`. That match is a name, not a key, only when the text after `sk-` splits on `-` into at least three segments, at least two segments are one or more `[a-z]`, and every segment is one or more `[a-z]` except that the final segment may be `v` plus 1 to 4 digits. `sk-learn-classification-examples-v2` and `sk-my-long-running-service-name` are names. A digit in any other segment, a longer digit run, an uppercase letter, or `_` keeps the match a key. An all-letter key is let through; that is an accepted risk |
+
+An all-letter key is let through: when every segment after `sk-` is `[a-z]+`
+and the segment counts above are met, the match is treated as a name. That is
+an accepted risk.
 
 Ordinary words such as `task-`, `risk-`, `disk-`, `ask-` or `Slovakia` never
 match, and referencing a credential by name
