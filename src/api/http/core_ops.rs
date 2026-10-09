@@ -411,19 +411,57 @@ pub(crate) async fn list_blackboard_tasks_handler(
         )
             .into_response();
     };
-    let tasks: Vec<_> = state
+    let nodes = match state
         .core
         .blackboard
-        .list_task_summaries()
+        .tasks_in_scope(claims.tenant_id(), claims.project_id())
+    {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = claims.tenant_id(),
+                "failed to read scoped blackboard tasks: {error}"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to read tasks"})),
+            )
+                .into_response();
+        }
+    };
+    let hierarchy: std::collections::HashMap<String, crate::memory::l2_blackboard::TaskSummary> =
+        state
+            .core
+            .blackboard
+            .list_task_summaries()
+            .into_iter()
+            .map(|summary| (summary.task_iri.clone(), summary))
+            .collect();
+    let tasks: Vec<_> = nodes
         .into_iter()
-        .filter(|summary| {
-            state
-                .core
-                .blackboard
-                .read_node(&summary.task_iri)
+        .filter(|node| task_is_in_scope(&node.json_ld, claims))
+        .map(|node| {
+            let status = serde_json::from_str::<Value>(&node.json_ld)
                 .ok()
-                .flatten()
-                .is_some_and(|task| task_is_in_scope(&task.json_ld, claims))
+                .and_then(|task| {
+                    task.get("status")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            if let Some(existing) = hierarchy.get(&node.iri) {
+                let mut summary = existing.clone();
+                summary.status = status;
+                summary
+            } else {
+                crate::memory::l2_blackboard::TaskSummary {
+                    task_iri: node.iri.clone(),
+                    status,
+                    node_count: state.core.blackboard.get_task_nodes(&node.iri).len(),
+                    parent: None,
+                    children: 0,
+                }
+            }
         })
         .collect();
     Json(json!({ "count": tasks.len(), "tasks": tasks })).into_response()

@@ -353,6 +353,16 @@ as tie-breaker):
 
 Cross-scope rows never appear. Anonymous → `401`; defaulted project → `403`.
 
+### 5.2 Task record behind `task_iri`
+
+`task_iri` names a task record owned by the invocation's tenant and project.
+
+- After the task reaches a terminal state, `GET /api/v1/tasks/{task_iri}` still returns that record (`200`) for the verified tenant and project that own it, and `GET /api/v1/tasks` still lists it.
+- The same reads succeed after a process restart. Startup loads scoped task records from the persistent knowledge graph into the working cache. A cache miss reads that graph, including the read-only archive written at completion.
+- Another tenant, or another project of the same tenant, receives the same not-found response as for an unknown task. The body does not reveal that the record exists.
+- Completion evicts the working-cache subtree only. It does not delete the task record from the persistent graph.
+- The record stays until an explicit retention cleanup deletes it. That lifetime is independent of invocation retention in §7.1: sweeping an invocation does not by itself make `task_iri` unreadable. There is no silent expiry on task completion.
+
 ## 6. Idempotency
 
 - Scope: `(tenant_id, project_id, actor_id, Idempotency-Key)`.

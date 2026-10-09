@@ -148,7 +148,8 @@ impl MemoryScheduler {
         Ok(session.evict_by_policy())
     }
 
-    /// Finish a task: persist its dirty L2 nodes, then release its subtree.
+    /// Finish a task: persist its dirty L2 nodes, archive the task record, then
+    /// evict the working-cache subtree.
     ///
     /// `tenant_l0` must be the claims-verified L0 handle of the run that owns
     /// `task_iri`. The scheduler's own startup handle is the shared legacy
@@ -156,6 +157,9 @@ impl MemoryScheduler {
     /// there. Only the task's own subtree is flushed, so dirty nodes of
     /// concurrent runs (possibly other tenants) are never written into this
     /// tenant's store. A read-only `tenant_l0` still rejects the write.
+    ///
+    /// The task record stays in the persistent graph. Completion does not
+    /// delete it; readers fall back to that graph when the cache misses.
     pub async fn on_task_complete(
         &self,
         task_iri: &str,
@@ -165,7 +169,12 @@ impl MemoryScheduler {
         if let Err(e) = self.consistency.on_l2_write(task_iri, task_iri, &[]).await {
             tracing::warn!("Consistency on_l2_write failed: {}", e);
         }
-        self.blackboard.release_subtree(task_iri)?;
+        // Join in-flight graph syncs before replacing the task document, so a
+        // late background write cannot overwrite the archived record or land
+        // after a delete.
+        self.blackboard.flush_oxigraph();
+        self.blackboard.archive_completed_task(task_iri)?;
+        self.blackboard.evict_subtree(task_iri)?;
         self.memory_bus
             .publish("TASK_COMPLETED", task_iri, "{}")
             .await;
