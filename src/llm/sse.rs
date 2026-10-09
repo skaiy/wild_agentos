@@ -20,16 +20,16 @@ impl SseParser {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, SseError> {
-        if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER_BYTES {
-            self.buffer.clear();
-            return Err(SseError(format!(
-                "SSE buffer exceeded {MAX_SSE_BUFFER_BYTES} bytes"
-            )));
+        // A chunk of complete frames may be larger than the cap; the cap
+        // applies to the incomplete tail left after those frames are taken.
+        // Only the newly appended suffix is normalized, plus a trailing CR
+        // that the previous push left in place (#396, #427 N9).
+        let mut start = self.buffer.len();
+        if start > 0 && self.buffer[start - 1] == b'\r' {
+            start -= 1;
         }
         self.buffer.extend_from_slice(chunk);
-        // Mixed LF and CRLF separators in one stream must not glue two frames
-        // into a single invalid payload (#396).
-        normalize_crlf(&mut self.buffer);
+        normalize_crlf_from(&mut self.buffer, start);
         let mut events = Vec::new();
 
         while let Some(frame) = self.next_frame() {
@@ -74,17 +74,17 @@ impl SseParser {
 /// Turn CRLF into LF so a stream that mixes the two separators splits on `\n\n`.
 /// A trailing CR is left in place: it may be the first byte of a CRLF that the
 /// next chunk completes.
-fn normalize_crlf(buffer: &mut Vec<u8>) {
+fn normalize_crlf_from(buffer: &mut Vec<u8>, start: usize) {
     let limit = if buffer.last() == Some(&b'\r') {
         buffer.len().saturating_sub(1)
     } else {
         buffer.len()
     };
-    if limit == 0 {
+    if start >= limit {
         return;
     }
-    let mut read = 0;
-    let mut write = 0;
+    let mut read = start;
+    let mut write = start;
     while read < limit {
         if buffer[read] == b'\r' && read + 1 < limit && buffer[read + 1] == b'\n' {
             buffer[write] = b'\n';
@@ -1035,6 +1035,21 @@ mod tests {
             parser.buffer.is_empty(),
             "a failed push must drop the buffer"
         );
+    }
+
+    /// A chunk made entirely of complete frames may exceed the cap. The cap
+    /// applies to the incomplete tail, which is empty here.
+    #[test]
+    fn complete_frames_larger_than_the_cap_are_kept() {
+        let mut parser = SseParser::new();
+        let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\n";
+        let chunk = frame.repeat((MAX_SSE_BUFFER_BYTES / frame.len()) + 2);
+        assert!(chunk.len() > MAX_SSE_BUFFER_BYTES);
+        let events = parser
+            .push(chunk.as_bytes())
+            .expect("complete frames must not trip the incomplete-buffer cap");
+        assert!(events.len() > 1, "frames: {}", events.len());
+        assert!(parser.buffer.is_empty());
     }
 
     /// #396: the debug preview used to slice at byte 200 and panic when that

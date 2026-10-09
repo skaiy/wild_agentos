@@ -280,8 +280,13 @@ pub(crate) async fn emit_cycle_iteration_handler(
     emit_control_event(&state, &identity, "CYCLE_ITERATION", payload).await
 }
 
+/// Stored control-event payloads are capped so a caller cannot pin an
+/// unbounded body on the bus (#427 N3).
+const MAX_CONTROL_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
+
 /// Dedicated run-control ingestion. The path selects the event type. The
-/// caller must be the task's `user_id` or a DA in that task's tenant and
+/// caller must be the task's `user_id` or a control-plane DA (explicit
+/// tenant and project, not a defaulted scope) in that task's tenant and
 /// project (#399). Cross-scope answers like a missing task.
 async fn emit_control_event(
     state: &AppState,
@@ -330,6 +335,16 @@ async fn emit_control_event(
         body.remove("source");
         body.insert("event_type".to_string(), json!(event_type));
     }
+    if payload.to_string().len() > MAX_CONTROL_EVENT_PAYLOAD_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "payload_too_large",
+                "message": "control event payload exceeds 64 KiB",
+            })),
+        )
+            .into_response();
+    }
     let event_id = state
         .core
         .emit_event(&task_iri, event_type, &source, &payload.to_string())
@@ -365,19 +380,25 @@ fn authorize_control_event(
         .get("user_id")
         .and_then(Value::as_str)
         .is_some_and(|user_id| user_id == claims.actor_id());
-    if is_owner || identity.has_role("DA") {
+    if is_owner {
         return Ok(());
     }
-    Err(Box::new(
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "control_event_forbidden",
-                "message": "run owner or same-scope DA required",
-            })),
-        )
-            .into_response(),
-    ))
+    // DA must be an explicit control-plane scope. A defaulted project is not
+    // a tenant-wide grant (#427 N2).
+    match identity.require_control_plane_da("control events") {
+        Ok(()) => Ok(()),
+        Err(error) if identity.has_role("DA") => Err(Box::new(error.into_response())),
+        Err(_) => Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "control_event_forbidden",
+                    "message": "run owner or same-scope DA required",
+                })),
+            )
+                .into_response(),
+        )),
+    }
 }
 
 /// `source_agent_iri` of an event posted through `POST /api/v1/events`:
@@ -442,8 +463,10 @@ async fn authorize_core_read(
 ///
 /// Callers need verified isolation claims matching the task's persisted tenant
 /// and project. A DA role does not cross tenants (#395). Only a platform admin
-/// (`require_platform_admin`) may write across tenants. A missing task is 404
-/// for every caller, including DA. Missing or legacy task scope is denied
+/// (`require_platform_admin`) may write across tenants. A missing task and an
+/// existing task outside the caller's tenant and project are the same 404
+/// (`core_read_not_found`), including same tenant with a different project, so
+/// writes are not an existence oracle. Missing or legacy task scope is denied
 /// rather than inferred from a request body.
 async fn authorize_core_write(
     state: &AppState,
@@ -460,13 +483,7 @@ async fn authorize_core_write(
 
     let task = match state.core.read_node(task_iri).await {
         Ok(Some(task)) => task,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "task not found"})),
-            )
-                .into_response())
-        }
+        Ok(None) => return Err(core_read_not_found()),
         Err(error) => {
             tracing::warn!(%task_iri, "failed to read task scope: {}", error);
             return Err((
@@ -477,28 +494,19 @@ async fn authorize_core_write(
         }
     };
     // The task exists. A platform admin may write it regardless of tenant.
-    // Everyone else, including DA, must match the persisted scope.
+    // Everyone else, including DA, must match the persisted scope. Out of
+    // scope answers exactly like a missing task (#427 N1).
     if identity.require_platform_admin("core writes").is_ok() {
         return Ok(());
     }
     let task_scope: Value = match serde_json::from_str(&task.json_ld) {
         Ok(scope) => scope,
-        Err(_) => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "task has no verified isolation scope"})),
-            )
-                .into_response())
-        }
+        Err(_) => return Err(core_read_not_found()),
     };
     let in_scope = task_scope.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
         && task_scope.get("project_id").and_then(Value::as_str) == Some(claims.project_id());
     if !in_scope {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "task is outside the verified isolation scope"})),
-        )
-            .into_response());
+        return Err(core_read_not_found());
     }
     Ok(())
 }
@@ -511,6 +519,9 @@ pub(crate) async fn stream_batch_events_handler(
     if let Err(error) = identity.require_verified_isolation_claims("batch event stream") {
         return error.into_response();
     }
+    let platform_admin = identity
+        .require_platform_admin("batch event stream")
+        .is_ok();
     let claims = identity
         .isolation_claims()
         .expect("verified isolation claims were required above")
@@ -533,7 +544,7 @@ pub(crate) async fn stream_batch_events_handler(
                     }
                     // A batch event is delivered only to subscribers in its
                     // tenant and project (#399). Unscoped events are dropped.
-                    if !batch_event_visible(&core, &event, &claims).await {
+                    if !batch_event_visible(&core, &event, &claims, platform_admin).await {
                         continue;
                     }
                     let payload: Value =
@@ -566,17 +577,34 @@ pub(crate) async fn stream_batch_events_handler(
 
 /// A `BATCH_*` event is visible when its task node is in the subscriber's
 /// tenant and project. If there is no task node, both `tenant_id` and
-/// `project_id` on the payload must match. Anything else is hidden (#399).
+/// `project_id` on the payload must match. An internal batch event with
+/// neither a task node nor a payload scope is delivered only to a platform
+/// admin (#399, #427 N7).
 async fn batch_event_visible(
     core: &crate::core::core_types::SemanticCore,
     event: &crate::core::event_bus::Event,
     claims: &crate::isolation::IsolationClaims,
+    platform_admin: bool,
 ) -> bool {
     match core.read_node(&event.task_iri).await {
         Ok(Some(node)) => task_is_in_scope(&node.json_ld, claims),
-        Ok(None) => payload_scope_matches(&event.payload, claims),
+        Ok(None) => {
+            if payload_has_scope(&event.payload) {
+                payload_scope_matches(&event.payload, claims)
+            } else {
+                platform_admin && event.source_agent_iri.starts_with("batch:")
+            }
+        }
         Err(_) => false,
     }
+}
+
+fn payload_has_scope(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    value.get("tenant_id").and_then(Value::as_str).is_some()
+        || value.get("project_id").and_then(Value::as_str).is_some()
 }
 
 fn payload_scope_matches(payload: &str, claims: &crate::isolation::IsolationClaims) -> bool {
@@ -1073,12 +1101,21 @@ mod tests {
     }
 
     fn jwt_as(sub: &str, tenant_id: &str, project_id: &str, roles: Vec<&str>) -> String {
+        jwt_as_project(sub, tenant_id, Some(project_id), roles)
+    }
+
+    fn jwt_as_project(
+        sub: &str,
+        tenant_id: &str,
+        project_id: Option<&str>,
+        roles: Vec<&str>,
+    ) -> String {
         encode(
             &Header::default(),
             &JwtClaims {
                 sub: sub.into(),
                 tenant_id: tenant_id.into(),
-                project_id: Some(project_id.into()),
+                project_id: project_id.map(str::to_owned),
                 roles: roles.into_iter().map(str::to_owned).collect(),
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
@@ -1298,7 +1335,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     response_status(&router, request).await,
-                    StatusCode::FORBIDDEN
+                    StatusCode::NOT_FOUND,
+                    "cross-scope write must match a missing task"
                 );
             }
         }
@@ -1376,11 +1414,13 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap();
+                let (status, body) = response_json(&router, request).await;
                 assert_eq!(
-                    response_status(&router, request).await,
-                    StatusCode::FORBIDDEN,
-                    "DA {tenant}/{project} {uri}"
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "DA {tenant}/{project} {uri} must match a missing task"
                 );
+                assert_eq!(body["error"], "not found");
             }
         }
 
@@ -1396,10 +1436,9 @@ mod tests {
                 json!({"task_iri": "iri://task/missing", "event_type": "CUSTOM"}).to_string(),
             ))
             .unwrap();
-        assert_eq!(
-            response_status(&router, missing_for_da).await,
-            StatusCode::NOT_FOUND
-        );
+        let (status, body) = response_json(&router, missing_for_da).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not found");
 
         let admin_request = Request::builder()
             .method("POST")
@@ -1638,6 +1677,42 @@ mod tests {
             rx.try_recv().is_err(),
             "rejected types must not reach the bus"
         );
+
+        // A DA whose project was defaulted is not a control-plane DA, even
+        // when that default matches the task's project.
+        let default_task = "iri://task/control-default";
+        scoped_task(&state, default_task, "tenant-a", "default", "owner-user");
+        let defaulted_da = jwt_as_project("da-user", "tenant-a", None, vec!["DA"]);
+        let (status, body) = response_json(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/control-events/intervention-required")
+                .header("authorization", format!("Bearer {defaulted_da}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"task_iri": default_task}).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "control_plane_claims_incomplete");
+
+        let huge = "x".repeat(super::MAX_CONTROL_EVENT_PAYLOAD_BYTES + 1);
+        let (status, body) = response_json(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/control-events/intervention-required")
+                .header("authorization", format!("Bearer {owner}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"task_iri": task_iri, "note": huge}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["error"], "payload_too_large");
     }
 
     async fn collect_sse(response: axum::response::Response, wait: std::time::Duration) -> String {
@@ -1750,6 +1825,78 @@ mod tests {
         assert!(!body_b.contains("unscoped-batch"), "{body_b}");
         assert!(body_a.contains("payload-tenant-a"), "{body_a}");
         assert!(!body_b.contains("payload-tenant-a"), "{body_b}");
+    }
+
+    /// #427 N7: BatchEventEmitter stamps tenant and project, so only that
+    /// scope sees the event. An emitter with no scope is visible to a
+    /// platform admin and hidden from tenants.
+    #[tokio::test]
+    async fn scoped_batch_emitter_events_stay_in_scope() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _env = Hs256Env::set();
+        let previous_platform = std::env::var_os(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, "platform");
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let router = Router::new()
+            .route("/api/v1/batch/events", get(stream_batch_events_handler))
+            .with_state(state.clone());
+        let open = |token: &str| {
+            Request::builder()
+                .uri("/api/v1/batch/events")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let token_a = jwt("tenant-a", "project-a", vec![]);
+        let token_b = jwt("tenant-b", "project-b", vec![]);
+        let token_admin = jwt(
+            "platform",
+            "ops",
+            vec![crate::api::http::iam::PLATFORM_ADMIN_ROLE],
+        );
+        let response_a = router.clone().oneshot(open(&token_a)).await.unwrap();
+        let response_b = router.clone().oneshot(open(&token_b)).await.unwrap();
+        let response_admin = router.oneshot(open(&token_admin)).await.unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_b.status(), StatusCode::OK);
+        assert_eq!(response_admin.status(), StatusCode::OK);
+
+        let scoped = crate::batch::BatchEventEmitter::new(state.core.events.clone())
+            .with_scope("tenant-a", "project-a");
+        scoped.emit_agent_started("agent-scoped").await;
+        let unscoped = crate::batch::BatchEventEmitter::new(state.core.events.clone());
+        unscoped.emit_agent_started("agent-unscoped").await;
+
+        let wait = std::time::Duration::from_millis(800);
+        let (body_a, body_b, body_admin) = tokio::join!(
+            collect_sse(response_a, wait),
+            collect_sse(response_b, wait),
+            collect_sse(response_admin, wait),
+        );
+        assert!(
+            body_a.contains("agent-scoped"),
+            "scoped subscriber: {body_a}"
+        );
+        assert!(!body_a.contains("agent-unscoped"), "{body_a}");
+        assert!(!body_b.contains("agent-scoped"), "{body_b}");
+        assert!(!body_b.contains("agent-unscoped"), "{body_b}");
+        assert!(
+            body_admin.contains("agent-unscoped"),
+            "platform admin sees unscoped batch events: {body_admin}"
+        );
+        assert!(
+            !body_admin.contains("agent-scoped"),
+            "a stamped scope is not a platform-wide broadcast: {body_admin}"
+        );
+        match previous_platform {
+            Some(value) => {
+                std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, value)
+            }
+            None => std::env::remove_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV),
+        }
     }
 
     async fn raw_response(router: &Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {

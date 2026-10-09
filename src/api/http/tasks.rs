@@ -22,7 +22,7 @@ use super::{AppState, TaskExecSpec};
 #[derive(Deserialize)]
 pub struct TaskRequest {
     pub user_input: String,
-    /// 用户态标识，用于会话隔离（可选，缺省为匿名）。
+    /// Ignored. The stored `user_id` is the verified actor (`claims.actor_id()`).
     pub user_id: Option<String>,
     /// 会话标识，用于多轮上下文隔离（可选）。
     pub session_id: Option<String>,
@@ -104,7 +104,7 @@ pub(crate) async fn create_task_handler(
             &req.user_input,
             None,
             None,
-            req.user_id.as_deref(),
+            Some(claims.actor_id()),
             req.session_id.as_deref(),
             claims,
         )
@@ -255,7 +255,14 @@ pub(crate) async fn stream_task_handler(
         Some(task_iri) => task_iri,
         None => match state
             .core
-            .init_task_with_claims(&req.prompt, None, None, None, None, claims)
+            .init_task_with_claims(
+                &req.prompt,
+                None,
+                None,
+                Some(claims.actor_id()),
+                None,
+                claims,
+            )
             .await
         {
             Ok(task_iri) => task_iri,
@@ -870,7 +877,7 @@ mod tests {
         body::{to_bytes, Body},
         http::{Request, StatusCode},
         response::IntoResponse,
-        routing::get,
+        routing::{get, post},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -1572,6 +1579,84 @@ mod tests {
         assert!(body.contains("event: phase_change"), "{body}");
         assert!(body.contains("\"to_phase\":\"completed\""), "{body}");
         assert!(body.contains("\"source\":\"AA\""), "{body}");
+    }
+
+    /// #427 N4: the stored user id is the verified actor, not the request body.
+    /// The stream path that creates a task does the same.
+    #[tokio::test]
+    async fn created_tasks_store_the_actor_id_not_the_body_user_id() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let saved_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let state = test_state();
+        let router = Router::new()
+            .route("/api/v1/tasks", post(create_task_handler))
+            .route("/api/v1/tasks/stream", post(stream_task_handler))
+            .with_state(state.clone());
+        let token = jwt("tenant-a", "project-a");
+        let created = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "user_input": "hello",
+                            "user_id": "someone-else",
+                            "tenant_id": "tenant-a",
+                            "project_id": "project-a",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let iri = created_body["task_iri"].as_str().unwrap();
+        let node = state.core.read_node(iri).await.unwrap().unwrap();
+        let stored: Value = serde_json::from_str(&node.json_ld).unwrap();
+        assert_eq!(stored["user_id"], "test-user");
+
+        let streamed = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks/stream")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"prompt": "streamed hello"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let streamed_body = to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
+        let streamed_text = String::from_utf8_lossy(&streamed_body);
+        let stream_iri = streamed_text
+            .split("\"task_iri\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("stream announces a task_iri");
+        let stream_node = state.core.read_node(stream_iri).await.unwrap().unwrap();
+        let stream_stored: Value = serde_json::from_str(&stream_node.json_ld).unwrap();
+        assert_eq!(stream_stored["user_id"], "test-user");
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
     }
 
     fn restore_env(name: &str, previous: Option<std::ffi::OsString>) {

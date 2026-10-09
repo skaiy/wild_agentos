@@ -510,15 +510,27 @@ entered the executor path).
   dedicated routes (`POST /api/v1/control-events/intervention-required`,
   `.../user-supplementary-input`, `.../human-approval-result`,
   `.../threshold-exceeded`, `.../cycle-iteration`) and only by the task
-  `user_id` or a DA in the task's tenant and project; a missing or
-  out-of-scope task is `404`, and a same-scope non-owner is `403`. The server
+  `user_id` or a control-plane DA in the task's tenant and project. That DA
+  must have an explicit project claim; a defaulted project is rejected. A
+  missing or out-of-scope task is `404`, a same-scope non-owner is `403`, and
+  a payload over 64 KiB is `413`. Core writes (`POST /api/v1/events` and
+  `POST /api/v1/nodes`) use that same `404` (`not found`) for a missing task
+  and for a task outside the caller's tenant or project, so the status does
+  not reveal that the task exists. A platform admin may still write across
+  tenants. Tasks created by `POST /api/v1/tasks`, `POST /api/v1/tasks/stream`,
+  and invocation execution store `user_id` from the verified actor, not from
+  the request body. The server
   sets the source to `external:http:<sub>`; a `source` member in the body is
   ignored and dropped from the stored payload. Task console SSE and invocation
   `progress` events drop any bus event whose source starts with `external:`,
   so a caller cannot change the displayed phase or inject display text.
   `GET /api/v1/batch/events` delivers a `BATCH_*` event only when its task
   node — or, if that node is absent, `tenant_id` and `project_id` on the
-  payload — matches the subscriber's verified tenant and project. The executor reports a terminal status: only an explicit success (`completed`, `success`,
+  payload — matches the subscriber's verified tenant and project. An internal
+  event whose source starts with `batch:` and which has neither a task node
+  nor those payload fields is delivered only to a platform admin. A non-2xx
+  answer from a streaming model call records only the status, model, and a
+  request id. The executor reports a terminal status: only an explicit success (`completed`, `success`,
   `succeeded`) can become `succeeded`; any other status (for example `timeout`
   or `partial_failure`) ends `failed` / `task_failed`, with the actual usage
   attached. A lagging SSE subscriber receives a `resync` event and should

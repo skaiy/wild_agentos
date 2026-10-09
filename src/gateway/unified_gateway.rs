@@ -1118,8 +1118,21 @@ impl UnifiedGateway {
                         ),
                     });
             }
+            // Same rule as the non-streaming 4xx path: the upstream body can
+            // echo the prompt, so the log and the error carry only status,
+            // model, and a request id (#427 N8).
+            let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+            let request_id = uuid::Uuid::new_v4().simple().to_string();
+            warn!(
+                status = %status,
+                model = %model,
+                request_id = %request_id,
+                "Stream API error"
+            );
             return Err(CoreError::Internal {
-                message: format!("Stream API error ({}): {}", status, text),
+                message: format!(
+                    "Stream API error ({status}); model={model}; request_id={request_id}"
+                ),
             });
         }
 
@@ -1793,6 +1806,69 @@ mod tests {
         );
         assert!(logged.contains("request_id"), "{logged}");
         assert!(logged.contains("test-model"), "{logged}");
+        assert!(logged.contains("400"), "{logged}");
+        server.abort();
+    }
+
+    /// #427 N8: a streaming non-2xx must not put the upstream body or the
+    /// prompt into the log or the error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_client_error_omits_body_and_prompt() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let prompt = "SECRET_STREAM_PROMPT_DO_NOT_LOG_9f3c";
+        let upstream = "SECRET_UPSTREAM_BODY_DO_NOT_LOG_9f3c";
+        let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let logs_for_writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || SharedWriter(logs_for_writer.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let upstream = upstream.to_string();
+                async move { (axum::http::StatusCode::BAD_REQUEST, upstream) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let gateway = gateway_with(&base, "test-key", 0);
+        let err = match gateway
+            .stream_chat_with_params("test-model", vec![user_msg(prompt)], None, None, None, None)
+            .await
+        {
+            Ok(_) => panic!("streaming 4xx must fail"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
+        assert!(!message.contains(prompt), "{message}");
+        assert!(!message.contains(upstream), "{message}");
+        assert!(message.contains("Stream API error"), "{message}");
+        assert!(message.contains("model=test-model"), "{message}");
+        assert!(message.contains("request_id="), "{message}");
+        let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains(prompt), "{logged}");
+        assert!(!logged.contains(upstream), "{logged}");
+        assert!(logged.contains("request_id"), "{logged}");
         assert!(logged.contains("400"), "{logged}");
         server.abort();
     }
