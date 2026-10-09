@@ -53,7 +53,7 @@ scope and server fields → `400 field_not_allowed` (§3).
 {
   "prompt": "…",                 // required unless `input` or `input_ref` is set
   "agent_id": "…",               // optional server-side agent definition (§4.1)
-  "agent_revision": "…",         // optional exact pin of that definition's revision; needs agent_id
+  "agent_revision": "…",         // reserved; not supported yet, any value → 422 (§4.3)
   "input": { … },                // optional inline JSON, ≤ 8192 bytes serialized
   "input_ref": {                 // optional immutable reference; mutually exclusive with `input`
     "uri": "<scheme>://…",       // routed to a registered resolver by prefix or scheme (§4.2)
@@ -72,7 +72,7 @@ scope and server fields → `400 field_not_allowed` (§3).
 | Field | Rule | Error |
 | --- | --- | --- |
 | `prompt` / `input` / `input_ref` | At least one must be present | `400 invalid_request` |
-| `agent_revision` | Must equal the current revision of `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Until agent definition revisions exist ([#317](https://github.com/skaiy/wild_agentos/issues/317)): any value → `422 agent_revision_unsupported`. After #317: mismatch → `409 agent_revision_mismatch`. Floating word or missing `agent_id` → `400 invalid_request` |
+| `agent_revision` | Not supported in this version (§4.3). Syntax is still checked: needs `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Floating word or missing `agent_id` → `400 invalid_request`; otherwise any value → `422 agent_revision_unsupported` (after the `agent_id` check, so an unknown `agent_id` is `422 agent_not_found` first) |
 | `input` | Any JSON value, ≤ 8192 bytes as compact JSON | Over limit → `413 payload_too_large` |
 | `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…` with a lowercase scheme and passes the shape check (§4.2); `sha256` is 64 lowercase hex; a registered resolver must match and accept the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` that fails the shape check (no `<scheme>://`, uppercase scheme, control characters, dot / empty segments, backslash, `%2e` / `%2f` / `%5c`) → `400 invalid_request`; no matching resolver, or the resolver rejects the `uri` → `422 input_ref_unresolvable`; `uri` names another project → `422 input_ref_scope_mismatch` |
 | `budget.*` | Positive integers (≥ 1); `max_cost` is micro-USD; unknown members rejected | `400 invalid_request` |
@@ -82,11 +82,10 @@ scope and server fields → `400 field_not_allowed` (§3).
 
 - `agent_id` that does not resolve to a definition in the caller's scope →
   `422 agent_not_found`, identical for unknown ids and other scopes.
-- Agent definitions on current `main` carry no revision. Until #317 adds
-  definition revisions, any create carrying `agent_revision` is rejected with
-  `422 agent_revision_unsupported` and nothing is persisted. The field is
-  never silently ignored, so a caller can never believe it pinned a revision
-  that the server did not check.
+- Agent definitions carry no revision, so any create carrying
+  `agent_revision` is rejected with `422 agent_revision_unsupported` and
+  nothing is persisted. The field is never silently ignored, so a caller can
+  never believe it pinned a revision that the server did not check. See §4.3.
 - `input_ref` content is fetched only by the execution bridge, with the
   creator's claims; the server checks its SHA-256 itself, and on a mismatch
   the invocation ends `failed` with `error.code = "input_digest_mismatch"`
@@ -115,19 +114,18 @@ scope and server fields → `400 field_not_allowed` (§3).
   executed by the Supervisor Agent as a multi-agent plan (decompose, run
   sub-agents, aggregate), not only a single agent.
 - Topology (single agent or orchestrated plan, sub-agent limits, parallelism)
-  is a property of the definition on the server. `agent_revision` pins the
-  definition, and with it the topology; a caller cannot choose or override
-  topology in the request. A `topology` or similar field is an unknown field →
-  `400 invalid_request`.
-- Without `agent_id` the server's default execution path is used.
+  is a property of the definition on the server; a caller cannot choose or
+  override topology in the request. A `topology` or similar field is an
+  unknown field → `400 invalid_request`.
+- In this version `agent_id` is checked only at create (it must name a
+  definition in the caller's scope). The execution bridge does not yet read
+  the definition: every invocation, with or without `agent_id`, runs on the
+  server's default execution path.
 - `agent_id` is the server-generated UUID returned by the agent registration
   endpoint. A caller cannot choose its own id at registration time.
-- Registration fields and topology for orchestrating agents belong to
-  [#317](https://github.com/skaiy/wild_agentos/issues/317).
-- Making orchestrating definitions addressable by id and revision is part of
-  the execution bridge
-  ([#317](https://github.com/skaiy/wild_agentos/issues/317)). Until then,
-  stored definitions have neither a revision nor a topology; see §11.
+- Stored definitions have neither a revision nor a topology. Registration
+  fields and topology for orchestrating agents, and running an invocation on
+  the definition it names, are future work; see §4.3 and §11.
 
 ### 4.2 `input_ref` resolvers
 
@@ -205,6 +203,26 @@ scope and server fields → `400 field_not_allowed` (§3).
   `src/api/http/invocations_input_ref.rs`. Until one is registered or the
   built-in is switched on, first integrations should send inline `input`
   (≤ 8192 bytes).
+
+### 4.3 `agent_revision` is not supported
+
+- Agent definitions are stored without a revision: an update overwrites the
+  definition in place (only `updated_at` changes), earlier versions are not
+  kept, and a delete removes it. There is nothing a pin could match, and the
+  execution bridge does not read the definition (§4.1), so a pin could not
+  change what runs either.
+- Therefore any create that carries `agent_revision` is rejected with
+  `422 agent_revision_unsupported` and nothing is persisted. This is the
+  intended behaviour of this version, not a temporary bug. Do not send the
+  field; omit it to use the current definition.
+- The server never checks a revision and then runs a different one: there is
+  no "check at submit only" mode, and `409 agent_revision_mismatch` is not
+  returned.
+- Real pinning needs immutable per-revision snapshots of a definition and an
+  execution path that runs the pinned snapshot. That is planned as a separate
+  milestone; until it ships, this section is the contract. Integrations that
+  need reproducible agent behaviour should not switch over on the assumption
+  that `agent_revision` will be honoured.
 
 ## 5. Resource (draft)
 
@@ -478,8 +496,9 @@ entered the executor path).
   `input_ref_fetch_failed`, SHA-256 mismatch → `failed` /
   `input_digest_mismatch`, both with fixed messages. There is no default
   outbound/network resolver.
-- `agent_revision`: until agent definition revisions exist in-tree, create still
-  returns `422 agent_revision_unsupported` (never silently ignored; no fake pin).
+- `agent_revision` is not supported: create returns
+  `422 agent_revision_unsupported` (never silently ignored; no fake pin), and
+  execution does not read the agent definition (§4.1, §4.3).
 - The terminal state comes only from the outcome the executor returns to the
   server when the run ends, never from task events. Events on the shared task
   event bus (including `TASK_COMPLETED` / `TASK_FAILED`) feed SSE streams only;
@@ -550,9 +569,9 @@ safe texts and never echo tokens, inputs or the original request.
 | 401 | `verified_isolation_claims_required` | No verified claims |
 | 403 | `claims_incomplete`, `cancel_not_permitted` | Defaulted project (body may carry `missing_field`); cancel by an actor that is neither the creator nor a DA |
 | 404 | `not_found` | Unknown id or another scope (identical body) |
-| 409 | `idempotency_key_conflict`, `idempotency_key_in_progress`, `revision_conflict`, `illegal_transition`, `agent_revision_mismatch` | See §4, §6, §7; a `revision_conflict` body may carry `current_revision` |
+| 409 | `idempotency_key_conflict`, `idempotency_key_in_progress`, `revision_conflict`, `illegal_transition` | See §6, §7; a `revision_conflict` body may carry `current_revision`. `agent_revision_mismatch` is not returned (§4.3) |
 | 413 | `payload_too_large` | Body > 64 KiB, `input` > 8192 bytes or `metadata` > 16 KiB / 64 keys |
-| 422 | `input_ref_unresolvable`, `input_ref_scope_mismatch`, `agent_not_found`, `agent_revision_unsupported` | No registered resolver matches or accepts `input_ref.uri`; `input_ref.uri` names another project than the caller's; `agent_id` not found in scope; `agent_revision` sent before agent definition revisions exist (#317, §4) |
+| 422 | `input_ref_unresolvable`, `input_ref_scope_mismatch`, `agent_not_found`, `agent_revision_unsupported` | No registered resolver matches or accepts `input_ref.uri`; `input_ref.uri` names another project than the caller's; `agent_id` not found in scope; `agent_revision` sent (not supported, §4.3) |
 | 429 | `too_many_active` | Per-scope active limit reached (§7.2); `Retry-After: 5` |
 | 500 | `persistence_failed` | Store write failed; nothing changed |
 | 503 | `execution_disabled`, `invocation_store_full`, `invocation_store_unavailable` | Execution switch off (§8); store still full after the retention sweep (§7.1); invocation store not configured or unreachable |
@@ -572,21 +591,21 @@ carry an `ETag` with the current revision.
 - Existing `/api/v1/tasks*` and OpenAI-compatible routes are unchanged.
 - No outbound `input_ref` resolver (S3, HTTP, …) ships in-tree; the only
   built-in reads platform artifacts and is off by default (§4.2).
-- Only the agent definition is pinned (`agent_revision`). Provider, model,
-  tool, policy and context revisions are intentionally not pinned server-side
-  in v0.12.0; pinning them is a possible follow-up.
+- No server-side pinning in v0.12.0: `agent_revision` is rejected (§4.3), and
+  provider, model, tool, policy and context revisions are not pinned either.
+  Pinning is a possible follow-up.
 - `usage` has no partner, caller or integrator attribution (`cost_source`
   only says how `cost` was obtained).
 
 ## 11. Prerequisites for integrators
 
-- **Exact agent pinning and orchestrating-agent targets require
-  [#317](https://github.com/skaiy/wild_agentos/issues/317).** Both depend on
-  agent definition revisions and a topology stored on the definition, which
-  #317 adds. Before #317, `agent_revision` returns
-  `422 agent_revision_unsupported` (§4) and an orchestrating plan cannot be
-  addressed as a stored definition (§4.1). Integrations that depend on either
-  should wait for #317 before switching over.
+- **Exact agent pinning and orchestrating-agent targets are not available.**
+  Both depend on agent definition revisions and a topology stored on the
+  definition, which do not exist yet. `agent_revision` returns
+  `422 agent_revision_unsupported` (§4.3), `agent_id` does not change what
+  runs (§4.1), and an orchestrating plan cannot be addressed as a stored
+  definition. Integrations that depend on either should not switch over until
+  that later milestone ships.
 - **Execution switch.** Execution defaults to off and stays off in production
   until the [#317](https://github.com/skaiy/wild_agentos/issues/317) execution
   bridge lands; until then creates return `503 execution_disabled` (§8).
@@ -602,7 +621,7 @@ carry an `ETag` with the current revision.
 - **Switch-over prerequisites:** #315 + #317 (projection scoping #310/#322 is already on main).
 - **Agent ids.** Use the server-generated UUID returned by agent registration as
   `agent_id`; ids cannot be self-assigned at registration. Registration fields
-  and topology for orchestrating agents come with #317 (§4.1).
+  and topology for orchestrating agents are future work (§4.1).
 - **Known inconsistency (agent registration).** `POST /api/v1/agents` still
   accepts a token whose project was filled in by default. An agent registered
   with such a token lands in the `default` project. The **same defaulted

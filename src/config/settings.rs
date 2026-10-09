@@ -101,9 +101,27 @@ fn warn_unrecognized_env_vars(env: &[(String, String)]) {
 
 /// File order is yaml < runtime override < environment. Explicit overrides
 /// must be applied last because config's set_override beats every file source.
+///
+/// Each file is read exactly once per load: the yaml and the runtime override
+/// are built into their own [`Config`] first and those same objects are added
+/// to the main builder (`Config` is a `Source`), so the endpoint/key binding
+/// below sees exactly the values the merged configuration uses (#303 review).
 fn config_builder_with_sources(
     yaml_name: &str,
     override_path: &Path,
+    env: &[(String, String)],
+) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
+    let deployment = Config::builder()
+        .add_source(config::File::with_name(yaml_name).required(false))
+        .build()?;
+    let runtime_override = RuntimeOverride::read(override_path)?;
+    builder_from_layers(&deployment, runtime_override.as_ref(), env)
+}
+
+/// Assemble the main builder from layers that were each read once.
+fn builder_from_layers(
+    deployment: &Config,
+    runtime_override: Option<&RuntimeOverride>,
     env: &[(String, String)],
 ) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
     let legacy = env
@@ -113,15 +131,16 @@ fn config_builder_with_sources(
         .collect();
     // Legacy splitting is a fallback for existing single-word deployments;
     // fields containing `_` must use the explicit table instead.
-    let mut builder = Config::builder()
-        .add_source(config::File::with_name(yaml_name).required(false))
-        .add_source(config::File::from(override_path.to_path_buf()).required(false))
-        .add_source(
-            Environment::with_prefix("AGENT_OS")
-                .separator("_")
-                .try_parsing(true)
-                .source(Some(legacy)),
-        );
+    let mut builder = Config::builder().add_source(deployment.clone());
+    if let Some(runtime_override) = runtime_override {
+        builder = builder.add_source(runtime_override.config.clone());
+    }
+    builder = builder.add_source(
+        Environment::with_prefix("AGENT_OS")
+            .separator("_")
+            .try_parsing(true)
+            .source(Some(legacy)),
+    );
     for (name, key) in ENV_KEY_MAP {
         if let Some((_, value)) = env.iter().find(|(candidate, _)| candidate == name) {
             // Keep the raw string. `config` coerces strings to bool/integer
@@ -134,7 +153,275 @@ fn config_builder_with_sources(
             builder = builder.set_override(key, Value::new(Some(&origin), kind))?;
         }
     }
+    bind_deployment_keys_to_their_endpoints(builder, deployment, runtime_override, env)
+}
+
+/// Top-level sections of the runtime override that hold an endpoint/key pair.
+const KEYED_OVERRIDE_SECTIONS: &[&str] = &["gateway", "embedding"];
+
+/// `gateway.model_mapping` maps model names (which may contain upper case) to
+/// model names; it can never fold into an endpoint or key field.
+const FREE_FORM_KEY_TABLES: &[(&str, &str)] = &[("gateway", "model_mapping")];
+
+/// `config_override.json`, read once per load.
+struct RuntimeOverride {
+    /// The parsed override, added as-is to the main builder.
+    config: Config,
+    /// Sections in [`KEYED_OVERRIDE_SECTIONS`] whose raw spelling is not
+    /// canonical (see [`noncanonical_keyed_sections`]).
+    noncanonical: Vec<&'static str>,
+}
+
+impl RuntimeOverride {
+    fn read(path: &Path) -> Result<Option<Self>, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // No path in the message: it ends up in startup logs.
+            Err(error) => {
+                return Err(ConfigError::Message(format!(
+                    "cannot read config_override.json: {}",
+                    error.kind()
+                )))
+            }
+        };
+        Ok(Some(Self::from_text(&text)?))
+    }
+
+    /// Both views (the `Config` and the canonical-spelling check) come from
+    /// the same bytes.
+    fn from_text(text: &str) -> Result<Self, ConfigError> {
+        let config = Config::builder()
+            .add_source(config::File::from_str(text, config::FileFormat::Json))
+            .build()?;
+        let noncanonical = if spelling_guard_disabled_for_test() {
+            Vec::new()
+        } else {
+            noncanonical_keyed_sections(text)
+        };
+        Ok(Self {
+            config,
+            noncanonical,
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test switch the spelling guard off on its own thread, so the
+    /// single-read part of the fix can be checked through the real load path.
+    static SPELLING_GUARD_DISABLED_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn spelling_guard_disabled_for_test() -> bool {
+    SPELLING_GUARD_DISABLED_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn spelling_guard_disabled_for_test() -> bool {
+    false
+}
+
+/// Sections of the raw override where a key could fold into another one.
+///
+/// `config` lowercases keys and splits dotted top-level keys while merging,
+/// and its tables are `HashMap`s: two spellings that fold to the same key
+/// (`base_url` / `BASE_URL`, `embedding` / `Embedding`, `embedding` /
+/// `embedding.oneapi`) are merged in a random order, so which one wins can
+/// change from one load to the next. The `PUT /api/v1/config` schema only
+/// writes lower-case keys, so any other spelling under `gateway` or
+/// `embedding` (at any depth, including the section name itself) is treated
+/// as untrusted and the deployment key is not paired with that section.
+fn noncanonical_keyed_sections(text: &str) -> Vec<&'static str> {
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        // `config` accepted the file, so this should not happen; fail closed.
+        return KEYED_OVERRIDE_SECTIONS.to_vec();
+    };
+    let mut noncanonical = Vec::new();
+    for &section in KEYED_OVERRIDE_SECTIONS {
+        let spellings: Vec<(&String, &serde_json::Value)> = root
+            .iter()
+            .filter(|(key, _)| {
+                key.split(['.', '['])
+                    .next()
+                    .is_some_and(|head| head.to_lowercase() == section)
+            })
+            .collect();
+        let canonical = match spellings.as_slice() {
+            [] => true,
+            [(key, value)] => key.as_str() == section && keys_are_canonical(section, value, 0),
+            // `Embedding` next to `embedding`, or `embedding.oneapi` next to it.
+            _ => false,
+        };
+        if !canonical {
+            noncanonical.push(section);
+        }
+    }
+    noncanonical
+}
+
+/// Every object key below `value` is lower case. Exact duplicates are already
+/// collapsed by the JSON parser (last one wins, as in `config`), so with all
+/// keys lower case no two keys in one table can fold together.
+fn keys_are_canonical(section: &str, value: &serde_json::Value, depth: usize) -> bool {
+    match value {
+        serde_json::Value::Object(table) => table.iter().all(|(key, child)| {
+            if key.to_lowercase() != *key {
+                return false;
+            }
+            if depth == 0 && FREE_FORM_KEY_TABLES.contains(&(section, key.as_str())) {
+                return true;
+            }
+            keys_are_canonical(section, child, depth + 1)
+        }),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .all(|item| keys_are_canonical(section, item, depth + 1)),
+        _ => true,
+    }
+}
+
+/// Endpoint/key pairs whose deployment key must not follow a base URL moved by
+/// the runtime override:
+/// `(override section, base_url path, api_key path, base_url env, api_key env)`.
+const ENDPOINT_KEY_BINDINGS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "gateway",
+        "gateway.base_url",
+        "gateway.api_key",
+        "AGENT_OS_GATEWAY_BASE_URL",
+        "AGENT_OS_GATEWAY_API_KEY",
+    ),
+    (
+        "embedding",
+        "embedding.oneapi.base_url",
+        "embedding.oneapi.api_key",
+        "AGENT_OS_EMBEDDING_ONEAPI_BASE_URL",
+        "AGENT_OS_EMBEDDING_ONEAPI_API_KEY",
+    ),
+];
+
+const ENDPOINT_KEY_BINDING_ORIGIN: &str = "endpoint key binding (config_override.json)";
+
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// WARN text for a non-canonical override section. Names only the section,
+/// the dropped field and the environment pair: never a key, URL or path.
+fn noncanonical_section_warning(
+    section: &str,
+    key_path: &str,
+    base_env: &str,
+    key_env: &str,
+) -> String {
+    format!(
+        "config_override.json spells keys in its {section} section in a non-canonical way \
+         (upper case, a dotted section name, or the section given twice); ignoring the \
+         deployment {key_path} for it. Rewrite that section in lower case, or set \
+         {base_env} together with {key_env}"
+    )
+}
+
+/// A deployment key (config.yaml or environment) belongs to the deployment's
+/// endpoint. When `config_override.json` (written at runtime by
+/// `PUT /api/v1/config` or the model/embedding routes) moves a base URL to a
+/// different endpoint and the environment does not set that base URL, the
+/// deployment key is dropped instead of being sent to the new endpoint after a
+/// restart. Only a key stored in the override itself is used with the
+/// override's endpoint. Keys are never logged.
+///
+/// `runtime_override` is the same object the main builder merges, so the
+/// base URL checked here is the one the merged configuration ends up with
+/// (`config` lowercases key paths, so `BASE_URL`, `OneApi.Base_Url` and
+/// `base_url` all name the same field). A section whose raw spelling is not
+/// canonical never keeps the deployment key at all (fail closed), whatever
+/// endpoint it names (#303 review).
+fn bind_deployment_keys_to_their_endpoints(
+    mut builder: ConfigBuilder<DefaultState>,
+    deployment: &Config,
+    runtime_override: Option<&RuntimeOverride>,
+    env: &[(String, String)],
+) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
+    let Some(runtime_override) = runtime_override else {
+        return Ok(builder);
+    };
+    let overrides = &runtime_override.config;
+    let override_string = |path: &str| overrides.get_string(path).ok();
+    let env_value = |name: &str| {
+        env.iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.as_str())
+    };
+    for (section, base_path, key_path, base_env, key_env) in ENDPOINT_KEY_BINDINGS {
+        // An environment base URL beats the override (set_override wins over
+        // every file source), so the key stays paired with the deployment's
+        // own endpoint.
+        if env_value(base_env).is_some() {
+            continue;
+        }
+        let noncanonical = runtime_override.noncanonical.contains(section);
+        // A base URL that is present but not a string (`null`, an array or
+        // an object) is a moved endpoint: fail closed instead of skipping the
+        // binding because `get_string` fails on it (#303 re-review).
+        let non_string_base = overrides.get::<Value>(base_path).is_ok_and(|value| {
+            matches!(
+                value.kind,
+                ValueKind::Nil | ValueKind::Array(_) | ValueKind::Table(_)
+            )
+        });
+        if !noncanonical && !non_string_base {
+            let override_base = override_string(base_path);
+            let Some(override_base) = non_blank(override_base.as_deref()) else {
+                continue;
+            };
+            let deployment_base = deployment.get_string(base_path).unwrap_or_default();
+            let deployment_base = normalize_api_base(&deployment_base);
+            if !deployment_base.is_empty() && deployment_base == normalize_api_base(override_base) {
+                continue;
+            }
+        }
+        let override_key = override_string(key_path);
+        let override_key = non_blank(override_key.as_deref());
+        let deployment_key_present = non_blank(env_value(key_env)).is_some()
+            || non_blank(deployment.get_string(key_path).ok().as_deref()).is_some();
+        let key = match override_key {
+            Some(key) => key.to_string(),
+            None => {
+                if deployment_key_present && noncanonical {
+                    tracing::warn!(
+                        "{}",
+                        noncanonical_section_warning(section, key_path, base_env, key_env)
+                    );
+                } else if deployment_key_present {
+                    tracing::warn!(
+                        "{base_path} from config_override.json is a different endpoint than the deployment's; \
+                         ignoring the deployment {key_path} for it (set {base_env} together with {key_env}, \
+                         or store a key for the new endpoint)"
+                    );
+                }
+                String::new()
+            }
+        };
+        let origin = ENDPOINT_KEY_BINDING_ORIGIN.to_string();
+        builder =
+            builder.set_override(*key_path, Value::new(Some(&origin), ValueKind::String(key)))?;
+    }
     Ok(builder)
+}
+
+/// `load_config` with explicit layers, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn load_config_layers_for_test(
+    yaml_name: &str,
+    override_path: &Path,
+    env: &[(String, String)],
+) -> Result<Config, ConfigError> {
+    config_builder_with_sources(yaml_name, override_path, env)?.build()
 }
 
 fn load_config() -> Result<Config, ConfigError> {
@@ -1826,6 +2113,426 @@ mod tests {
         assert!(err.contains("(at `gateway.max_retries`)"), "{err}");
         assert!(!err.contains("AGENT_OS_"), "{err}");
         assert!(err.contains("oops"), "{err}");
+    }
+
+    /// #303 review: a deployment key (yaml or env) never follows a base URL
+    /// that the runtime override moved to another endpoint.
+    #[test]
+    fn isolation_contract_deployment_key_does_not_follow_override_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "gateway:\n  base_url: https://deploy.invalid/v1\n  api_key: yaml-deploy-key\n\
+             embedding:\n  oneapi:\n    base_url: https://deploy-emb.invalid/v1\n    api_key: yaml-emb-key\n",
+        )
+        .unwrap();
+        let override_file = dir.path().join("config_override.json");
+        let get = |env: &[(&str, &str)], path: &str| {
+            test_config(dir.path(), env)
+                .unwrap()
+                .get::<String>(path)
+                .unwrap()
+        };
+        let env_keys = [
+            ("AGENT_OS_GATEWAY_API_KEY", "env-deploy-key"),
+            ("AGENT_OS_EMBEDDING_ONEAPI_API_KEY", "env-emb-key"),
+        ];
+
+        // No override: deployment keys as before.
+        assert_eq!(get(&[], "gateway.api_key"), "yaml-deploy-key");
+        assert_eq!(get(&env_keys, "gateway.api_key"), "env-deploy-key");
+
+        // Override moved both endpoints, no key of its own: no deployment key.
+        std::fs::write(
+            &override_file,
+            r#"{"gateway":{"base_url":"https://attacker.invalid"},
+                "embedding":{"oneapi":{"base_url":"https://attacker.invalid/v1"}}}"#,
+        )
+        .unwrap();
+        for env in [&[][..], &env_keys[..]] {
+            assert_eq!(get(env, "gateway.base_url"), "https://attacker.invalid");
+            assert_eq!(get(env, "gateway.api_key"), "");
+            assert_eq!(get(env, "embedding.oneapi.api_key"), "");
+        }
+
+        // The environment base URL beats the override: deployment pair intact.
+        let env_base = [
+            ("AGENT_OS_GATEWAY_BASE_URL", "https://deploy.invalid"),
+            ("AGENT_OS_GATEWAY_API_KEY", "env-deploy-key"),
+        ];
+        assert_eq!(get(&env_base, "gateway.base_url"), "https://deploy.invalid");
+        assert_eq!(get(&env_base, "gateway.api_key"), "env-deploy-key");
+
+        // Same endpoint, different spelling: deployment keys kept.
+        std::fs::write(
+            &override_file,
+            r#"{"gateway":{"base_url":"https://deploy.invalid/"},
+                "embedding":{"oneapi":{"base_url":"https://deploy-emb.invalid"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(get(&env_keys, "gateway.api_key"), "env-deploy-key");
+        assert_eq!(get(&env_keys, "embedding.oneapi.api_key"), "env-emb-key");
+
+        // A key stored with the moved endpoint is the only key used for it.
+        std::fs::write(
+            &override_file,
+            r#"{"gateway":{"base_url":"https://other.invalid","api_key":"override-key"},
+                "embedding":{"oneapi":{"base_url":"https://other.invalid/v1","api_key":"override-emb-key"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(get(&env_keys, "gateway.api_key"), "override-key");
+        assert_eq!(
+            get(&env_keys, "embedding.oneapi.api_key"),
+            "override-emb-key"
+        );
+    }
+
+    const DEPLOY_LAYERS_YAML: &str = "gateway:\n  base_url: https://deploy.invalid/v1\n  api_key: yaml-deploy-key\n\
+         embedding:\n  oneapi:\n    base_url: https://deploy-emb.invalid/v1\n    api_key: yaml-emb-key\n";
+    const DEPLOY_ENV_KEYS: [(&str, &str); 2] = [
+        ("AGENT_OS_GATEWAY_API_KEY", "env-deploy-key"),
+        ("AGENT_OS_EMBEDDING_ONEAPI_API_KEY", "env-emb-key"),
+    ];
+    const DEPLOYMENT_KEYS: [&str; 4] = [
+        "yaml-deploy-key",
+        "yaml-emb-key",
+        "env-deploy-key",
+        "env-emb-key",
+    ];
+
+    /// Override samples where two spellings fold into one endpoint field:
+    /// `(base_url path, api_key path, deployment base, raw override)`.
+    /// Exact duplicates cannot be written with `json!`, hence raw text.
+    fn duplicate_cased_override_samples(
+    ) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+        vec![
+            // Same table: `base_url` and `BASE_URL`.
+            (
+                "embedding.oneapi.base_url",
+                "embedding.oneapi.api_key",
+                "https://deploy-emb.invalid/v1",
+                r#"{"embedding":{"oneapi":{"base_url":"https://deploy-emb.invalid/v1","BASE_URL":"https://atk.invalid/v1"}}}"#,
+            ),
+            // Top level: `embedding` and `Embedding`.
+            (
+                "embedding.oneapi.base_url",
+                "embedding.oneapi.api_key",
+                "https://deploy-emb.invalid/v1",
+                r#"{"embedding":{"oneapi":{"base_url":"https://deploy-emb.invalid/v1"}},"Embedding":{"oneapi":{"base_url":"https://atk.invalid/v1"}}}"#,
+            ),
+            (
+                "gateway.base_url",
+                "gateway.api_key",
+                "https://deploy.invalid/v1",
+                r#"{"gateway":{"base_url":"https://deploy.invalid/v1","BASE_URL":"https://atk.invalid/v1"}}"#,
+            ),
+            (
+                "gateway.base_url",
+                "gateway.api_key",
+                "https://deploy.invalid/v1",
+                r#"{"gateway":{"base_url":"https://deploy.invalid/v1"},"Gateway":{"base_url":"https://atk.invalid/v1"}}"#,
+            ),
+        ]
+    }
+
+    const DUPLICATE_LOADS: usize = 200;
+
+    /// #303 re-review (BLOCKER on #352): `config` folds keys that differ only
+    /// in case in a random order, so an override holding both
+    /// `base_url` = deployment endpoint and `BASE_URL` = another endpoint
+    /// (same table, or `embedding` next to `Embedding`) resolved differently
+    /// from one load to the next. The deployment key must never be paired
+    /// with a non-deployment URL, and a section spelled that way never keeps
+    /// the deployment key at all.
+    #[test]
+    fn isolation_contract_duplicate_cased_override_keys_never_pair_deployment_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), DEPLOY_LAYERS_YAML).unwrap();
+        let override_file = dir.path().join("config_override.json");
+        for (base_path, key_path, deploy_base, raw) in duplicate_cased_override_samples() {
+            std::fs::write(&override_file, raw).unwrap();
+            for env in [&[][..], &DEPLOY_ENV_KEYS[..]] {
+                for _ in 0..DUPLICATE_LOADS {
+                    let config = test_config(dir.path(), env).unwrap();
+                    let base = config.get_string(base_path).unwrap();
+                    let key = config.get_string(key_path).unwrap();
+                    assert!(
+                        normalize_api_base(&base) == normalize_api_base(deploy_base)
+                            || !DEPLOYMENT_KEYS.contains(&key.as_str()),
+                        "{raw}: deployment key paired with a non-deployment URL"
+                    );
+                    assert_eq!(
+                        key, "",
+                        "{raw}: non-canonical section kept the deployment key"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Switches the spelling guard off on this thread until dropped.
+    struct SpellingGuardOff;
+
+    impl SpellingGuardOff {
+        fn new() -> Self {
+            SPELLING_GUARD_DISABLED_FOR_TEST.with(|off| off.set(true));
+            Self
+        }
+    }
+
+    impl Drop for SpellingGuardOff {
+        fn drop(&mut self) {
+            SPELLING_GUARD_DISABLED_FOR_TEST.with(|off| off.set(false));
+        }
+    }
+
+    /// The single-read part of the fix on its own: with the spelling guard
+    /// switched off, a load through the real path
+    /// (`config_builder_with_sources`, via `load_config_layers_for_test`)
+    /// gives the key binding and the merged configuration the same folded
+    /// override (one read and one parse per load), so a load that ends up on
+    /// the other endpoint has no deployment key and a load that ends up on
+    /// the deployment endpoint keeps it. If the override were read or parsed
+    /// twice, the two parses would fold differently in some loads and this
+    /// test would fail (#303 re-review nit: the earlier version called
+    /// `builder_from_layers` directly and could not see such a regression).
+    #[test]
+    fn isolation_contract_override_is_read_once_per_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), DEPLOY_LAYERS_YAML).unwrap();
+        let yaml = dir.path().join("config");
+        let override_file = dir.path().join("config_override.json");
+        let env: Vec<(String, String)> = DEPLOY_ENV_KEYS
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        for (base_path, key_path, deploy_base, raw) in duplicate_cased_override_samples() {
+            // The guard would otherwise drop the deployment key outright.
+            assert!(
+                !RuntimeOverride::from_text(raw)
+                    .unwrap()
+                    .noncanonical
+                    .is_empty(),
+                "{raw}"
+            );
+            std::fs::write(&override_file, raw).unwrap();
+            let _guard_off = SpellingGuardOff::new();
+            let mut moved = 0;
+            for _ in 0..DUPLICATE_LOADS {
+                let config =
+                    load_config_layers_for_test(yaml.to_str().unwrap(), &override_file, &env)
+                        .unwrap();
+                let base = config.get_string(base_path).unwrap();
+                let key = config.get_string(key_path).unwrap();
+                if normalize_api_base(&base) == normalize_api_base(deploy_base) {
+                    assert!(DEPLOYMENT_KEYS.contains(&key.as_str()), "{raw}: {key_path}");
+                } else {
+                    moved += 1;
+                    assert_eq!(
+                        key, "",
+                        "{raw}: deployment key paired with a non-deployment URL"
+                    );
+                }
+            }
+            // The sample really is ambiguous (both spellings win sometimes).
+            assert!(moved > 0 && moved < DUPLICATE_LOADS, "{raw}: moved {moved}");
+        }
+    }
+
+    /// #303 re-review nit: an override whose `base_url` is present but not
+    /// a string (`null`, an array or an object) counts as a moved endpoint
+    /// in the binding itself, for `gateway` and `embedding.oneapi` alike, so
+    /// the deployment key (yaml or environment) is replaced by an empty key.
+    /// Checked on the bound key, not on `Settings` deserialization.
+    #[test]
+    fn isolation_contract_non_string_override_base_url_drops_deployment_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), DEPLOY_LAYERS_YAML).unwrap();
+        let override_file = dir.path().join("config_override.json");
+        let non_strings = [
+            serde_json::json!(null),
+            serde_json::json!(["https://deploy.invalid/v1"]),
+            serde_json::json!({ "url": "https://deploy.invalid/v1" }),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ];
+        let sections = [
+            (
+                "gateway.api_key",
+                "embedding.oneapi.api_key",
+                ["yaml-emb-key", "env-emb-key"],
+            ),
+            (
+                "embedding.oneapi.api_key",
+                "gateway.api_key",
+                ["yaml-deploy-key", "env-deploy-key"],
+            ),
+        ];
+        for base in &non_strings {
+            for (key_path, other_key_path, other_keys) in sections {
+                let raw = if key_path == "gateway.api_key" {
+                    serde_json::json!({ "gateway": { "base_url": base } })
+                } else {
+                    serde_json::json!({ "embedding": { "oneapi": { "base_url": base } } })
+                };
+                std::fs::write(&override_file, raw.to_string()).unwrap();
+                for (env, other_key) in [
+                    (&[][..], other_keys[0]),
+                    (&DEPLOY_ENV_KEYS[..], other_keys[1]),
+                ] {
+                    let config = test_config(dir.path(), env).unwrap();
+                    let key = config.get_string(key_path).unwrap();
+                    assert!(
+                        !DEPLOYMENT_KEYS.contains(&key.as_str()),
+                        "{raw}: {key_path}"
+                    );
+                    assert_eq!(key, "", "{raw}: {key_path}");
+                    // The other section is untouched.
+                    assert_eq!(
+                        config.get_string(other_key_path).unwrap(),
+                        other_key,
+                        "{raw}: {other_key_path}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #303 re-review: an override written before the PUT schema was typed
+    /// may hold non-lower-case keys under `gateway` / `embedding` (ollama,
+    /// fallback and oneapi alike). Such a section never keeps the deployment
+    /// key; a WARN names the section and the env pair, never a key or a path.
+    /// The file is not rewritten. Canonical overrides are unaffected.
+    #[test]
+    fn isolation_contract_noncanonical_override_keys_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), DEPLOY_LAYERS_YAML).unwrap();
+        let override_file = dir.path().join("config_override.json");
+        let keys = |env: &[(&str, &str)]| {
+            let config = test_config(dir.path(), env).unwrap();
+            (
+                config.get_string("gateway.api_key").unwrap(),
+                config.get_string("embedding.oneapi.api_key").unwrap(),
+            )
+        };
+        let deployment_keys = |env: &[(&str, &str)]| {
+            if env.is_empty() {
+                ("yaml-deploy-key", "yaml-emb-key")
+            } else {
+                ("env-deploy-key", "env-emb-key")
+            }
+        };
+
+        let embedding_samples = [
+            r#"{"Embedding":{"provider":"oneapi"}}"#,
+            r#"{"embedding":{"Provider":"oneapi"}}"#,
+            r#"{"embedding":{"Ollama":{"base_url":"http://ollama.invalid:11434"}}}"#,
+            r#"{"embedding":{"ollama":{"BASE_URL":"http://ollama.invalid:11434"}}}"#,
+            r#"{"embedding":{"Fallback":{"dimension":8}}}"#,
+            r#"{"embedding":{"fallback":{"Dimension":8}}}"#,
+            // Same endpoint as the deployment, but cased: still untrusted.
+            r#"{"embedding":{"oneapi":{"Base_Url":"https://deploy-emb.invalid/v1"}}}"#,
+            r#"{"embedding.oneapi":{"model":"m"}}"#,
+        ];
+        for raw in embedding_samples {
+            std::fs::write(&override_file, raw).unwrap();
+            for env in [&[][..], &DEPLOY_ENV_KEYS[..]] {
+                let (gateway_key, embedding_key) = keys(env);
+                assert_eq!(embedding_key, "", "{raw}");
+                assert_eq!(gateway_key, deployment_keys(env).0, "{raw}");
+            }
+            assert_eq!(std::fs::read_to_string(&override_file).unwrap(), raw);
+        }
+        let gateway_samples = [
+            r#"{"Gateway":{"default_model":"m"}}"#,
+            r#"{"gateway":{"Default_Model":"m"}}"#,
+            r#"{"gateway":{"Model_Mapping":{"a":"b"}}}"#,
+        ];
+        for raw in gateway_samples {
+            std::fs::write(&override_file, raw).unwrap();
+            for env in [&[][..], &DEPLOY_ENV_KEYS[..]] {
+                let (gateway_key, embedding_key) = keys(env);
+                assert_eq!(gateway_key, "", "{raw}");
+                assert_eq!(embedding_key, deployment_keys(env).1, "{raw}");
+            }
+        }
+
+        // Canonical spelling (model names under gateway.model_mapping may be
+        // upper case) and unrelated sections: deployment keys kept.
+        for raw in [
+            r#"{"gateway":{"default_model":"m","model_mapping":{"GPT-4":"gpt-4o"}},
+                "embedding":{"provider":"oneapi","ollama":{"base_url":"http://ollama.invalid:11434"},
+                             "fallback":{"dimension":8},"oneapi":{"base_url":"https://deploy-emb.invalid"}}}"#,
+            r#"{"Models":{"providers":[]}}"#,
+        ] {
+            std::fs::write(&override_file, raw).unwrap();
+            for env in [&[][..], &DEPLOY_ENV_KEYS[..]] {
+                let expected = deployment_keys(env);
+                assert_eq!(keys(env), (expected.0.into(), expected.1.into()), "{raw}");
+            }
+        }
+
+        // An environment base URL still pins the deployment pair.
+        std::fs::write(
+            &override_file,
+            r#"{"Gateway":{"base_url":"https://atk.invalid"}}"#,
+        )
+        .unwrap();
+        let env_pair = [
+            ("AGENT_OS_GATEWAY_BASE_URL", "https://deploy.invalid"),
+            ("AGENT_OS_GATEWAY_API_KEY", "env-deploy-key"),
+        ];
+        let config = test_config(dir.path(), &env_pair).unwrap();
+        assert_eq!(
+            config.get_string("gateway.base_url").unwrap(),
+            "https://deploy.invalid"
+        );
+        assert_eq!(
+            config.get_string("gateway.api_key").unwrap(),
+            "env-deploy-key"
+        );
+
+        // A key stored in the override itself is still the override's own.
+        std::fs::write(
+            &override_file,
+            r#"{"embedding":{"OneApi":{"base_url":"https://other.invalid/v1","api_key":"override-emb-key"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(keys(&DEPLOY_ENV_KEYS).1, "override-emb-key");
+
+        // The WARN names the section and the env pair; no key, no path.
+        let (_, _, key_path, base_env, key_env) = ENDPOINT_KEY_BINDINGS[1];
+        let warning = noncanonical_section_warning("embedding", key_path, base_env, key_env);
+        assert!(warning.contains("embedding section"), "{warning}");
+        assert!(warning.contains("embedding.oneapi.api_key"), "{warning}");
+        assert!(
+            warning.contains("AGENT_OS_EMBEDDING_ONEAPI_BASE_URL"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("AGENT_OS_EMBEDDING_ONEAPI_API_KEY"),
+            "{warning}"
+        );
+        // Whatever the load logs (capture depends on the process-wide tracing
+        // state shared with parallel tests) never carries a key or a path.
+        std::fs::write(&override_file, embedding_samples[2]).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_writer({
+                let log = log.clone();
+                move || LogWriter(log.clone())
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            test_config(dir.path(), &DEPLOY_ENV_KEYS).unwrap();
+        });
+        let line = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        for key in DEPLOYMENT_KEYS {
+            assert!(!line.contains(key), "{line}");
+        }
+        assert!(!line.contains(dir.path().to_str().unwrap()), "{line}");
+        assert!(!line.contains("ollama.invalid"), "{line}");
     }
 
     #[test]

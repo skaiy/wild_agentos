@@ -610,6 +610,11 @@ impl UnifiedGateway {
         }))
     }
 
+    /// Current normalized base URL (no credential is part of it).
+    pub fn base_url(&self) -> String {
+        self.base_url.read().unwrap().clone()
+    }
+
     pub fn set_base_url(&self, url: String) {
         *self.base_url.write().unwrap() = crate::config::settings::normalize_api_base(&url);
     }
