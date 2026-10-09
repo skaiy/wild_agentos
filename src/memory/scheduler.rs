@@ -180,7 +180,6 @@ impl MemoryScheduler {
         self.memory_bus
             .publish("TASK_COMPLETED", task_iri, "{}")
             .await;
-        let _ = self.blackboard.discard_non_task_nodes()?;
         Ok(())
     }
 
@@ -189,16 +188,17 @@ impl MemoryScheduler {
     ///
     /// The task's dirty subtree is flushed into `tenant_l0` and then released.
     /// If the flush fails, the subtree is still released so L2 does not grow;
-    /// the error is returned after that release. Task-less nodes (session,
-    /// memory, and any IRI outside `iri://task/`) are discarded and are not
-    /// written into a tenant store.
+    /// the error is returned after that release. Only that task's subtree is
+    /// released. The shared blackboard is not prefix-filtered: production task
+    /// IRIs are `iri://task_<uuid>`, and dropping every other IRI would delete
+    /// in-flight runs of other tenants. Nodes this run recorded outside the
+    /// subtree can be removed with [`Blackboard::discard_recorded_nodes`];
+    /// nothing else is.
     pub fn on_run_end(&self, task_iri: &str, tenant_l0: &L0Store) -> Result<(), CoreError> {
         let flushed = self.blackboard.flush_dirty_subtree(task_iri, tenant_l0);
         let released = self.blackboard.release_subtree(task_iri);
-        let discarded = self.blackboard.discard_non_task_nodes();
         flushed?;
         released?;
-        discarded?;
         Ok(())
     }
 
@@ -551,9 +551,10 @@ mod tests {
     }
 
     /// Timeout, cancel, and failure never reach `on_task_complete`. `on_run_end`
-    /// still flushes that task and discards task-less nodes instead of leaving
-    /// them in L2. A node written once (`dirty == false`) is released without
-    /// being persisted.
+    /// still flushes that task and releases only its subtree. Nodes this run
+    /// did not record (session, memory, and other tasks) stay in L2 and are
+    /// not written into this tenant. A node written once (`dirty == false`) is
+    /// released without being persisted.
     #[test]
     fn stopped_run_flushes_its_subtree_and_discards_taskless_nodes() {
         let dir = tempdir().unwrap();
@@ -618,9 +619,84 @@ mod tests {
                 tenant_l0.retrieve(iri).unwrap().is_none(),
                 "{iri} must not be written into the tenant L0"
             );
-            assert!(blackboard.read_node(iri).unwrap().is_none(), "{iri}");
+            assert!(
+                blackboard.read_node(iri).unwrap().is_some(),
+                "{iri} was not recorded by this run and must stay in L2"
+            );
         }
         assert!(blackboard.read_node(other).unwrap().unwrap().dirty);
         assert_eq!(legacy.count().unwrap(), 0);
+    }
+
+    /// PoC (review #435): production task IRIs are `iri://task_<uuid>`
+    /// (core_types.rs init_task). Another tenant's run ending must not drop
+    /// this tenant's in-flight dirty L2 nodes.
+    #[test]
+    fn poc_other_tenant_run_end_must_not_discard_inflight_production_task_nodes() {
+        let dir = tempdir().unwrap();
+        let legacy = Arc::new(
+            L0Store::open_legacy_readonly(dir.path().join("legacy").to_str().unwrap()).unwrap(),
+        );
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), 1024));
+        let memory_bus = Arc::new(MemoryBus::new(Arc::new(EventBus::new(100))));
+        let consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            legacy.clone(),
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let scheduler = MemoryScheduler::new(
+            legacy.clone(),
+            blackboard.clone(),
+            projection,
+            consistency,
+            memory_bus,
+        );
+        let a = crate::isolation::IsolationClaims::from_verified("tenant-a", "p", "u").unwrap();
+        let b = crate::isolation::IsolationClaims::from_verified("tenant-b", "p", "u").unwrap();
+        let a_l0 = L0Store::open_for_claims(dir.path(), &a).unwrap();
+        let b_l0 = L0Store::open_for_claims(dir.path(), &b).unwrap();
+        let config = crate::CoreConfig::default();
+        let b_task = "iri://task_bbbbbbbb-0000-0000-0000-000000000000";
+        let b_node = format!("{b_task}/result");
+        blackboard
+            .write_node(&b_node, r#"{"v":1}"#, &config)
+            .unwrap();
+        blackboard
+            .write_node(&b_node, r#"{"v":2}"#, &config)
+            .unwrap();
+        assert!(blackboard.read_node(&b_node).unwrap().unwrap().dirty);
+        // tenant A's run ends (timeout/cancel/success all call on_run_end)
+        scheduler
+            .on_run_end("iri://task_aaaaaaaa-0000-0000-0000-000000000000", &a_l0)
+            .unwrap();
+        assert!(
+            blackboard.read_node(&b_node).unwrap().is_some(),
+            "tenant A's run end deleted tenant B's in-flight dirty node"
+        );
+        let _ = b_l0;
+    }
+
+    /// Orphan cleanup may delete only IRIs this caller recorded. It must not
+    /// prefix-filter the shared cache.
+    #[test]
+    fn discard_recorded_nodes_leaves_other_production_task_nodes() {
+        let blackboard = Blackboard::new().unwrap();
+        let config = crate::CoreConfig::default();
+        let kept = "iri://task_bbbbbbbb-0000-0000-0000-000000000000/result";
+        let recorded = "iri://session/this-run";
+        blackboard.write_node(kept, r#"{"v":1}"#, &config).unwrap();
+        blackboard.write_node(kept, r#"{"v":2}"#, &config).unwrap();
+        blackboard
+            .write_node(recorded, r#"{"v":1}"#, &config)
+            .unwrap();
+
+        blackboard
+            .discard_recorded_nodes(&[recorded.to_string()])
+            .unwrap();
+
+        assert!(blackboard.read_node(kept).unwrap().unwrap().dirty);
+        assert!(blackboard.read_node(recorded).unwrap().is_none());
     }
 }

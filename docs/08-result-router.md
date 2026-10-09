@@ -185,11 +185,12 @@ owned, not global:
   claims (`graphify_json_for_claims`). Without claims there is no graphify; the
   result is truncated and gets a `read_full_result_{call_id}` reader instead.
   Each written quad is recorded for that run, including a
-  `prov/generatedByRun` marker. When the run ends, those exact quads are
-  deleted from the claims graph. Triples written by another source, or by
-  another run in the same project, stay. The record is in memory, so a process
-  crash leaves the triples until the next successful run does not see them as
-  its own.
+  `prov/generatedByRun` marker. When the run ends, quads that only this run
+  recorded are deleted from the claims graph. A triple with the same subject,
+  predicate, and object that another live run in the same project also recorded
+  stays until that run ends too. Triples written by another source stay. The
+  record is in memory, so a process crash leaves the triples until the next
+  successful run does not see them as its own.
 - **Lifetime.** Full results are kept in memory only, not copied to L0. When the
   run ends, its readers and results are removed. A TTL (default 1 hour,
   `AGENTOS_MICRO_TOOL_TTL_SECS`), a per-tenant quota (default 256 readers and

@@ -552,27 +552,26 @@ impl Blackboard {
         self.flush_nodes(vec![node_iri.to_string()], l0_store)
     }
 
-    /// Drop cached nodes that are not part of any `iri://task/` tree.
+    /// Remove only node IRIs this caller recorded.
     ///
-    /// Session, memory, and other task-less nodes are not tenant-scoped. They
-    /// are discarded instead of being written into whichever run happens to
-    /// finish. Returns how many nodes were removed.
-    pub fn discard_non_task_nodes(&self) -> Result<usize, CoreError> {
-        let iris: Vec<String> = self
-            .node_cache
-            .iter()
-            .map(|entry| entry.key().clone())
-            .filter(|iri| !iri.starts_with("iri://task/"))
-            .collect();
+    /// Does not scan the shared cache and does not keep or drop entries by IRI
+    /// prefix. Production task IRIs are `iri://task_<uuid>`, so a prefix sweep
+    /// of everything that does not start with `iri://task/` would delete other
+    /// in-flight runs. IRIs absent from `recorded` stay. Exact `task_tree` keys
+    /// in `recorded` are removed; every other task stays.
+    pub fn discard_recorded_nodes(&self, recorded: &[String]) -> Result<usize, CoreError> {
         let mut removed = 0;
-        for iri in iris {
-            if self.delete_node(&iri).unwrap_or(false) {
+        for iri in recorded {
+            if self.delete_node(iri).unwrap_or(false) {
                 removed += 1;
             }
         }
-        self.task_tree
-            .write()
-            .retain(|task_iri, _| task_iri.starts_with("iri://task/"));
+        if !recorded.is_empty() {
+            let mut tree = self.task_tree.write();
+            for iri in recorded {
+                tree.remove(iri);
+            }
+        }
         Ok(removed)
     }
 

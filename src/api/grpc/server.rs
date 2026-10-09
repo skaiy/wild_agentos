@@ -850,6 +850,10 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
         let cancellation = spec.cancellation.clone();
         // Set only when the caller's token (not our own timeout) stopped the run.
         let mut cancelled_by_caller = false;
+        // `biased` is intentional. Branches are polled in source order, so a
+        // caller cancellation that is ready in the same turn as a result (or
+        // the timeout) wins. The run is reported as cancelled rather than
+        // completed when those two arrive together.
         let execution = if self.settings.agents.timeout_seconds > 0 {
             let timeout = std::time::Duration::from_secs(self.settings.agents.timeout_seconds);
             tokio::select! {
@@ -944,8 +948,9 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
         };
 
         // process_task is dropped on timeout or cancellation, so its completion
-        // hook never runs. Settle the task subtree here on every exit, including
-        // success (task-less nodes are discarded; a second subtree flush is empty).
+        // hook never runs. Settle only this task's subtree here on every exit,
+        // including success (a second subtree flush is empty). Other runs' nodes
+        // stay in the shared blackboard.
         if let Err(error) = self.scheduler.on_run_end(&spec.task_iri, l0.as_ref()) {
             let count = crate::memory::l0_store::note_l0_write_rejected("run_end");
             tracing::warn!(error = %error, count, "L0 run-end flush rejected");

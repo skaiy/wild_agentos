@@ -219,15 +219,15 @@ impl TenantL0Registry {
         slot: &Arc<TenantSlot>,
         claims: &IsolationClaims,
     ) -> Result<Arc<L0Store>, CoreError> {
-        if let Some(handle) = slot.store.get() {
-            return Ok(handle.clone());
+        if let Some(handle) = self.clone_open_handle(slot) {
+            return Ok(handle);
         }
         let _open = slot
             .open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(handle) = slot.store.get() {
-            return Ok(handle.clone());
+        if let Some(handle) = self.clone_open_handle(slot) {
+            return Ok(handle);
         }
         // Copy the hook out before calling it. The lock guard must not stay
         // alive across the hook: the hook blocks, and another tenant's open
@@ -265,6 +265,19 @@ impl TenantL0Registry {
         }
     }
 
+    /// Clone an already-open handle while the map lock is held.
+    ///
+    /// `release_idle` needs that lock, so it cannot observe a handle strong
+    /// count of 1 between the lookup and the clone.
+    fn clone_open_handle(&self, slot: &Arc<TenantSlot>) -> Option<Arc<L0Store>> {
+        slot.store.get()?;
+        let _handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.store.get().map(Arc::clone)
+    }
+
     /// Close every handle that only the registry still holds. Returns how many
     /// were closed.
     pub fn release_idle(&self) -> usize {
@@ -287,11 +300,21 @@ impl TenantL0Registry {
 }
 
 fn evict_idle_slots(handles: &mut std::collections::HashMap<PathBuf, Arc<TenantSlot>>) {
-    handles.retain(|_, slot| match slot.store.get() {
-        // `strong_count == 1` means only this slot still holds the database.
-        Some(handle) => Arc::strong_count(handle) > 1,
-        // An empty slot is an open still in progress. Keep it.
-        None => Arc::strong_count(slot) > 1,
+    handles.retain(|_, slot| {
+        // `prepare_slot` returns this Arc before the caller clones the
+        // database handle. In that window only the slot owns the store, so a
+        // check of the store's strong count alone evicts a slot another caller
+        // still holds. The orphaned handle keeps the redb file lock and the
+        // next open fails with "Database already open".
+        if Arc::strong_count(slot) > 1 {
+            return true;
+        }
+        match slot.store.get() {
+            // Only the slot still holds the database. No run is using it.
+            Some(handle) => Arc::strong_count(handle) > 1,
+            // Only the map held an empty slot. The opener is gone.
+            None => false,
+        }
     });
 }
 
@@ -319,8 +342,9 @@ fn open_database_off_worker(
     open()
 }
 
-/// Count a rejected L0 write and log it. The count is the audit value; the
-/// log line does not include a filesystem path.
+/// Count a rejected L0 write and log it. The count is process-wide: every
+/// rejected L0 write in this process increments the same counter. That count
+/// is the audit value; the log line does not include a filesystem path.
 pub(crate) fn note_l0_write_rejected(kind: &str) -> u64 {
     static REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1977,6 +2001,27 @@ mod tests {
         assert_eq!(reopened.count().unwrap(), 1);
         assert!(reopened.retrieve(legacy).unwrap().is_none());
         assert_eq!(reopened.retrieve(owned).unwrap().unwrap().content, "owned");
+    }
+
+    /// PoC (review #435): eviction between prepare_slot and open_slot orphans
+    /// a live handle; the next open re-creates the same redb file (#355 symptom).
+    #[test]
+    fn poc_evicted_slot_with_live_handle_breaks_next_open() {
+        let dir = tempdir().unwrap();
+        let registry = TenantL0Registry::new(dir.path());
+        let claims = IsolationClaims::from_verified("acme", "p", "actor").unwrap();
+        drop(registry.get_or_open(&claims).unwrap());
+        let path = tenant_path(dir.path(), &claims).unwrap();
+        let slot = registry.prepare_slot(&path).unwrap(); // run 1 got its slot
+        registry.release_idle(); // another run's lease drops concurrently
+        let held = registry.open_slot(&path, &slot, &claims).unwrap(); // run 1 holds db
+        let second = registry.get_or_open(&claims); // run 2, same tenant
+        assert!(
+            second.is_ok(),
+            "same-tenant open failed while a handle is live: {:?}",
+            second.err()
+        );
+        drop(held);
     }
 
     fn test_store(dir: &tempfile::TempDir) -> L0Store {

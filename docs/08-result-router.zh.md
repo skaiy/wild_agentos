@@ -179,9 +179,10 @@ sequenceDiagram
 - **图谱化。** 只有带已验证 claims 时才做，写进由这些 claims 生成的图
   （`graphify_json_for_claims`）。没有 claims 时不做图谱化，改为截断，并注册
   `read_full_result_{call_id}` 读取器。本次写入的每条 quad 都按 run 记在内存里，
-  其中包含 `prov/generatedByRun` 标记。run 结束时，只从 claims 图删除这些 quad。
-  同一项目里其他来源、或其他 run 写入的三元组保留。记录在内存中，进程崩溃后这些
-  三元组会留下，直到没有后续逻辑把它们当成自己的写入。
+  其中包含 `prov/generatedByRun` 标记。run 结束时，只从 claims 图删除仅该 run
+  登记过的 quad。同一项目里另一个仍在运行的 run 也写入了相同主语、谓语和宾语时，
+  这条三元组会保留到那个 run 也结束。其他来源写入的三元组保留。记录在内存中，进程
+  崩溃后这些三元组会留下，直到没有后续逻辑把它们当成自己的写入。
 - **生命周期。** 完整结果只保存在内存中，不再写入 L0。run 结束时删除该 run 的
   读取器和结果。另有 TTL（默认 1 小时，`AGENTOS_MICRO_TOOL_TTL_SECS`）、按租户配额
   （读取器、结果各默认 256 条，`AGENTOS_MICRO_TOOL_TENANT_QUOTA`，硬上限 1024）和总量上限

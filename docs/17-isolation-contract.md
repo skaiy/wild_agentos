@@ -423,7 +423,8 @@ the action and the resource `l0`. It does not include a filesystem path or a
 tenant id. Session archive, experience archive, emphasis, and approval records
 use that same tenant handle. A write with no verified claims returns that
 permission error; the runner logs it and emits `L0_WRITE_REJECTED` with a kind
-and a count. The event does not include a path or the error text.
+and a count. The count is process-wide: every rejected L0 write in the process
+increments the same counter. The event does not include a path or the error text.
 
 L0 isolation is per tenant. Projects of one tenant share one directory and one
 open handle. Tenant ids that contain an ASCII uppercase letter are rejected
@@ -447,12 +448,15 @@ node persists the update. Write-through consistency flushes only the node that
 was just written, into the caller-supplied tenant handle. It does not flush
 every dirty node in the process.
 
-Nodes whose IRI is not under `iri://task/` (session and memory records, and
-any other non-task IRI) are not part of a tenant's task subtree. They are
-discarded at the end of a run and are not written into a tenant L0. A run that
-fails, times out, or is cancelled still flushes its own dirty task subtree
+A run ends by flushing and releasing only that task's own subtree. The shared
+blackboard is not prefix-filtered. Production task IRIs are `iri://task_<uuid>`,
+so deleting every IRI that does not start with `iri://task/` would remove other
+in-flight runs' dirty nodes. Session and memory nodes stay in L2 unless they
+were recorded on the finishing task. They are not written into this tenant's
+L0. If a run must drop orphans, it deletes only the IRIs it recorded. A run
+that fails, times out, or is cancelled still flushes its own dirty task subtree
 into its tenant L0 and then releases that subtree, including when the flush
-itself fails, so L2 does not keep the subtree. The shared startup store stays
+itself fails, so L2 does not keep that subtree. The shared startup store stays
 read-only.
 
 ## Graph interface

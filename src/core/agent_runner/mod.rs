@@ -442,7 +442,7 @@ impl Drop for ToolRestrictionRunGuard {
 
 impl ToolRestrictionRunGuard {
     fn delete_graphify_quads(&mut self) {
-        let Some(record) = self.graphify_ledger.take(&self.run_id) else {
+        let Some(record) = self.graphify_ledger.take_exclusive(&self.run_id) else {
             return;
         };
         let Some(store) = self.graph_store.clone() else {
@@ -662,8 +662,8 @@ impl AgentRunner {
         }
     }
 
-    /// Warn and emit `L0_WRITE_REJECTED` with a count. The payload has no
-    /// filesystem path and no error text.
+    /// Warn and emit `L0_WRITE_REJECTED` with a count. The count is
+    /// process-wide. The payload has no filesystem path and no error text.
     pub(crate) async fn report_l0_write_rejected(&self, kind: &str, task_iri: &str) {
         let count = crate::memory::l0_store::note_l0_write_rejected(kind);
         let payload = serde_json::json!({"kind": kind, "count": count}).to_string();

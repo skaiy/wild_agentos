@@ -1,8 +1,9 @@
 //! In-memory record of the quads one run wrote into a claims graph.
 //!
 //! Graphify writes into `graph://{tenant}/{project}`, which other sources also
-//! use. The run guard deletes exactly the quads recorded here when the run
-//! ends, so another source's triples in the same graph stay.
+//! use. The run guard deletes the quads only this run recorded. A triple with
+//! the same subject, predicate, and object that another live run also recorded
+//! stays until that run ends. Another source's triples in the same graph stay.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -40,10 +41,28 @@ impl GraphifyRunLedger {
         }
     }
 
-    pub(crate) fn take(&self, run_id: &str) -> Option<GraphifyRunRecord> {
-        self.runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(run_id)
+    /// Remove `run_id`'s record and return the quads no other live run recorded.
+    ///
+    /// Deletion is by triple value. Two runs in the same project can graphify
+    /// the same subject, predicate, and object; deleting that value when the
+    /// first run ends would remove a triple the other run still uses. Those
+    /// shared quads are left out of the returned record. This run's marker is
+    /// unique, so it is always included.
+    pub(crate) fn take_exclusive(&self, run_id: &str) -> Option<GraphifyRunRecord> {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut record = runs.remove(run_id)?;
+        record.quads.retain(|quad| {
+            !runs
+                .values()
+                .any(|other| other.quads.iter().any(|kept| same_quad(kept, quad)))
+        });
+        Some(record)
     }
+}
+
+fn same_quad(left: &RdfQuad, right: &RdfQuad) -> bool {
+    left.subject == right.subject
+        && left.predicate == right.predicate
+        && left.object == right.object
+        && left.graph == right.graph
 }
