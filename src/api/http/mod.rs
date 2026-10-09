@@ -48,6 +48,7 @@ pub mod models;
 pub mod ontology;
 pub mod ontology_guardrails;
 pub mod prompts;
+pub(crate) mod provider_outbound;
 pub mod runtime;
 pub mod skills;
 pub mod tasks;

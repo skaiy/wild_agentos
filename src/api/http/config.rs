@@ -23,17 +23,19 @@ use super::{data_dir, AppState};
 
 /// Validated request schema for the configuration write surface.
 ///
-/// The settings document remains extensible for the non-gateway sections, but
-/// gateway is typed because it controls the credentials used by the shared LLM
-/// gateway.  This prevents a typo or arbitrary top-level JSON from silently
-/// becoming persistent configuration.
+/// The settings document remains extensible for the models/admin sections, but
+/// gateway and embedding are typed because they pair an endpoint with a
+/// credential.  Unknown fields, including differently cased spellings such as
+/// `BASE_URL` or `OneApi`, are rejected (422) instead of being persisted: the
+/// configuration loader lowercases keys, so such a spelling would otherwise
+/// slip past the endpoint/key checks below (#303 review).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigUpdateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     gateway: Option<GatewayConfigPatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    embedding: Option<Value>,
+    embedding: Option<EmbeddingConfigPatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     models: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,6 +69,62 @@ struct GatewayConfigPatch {
     api_key_configured: Option<bool>,
 }
 
+/// Typed `embedding` section of `PUT /api/v1/config` (#303 review). Mirrors
+/// `EmbeddingSettings`; only the exact lowercase field names are accepted.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddingConfigPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ollama: Option<OllamaEmbeddingPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oneapi: Option<OneApiEmbeddingPatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback: Option<FallbackEmbeddingPatch>,
+    /// UI-only state echoed back by older clients; never persisted or applied.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    active_dimension: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OllamaEmbeddingPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimension: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OneApiEmbeddingPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimension: Option<usize>,
+    /// UI-only state, never persisted or applied.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    api_key_configured: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FallbackEmbeddingPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimension: Option<usize>,
+}
+
 impl ConfigUpdateRequest {
     fn into_patch(self) -> Value {
         serde_json::to_value(self).expect("configuration DTO is serializable")
@@ -90,9 +148,51 @@ pub(crate) fn same_provider_endpoint(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
+/// Whether applying `patch` would send the configured gateway key to a new
+/// endpoint (#303).
+///
+/// The key belongs to the endpoint it was configured with. A patch that moves
+/// `gateway.base_url` to a different endpoint must carry its own non-empty
+/// `gateway.api_key`; otherwise the request is refused before anything is
+/// saved or applied. Clearing the base URL, keeping the same endpoint, or a
+/// gateway without a key are unaffected.
+///
+/// A `base_url` that is present but not a string (`null`, a number, an array
+/// or an object) is treated as a moved endpoint (fail closed). The typed
+/// request DTO never produces one; this is defense in depth.
+fn gateway_key_would_follow_new_base_url(
+    gateway: &crate::gateway::unified_gateway::UnifiedGateway,
+    patch: &Value,
+) -> bool {
+    let Some(gw_patch) = patch.get("gateway").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let Some(new_base) = gw_patch.get("base_url") else {
+        return false;
+    };
+    let moves_endpoint = match new_base.as_str() {
+        Some(new_base) => {
+            !new_base.trim().is_empty() && !same_provider_endpoint(new_base, &gateway.base_url())
+        }
+        None => true,
+    };
+    let explicit_key = gw_patch
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .is_some_and(|key| !key.trim().is_empty());
+    !explicit_key && gateway.api_key_configured() && moves_endpoint
+}
+
 /// 将网关配置持久化到运行期覆盖文件，重启后由 Settings::load() 生效。
 /// Gateway API keys are runtime-only and never written to this file.
+///
+/// Read-modify-write is serialized within the process, and the file is
+/// replaced atomically (owner-only temporary file in the same directory, then
+/// rename), so a concurrent `Settings` load never sees a half-written file.
 pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
+    let _serialized = CONFIG_OVERRIDE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = config_override_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -224,7 +324,68 @@ pub(crate) fn save_config_override(patch: &Value) -> std::io::Result<()> {
     }
 
     let content = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(&path, content)
+    write_file_atomically(&path, content.as_bytes())
+}
+
+/// [`save_config_override`] for async handlers: the read-modify-write, the
+/// fsync and the time spent waiting for [`CONFIG_OVERRIDE_WRITE_LOCK`] run on
+/// the blocking pool, not on a runtime worker. The lock is only ever taken
+/// inside `save_config_override`, which does no network I/O and never awaits.
+pub(crate) async fn save_config_override_off_runtime(patch: &Value) -> std::io::Result<()> {
+    let patch = patch.clone();
+    tokio::task::spawn_blocking(move || save_config_override(&patch))
+        .await
+        .map_err(|error| {
+            // A panic message may contain paths: log it, return fixed text.
+            tracing::error!("config override writer task failed: {error}");
+            std::io::Error::other("config override writer failed")
+        })?
+}
+
+/// Serializes `save_config_override` read-modify-write cycles in this process.
+static CONFIG_OVERRIDE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Write `bytes` to a new owner-only (0600 on Unix) temporary file next to
+/// `path`, flush it, and rename it over `path`. Readers see either the old or
+/// the new file, never a partial one. The result keeps the 0600 mode.
+///
+/// The temporary file gets an unpredictable name (`tempfile`, created with
+/// `O_EXCL`), so a leftover from a crashed write (in a container the PID is
+/// always 1) can neither make the next save fail nor be removed by it: on
+/// error only the file this call created is deleted (#303 re-review).
+fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config_override.json".to_string());
+    let prefix = format!(".{name}.tmp-");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    // Dropping `temp` (or the `PersistError` holding it) on any error below
+    // removes the temporary file this call created, and nothing else.
+    let mut temp = builder.tempfile_in(dir)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
+    // Best effort: persist the rename itself.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// 递归深合并 src 到 dst（对象逐键合并，其余类型直接覆盖）。
@@ -385,13 +546,27 @@ pub(crate) async fn update_config_handler(
         Err(rejection) => return rejection,
     };
     let patch = request.into_patch();
+    if gateway_key_would_follow_new_base_url(&state.gateway, &patch) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "explicit_api_key_required",
+                "message": "changing gateway.base_url requires an explicit gateway.api_key",
+            })),
+        )
+            .into_response();
+    }
 
-    if let Err(error) = save_config_override(&patch) {
+    if let Err(error) = save_config_override_off_runtime(&patch).await {
+        // The full error (it may name the data directory and the temporary
+        // file) goes to the server log only; the response carries the error
+        // kind (#303 re-review).
+        tracing::error!("persisting config_override.json failed: {error}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
                 "status": "error",
-                "message": format!("配置持久化失败：{error}"),
+                "message": format!("配置持久化失败：{}", error.kind()),
                 "persisted": false,
             })),
         )
@@ -588,12 +763,60 @@ pub(crate) fn hot_reload_models(state: &Arc<AppState>) {
     );
 }
 
+/// Serializes [`hot_reload_embedding`].
+static EMBEDDING_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Test probe: the largest number of [`hot_reload_embedding`] bodies seen
+/// running at the same time (must stay 1).
+#[cfg(test)]
+pub(crate) mod embedding_reload_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct Entered;
+
+    pub(crate) fn enter() -> Entered {
+        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+        Entered
+    }
+
+    impl Drop for Entered {
+        fn drop(&mut self) {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Unique name for the rotated vector store directory. Serialized reloads can
+/// run within the same second, so the timestamp alone is not enough.
+fn vector_store_backup_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "vector_store.bak-{}-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S%9f"),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Embedding 配置热切换：按最新持久化配置重建 embedding 服务，原子换入新维度向量库，
 /// 并后台重建所有向量 KB 索引（从原文台账重嵌入）。免进程重启即时生效。
 /// 返回 (old_dim, new_dim, dim_changed, reindex_queued)。
+///
+/// Reloads are serialized (one at a time per process), and each reload reads
+/// the configuration (and `config_override.json`) exactly once: the endpoint
+/// and the key it uses come from that single read (#303 review).
 pub(crate) async fn hot_reload_embedding(
     state: &Arc<AppState>,
 ) -> Result<(usize, usize, bool, usize), String> {
+    let _serialized = EMBEDDING_RELOAD_LOCK.lock().await;
+    #[cfg(test)]
+    let _probe = embedding_reload_probe::enter();
+    #[cfg(test)]
+    tokio::task::yield_now().await;
     let settings = crate::config::settings::Settings::load().unwrap_or_default();
     let embedding = settings.embedding.clone();
     let timeout = settings.agents.embedding_timeout_secs;
@@ -606,10 +829,7 @@ pub(crate) async fn hot_reload_embedding(
     // 任何 embedding 变更都需换库重建（旧向量来自旧模型，语义不可混用；维度变更更是结构不兼容）。
     // 用全新目录打开，旧库整体移为 .bak-<ts> 便于回滚，同时避免与仍被引用的旧句柄争用同一文件。
     if vdir.exists() {
-        let bak = data_dir().join(format!(
-            "vector_store.bak-{}",
-            chrono::Utc::now().format("%Y%m%d%H%M%S")
-        ));
+        let bak = data_dir().join(vector_store_backup_name());
         std::fs::rename(&vdir, &bak).map_err(|e| format!("轮换旧向量目录失败: {e}"))?;
         tracing::info!("embedding 热切换：旧向量库已移至 {}", bak.display());
     }
@@ -655,6 +875,252 @@ mod tests {
             model_mapping: std::collections::HashMap::new(),
         })
         .unwrap()
+    }
+
+    /// #303 re-review nit: the override is replaced atomically by an
+    /// owner-only file, and concurrent saves neither lose updates nor expose
+    /// a half-written file to readers.
+    #[test]
+    fn save_config_override_is_atomic_owner_only_and_serialized() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = super::super::control_plane_route_auth_tests::EnvGuard::set(&[(
+            "AGENTOS_DATA_DIR",
+            dir.path().to_string_lossy().into_owned(),
+        )]);
+        let path = dir.path().join("config_override.json");
+        std::fs::write(&path, r#"{"gateway":{"default_model":"old"}}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let text = std::fs::read_to_string(&path).expect("override always present");
+                    serde_json::from_str::<Value>(&text)
+                        .unwrap_or_else(|e| panic!("partial override read ({e}): {text:?}"));
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    for round in 0..25 {
+                        let patch = json!({ "gateway": { format!("t{i}"): round } });
+                        save_config_override(&patch).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["gateway"]["default_model"], "old");
+        for i in 0..8 {
+            assert_eq!(
+                saved["gateway"][format!("t{i}")],
+                24,
+                "lost update for t{i}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "override mode {mode:o}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config_override.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    }
+
+    fn override_dir_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #303 re-review nit: the temporary file name is not predictable. A
+    /// leftover from a crashed write under the old `<pid>-<seq>` naming (in a
+    /// container the PID is 1 and the sequence restarts at 0) used to make
+    /// the first save after a restart fail with EEXIST (500), and the error
+    /// cleanup removed a file that call had not created. Now the save
+    /// succeeds and leftovers are left alone, on success and on error.
+    #[test]
+    fn save_config_override_survives_and_keeps_stale_temp_files() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = super::super::control_plane_route_auth_tests::EnvGuard::set(&[(
+            "AGENTOS_DATA_DIR",
+            dir.path().to_string_lossy().into_owned(),
+        )]);
+        let path = dir.path().join("config_override.json");
+        // Old names `.config_override.json.tmp-<pid>-<seq>` for this process
+        // and for PID 1, covering more sequence numbers than the whole test
+        // binary ever saves.
+        const STALE_SEQUENCES: u64 = 1024;
+        let stale: Vec<String> = [std::process::id(), 1]
+            .iter()
+            .flat_map(|pid| {
+                (0..STALE_SEQUENCES)
+                    .map(move |seq| format!(".config_override.json.tmp-{pid}-{seq}"))
+            })
+            .collect();
+        for name in &stale {
+            std::fs::write(dir.path().join(name), "stale").unwrap();
+        }
+
+        save_config_override(&json!({ "gateway": { "default_model": "m1" } })).unwrap();
+        save_config_override(&json!({ "gateway": { "timeout_seconds": 7 } })).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["gateway"]["default_model"], "m1");
+        assert_eq!(saved["gateway"]["timeout_seconds"], 7);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "override mode {mode:o}");
+        }
+        let mut expected = stale.clone();
+        expected.push("config_override.json".to_string());
+        expected.sort();
+        assert_eq!(override_dir_entries(dir.path()), expected);
+        for name in &stale {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                "stale",
+                "{name}"
+            );
+        }
+
+        // A failing rename (the target is a directory) cleans up only the
+        // temporary file this call created.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(dir.path().join(".blocked.tmp-1-0"), "stale").unwrap();
+        assert!(write_file_atomically(&blocked, b"{}").is_err());
+        let mut expected_after_error = expected.clone();
+        expected_after_error.push(".blocked.tmp-1-0".to_string());
+        expected_after_error.push("blocked".to_string());
+        expected_after_error.sort();
+        assert_eq!(override_dir_entries(dir.path()), expected_after_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".blocked.tmp-1-0")).unwrap(),
+            "stale"
+        );
+    }
+
+    /// #303 re-review nit: async handlers persist the override on the
+    /// blocking pool, so waiting for the process-wide write lock (or for the
+    /// fsync) never stalls a runtime worker. On a current-thread runtime a
+    /// timer task keeps running while another thread holds the lock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn save_config_override_off_runtime_does_not_block_the_runtime() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _env = super::super::control_plane_route_auth_tests::EnvGuard::set(&[(
+            "AGENTOS_DATA_DIR",
+            dir.path().to_string_lossy().into_owned(),
+        )]);
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = CONFIG_OVERRIDE_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        });
+        locked_rx.recv().unwrap();
+
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
+        save_config_override_off_runtime(&json!({ "gateway": { "default_model": "async" } }))
+            .await
+            .unwrap();
+        ticker.abort();
+        holder.join().unwrap();
+
+        let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ticks >= 5,
+            "runtime stalled while waiting for the write lock ({ticks} ticks)"
+        );
+        let saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("config_override.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["gateway"]["default_model"], "async");
+    }
+
+    /// #303 re-review nit: a `gateway.base_url` that is present but not a
+    /// string counts as a moved endpoint, so the configured key is never kept
+    /// for it unless the patch carries its own key.
+    #[test]
+    fn gateway_key_binding_treats_non_string_base_url_as_moved() {
+        let gateway = test_gateway();
+        gateway.set_api_key(FAKE_KEY.to_string());
+        assert!(gateway.api_key_configured());
+        let follows =
+            |gw: Value| gateway_key_would_follow_new_base_url(&gateway, &json!({ "gateway": gw }));
+
+        for base in [
+            json!(null),
+            json!(["https://other.invalid/v1"]),
+            json!({ "url": "https://other.invalid/v1" }),
+            json!(42),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(follows(json!({ "base_url": base.clone() })), "{base}");
+            assert!(
+                follows(json!({ "base_url": base.clone(), "api_key": " " })),
+                "{base}: blank key"
+            );
+            assert!(
+                !follows(json!({ "base_url": base.clone(), "api_key": "new-endpoint-key" })),
+                "{base}: explicit key"
+            );
+        }
+        // Unchanged string behaviour.
+        assert!(follows(json!({ "base_url": "https://other.invalid/v1" })));
+        assert!(!follows(json!({ "base_url": "http://localhost/v1/" })));
+        assert!(!follows(json!({ "base_url": "  " })));
+        assert!(!follows(json!({ "default_model": "m" })));
+
+        // No configured key: nothing can follow.
+        let keyless = test_gateway();
+        assert!(!gateway_key_would_follow_new_base_url(
+            &keyless,
+            &json!({ "gateway": { "base_url": null } })
+        ));
     }
 
     #[tokio::test]
