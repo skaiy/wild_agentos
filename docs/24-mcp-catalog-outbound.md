@@ -210,8 +210,9 @@ allowlist; the catalog has no update endpoint.
 
 `POST /mcp` is the inbound Streamable HTTP endpoint that publishes explicitly
 exposed tenant Skills to external MCP clients. It is **not** a proxy for
-catalog registrations and it does not route catalog tools. Its Skill exposure
-and write-gate policies are unchanged.
+catalog registrations and it does not route catalog tools. Skill exposures on
+that endpoint are scoped to the caller's verified tenant and project. This
+document does not change the catalog outbound rules.
 
 Inbound `IsolationClaims` authorize the service's catalog lookup only. They are never
 used as a bearer credential, but their verified `tenant_id` and `project_id`

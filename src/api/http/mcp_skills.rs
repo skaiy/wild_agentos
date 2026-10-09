@@ -4,6 +4,10 @@
 //! third-party MCP servers. A Skill is never externally visible by default:
 //! a DA must explicitly create an exposure after its tenant publish gate has
 //! succeeded. Kernel (`iri://`) skills cannot be exposed.
+//!
+//! Each exposure belongs to one verified tenant and project. Rows stored
+//! before `project_id` existed stay on disk but are not listed, updated,
+//! deleted, or served over MCP until a DA recreates them.
 
 use std::sync::Arc;
 
@@ -25,6 +29,10 @@ use super::{data_dir, skills::is_tenant_published_skill, AppState};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct McpSkillExposure {
     pub tenant_id: String,
+    /// Verified project that owns this exposure. Missing or empty on legacy
+    /// rows, which fail closed instead of joining any project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub skill_iri: String,
     pub tool_name: String,
     #[serde(default = "default_enabled")]
@@ -39,11 +47,36 @@ fn exposures_path() -> std::path::PathBuf {
     data_dir().join("mcp_skill_exposures.json")
 }
 
+fn exposure_project_id(exposure: &McpSkillExposure) -> Option<&str> {
+    exposure
+        .project_id
+        .as_deref()
+        .filter(|project_id| !project_id.is_empty())
+}
+
+fn exposure_in_scope(exposure: &McpSkillExposure, tenant_id: &str, project_id: &str) -> bool {
+    exposure.tenant_id == tenant_id && exposure_project_id(exposure) == Some(project_id)
+}
+
 fn load_exposures() -> Vec<McpSkillExposure> {
-    std::fs::read_to_string(exposures_path())
+    let exposures: Vec<McpSkillExposure> = std::fs::read_to_string(exposures_path())
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let legacy = exposures
+        .iter()
+        .filter(|exposure| exposure_project_id(exposure).is_none())
+        .count();
+    if legacy > 0 {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                legacy_count = legacy,
+                "MCP skill exposures without project_id are ignored; recreate them for a project"
+            );
+        });
+    }
+    exposures
 }
 
 fn save_exposures(exposures: &[McpSkillExposure]) -> std::io::Result<()> {
@@ -105,12 +138,13 @@ fn mcp_tool(skill: &SkillMeta, exposure: &McpSkillExposure) -> Value {
 
 fn exposed_skill(
     state: &AppState,
-    identity: &UserIdentity,
+    tenant_id: &str,
+    project_id: &str,
     tool_name: &str,
 ) -> Option<(McpSkillExposure, SkillMeta)> {
     load_exposures().into_iter().find_map(|exposure| {
         (exposure.enabled
-            && exposure.tenant_id == identity.tenant_id
+            && exposure_in_scope(&exposure, tenant_id, project_id)
             && exposure.tool_name == tool_name
             && is_tenant_published_skill(&exposure.skill_iri)
             && !exposure.skill_iri.starts_with("iri://"))
@@ -125,6 +159,15 @@ fn exposed_skill(
     })
 }
 
+fn mcp_claims_scope(identity: &UserIdentity) -> Option<(String, String)> {
+    identity.isolation_claims().map(|claims| {
+        (
+            claims.tenant_id().to_owned(),
+            claims.project_id().to_owned(),
+        )
+    })
+}
+
 /// POST /mcp — Streamable-HTTP-compatible JSON-RPC subset for tenant Skills.
 pub(crate) async fn skill_mcp_handler(
     State(state): State<Arc<AppState>>,
@@ -134,6 +177,13 @@ pub(crate) async fn skill_mcp_handler(
     if let Err(error) = require_mcp_identity(&identity) {
         return error.into_response();
     }
+    let Some((tenant_id, project_id)) = mcp_claims_scope(&identity) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized", "message": "MCP requires a verified Bearer JWT"})),
+        )
+            .into_response();
+    };
 
     let response = match message.method.as_deref() {
         Some("initialize") => MCPMessage::response(
@@ -149,7 +199,7 @@ pub(crate) async fn skill_mcp_handler(
                 .into_iter()
                 .filter(|exposure| {
                     exposure.enabled
-                        && exposure.tenant_id == identity.tenant_id
+                        && exposure_in_scope(exposure, &tenant_id, &project_id)
                         && is_tenant_published_skill(&exposure.skill_iri)
                         && !exposure.skill_iri.starts_with("iri://")
                 })
@@ -171,7 +221,8 @@ pub(crate) async fn skill_mcp_handler(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let Some((exposure, skill)) = exposed_skill(&state, &identity, tool_name) else {
+            let Some((exposure, skill)) = exposed_skill(&state, &tenant_id, &project_id, tool_name)
+            else {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(mcp_error(-32601, "Skill MCP tool not found", message.id)),
@@ -232,20 +283,27 @@ pub(crate) async fn skill_mcp_handler(
     (StatusCode::OK, Json(response)).into_response()
 }
 
-/// Gate for exposure writes (#302): verified JWT scope with an explicit
-/// project and the DA role. Returns the verified tenant that owns the write.
-fn verified_exposure_tenant(identity: &UserIdentity) -> Result<String, (StatusCode, Json<Value>)> {
-    identity.require_control_plane_da("skill exposure writes")?;
+/// Gate for exposure reads and writes (#302, #384): verified JWT scope with an
+/// explicit project and the DA role. The scope is the verified tenant and
+/// project, never an unverified identity field or a defaulted project.
+fn verified_exposure_scope(
+    identity: &UserIdentity,
+    resource: &str,
+) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    identity.require_control_plane_da(resource)?;
     let claims = identity.isolation_claims().ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "error": "verified_isolation_claims_required",
-                "message": "verified isolation claims required for skill exposure writes",
+                "message": format!("verified isolation claims required for {resource}"),
             })),
         )
     })?;
-    Ok(claims.tenant_id().to_owned())
+    Ok((
+        claims.tenant_id().to_owned(),
+        claims.project_id().to_owned(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,29 +314,15 @@ pub(crate) struct McpSkillExposureRequest {
     pub enabled: bool,
 }
 
-/// GET /api/v1/mcp/skill-exposures — DA-only tenant-local exposure configuration.
+/// GET /api/v1/mcp/skill-exposures — control-plane DA, one project's exposures.
 pub(crate) async fn list_skill_exposures_handler(identity: UserIdentity) -> impl IntoResponse {
-    if let Err(error) = identity.require_verified_isolation_claims("skill exposures") {
-        return error.into_response();
-    }
-    if let Err(error) = identity.require_role("DA") {
-        return error.into_response();
-    }
-    // #302: filter by the verified tenant, never the unverified identity field.
-    let Some(claims) = identity.isolation_claims() else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "verified_isolation_claims_required",
-                "message": "verified isolation claims required for skill exposures",
-            })),
-        )
-            .into_response();
+    let (tenant_id, project_id) = match verified_exposure_scope(&identity, "skill exposures") {
+        Ok(scope) => scope,
+        Err(error) => return error.into_response(),
     };
-    let tenant_id = claims.tenant_id();
     let exposures: Vec<_> = load_exposures()
         .into_iter()
-        .filter(|exposure| exposure.tenant_id == tenant_id)
+        .filter(|exposure| exposure_in_scope(exposure, &tenant_id, &project_id))
         .collect();
     Json(json!({"count": exposures.len(), "exposures": exposures})).into_response()
 }
@@ -289,10 +333,11 @@ pub(crate) async fn upsert_skill_exposure_handler(
     identity: UserIdentity,
     Json(request): Json<McpSkillExposureRequest>,
 ) -> impl IntoResponse {
-    // #302: the exposure is owned by the verified tenant, never by an
-    // unverified X-Identity tenant or the non-strict anonymous bypass.
-    let tenant_id = match verified_exposure_tenant(&identity) {
-        Ok(tenant_id) => tenant_id,
+    // #302 / #384: the exposure is owned by the verified tenant and project,
+    // never by an unverified X-Identity tenant or a defaulted project.
+    let (tenant_id, project_id) = match verified_exposure_scope(&identity, "skill exposure writes")
+    {
+        Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
     if request.skill_iri.starts_with("iri://") {
@@ -333,18 +378,21 @@ pub(crate) async fn upsert_skill_exposure_handler(
     }
 
     let exposure = McpSkillExposure {
-        tenant_id,
+        tenant_id: tenant_id.clone(),
+        project_id: Some(project_id.clone()),
         skill_iri: request.skill_iri,
         tool_name: request.tool_name,
         enabled: request.enabled,
     };
     let mut exposures = load_exposures();
     if let Some(existing) = exposures.iter_mut().find(|existing| {
-        existing.tenant_id == exposure.tenant_id && existing.skill_iri == exposure.skill_iri
+        exposure_in_scope(existing, &tenant_id, &project_id)
+            && existing.skill_iri == exposure.skill_iri
     }) {
         *existing = exposure.clone();
     } else if exposures.iter().any(|existing| {
-        existing.tenant_id == exposure.tenant_id && existing.tool_name == exposure.tool_name
+        exposure_in_scope(existing, &tenant_id, &project_id)
+            && existing.tool_name == exposure.tool_name
     }) {
         return (
             StatusCode::CONFLICT,
@@ -378,14 +426,16 @@ pub(crate) async fn delete_skill_exposure_handler(
     identity: UserIdentity,
     Query(query): Query<McpSkillExposureQuery>,
 ) -> impl IntoResponse {
-    let tenant_id = match verified_exposure_tenant(&identity) {
-        Ok(tenant_id) => tenant_id,
+    let (tenant_id, project_id) = match verified_exposure_scope(&identity, "skill exposure writes")
+    {
+        Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
     let mut exposures = load_exposures();
     let before = exposures.len();
     exposures.retain(|exposure| {
-        !(exposure.tenant_id == tenant_id && exposure.skill_iri == query.skill_iri)
+        !(exposure_in_scope(exposure, &tenant_id, &project_id)
+            && exposure.skill_iri == query.skill_iri)
     });
     if exposures.len() == before {
         return StatusCode::NOT_FOUND.into_response();
@@ -429,6 +479,7 @@ mod tests {
         let skill = sample_skill();
         let exposure = McpSkillExposure {
             tenant_id: "acme".into(),
+            project_id: Some("project-a".into()),
             skill_iri: skill.skill_iri.clone(),
             tool_name: "weather.lookup".into(),
             enabled: true,
@@ -443,6 +494,7 @@ mod tests {
     fn system_iri_is_not_an_external_skill_candidate() {
         let exposure = McpSkillExposure {
             tenant_id: "acme".into(),
+            project_id: Some("project-a".into()),
             skill_iri: "iri://skills/code_execute".into(),
             tool_name: "dangerous.execute".into(),
             enabled: true,

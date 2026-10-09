@@ -73,11 +73,14 @@ the same two gates:
   for every tenant). Prompt reads are unchanged.
 - **Tenant-scoped → `require_control_plane_da`** (verified JWT, explicit
   tenant and project, `DA`): `POST /api/v1/market/packages` and
-  `.../:name/{install,rollback,upgrade}`; `POST, DELETE
-  /api/v1/mcp/skill-exposures` (the owning tenant is taken from verified
-  claims, never from `X-Identity`); `POST /api/v1/kb/bases/:id/reindex`.
+  `.../:name/{install,rollback,upgrade}`; `GET, POST, DELETE
+  /api/v1/mcp/skill-exposures` (the owning tenant and project are taken from
+  verified claims, never from `X-Identity` or a defaulted project);
+  `POST /api/v1/kb/bases/:id/reindex`.
 - Another tenant's knowledge base, skill exposure, or private market package
-  answers the same `404` as a missing one.
+  answers the same `404` as a missing one. Another project's skill exposure
+  in the same tenant does too. A stored skill exposure with no `project_id`
+  is not listed, called, or deleted until a DA recreates it for one project.
 
 ### API client id collisions and recovery
 

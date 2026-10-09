@@ -331,6 +331,21 @@ CI 中的 `skill-package-gate` job 同时执行一个通过和一个故意失败
 cargo test --lib skill_package_gate_ --verbose
 ```
 
+### 已发布 Skill 的 MCP 工具
+
+外部 MCP 客户端通过 `POST /mcp` 使用 JSON-RPC（`initialize`、`tools/list`、
+`tools/call`）。租户 Skill 只有在最近一次准入运行以 `visibility: tenant` 通过，
+并且 DA 通过 `POST /api/v1/mcp/skill-exposures` 明确添加记录之后才会出现。
+暴露配置按已验证的 tenant 和 project 隔离，默认拒绝；`iri://` 内核 Skill 永远不能暴露。
+列出、创建和删除都要求 control-plane DA（已验证 JWT、显式 project、`DA`）。
+`POST /mcp` 只返回同一已验证 tenant 和 project 的暴露。没有 `project_id` 的已存记录会被忽略，
+直到 DA 重新创建。
+
+MCP 端点即使在开发模式下也要求已验证的 Bearer JWT。工具发现按 tenant、project 以及
+Skill 的 `allowed_roles` 过滤；没有允许角色的调用返回 HTTP 403。参数必须是 JSON 对象，
+并在接受调用前按已发布的 `input_schema` 校验。响应是已校验的调用信封：MCP HTTP 层
+绝不执行包源码。这保留了包门禁「不执行任意代码」的边界，由运行时执行器消费该信封。
+
 ### 超图组合 (Hypergraph)
 
 技能图谱支持第一类超图组合，通过 `Hyperedge` 类型和 `CompositionType` 枚举定义复杂工作流：

@@ -115,7 +115,7 @@ fn router(state: Arc<AppState>) -> Router {
             upgrade_package_handler,
         },
         mcp_skills::{
-            delete_skill_exposure_handler, list_skill_exposures_handler,
+            delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
             upsert_skill_exposure_handler,
         },
         prompts::{
@@ -157,6 +157,7 @@ fn router(state: Arc<AppState>) -> Router {
             "/api/v1/market/packages/:name/upgrade",
             post(upgrade_package_handler),
         )
+        .route("/mcp", post(skill_mcp_handler))
         .route(
             "/api/v1/mcp/skill-exposures",
             get(list_skill_exposures_handler)
@@ -464,6 +465,7 @@ async fn isolation_contract_skill_exposure_writes_use_verified_tenant() {
     let app = router(test_state(dir.path()));
     let exposure = super::mcp_skills::McpSkillExposure {
         tenant_id: "tenant-b".into(),
+        project_id: Some("project-b".into()),
         skill_iri: "skill://b/weather".into(),
         tool_name: "weather".into(),
         enabled: true,
@@ -505,12 +507,23 @@ async fn isolation_contract_skill_exposure_writes_use_verified_tenant() {
         assert_eq!(stored(), before, "{method} {uri} changed exposures");
     }
 
-    // Listing is scoped to the verified tenant.
+    // Listing uses the same control-plane DA gate as writes. A verified token
+    // whose project was defaulted is not an explicit project scope.
     let list_uri = "/api/v1/mcp/skill-exposures";
     for caller in [Caller::Anonymous, Caller::XIdentity(&spoofed_b)] {
         let (status, _) = call(&app, Method::GET, list_uri, caller, Value::Null).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
+    let (status, error) = call(
+        &app,
+        Method::GET,
+        list_uri,
+        Caller::Bearer(&da_defaulted),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"], "control_plane_claims_incomplete");
     let (status, listed) = call(
         &app,
         Method::GET,
@@ -557,6 +570,334 @@ async fn isolation_contract_skill_exposure_writes_use_verified_tenant() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_ne!(stored(), before);
+}
+
+fn publish_exposed_skill(state: &AppState, iri: &str) {
+    use crate::tools::skill_pipeline::{PipelineRun, PipelineSource, SkillVisibility};
+    use crate::tools::skill_registry::SkillMeta;
+
+    state.core.skills.register_skill(SkillMeta {
+        skill_iri: iri.into(),
+        name: "weather".into(),
+        description: "Read weather".into(),
+        version: "1.0.0".into(),
+        category: "weather".into(),
+        security_level: "normal".into(),
+        allowed_roles: vec!["DA".into()],
+        input_schema: json!({"type": "object"}),
+        output_schema: json!({"type": "object"}),
+        compiled_template: "{}".into(),
+        signature: None,
+        signature_algorithm: None,
+        input_mapping: Default::default(),
+        output_mapping: Default::default(),
+        skill_types: vec![],
+    });
+    super::skills::append_pipeline_run(&PipelineRun {
+        run_id: format!("run-{iri}"),
+        skill_iri: iri.into(),
+        skill_name: "weather".into(),
+        version: "1.0.0".into(),
+        source: PipelineSource::Manual,
+        visibility: SkillVisibility::Tenant,
+        tenant_promotion_review: None,
+        triggered_by: "da".into(),
+        repo_url: None,
+        started_at: "2026-01-01T00:00:00Z".into(),
+        duration_ms: 1,
+        stages: vec![],
+        gate_passed: true,
+        published: true,
+        summary: "published".into(),
+    })
+    .unwrap();
+}
+
+fn exposure_rows(dir: &std::path::Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(dir.join("mcp_skill_exposures.json"))
+        .unwrap_or_else(|_| "[]".into());
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// #384: an exposure belongs to one verified project. Another project in the
+/// same tenant cannot list, overwrite, delete, or call it. Removing the
+/// project predicate from list, upsert, delete, or MCP lookup turns this red.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_is_isolated_per_project() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://acme/weather";
+    publish_exposed_skill(&state, iri);
+    let app = router(state);
+    let da_a = token("tenant-a", &["DA"], Some("project-a"));
+    let da_b = token("tenant-a", &["DA"], Some("project-b"));
+    let create = json!({"skill_iri": iri, "tool_name": "weather.lookup", "enabled": true});
+
+    let (status, created) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_a),
+        create,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["exposure"]["tenant_id"], "tenant-a");
+    assert_eq!(created["exposure"]["project_id"], "project-a");
+    assert_eq!(created["exposure"]["tool_name"], "weather.lookup");
+    assert_eq!(created["exposure"]["enabled"], true);
+
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_b),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 0, "project B listed project A's exposure");
+    assert!(listed["exposures"].as_array().unwrap().is_empty());
+
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_a),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["exposures"][0]["project_id"], "project-a");
+
+    let list_rpc = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let call_rpc = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "weather.lookup", "arguments": {}}
+    });
+    let (status, tools) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da_a),
+        list_rpc.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(tools["result"]["tools"][0]["name"], "weather.lookup");
+    let (status, called) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da_a),
+        call_rpc.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{called}");
+    assert_eq!(called["result"]["content"][0]["json"]["status"], "accepted");
+
+    let (status, tools) = call(&app, Method::POST, "/mcp", Caller::Bearer(&da_b), list_rpc).await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(
+        tools["result"]["tools"].as_array().unwrap().len(),
+        0,
+        "project B's MCP listed project A's tool"
+    );
+    let (status, missing_tool) =
+        call(&app, Method::POST, "/mcp", Caller::Bearer(&da_b), call_rpc).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing_tool}");
+
+    let delete_uri = format!("/api/v1/mcp/skill-exposures?skill_iri={iri}");
+    let missing_uri = "/api/v1/mcp/skill-exposures?skill_iri=skill://acme/missing";
+    let (foreign_status, foreign_body) = call(
+        &app,
+        Method::DELETE,
+        &delete_uri,
+        Caller::Bearer(&da_b),
+        Value::Null,
+    )
+    .await;
+    let (missing_status, missing_body) = call(
+        &app,
+        Method::DELETE,
+        missing_uri,
+        Caller::Bearer(&da_b),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(foreign_status, missing_status);
+    assert_eq!(foreign_body, missing_body);
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    let rows = exposure_rows(dir.path());
+    assert_eq!(
+        rows.len(),
+        1,
+        "project B's delete changed project A's exposure"
+    );
+    assert_eq!(rows[0]["project_id"], "project-a");
+    assert_eq!(rows[0]["enabled"], true);
+    assert_eq!(rows[0]["tool_name"], "weather.lookup");
+
+    // Same skill IRI and tool name from project B must not replace A's row.
+    let (status, upserted) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_b),
+        json!({"skill_iri": iri, "tool_name": "weather.lookup", "enabled": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{upserted}");
+    assert_eq!(upserted["exposure"]["project_id"], "project-b");
+    assert_eq!(upserted["exposure"]["enabled"], false);
+    let rows = exposure_rows(dir.path());
+    let project_a = rows
+        .iter()
+        .find(|row| row["project_id"] == "project-a")
+        .expect("project A's exposure is missing");
+    assert_eq!(project_a["enabled"], true);
+    assert_eq!(project_a["tool_name"], "weather.lookup");
+    assert_eq!(project_a["skill_iri"], iri);
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_a),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["exposures"][0]["project_id"], "project-a");
+    assert_eq!(listed["exposures"][0]["enabled"], true);
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da_b),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["exposures"][0]["project_id"], "project-b");
+    assert_eq!(listed["exposures"][0]["enabled"], false);
+}
+
+/// #384: rows written before project_id existed stay invisible and undeletable.
+/// They are not assigned to the caller's project on read or on a later upsert.
+#[tokio::test]
+async fn isolation_contract_skill_exposure_legacy_rows_fail_closed() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-b/legacy";
+    publish_exposed_skill(&state, iri);
+    let path = dir.path().join("mcp_skill_exposures.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!([{
+            "tenant_id": "tenant-b",
+            "skill_iri": iri,
+            "tool_name": "legacy.tool",
+            "enabled": true
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    let app = router(state);
+    let da = token("tenant-b", &["DA"], Some("project-b"));
+
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["count"], 0, "legacy exposure was visible");
+    assert!(listed["exposures"].as_array().unwrap().is_empty());
+
+    let (legacy_status, legacy_body) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/mcp/skill-exposures?skill_iri={iri}"),
+        Caller::Bearer(&da),
+        Value::Null,
+    )
+    .await;
+    let (missing_status, missing_body) = call(
+        &app,
+        Method::DELETE,
+        "/api/v1/mcp/skill-exposures?skill_iri=skill://tenant-b/missing",
+        Caller::Bearer(&da),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(legacy_status, missing_status);
+    assert_eq!(legacy_body, missing_body);
+    assert_eq!(legacy_status, StatusCode::NOT_FOUND);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+    let (status, tools) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 0);
+    let (status, called) = call(
+        &app,
+        Method::POST,
+        "/mcp",
+        Caller::Bearer(&da),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "legacy.tool", "arguments": {}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{called}");
+
+    let (status, upserted) = call(
+        &app,
+        Method::POST,
+        "/api/v1/mcp/skill-exposures",
+        Caller::Bearer(&da),
+        json!({"skill_iri": iri, "tool_name": "legacy.tool", "enabled": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{upserted}");
+    let rows = exposure_rows(dir.path());
+    assert!(
+        rows.iter().any(|row| {
+            row["skill_iri"] == iri
+                && row["enabled"] == true
+                && row["tool_name"] == "legacy.tool"
+                && row.get("project_id").and_then(Value::as_str).is_none()
+        }),
+        "legacy row was adopted into a project: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row["project_id"] == "project-b" && row["enabled"] == false && row["skill_iri"] == iri
+        }),
+        "project upsert did not create its own row: {rows:?}"
+    );
 }
 
 /// KB reindex: another tenant's knowledge base answers 404 (as if missing)

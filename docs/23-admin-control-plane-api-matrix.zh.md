@@ -64,9 +64,12 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
   Prompt 读取不变。
 - **按租户隔离 → `require_control_plane_da`**（已验证 JWT、显式 tenant 和 project、`DA`）：
   `POST /api/v1/market/packages` 及 `.../:name/{install,rollback,upgrade}`；
-  `POST, DELETE /api/v1/mcp/skill-exposures`（所属 tenant 取自已验证 claims，不取自
-  `X-Identity`）；`POST /api/v1/kb/bases/:id/reindex`。
-- 其他租户的知识库、技能暴露记录或市场私有包，与不存在时返回同样的 `404`。
+  `GET, POST, DELETE /api/v1/mcp/skill-exposures`（所属 tenant 和 project 取自已验证
+  claims，不取自 `X-Identity`，也不取自回落的默认 project）；
+  `POST /api/v1/kb/bases/:id/reindex`。
+- 其他租户的知识库、技能暴露记录或市场私有包，与不存在时返回同样的 `404`。同一 tenant
+  下其他 project 的技能暴露也是如此。没有 `project_id` 的已存技能暴露不可列出、不可调用、
+  不可删除，直到 DA 为某一个 project 重新创建。
 
 ### API client id 冲突与恢复
 
