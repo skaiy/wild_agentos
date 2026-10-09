@@ -669,6 +669,7 @@ Output the summary report directly, not in JSON format."#,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
                 cached_prompt_tokens: u.cached_prompt_tokens,
+                cost_usd: u.cost_usd,
             });
 
         Ok(crate::gateway::unified_gateway::ChatCompletionResponse {

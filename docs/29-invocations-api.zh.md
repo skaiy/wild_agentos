@@ -135,14 +135,28 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
     "input_tokens": 1200,        // status = succeeded 时必填
     "output_tokens": 345,        // status = succeeded 时必填
     "cost": 18000,               // status = succeeded 时必填；整数微美元
+    "cost_source": "gateway",    // 只要带 cost 就必填；见下文
     "tool_calls": [{ "name": "…", "transport": "mcp" }]  // 可选；transport 见下
   }
 }
 ```
 
-- **成功态 usage（VAL-016 / VAL-017）。** 当 `status` 为 `succeeded` 时，`result.usage` **必须**存在，且包含非空 `model`、`input_tokens`、`output_tokens` 以及整数 `cost`（微美元，与 `budget.max_cost` 同单位）。缺任一项就**不得**记为 `succeeded`（失败关闭：迁到 `failed` 且 `error.code = "incomplete_usage"`，或拒绝该终态写入）。`provider` 与 `tool_calls` 在所有终态上仍可选。
+- **成功态 usage（VAL-016 / VAL-017）。** 当 `status` 为 `succeeded` 时，`result.usage` **必须**存在，且包含非空 `model`、`input_tokens`、`output_tokens`、整数 `cost`（微美元，与 `budget.max_cost` 同单位）及其 `cost_source`。缺任一项就**不得**记为 `succeeded`（失败关闭：迁到 `failed` 且 `error.code = "incomplete_usage"`，或拒绝该终态写入）。`provider` 与 `tool_calls` 在所有终态上仍可选。
+- **`cost_source`（闭集）。** 不带 `cost_source` 就不会有 `cost`；服务端从不估算成本，也不填 `0`：
+  - `gateway`：上游或外置网关回报了本次运行中每一次模型调用的费用（OpenAI 兼容的 `usage.cost`，单位美元，换算为微美元并四舍五入取整）；
+  - `config_price_table`：网关回报不完整时，按运维配置的单价表计算（`pricing.models` 是条目列表，每条含 `model`、`input_usd_per_million_tokens`、`output_usd_per_million_tokens`；每百万 token 的美元数即每 token 的微美元数；按模型向上取整）。运行用到的每个模型都必须有条目。单价表默认为空。`model` 填上游在响应里返回的模型名（`model` 字段），精确匹配：不忽略大小写，不做前缀或别名匹配。单价表里有负价、NaN 或无穷大、模型名为空或重复、两个只差大小写的模型名，或者未知字段（例如拼错的 `modls`）时，服务拒绝启动。示例：
+
+    ```yaml
+    pricing:
+      models:
+        - model: "GPT-4.1"
+          input_usd_per_million_tokens: 2.0
+          output_usd_per_million_tokens: 8.0
+    ```
+  - 两者都没有 → 不写 `cost` 和 `cost_source`，运行以 `failed` / `incomplete_usage` 结束，错误 message 说明未配置成本来源。
+- **计量方式。** `input_tokens` / `output_tokens` 是本次运行所有模型调用（规划、各 agent、流式与非流式）的总和，按运行分别计数，并发运行互不混算。流式 chat completions 调用会向上游请求 usage（`stream_options.include_usage`）；上游以 400 或 422 拒绝、且错误体里提到 `stream_options` 或 `include_usage` 时，去掉该参数重试一次。上游一旦回了 2xx，这次调用就计入，即使之后响应体解析失败并重试。usage 块必须两项 token 数都在、且是能放进 32 位的整数才算数；`null`、缺一项或越界都按"未回报 usage"处理，绝不当成 0。只要有一次调用没有回报 usage，就不写 token 数（不少报），该运行也不能成功。运行超时或被取消时，仍在跑的 agent 会被中止。`model` 取本次运行中 token 数最多的模型。
 - 在 `failed` / `cancelled` / `interrupted` 路径上，`usage` 可选；若带了，结构仍须合法（未知成员拒绝；有 `cost` 时必须是整数）。`failed` 的调用也可以带 `result`，其中只有 `usage`（例如 `budget_exceeded` 之后），`summary` 为空。
-- `usage` 报告的是服务端为执行 `budget`（`budget_exceeded`）本来就在做的计量，不含任何合作方或来源归因。
+- `usage` 报告的是服务端为执行 `budget`（`budget_exceeded`）本来就在做的计量，除说明 `cost` 如何得到的 `cost_source` 外，不含任何对合作方、调用方或集成方的归因。
 - **`tool_calls[].transport` 词表（闭集）。** 每条 tool-call 可带 `transport`，取值只能是：
   `mcp` | `http` | `a2a` | `local` | `unknown`。
   - `mcp` — 经 MCP 服务绑定调用的工具。
@@ -205,7 +219,7 @@ queued ──► running ──► succeeded
 - 终态迁到*另一个*状态（例如取消已 `succeeded` 的调用）仍是 `409 illegal_transition`。
 - 进程重启时，未到终态的调用改为 `failed`，`error.code = "interrupted"`，不自动重跑。用同一个 `Idempotency-Key` 重放只会拿到这个 failed 资源；要重新提交请换新 key。
 
-失败调用的 `error.code` 取值：`execution_failed`、`interrupted`、`deadline_exceeded`、`budget_exceeded`、`input_digest_mismatch`。
+失败调用的 `error.code` 取值：`execution_failed`、`interrupted`、`deadline_exceeded`、`budget_exceeded`、`input_digest_mismatch`、`incomplete_usage`、`task_failed`。
 
 ### 7.1 保留与清理
 
@@ -237,7 +251,7 @@ queued ──► running ──► succeeded
 - `request.budget` 在执行路径上强制：已计量 usage 超过任一给出的 `max_tokens` / `max_tool_calls` / `max_cost`（micro-USD）时，调用以 `failed` / `budget_exceeded` 结束，并尽量带回 `result.usage`。落到 `succeeded` 仍须完整 usage（VAL-016）。
 - `input_ref` 使用可插拔的解析器注册表（按前缀或 scheme，§4.2）。默认什么都没注册（创建 → `422 input_ref_unresolvable`），内置的 `wao-artifact://` 解析器默认关。匹配的解析器在执行路径用创建者的 claims 拉取字节，超时和大小上限由服务端强制；服务端核对 SHA-256 后把文本和 prompt 一起交给任务。取数失败 → `failed` / `input_ref_fetch_failed`，SHA-256 不符 → `failed` / `input_digest_mismatch`，两者都是固定文案。不提供默认外网 resolver。
 - 不支持 `agent_revision`：创建返回 `422 agent_revision_unsupported`（不得静默忽略；不假装已 pin），执行也不读取 agent 定义（§4.1、§4.3）。
-- 任务事件驱动状态迁移。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
+- 终态只来自执行器在运行结束时交还给服务端的结果，从不来自任务事件。共享任务事件总线上的事件（包括 `TASK_COMPLETED` / `TASK_FAILED`）只供 SSE 使用；其他组件和调用方都能往总线上发事件，所以它们永远不会结束调用。`POST /api/v1/events` 对任何角色都拒收所有 `TASK_*` 事件类型（不区分大小写），返回 `403 reserved_event_type`；事件来源由服务端写成 `external:http:<sub>`，请求体里的 `source` 字段被忽略，也不会留在存下的 payload 里。执行器上报终态状态：只有明确成功（`completed`、`success`、`succeeded`）才能成为 `succeeded`；其他状态（例如 `timeout`、`partial_failure`）以 `failed` / `task_failed` 结束，并带上实际用量。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
 - 每次运行都计量，用量随终态迁移写入 `result.usage`。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。
 - 执行受配置开关控制，默认**关闭**（`AGENTOS_INVOCATION_EXECUTION_ENABLED`）。生产仅在明确启用 TaskExecutor 桥时打开。桥运行时强制投影按 scope 绑定（#310/#322）与 VAL-PROJ-CTX fail-closed（缺 claims / 空投影 → `failed` / `projection_context_missing`）。
 - 开关关闭时，新的创建请求返回 `503 execution_disabled`，什么都不落盘（没有资源，也没有幂等记录），因此不会有调用永远停在非终态。开关关闭前已登记的 key 重放仍返回 `200` 和原资源。开关在启动时读取；关闭开关需要重启，重启会把执行中的调用改为 `failed/interrupted`。
@@ -266,7 +280,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","pr
 
 event: result
 id: 3.1
-data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","result":{"summary":"…","artifacts":[],"usage":{"input_tokens":1200,"output_tokens":345,"cost":18000}}}
+data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","result":{"summary":"…","artifacts":[],"usage":{"model":"…","input_tokens":1200,"output_tokens":345,"cost":18000,"cost_source":"gateway"}}}
 ```
 
 ## 9. 错误码（草案）
@@ -296,7 +310,7 @@ data: {"invocation_id":"inv_…","revision":3,"at":"…","state":"succeeded","re
 - 现有 `/api/v1/tasks*` 和 OpenAI 兼容路由不变。
 - 仓库内不提供对外取数的 `input_ref` 解析器（S3、HTTP 等）；唯一的内置解析器读取平台制品，且默认关（§4.2）。
 - v0.12.0 服务端不做任何钉住：`agent_revision` 会被拒绝（§4.3），provider、model、工具、策略和上下文的修订也不钉住。以后可另开 follow-up。
-- `usage` 不含合作方或来源归因。
+- `usage` 不含合作方、调用方或集成方归因（`cost_source` 只说明 `cost` 如何得到）。
 
 ## 11. 集成方前提
 

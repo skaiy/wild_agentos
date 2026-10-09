@@ -23,7 +23,7 @@ use crate::api::http::invocations_execution::{
 use crate::api::http::invocations_store::{
     InvocationStoreConfig, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
 };
-use crate::api::http::{TaskExecSpec, TaskExecutor, TEST_ENV_LOCK};
+use crate::api::http::{TaskExecSpec, TaskExecutor, TaskOutcome, TEST_ENV_LOCK};
 use crate::core::core_types::SemanticCore;
 use crate::isolation::IsolationClaims;
 
@@ -42,64 +42,110 @@ enum MockMode {
     SucceedWithoutUsage,
     Fail,
     HangUntilCancel,
+    /// The memory scheduler's empty `TASK_COMPLETED` reaches the bus before
+    /// the executor's real terminal event (production order, #337).
+    SchedulerEventFirst,
+    /// Executor reports `TASK_COMPLETED` with this SA status and full usage.
+    CompletedWithStatus(&'static str),
+}
+
+fn full_usage() -> Value {
+    json!({
+        "model": "mock-model",
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cost": 42,
+        "cost_source": "gateway"
+    })
+}
+
+fn usage_value(value: Value) -> Option<crate::api::http::invocations_store::InvocationUsage> {
+    Some(serde_json::from_value(value).expect("usage"))
+}
+
+impl MockExecutor {
+    /// Publishes the display event for SSE, like the production executor.
+    async fn emit_terminal(&self, task_iri: &str, event_type: &str, payload: Value) {
+        self.events
+            .emit(
+                task_iri,
+                event_type,
+                crate::api::http::TASK_TERMINAL_SOURCE,
+                &payload.to_string(),
+            )
+            .await;
+    }
 }
 
 #[async_trait]
 impl TaskExecutor for MockExecutor {
-    async fn execute(&self, spec: TaskExecSpec) {
+    async fn execute(&self, spec: TaskExecSpec) -> TaskOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.seen_claims.lock().unwrap() = Some(spec.isolation_claims.clone());
         match self.mode {
             MockMode::SucceedWithUsage => {
-                self.events
-                    .emit(
-                        &spec.task_iri,
-                        "TASK_COMPLETED",
-                        "mock",
-                        &json!({
-                            "status": "succeeded",
-                            "summary": "mock-ok",
-                            "usage": {
-                                "model": "mock-model",
-                                "input_tokens": 11,
-                                "output_tokens": 7,
-                                "cost": 42
-                            }
-                        })
-                        .to_string(),
-                    )
-                    .await;
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_COMPLETED",
+                    json!({"status": "succeeded", "summary": "mock-ok", "usage": full_usage()}),
+                )
+                .await;
+                TaskOutcome::completed("succeeded", "mock-ok", usage_value(full_usage()))
             }
             MockMode::SucceedWithoutUsage => {
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_COMPLETED",
+                    json!({"status": "succeeded", "summary": "missing-usage"}),
+                )
+                .await;
+                TaskOutcome::completed("succeeded", "missing-usage", None)
+            }
+            MockMode::Fail => {
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_FAILED",
+                    json!({"status": "failed", "summary": "mock-boom"}),
+                )
+                .await;
+                TaskOutcome::failed("mock-boom", None)
+            }
+            MockMode::SchedulerEventFirst => {
                 self.events
                     .emit(
                         &spec.task_iri,
                         "TASK_COMPLETED",
-                        "mock",
-                        &json!({"status": "succeeded", "summary": "missing-usage"}).to_string(),
+                        "system:memory_scheduler",
+                        "{}",
                     )
                     .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_COMPLETED",
+                    json!({"status": "completed", "summary": "real-summary", "usage": full_usage()}),
+                )
+                .await;
+                TaskOutcome::completed("completed", "real-summary", usage_value(full_usage()))
             }
-            MockMode::Fail => {
-                self.events
-                    .emit(
-                        &spec.task_iri,
-                        "TASK_FAILED",
-                        "mock",
-                        &json!({"status": "failed", "summary": "mock-boom"}).to_string(),
-                    )
-                    .await;
+            MockMode::CompletedWithStatus(status) => {
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_COMPLETED",
+                    json!({"status": status, "summary": "s", "usage": full_usage()}),
+                )
+                .await;
+                TaskOutcome::completed(status, "s", usage_value(full_usage()))
             }
             MockMode::HangUntilCancel => {
                 spec.cancellation.cancelled().await;
-                self.events
-                    .emit(
-                        &spec.task_iri,
-                        "TASK_FAILED",
-                        "mock",
-                        &json!({"status": "failed", "summary": "cancelled-by-token"}).to_string(),
-                    )
-                    .await;
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_FAILED",
+                    json!({"status": "failed", "summary": "cancelled-by-token"}),
+                )
+                .await;
+                TaskOutcome::cancelled(None)
             }
         }
     }
@@ -409,4 +455,209 @@ fn claims_from_invocation_round_trips_scope() {
     let claims = claims_from_invocation(&inv).unwrap();
     assert_eq!(claims.tenant_id(), "tenant-a");
     assert_eq!(claims.actor_id(), "alice");
+}
+
+/// #337: the scheduler's empty `TASK_COMPLETED` arrives first; the invocation
+/// must still close on the executor's terminal event (its usage and summary).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_ignores_the_scheduler_task_completed_that_arrives_first() {
+    let h = make_bridge_harness(
+        MockMode::SchedulerEventFirst,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(
+        inv.state,
+        InvocationState::Succeeded,
+        "error={:?}",
+        inv.error
+    );
+    let result = inv.result.as_ref().unwrap();
+    assert_eq!(result.summary, "real-summary");
+    assert_eq!(result.usage.as_ref().unwrap().input_tokens, Some(11));
+}
+
+/// #337: SA statuses other than an explicit success never become `succeeded`,
+/// even with complete usage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_non_success_sa_status_is_not_succeeded() {
+    for status in ["timeout", "partial_failure", "aborted"] {
+        let h = make_bridge_harness(
+            MockMode::CompletedWithStatus(status),
+            Arc::new(ScopedProjectionGate),
+        );
+        let created = create_inv(&h.router, &alice(), body()).await;
+        let id = created.json()["id"].as_str().unwrap().to_string();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+        let inv = wait_terminal(&h.store, &id, &claims).await;
+        assert_eq!(inv.state, InvocationState::Failed, "{status}");
+        let error = inv.error.as_ref().unwrap();
+        assert_eq!(error.code, "task_failed");
+        assert!(error.message.contains(status), "{}", error.message);
+        // Actual usage is still reported on the failed invocation.
+        assert_eq!(
+            inv.result.as_ref().unwrap().usage.as_ref().unwrap().cost,
+            Some(42)
+        );
+        drop(h);
+    }
+}
+
+/// `completed` (what the SA returns) succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_completed_sa_status_succeeds() {
+    let h = make_bridge_harness(
+        MockMode::CompletedWithStatus("completed"),
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(
+        inv.state,
+        InvocationState::Succeeded,
+        "error={:?}",
+        inv.error
+    );
+}
+
+// ── #337 B1: forged terminal events ───────────────────────────────────────
+
+const FORGED_SUMMARY: &str = "FORGED-SUMMARY";
+
+fn forged_terminal_body(task_iri: &str) -> Value {
+    json!({
+        "task_iri": task_iri,
+        "event_type": "TASK_COMPLETED",
+        "source": "SA",
+        "status": "completed",
+        "summary": FORGED_SUMMARY,
+        "usage": {"model": "m", "input_tokens": 0, "output_tokens": 0, "cost": 0, "cost_source": "gateway"}
+    })
+}
+
+/// Creates an invocation whose executor runs until cancelled and returns its
+/// id and task IRI once it is running.
+async fn running_invocation(h: &BridgeHarness) -> (String, String) {
+    let created = create_inv(&h.router, &alice(), body()).await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.json());
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let task_iri = loop {
+        let got = call(
+            &h.router,
+            "GET",
+            &format!("/v1/invocations/{id}"),
+            Some(&alice()),
+            &[],
+            None,
+        )
+        .await;
+        if got.json()["state"] == "running" {
+            if let Some(task_iri) = got.json()["task_iri"].as_str() {
+                break task_iri.to_string();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never running: {}",
+            got.json()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    (id, task_iri)
+}
+
+/// The forged event did not close the invocation: it is still running, and
+/// after a real cancel it ends `cancelled`, never `succeeded`.
+async fn assert_not_closed_by_forgery(h: &BridgeHarness, id: &str) {
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let inv = h.store.get_for_claims(&claims, id).await.unwrap();
+    assert_eq!(
+        inv.state,
+        InvocationState::Running,
+        "forged event must not end the run: {:?} {:?}",
+        inv.result,
+        inv.error
+    );
+    let cancel = call(
+        &h.router,
+        "POST",
+        &format!("/v1/invocations/{id}/cancel"),
+        Some(&alice()),
+        &[],
+        None,
+    )
+    .await;
+    assert!(cancel.status.is_success(), "{}", cancel.json());
+    let inv = wait_terminal(&h.store, id, &claims).await;
+    assert_eq!(inv.state, InvocationState::Cancelled);
+    let persisted = serde_json::to_string(&inv).unwrap();
+    assert!(!persisted.contains(FORGED_SUMMARY), "{persisted}");
+}
+
+async fn post_event(h: &BridgeHarness, token: &str, body: Value) -> StatusCode {
+    let events_router = Router::new()
+        .route(
+            "/api/v1/events",
+            axum::routing::post(crate::api::http::core_ops::emit_event_handler),
+        )
+        .with_state(h.state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/events")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    events_router.oneshot(req).await.unwrap().status()
+}
+
+/// B1 layer 1: a member of the invocation's own tenant/project cannot post a
+/// terminal event through `POST /api/v1/events`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_terminal_event_from_same_scope_member_is_rejected() {
+    let h = make_bridge_harness(MockMode::HangUntilCancel, Arc::new(ScopedProjectionGate));
+    let (id, task_iri) = running_invocation(&h).await;
+    let status = post_event(&h, &alice(), forged_terminal_body(&task_iri)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_not_closed_by_forgery(&h, &id).await;
+}
+
+/// B1 layer 1: a DA of another tenant (which `authorize_core_write` still lets
+/// through, #395) cannot post a terminal event either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_terminal_event_from_cross_tenant_da_is_rejected() {
+    let h = make_bridge_harness(MockMode::HangUntilCancel, Arc::new(ScopedProjectionGate));
+    let (id, task_iri) = running_invocation(&h).await;
+    let mallory = super::tests::token("mallory", "tenant-b", Some("project-z"), &["DA"]);
+    let status = post_event(&h, &mallory, forged_terminal_body(&task_iri)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_not_closed_by_forgery(&h, &id).await;
+}
+
+/// B1 layer 2: even a `TASK_COMPLETED` that reaches the bus with the
+/// executor's own source and a complete payload does not end the invocation;
+/// only the executor's returned outcome does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_event_on_the_bus_does_not_end_the_invocation() {
+    let h = make_bridge_harness(MockMode::HangUntilCancel, Arc::new(ScopedProjectionGate));
+    let (id, task_iri) = running_invocation(&h).await;
+    for event_type in ["TASK_COMPLETED", "TASK_FAILED"] {
+        h.state
+            .core
+            .emit_event(
+                &task_iri,
+                event_type,
+                crate::api::http::TASK_TERMINAL_SOURCE,
+                &forged_terminal_body(&task_iri).to_string(),
+            )
+            .await;
+    }
+    assert_not_closed_by_forgery(&h, &id).await;
 }

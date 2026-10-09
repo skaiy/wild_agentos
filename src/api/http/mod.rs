@@ -208,6 +208,73 @@ pub struct TaskExecSpec {
     pub isolation_claims: crate::isolation::IsolationClaims,
 }
 
+/// `source_agent_iri` of the terminal `TASK_COMPLETED` / `TASK_FAILED` event a
+/// [`TaskExecutor`] publishes for SSE subscribers. Bus events are display
+/// only: the run's real outcome is the [`TaskOutcome`] `execute` returns.
+pub(crate) const TASK_TERMINAL_SOURCE: &str = "SA";
+
+/// How a run ended, as returned by [`TaskExecutor::execute`].
+///
+/// This is the only channel the invocation bridge trusts for a terminal
+/// state (#337): events on the shared bus can be published by other
+/// components (the memory scheduler) or callers, so they only feed SSE.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskOutcome {
+    pub(crate) kind: TaskOutcomeKind,
+    /// SA result status (`completed`, `timeout`, `partial_failure`, …) or
+    /// `failed` / `cancelled`.
+    pub(crate) status: String,
+    pub(crate) summary: String,
+    /// Usage metered for the run; `None` when it made no LLM call.
+    pub(crate) usage: Option<invocations_store::InvocationUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskOutcomeKind {
+    /// The pipeline finished and reported `status` (not necessarily success).
+    Completed,
+    /// The run failed before or during execution.
+    Failed,
+    /// The run stopped because its cancellation token fired.
+    Cancelled,
+}
+
+impl TaskOutcome {
+    pub(crate) fn completed(
+        status: impl Into<String>,
+        summary: impl Into<String>,
+        usage: Option<invocations_store::InvocationUsage>,
+    ) -> Self {
+        Self {
+            kind: TaskOutcomeKind::Completed,
+            status: status.into(),
+            summary: summary.into(),
+            usage,
+        }
+    }
+
+    pub(crate) fn failed(
+        summary: impl Into<String>,
+        usage: Option<invocations_store::InvocationUsage>,
+    ) -> Self {
+        Self {
+            kind: TaskOutcomeKind::Failed,
+            status: "failed".into(),
+            summary: summary.into(),
+            usage,
+        }
+    }
+
+    pub(crate) fn cancelled(usage: Option<invocations_store::InvocationUsage>) -> Self {
+        Self {
+            kind: TaskOutcomeKind::Cancelled,
+            status: "cancelled".into(),
+            summary: String::new(),
+            usage,
+        }
+    }
+}
+
 /// 任务执行器抽象：把「触发并驱动一次任务端到端执行」与 HTTP 传输层解耦。
 ///
 /// 实现方（`api::grpc::server::HttpTaskExecutor`）持有已运行服务的共享运行态
@@ -215,7 +282,9 @@ pub struct TaskExecSpec {
 /// 并把执行事件发布到**同一条**共享事件总线，供 `stream_task_handler` 的 SSE 循环转发给前端。
 #[async_trait::async_trait]
 pub trait TaskExecutor: Send + Sync {
-    async fn execute(&self, spec: TaskExecSpec);
+    /// Runs the task to the end and returns how it ended. Events published on
+    /// the bus while running are for SSE only.
+    async fn execute(&self, spec: TaskExecSpec) -> TaskOutcome;
 }
 
 /// 持久化数据目录；可由 AGENTOS_DATA_DIR 覆盖（便于测试隔离），缺省为 "data"。

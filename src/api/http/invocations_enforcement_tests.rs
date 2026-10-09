@@ -43,7 +43,7 @@ struct HoldExecutor {
 
 #[async_trait]
 impl TaskExecutor for HoldExecutor {
-    async fn execute(&self, spec: TaskExecSpec) {
+    async fn execute(&self, spec: TaskExecSpec) -> crate::api::http::TaskOutcome {
         self.prompts.lock().unwrap().push(spec.prompt.clone());
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.release.notified().await;
@@ -52,24 +52,31 @@ impl TaskExecutor for HoldExecutor {
                 "model": "m",
                 "input_tokens": 100,
                 "output_tokens": 100,
-                "cost": 9_999
+                "cost": 9_999,
+                "cost_source": "gateway"
             })
         } else {
             json!({
                 "model": "m",
                 "input_tokens": 1,
                 "output_tokens": 1,
-                "cost": 1
+                "cost": 1,
+                "cost_source": "gateway"
             })
         };
         self.events
             .emit(
                 &spec.task_iri,
                 "TASK_COMPLETED",
-                "hold",
+                crate::api::http::TASK_TERMINAL_SOURCE,
                 &json!({"status": "succeeded", "summary": "held-ok", "usage": usage}).to_string(),
             )
             .await;
+        crate::api::http::TaskOutcome::completed(
+            "succeeded",
+            "held-ok",
+            Some(serde_json::from_value(usage).expect("usage")),
+        )
     }
 }
 

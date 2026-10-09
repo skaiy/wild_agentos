@@ -184,16 +184,52 @@ pub(crate) async fn emit_event_handler(
     let event_type = payload
         .get("event_type")
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .unwrap_or("CUSTOM");
-    let source = payload
-        .get("source")
-        .and_then(|v| v.as_str())
-        .unwrap_or("http_api");
+    // Task lifecycle and terminal events (`TASK_*`) are published only by the
+    // server itself; a caller cannot post them, whatever its role (#337).
+    if is_reserved_event_type(event_type) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "reserved_event_type",
+                "message": "TASK_* lifecycle events are published by the server only",
+            })),
+        )
+            .into_response();
+    }
+    // The source is set by the server from the verified caller; a `source`
+    // member in the body is ignored, so no caller can speak as an executor.
+    let source = external_event_source(&identity);
+    // Drop the caller's `source` from the stored payload too, so no reader of
+    // the payload can mistake it for the event's origin.
+    let mut stored = payload.clone();
+    if let Some(body) = stored.as_object_mut() {
+        body.remove("source");
+    }
     let event_id = state
         .core
-        .emit_event(task_iri, event_type, source, &payload.to_string())
+        .emit_event(task_iri, event_type, &source, &stored.to_string())
         .await;
     Json(json!({"event_id": event_id, "status": "emitted"})).into_response()
+}
+
+/// `TASK_*` event types (case-insensitive) are the task lifecycle: created,
+/// started, completed, failed, cancelled, archived. Only the server emits them.
+pub(crate) fn is_reserved_event_type(event_type: &str) -> bool {
+    event_type
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("TASK_"))
+}
+
+/// `source_agent_iri` of an event posted through `POST /api/v1/events`:
+/// `external:http:<sub>`, from the verified caller.
+pub(crate) fn external_event_source(identity: &UserIdentity) -> String {
+    let sub = identity
+        .isolation_claims()
+        .map(|claims| claims.actor_id().to_string())
+        .unwrap_or_else(|| identity.user_id.clone());
+    format!("external:http:{sub}")
 }
 
 /// Body returned for both a missing node and a node outside the caller's
@@ -861,6 +897,110 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// #337 B1: `TASK_*` lifecycle events cannot be posted (any role, any
+    /// spelling), and the source of a posted event is set by the server.
+    #[tokio::test]
+    async fn events_api_rejects_task_lifecycle_types_and_sets_the_source() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let task_iri = "iri://task/test-reserved";
+        state
+            .core
+            .blackboard
+            .write_node(
+                task_iri,
+                &json!({
+                    "@id": task_iri,
+                    "@type": "Task",
+                    "tenant_id": "tenant-a",
+                    "project_id": "project-a",
+                })
+                .to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/events", post(emit_event_handler))
+            .with_state(state.clone());
+        let post_event = |token: String, body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/events")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let mut rx = state.core.events.subscribe();
+
+        for token in [
+            jwt("tenant-a", "project-a", vec![]),
+            jwt("tenant-a", "project-a", vec!["DA"]),
+            jwt("tenant-b", "project-z", vec!["DA"]),
+        ] {
+            for event_type in [
+                "TASK_COMPLETED",
+                "TASK_FAILED",
+                "TASK_STARTED",
+                "TASK_CREATED",
+                "TASK_CANCELLED",
+                "task_completed",
+                " TASK_COMPLETED ",
+                "Task_Failed",
+            ] {
+                let request = post_event(
+                    token.clone(),
+                    json!({
+                        "task_iri": task_iri,
+                        "event_type": event_type,
+                        "source": "SA",
+                        "status": "completed",
+                    }),
+                );
+                assert_eq!(
+                    response_status(&router, request).await,
+                    StatusCode::FORBIDDEN,
+                    "{event_type}"
+                );
+            }
+        }
+        assert!(rx.try_recv().is_err(), "no reserved event reached the bus");
+
+        let request = post_event(
+            jwt("tenant-a", "project-a", vec![]),
+            json!({"task_iri": task_iri, "event_type": "CUSTOM", "source": "SA"}),
+        );
+        assert_eq!(response_status(&router, request).await, StatusCode::OK);
+        let event = rx.try_recv().expect("custom event emitted");
+        assert_eq!(event.event_type, "CUSTOM");
+        assert_eq!(event.source_agent_iri, "external:http:test-user");
+        let stored: Value = serde_json::from_str(&event.payload).unwrap();
+        assert!(
+            stored.get("source").is_none(),
+            "caller-written source must not stay in the payload: {stored}"
+        );
+        assert_eq!(stored["task_iri"], task_iri);
+
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+        match previous_jwt_secret {
+            Some(value) => std::env::set_var("AGENTOS_JWT_SECRET", value),
+            None => std::env::remove_var("AGENTOS_JWT_SECRET"),
+        }
     }
 
     #[tokio::test]

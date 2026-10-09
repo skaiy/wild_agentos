@@ -999,8 +999,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::api::http::TaskExecutor for CountingExecutor {
-        async fn execute(&self, _spec: crate::api::http::TaskExecSpec) {
+        async fn execute(
+            &self,
+            _spec: crate::api::http::TaskExecSpec,
+        ) -> crate::api::http::TaskOutcome {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::api::http::TaskOutcome::completed("completed", "", None)
         }
     }
 

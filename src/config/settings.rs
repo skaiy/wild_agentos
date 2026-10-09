@@ -459,6 +459,113 @@ pub struct Settings {
     pub a2a: A2aSettings,
     #[serde(default)]
     pub online_corpus_watchers: OnlineCorpusWatcherSettings,
+    /// Optional operator price table for invocation cost (#337).
+    #[serde(default)]
+    pub pricing: PricingSettings,
+}
+
+/// Operator-configured unit prices used to compute an invocation's `cost`
+/// when the gateway reports none (`usage.cost_source = config_price_table`).
+///
+/// This is an optional operator input, not kernel pricing: the kernel ships
+/// no prices, and the table is empty by default. With neither a
+/// gateway-reported cost nor a table entry for every model a run used, the
+/// invocation cannot succeed (`incomplete_usage`).
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(try_from = "RawPricingSettings")]
+pub struct PricingSettings {
+    /// Model name exactly as the upstream reports it in its response
+    /// (`model`) → unit prices. Lookups are exact; no case folding.
+    pub models: std::collections::HashMap<String, ModelPrice>,
+}
+
+/// The wire shape of `pricing`; unknown members (for example a misspelled
+/// `modls`) are rejected instead of silently leaving the table empty.
+///
+/// `models` is a list of entries naming their model in a value, not a map
+/// keyed by model name: the configuration loader lower-cases map keys, which
+/// would break exact matching and silently merge names that differ only in
+/// letter case.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPricingSettings {
+    #[serde(default)]
+    models: Vec<RawModelPrice>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelPrice {
+    model: String,
+    input_usd_per_million_tokens: f64,
+    output_usd_per_million_tokens: f64,
+}
+
+impl TryFrom<RawPricingSettings> for PricingSettings {
+    type Error = String;
+
+    /// Rejects at load time (so the server does not start) any price that is
+    /// negative, NaN or infinite, an empty model name, a model listed twice,
+    /// and model names that differ only in letter case (ambiguous to
+    /// operators).
+    fn try_from(raw: RawPricingSettings) -> Result<Self, Self::Error> {
+        let mut models = std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for entry in raw.models {
+            let name = entry.model;
+            if name.trim().is_empty() {
+                return Err("pricing.models: model name must not be empty".to_string());
+            }
+            let price = ModelPrice {
+                input_usd_per_million_tokens: entry.input_usd_per_million_tokens,
+                output_usd_per_million_tokens: entry.output_usd_per_million_tokens,
+            };
+            if !price.is_valid() {
+                return Err(format!(
+                    "pricing.models `{name}`: prices must be finite and >= 0"
+                ));
+            }
+            if let Some(other) = seen.insert(name.to_ascii_lowercase(), name.clone()) {
+                return Err(if other == name {
+                    format!("pricing.models: `{name}` is listed twice")
+                } else {
+                    format!(
+                        "pricing.models: `{other}` and `{name}` differ only in letter case; model names are matched exactly, keep one"
+                    )
+                });
+            }
+            models.insert(name, price);
+        }
+        Ok(Self { models })
+    }
+}
+
+/// Unit prices of one model, in USD per one million tokens.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrice {
+    pub input_usd_per_million_tokens: f64,
+    pub output_usd_per_million_tokens: f64,
+}
+
+impl ModelPrice {
+    /// Both prices are finite and non-negative.
+    pub fn is_valid(&self) -> bool {
+        [
+            self.input_usd_per_million_tokens,
+            self.output_usd_per_million_tokens,
+        ]
+        .iter()
+        .all(|p| p.is_finite() && *p >= 0.0)
+    }
+}
+
+impl PricingSettings {
+    /// The price entry for exactly `model` (the model name the upstream
+    /// returned). No case folding, prefix or alias matching.
+    pub fn price_for(&self, model: &str) -> Option<&ModelPrice> {
+        self.models.get(model).filter(|price| price.is_valid())
+    }
 }
 
 /// Deploy-time registrations for the claims-scoped online corpus job watcher.
@@ -1654,6 +1761,7 @@ impl Default for Settings {
             admin_policies: AdminPolicySettings::default(),
             a2a: A2aSettings::default(),
             online_corpus_watchers: OnlineCorpusWatcherSettings::default(),
+            pricing: PricingSettings::default(),
         }
     }
 }
@@ -2820,5 +2928,70 @@ mod tests {
             .to_string();
         assert!(err.contains("max_projection_size"), "{err}");
         assert!(err.contains("memory.l2"), "{err}");
+    }
+
+    fn pricing_from_yaml(yaml: &str) -> Result<PricingSettings, ConfigError> {
+        Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()?
+            .get::<PricingSettings>("pricing")
+    }
+
+    fn price_entry(model: &str, input: &str, output: &str) -> String {
+        format!(
+            "    - {{ model: \"{model}\", input_usd_per_million_tokens: {input}, output_usd_per_million_tokens: {output} }}\n"
+        )
+    }
+
+    /// N4: a price table that cannot be trusted stops the load.
+    #[test]
+    fn pricing_rejects_invalid_prices_typos_and_case_collisions() {
+        let table = |entries: &[String]| format!("pricing:\n  models:\n{}", entries.concat());
+        for (yaml, needle) in [
+            (table(&[price_entry("m", "-1.0", "1.0")]), "finite"),
+            // YAML `.nan` / `.inf` already fail to load as numbers; a number
+            // too large for f64 loads as infinity and is caught here.
+            (table(&[price_entry("m", ".nan", "1.0")]), "failed"),
+            (table(&[price_entry("m", "1.0", ".inf")]), "failed"),
+            (table(&[price_entry("m", "1e400", "1.0")]), "finite"),
+            (table(&[price_entry("m", "1.0", "-1e400")]), "finite"),
+            (table(&[price_entry("", "1.0", "1.0")]), "empty"),
+            (
+                table(&[price_entry("A", "1.0", "1.0"), price_entry("a", "9.0", "9.0")]),
+                "letter case",
+            ),
+            (
+                table(&[price_entry("m", "1.0", "1.0"), price_entry("m", "2.0", "2.0")]),
+                "listed twice",
+            ),
+            ("pricing:\n  modls: []\n".to_string(), "modls"),
+            (
+                "pricing:\n  models:\n    - { model: m, input_usd_per_million_tokens: 1.0, output_usd_per_millon_tokens: 1.0 }\n".to_string(),
+                "output_usd_per_millon_tokens",
+            ),
+        ] {
+            let err = pricing_from_yaml(&yaml).expect_err(&yaml).to_string();
+            assert!(err.contains(needle), "{yaml} -> {err}");
+        }
+    }
+
+    /// Lookups use the upstream's model name exactly, with its letter case
+    /// kept through loading.
+    #[test]
+    fn pricing_matches_model_names_exactly() {
+        let pricing = pricing_from_yaml(&format!(
+            "pricing:\n  models:\n{}{}",
+            price_entry("GPT-4.1", "2.0", "8.0"),
+            price_entry("vendor/Model-X", "0", "0.5"),
+        ))
+        .unwrap();
+        let price = pricing.price_for("GPT-4.1").expect("exact name");
+        assert_eq!(price.input_usd_per_million_tokens, 2.0);
+        assert_eq!(price.output_usd_per_million_tokens, 8.0);
+        assert!(pricing.price_for("gpt-4.1").is_none());
+        assert!(pricing.price_for("GPT-4.1-mini").is_none());
+        assert!(pricing.price_for("vendor/Model-X").is_some());
+        assert!(pricing.price_for("vendor/model-x").is_none());
+        assert_eq!(pricing_from_yaml("pricing: {}\n").unwrap().models.len(), 0);
     }
 }
