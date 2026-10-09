@@ -25,25 +25,22 @@ use super::invocations_enforcement::{
     FifoScheduler, InputRefRegistry, RunningScope, BUDGET_EXCEEDED_ERROR_CODE,
 };
 use super::invocations_store::{
-    scrub_secret_shaped_text, Invocation, InvocationErrorInfo, InvocationResult, InvocationState,
-    InvocationStore, InvocationToolCallUsage, InvocationUsage, TransitionPatch,
+    scrub_secret_shaped_text, validate_usage, Invocation, InvocationErrorInfo, InvocationResult,
+    InvocationState, InvocationStore, InvocationUsage, TransitionPatch,
     DEADLINE_EXCEEDED_ERROR_CODE, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
     TASK_INIT_FAILED_ERROR_CODE,
 };
-use super::{TaskExecSpec, TaskExecutor};
+use super::{TaskExecSpec, TaskExecutor, TaskOutcome, TaskOutcomeKind};
 use crate::core::core_types::SemanticCore;
-use crate::core::event_bus::EventBus;
 use crate::isolation::IsolationClaims;
 
 /// Incomplete `result.usage` when closing as `succeeded` (VAL-016 / VAL-017).
 pub(crate) const INCOMPLETE_USAGE_ERROR_CODE: &str = "incomplete_usage";
+/// `result.usage` does not match the public contract. Never store it, and
+/// never treat it as absent so the run can succeed.
+pub(crate) const INVALID_USAGE_ERROR_CODE: &str = "invalid_usage";
 /// Executor join failed with a panic / unexpected abort.
 pub(crate) const EXECUTOR_PANIC_ERROR_CODE: &str = "executor_panic";
-/// Executor finished (or was abandoned) without a TASK_COMPLETED / TASK_FAILED event.
-pub(crate) const TERMINAL_EVENT_MISSING_ERROR_CODE: &str = "terminal_event_missing";
-/// A terminal event carried a `usage` object that does not match the public
-/// contract. Never silently turn that into missing usage and succeed.
-pub(crate) const INVALID_USAGE_ERROR_CODE: &str = "invalid_usage";
 /// Soft upper bound for persisted result summaries (#317 scrub).
 pub(crate) const MAX_RESULT_SUMMARY_CHARS: usize = 4_096;
 /// Scoped frame used for the H4 projection gate (non-SPARQL, task-local).
@@ -89,24 +86,49 @@ impl InvocationCancellationRegistry {
     }
 }
 
-/// VAL-016: `succeeded` requires non-empty `model`, both token counts, and
-/// integer `cost` (micro-USD). Provider / tool_calls remain optional.
-pub(crate) fn usage_is_complete_for_succeeded(usage: &InvocationUsage) -> bool {
-    let model_ok = usage.model.as_deref().is_some_and(|m| !m.trim().is_empty());
-    model_ok
-        && usage.input_tokens.is_some()
-        && usage.output_tokens.is_some()
-        && usage.cost.is_some()
+/// Names of the VAL-016 fields `usage` lacks (field names only, for logs).
+/// `succeeded` requires non-empty `model`, both token counts, and integer
+/// `cost` (micro-USD) with its `cost_source` (#337). Provider / tool_calls
+/// remain optional.
+pub(crate) fn missing_usage_fields(usage: &InvocationUsage) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if usage.model.as_deref().is_none_or(|m| m.trim().is_empty()) {
+        missing.push("model");
+    }
+    if usage.input_tokens.is_none() {
+        missing.push("input_tokens");
+    }
+    if usage.output_tokens.is_none() {
+        missing.push("output_tokens");
+    }
+    if usage.cost.is_none() {
+        missing.push("cost");
+    }
+    if usage.cost_source.is_none() {
+        missing.push("cost_source");
+    }
+    missing
 }
 
 /// Returns `Ok` when `result.usage` is complete enough for `succeeded`.
 pub(crate) fn require_complete_usage_for_succeeded(
     result: &InvocationResult,
 ) -> Result<(), IncompleteUsage> {
-    match result.usage.as_ref() {
-        Some(usage) if usage_is_complete_for_succeeded(usage) => Ok(()),
-        Some(_) => Err(IncompleteUsage::IncompleteFields),
-        None => Err(IncompleteUsage::Missing),
+    let Some(usage) = result.usage.as_ref() else {
+        return Err(IncompleteUsage::Missing);
+    };
+    let missing = missing_usage_fields(usage);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let only_cost = missing.iter().all(|f| *f == "cost" || *f == "cost_source");
+    if only_cost && usage.cost.is_none() {
+        // Tokens and model are known; nothing priced the run.
+        Err(IncompleteUsage::NoCostSource)
+    } else if only_cost {
+        Err(IncompleteUsage::CostWithoutSource)
+    } else {
+        Err(IncompleteUsage::IncompleteFields)
     }
 }
 
@@ -114,6 +136,11 @@ pub(crate) fn require_complete_usage_for_succeeded(
 pub(crate) enum IncompleteUsage {
     Missing,
     IncompleteFields,
+    /// Model and tokens are complete, but neither the gateway reported a cost
+    /// nor does the operator price table cover the run (#337).
+    NoCostSource,
+    /// `cost` set without `cost_source`.
+    CostWithoutSource,
 }
 
 impl IncompleteUsage {
@@ -125,10 +152,20 @@ impl IncompleteUsage {
         match self {
             Self::Missing => "succeeded requires result.usage",
             Self::IncompleteFields => {
-                "succeeded requires result.usage.model, input_tokens, output_tokens, and cost"
+                "succeeded requires result.usage.model, input_tokens, output_tokens, cost and cost_source"
             }
+            Self::NoCostSource => {
+                "no cost source configured: the gateway reported no cost and no operator price table entry covers the model(s) used"
+            }
+            Self::CostWithoutSource => "result.usage.cost requires cost_source",
         }
     }
+}
+
+/// SA result statuses that mean the task actually completed. Anything else
+/// (`timeout`, `partial_failure`, …) must not become `succeeded`.
+pub(crate) fn status_is_success(status: &str) -> bool {
+    matches!(status, "completed" | "success" | "succeeded")
 }
 
 /// Applies a successful terminal transition only when usage is complete
@@ -300,52 +337,6 @@ fn neutralize_input_ref_close(text: &str) -> String {
     out
 }
 
-/// Parses usage (+ summary) out of a TASK_* event payload.
-pub(crate) fn parse_terminal_payload(
-    payload: &str,
-) -> Result<(String, Option<InvocationUsage>), String> {
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return Ok((scrub_result_summary(payload), None));
-    };
-    let summary = value
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let usage = match value.get("usage") {
-        Some(usage) => Some(
-            serde_json::from_value::<InvocationUsage>(usage.clone())
-                .map_err(|_| "terminal event usage is invalid".to_string())?,
-        ),
-        None => None,
-    };
-    Ok((scrub_result_summary(&summary), usage))
-}
-
-/// Built-in tools execute in process unless their implementation makes a
-/// direct network request. The persisted usage deliberately excludes tool
-/// arguments and results, which can contain sensitive data.
-pub(crate) fn built_in_tool_transport(name: &str) -> &'static str {
-    match name {
-        "web_search" | "web_fetch" | "http_request" | "knowledge_import_url" => "http",
-        _ => "local",
-    }
-}
-
-fn tool_call_from_event(event: &crate::core::event_bus::Event) -> Option<InvocationToolCallUsage> {
-    if event.event_type != "TOOL_CALL" {
-        return None;
-    }
-    let payload: Value = serde_json::from_str(&event.payload).ok()?;
-    let name = payload
-        .pointer("/event/ToolCall/tool_name")
-        .and_then(Value::as_str)?;
-    (!name.trim().is_empty()).then(|| InvocationToolCallUsage {
-        name: name.to_string(),
-        transport: Some(built_in_tool_transport(name).to_string()),
-    })
-}
-
 /// Production dispatcher: FIFO running caps → input_ref → init task →
 /// projection gate → TaskExecutor → state drive (#317 / #331).
 pub(crate) struct InvocationExecutionBridge {
@@ -353,7 +344,6 @@ pub(crate) struct InvocationExecutionBridge {
     cancellations: InvocationCancellationRegistry,
     core: Arc<SemanticCore>,
     executor: Arc<dyn TaskExecutor>,
-    events: Arc<EventBus>,
     shutdown: CancellationToken,
     projection_gate: Arc<dyn ProjectionContextGate>,
     scheduler: Arc<FifoScheduler>,
@@ -393,13 +383,11 @@ impl InvocationExecutionBridge {
         scheduler: Arc<FifoScheduler>,
         input_refs: InputRefRegistry,
     ) -> Self {
-        let events = core.events.clone();
         Self {
             store,
             cancellations,
             core,
             executor,
-            events,
             shutdown,
             projection_gate,
             scheduler,
@@ -448,7 +436,6 @@ impl InvocationDispatcher for InvocationExecutionBridge {
             store: self.store.clone(),
             core: self.core.clone(),
             executor: self.executor.clone(),
-            events: self.events.clone(),
             gate: self.projection_gate.clone(),
             input_refs: self.input_refs.clone(),
             scheduler: self.scheduler.clone(),
@@ -635,7 +622,6 @@ struct InvocationRunDeps {
     store: Arc<InvocationStore>,
     core: Arc<SemanticCore>,
     executor: Arc<dyn TaskExecutor>,
-    events: Arc<EventBus>,
     gate: Arc<dyn ProjectionContextGate>,
     input_refs: InputRefRegistry,
     scheduler: Arc<FifoScheduler>,
@@ -650,7 +636,6 @@ async fn run_invocation(
         store,
         core,
         executor,
-        events,
         gate,
         input_refs,
         scheduler,
@@ -764,9 +749,6 @@ async fn run_invocation(
     // Store row left `queued`; wake peers that were waiting for a new FIFO head.
     scheduler.notify().notify_waiters();
 
-    // Subscribe before spawning the executor so early events are not missed.
-    let mut rx = events.subscribe();
-
     let spec = TaskExecSpec {
         prompt,
         task_iri: task_iri.clone(),
@@ -776,194 +758,149 @@ async fn run_invocation(
         isolation_claims: claims.clone(),
     };
 
-    let exec_task_iri = task_iri.clone();
-    let exec_events = events.clone();
-    let mut execution = tokio::spawn(async move {
-        executor.execute(spec).await;
-    });
+    // The terminal state comes only from what `execute` returns. Events on the
+    // shared bus can come from other components (the memory scheduler emits
+    // `TASK_COMPLETED`) or from callers, so the bridge never reads them (#337).
+    let mut execution = tokio::spawn(async move { executor.execute(spec).await });
 
-    let mut terminal_event = None;
-    let mut tool_calls = Vec::new();
-    let mut executor_done = false;
-
-    while terminal_event.is_none() {
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled(), if !executor_done => {
-                // Requested cancel: wait for the executor to unwind, then
-                // prefer a real terminal event if one arrived; else cancelled.
-                let join = (&mut execution).await;
-                if let Ok(event) = rx.try_recv() {
-                    if event.task_iri == task_iri
-                        && (event.event_type == "TASK_COMPLETED"
-                            || event.event_type == "TASK_FAILED")
-                    {
-                        terminal_event = Some(event);
-                        break;
-                    }
-                }
-                // Drain a few more events briefly.
-                for _ in 0..8 {
-                    match rx.try_recv() {
-                        Ok(event)
-                            if event.task_iri == task_iri
-                                && (event.event_type == "TASK_COMPLETED"
-                                    || event.event_type == "TASK_FAILED") =>
+    let join = tokio::select! {
+        biased;
+        join = &mut execution => join,
+        _ = cancellation.cancelled() => {
+            // Requested cancel: wait for the executor to unwind and keep its
+            // real outcome if it finished anyway; otherwise record cancelled.
+            let join = (&mut execution).await;
+            match join {
+                Ok(outcome) if outcome.kind != TaskOutcomeKind::Cancelled => Ok(outcome),
+                Ok(_) => {
+                    // Deadline watcher may already have written failed/deadline_exceeded.
+                    if let Ok(current) = store.get_for_claims(&claims, &invocation.id).await {
+                        if current.state.is_terminal()
+                            || current
+                                .error
+                                .as_ref()
+                                .is_some_and(|e| e.code == DEADLINE_EXCEEDED_ERROR_CODE)
                         {
-                            terminal_event = Some(event);
-                            break;
+                            return;
                         }
-                        Ok(_) => continue,
-                        Err(_) => break,
                     }
-                }
-                if terminal_event.is_some() {
-                    break;
-                }
-                if let Err(error) = join {
-                    if error.is_panic() {
-                        let _ = fail_running(
-                            &store,
+                    let _ = store
+                        .transition_for_claims(
                             &claims,
                             &invocation.id,
-                            EXECUTOR_PANIC_ERROR_CODE,
-                            &format!("task executor panicked: {error}"),
                             None,
+                            InvocationState::Cancelled,
+                            TransitionPatch::default(),
                         )
                         .await;
-                        return;
-                    }
+                    return;
                 }
-                // Deadline watcher may already have written failed/deadline_exceeded.
-                if let Ok(current) = store.get_for_claims(&claims, &invocation.id).await {
-                    if current.state.is_terminal() {
-                        return;
-                    }
-                    if current
-                        .error
-                        .as_ref()
-                        .is_some_and(|e| e.code == DEADLINE_EXCEEDED_ERROR_CODE)
-                    {
-                        return;
-                    }
-                }
-                let _ = store
-                    .transition_for_claims(
-                        &claims,
-                        &invocation.id,
-                        None,
-                        InvocationState::Cancelled,
-                        TransitionPatch::default(),
-                    )
-                    .await;
-                return;
-            }
-            join = &mut execution, if !executor_done => {
-                executor_done = true;
-                match join {
-                    Ok(()) => {}
-                    Err(error) => {
-                        let _ = exec_events
-                            .emit(
-                                &exec_task_iri,
-                                "TASK_FAILED",
-                                "invocation",
-                                &serde_json::json!({
-                                    "status": "failed",
-                                    "summary": format!(
-                                        "task executor terminated unexpectedly: {error}"
-                                    ),
-                                })
-                                .to_string(),
-                            )
-                            .await;
-                    }
-                }
-            }
-            result = rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        if event.task_iri != task_iri {
-                            continue;
-                        }
-                        if let Some(tool_call) = tool_call_from_event(&event) {
-                            tool_calls.push(tool_call);
-                        }
-                        if event.event_type == "TASK_COMPLETED"
-                            || event.event_type == "TASK_FAILED"
-                        {
-                            terminal_event = Some(event);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
-                    }
-                }
+                Err(error) => Err(error),
             }
         }
+    };
 
-        // Executor finished but terminal event not yet received: keep
-        // receiving for a short window, then fail closed.
-        if executor_done && terminal_event.is_none() {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(event))
-                    if event.task_iri == task_iri
-                        && (event.event_type == "TASK_COMPLETED"
-                            || event.event_type == "TASK_FAILED") =>
-                {
-                    terminal_event = Some(event);
-                }
-                Ok(Ok(_)) => continue,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(_)) | Err(_) => break,
-            }
+    let outcome = match join {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let (code, message) = if error.is_panic() {
+                (
+                    EXECUTOR_PANIC_ERROR_CODE,
+                    format!("task executor panicked: {error}"),
+                )
+            } else {
+                (
+                    "task_failed",
+                    format!("task executor terminated unexpectedly: {error}"),
+                )
+            };
+            let _ = fail_running(&store, &claims, &invocation.id, code, &message, None).await;
+            return;
         }
-    }
-
-    let Some(event) = terminal_event else {
-        let current = store.get_for_claims(&claims, &invocation.id).await.ok();
-        if current.as_ref().is_some_and(|inv| inv.state.is_terminal()) {
+    };
+    if outcome.kind == TaskOutcomeKind::Cancelled {
+        // Cancelled without a cancel request (for example the executor's own
+        // run timeout fired its token): the run did not complete.
+        if let Err(reason) = outcome.usage.as_ref().map(validate_usage).transpose() {
+            tracing::warn!(
+                invocation_id = %invocation.id,
+                reason,
+                "invocation usage invalid; not persisting it"
+            );
+            let _ = fail_running(
+                &store,
+                &claims,
+                &invocation.id,
+                INVALID_USAGE_ERROR_CODE,
+                "invocation usage is invalid",
+                None,
+            )
+            .await;
             return;
         }
         let _ = fail_running(
             &store,
             &claims,
             &invocation.id,
-            TERMINAL_EVENT_MISSING_ERROR_CODE,
-            "execution ended without a terminal task event",
+            "task_failed",
+            "task execution was cancelled",
+            outcome.usage,
+        )
+        .await;
+        return;
+    }
+
+    apply_task_outcome(&store, &claims, &invocation, outcome).await;
+}
+
+async fn apply_task_outcome(
+    store: &InvocationStore,
+    claims: &IsolationClaims,
+    invocation: &Invocation,
+    outcome: TaskOutcome,
+) {
+    let id = invocation.id.as_str();
+    let TaskOutcome {
+        kind,
+        status,
+        summary,
+        usage,
+    } = outcome;
+    let summary = scrub_result_summary(&summary);
+    // Illegal usage must not be stored and must not be dropped so the run
+    // can still succeed. The store also rejects it at write time.
+    if let Err(reason) = usage.as_ref().map(validate_usage).transpose() {
+        tracing::warn!(
+            invocation_id = %id,
+            reason,
+            "invocation usage invalid; not persisting it"
+        );
+        let _ = fail_running(
+            store,
+            claims,
+            id,
+            INVALID_USAGE_ERROR_CODE,
+            "invocation usage is invalid",
             None,
         )
         .await;
         return;
-    };
-
-    apply_terminal_event(&store, &claims, &invocation, &event, tool_calls).await;
-}
-
-async fn apply_terminal_event(
-    store: &InvocationStore,
-    claims: &IsolationClaims,
-    invocation: &Invocation,
-    event: &crate::core::event_bus::Event,
-    tool_calls: Vec<InvocationToolCallUsage>,
-) {
-    let id = invocation.id.as_str();
-    let (summary, mut usage) = match parse_terminal_payload(&event.payload) {
-        Ok(parsed) => parsed,
-        Err(message) => {
-            let _ = fail_running(store, claims, id, INVALID_USAGE_ERROR_CODE, &message, None).await;
+    }
+    if kind == TaskOutcomeKind::Completed {
+        // The executor completes every pipeline it finishes; only an
+        // explicitly successful SA status may become `succeeded` (#337).
+        if !status_is_success(&status) {
+            let _ = fail_running(
+                store,
+                claims,
+                id,
+                "task_failed",
+                &format!("task ended with status '{}'", scrub_result_summary(&status)),
+                usage,
+            )
+            .await;
             return;
         }
-    };
-    if !tool_calls.is_empty() {
-        if let Some(usage) = usage.as_mut() {
-            usage.tool_calls = Some(tool_calls);
-        }
-    }
-    if event.event_type == "TASK_COMPLETED" {
         // Budget gate before VAL-016 succeeded write (#331).
         if let (Some(budget), Some(usage_ref)) =
             (invocation.request.budget.as_ref(), usage.as_ref())
@@ -981,6 +918,7 @@ async fn apply_terminal_event(
                 return;
             }
         }
+        let usage_for_log = usage.clone();
         let result = InvocationResult {
             summary,
             artifacts: vec![],
@@ -1002,13 +940,24 @@ async fn apply_terminal_event(
                     .await;
             }
             Err(incomplete) => {
+                // Field names only: never the prompt, summary or any secret.
+                tracing::warn!(
+                    invocation_id = %id,
+                    missing = ?usage_ref_missing(&usage_for_log),
+                    "invocation usage incomplete; not recording succeeded"
+                );
                 let _ = fail_running(
                     store,
                     claims,
                     id,
                     incomplete.as_error_code(),
                     incomplete.as_message(),
-                    None,
+                    // A cost without its source is not persisted at all.
+                    if incomplete == IncompleteUsage::CostWithoutSource {
+                        None
+                    } else {
+                        usage_for_log
+                    },
                 )
                 .await;
             }
@@ -1027,6 +976,13 @@ async fn apply_terminal_event(
             usage,
         )
         .await;
+    }
+}
+
+fn usage_ref_missing(usage: &Option<InvocationUsage>) -> Vec<&'static str> {
+    match usage {
+        Some(usage) => missing_usage_fields(usage),
+        None => vec!["usage"],
     }
 }
 
@@ -1096,7 +1052,9 @@ async fn fail_running(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::http::invocations_store::{InvocationErrorInfo, InvocationToolCallUsage};
+    use crate::api::http::invocations_store::{
+        CostSource, InvocationErrorInfo, InvocationToolCallUsage,
+    };
 
     fn complete_usage() -> InvocationUsage {
         InvocationUsage {
@@ -1105,6 +1063,7 @@ mod tests {
             input_tokens: Some(10),
             output_tokens: Some(4),
             cost: Some(1_000),
+            cost_source: Some(CostSource::Gateway),
             tool_calls: Some(vec![InvocationToolCallUsage {
                 name: "search".into(),
                 transport: Some("mcp".into()),
@@ -1142,7 +1101,6 @@ mod tests {
             |u: &mut InvocationUsage| u.model = Some("  ".into()),
             |u: &mut InvocationUsage| u.input_tokens = None,
             |u: &mut InvocationUsage| u.output_tokens = None,
-            |u: &mut InvocationUsage| u.cost = None,
         ] {
             let mut usage = complete_usage();
             mutate(&mut usage);
@@ -1155,6 +1113,55 @@ mod tests {
                 succeeded_patch_or_reject(result).unwrap_err(),
                 IncompleteUsage::IncompleteFields
             );
+        }
+    }
+
+    /// #337: tokens and model complete but nothing priced the run.
+    #[test]
+    fn val016_missing_cost_reports_no_cost_source() {
+        let mut usage = complete_usage();
+        usage.cost = None;
+        usage.cost_source = None;
+        let result = InvocationResult {
+            summary: "ok".into(),
+            artifacts: vec![],
+            usage: Some(usage),
+        };
+        let err = succeeded_patch_or_reject(result).unwrap_err();
+        assert_eq!(err, IncompleteUsage::NoCostSource);
+        assert!(err.as_message().contains("no cost source"));
+    }
+
+    /// #337: a cost without its source is not accepted.
+    #[test]
+    fn val016_cost_without_source_is_rejected() {
+        let mut usage = complete_usage();
+        usage.cost_source = None;
+        let result = InvocationResult {
+            summary: "ok".into(),
+            artifacts: vec![],
+            usage: Some(usage),
+        };
+        assert_eq!(
+            succeeded_patch_or_reject(result).unwrap_err(),
+            IncompleteUsage::CostWithoutSource
+        );
+    }
+
+    #[test]
+    fn only_explicit_success_statuses_succeed() {
+        for ok in ["completed", "success", "succeeded"] {
+            assert!(status_is_success(ok));
+        }
+        for bad in [
+            "timeout",
+            "partial_failure",
+            "partial_success",
+            "failed",
+            "aborted",
+            "",
+        ] {
+            assert!(!status_is_success(bad), "{bad}");
         }
     }
 
@@ -1215,48 +1222,5 @@ mod tests {
             MAX_RESULT_SUMMARY_CHARS
         );
         assert!(scrub_result_summary("leak api_key=secret").contains("[redacted]"));
-    }
-
-    #[test]
-    fn parse_terminal_payload_reads_usage() {
-        let payload = serde_json::json!({
-            "status": "succeeded",
-            "summary": "ok",
-            "usage": {
-                "model": "m",
-                "input_tokens": 1,
-                "output_tokens": 2,
-                "cost": 3
-            }
-        })
-        .to_string();
-        let (summary, usage) = parse_terminal_payload(&payload).unwrap();
-        assert_eq!(summary, "ok");
-        let usage = usage.expect("usage");
-        assert_eq!(usage.model.as_deref(), Some("m"));
-        assert_eq!(usage.cost, Some(3));
-    }
-
-    #[test]
-    fn malformed_terminal_usage_is_not_silently_dropped() {
-        let payload = serde_json::json!({
-            "summary": "ok",
-            "usage": {
-                "model": "m",
-                "input_tokens": 1,
-                "output_tokens": 2,
-                "cost": 3,
-                "unexpected": true
-            }
-        })
-        .to_string();
-        assert!(parse_terminal_payload(&payload).is_err());
-    }
-
-    #[test]
-    fn built_in_network_tools_are_recorded_as_http() {
-        assert_eq!(built_in_tool_transport("web_search"), "http");
-        assert_eq!(built_in_tool_transport("web_fetch"), "http");
-        assert_eq!(built_in_tool_transport("file_read"), "local");
     }
 }

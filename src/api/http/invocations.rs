@@ -1199,5 +1199,9 @@ mod idempotency_tests;
 mod bridge_tests;
 
 #[cfg(test)]
+#[path = "invocations_usage_tests.rs"]
+mod usage_tests;
+
+#[cfg(test)]
 #[path = "invocations_enforcement_tests.rs"]
 mod enforcement_tests;

@@ -141,6 +141,14 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
 
     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
         if choices.is_empty() {
+            // `stream_options.include_usage` delivers usage on a trailing
+            // chunk with an empty `choices` array.
+            if let Some(usage) = json.get("usage").and_then(chat_chunk_usage) {
+                return Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
+                    finish_reason: None,
+                    usage: Some(usage),
+                })));
+            }
             return Ok(None);
         }
 
@@ -204,36 +212,20 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
 
         if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
             if !finish_reason.is_empty() {
+                // Some upstreams put the usage block on the finish chunk
+                // itself rather than on a separate trailing chunk.
                 return Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
                     finish_reason: Some(finish_reason.to_string()),
-                    usage: None,
+                    usage: json.get("usage").and_then(chat_chunk_usage),
                 })));
             }
         }
     }
 
-    if let Some(usage) = json.get("usage") {
-        let prompt_tokens = usage
-            .get("prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let completion_tokens = usage
-            .get("completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let total_tokens = usage
-            .get("total_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-
+    if let Some(usage) = json.get("usage").and_then(chat_chunk_usage) {
         return Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
             finish_reason: None,
-            usage: Some(Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                cached_prompt_tokens: cached_prompt_tokens(usage),
-            }),
+            usage: Some(usage),
         })));
     }
 
@@ -391,13 +383,9 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
                 "incomplete" => "length".to_string(),
                 _ => "error".to_string(),
             };
-            let usage = response.and_then(|r| r.get("usage")).map(|u| Usage {
-                prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-                    as u32,
-                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                cached_prompt_tokens: cached_prompt_tokens(u),
-            });
+            let usage = response
+                .and_then(|r| r.get("usage"))
+                .and_then(responses_usage);
             Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
                 finish_reason: Some(finish_reason),
                 usage,
@@ -405,6 +393,67 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
         }
         _ => Ok(None),
     }
+}
+
+/// Usage block of a chat-completions stream chunk.
+/// Usage from a chat-completions chunk. `None` for `"usage": null` (sent on
+/// every chunk by upstreams honouring `include_usage`) or a block without
+/// token counts, so it is never mistaken for a reported zero.
+fn chat_chunk_usage(usage: &serde_json::Value) -> Option<Usage> {
+    let (prompt_tokens, completion_tokens, total_tokens) =
+        reported_token_counts(usage, "prompt_tokens", "completion_tokens")?;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cached_prompt_tokens: cached_prompt_tokens(usage),
+        cost_usd: reported_cost_usd(usage),
+    })
+}
+
+/// Usage from a Responses API `usage` block (`input_tokens` /
+/// `output_tokens`), under the same rules as [`chat_chunk_usage`].
+fn responses_usage(usage: &serde_json::Value) -> Option<Usage> {
+    let (prompt_tokens, completion_tokens, total_tokens) =
+        reported_token_counts(usage, "input_tokens", "output_tokens")?;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cached_prompt_tokens: cached_prompt_tokens(usage),
+        cost_usd: reported_cost_usd(usage),
+    })
+}
+
+/// `(input, output, total)` token counts an upstream reported, or `None`
+/// unless both `input_key` and `output_key` are present as non-negative
+/// integers that fit in `u32`. `null`, a missing count or an out-of-range
+/// value is "no usage reported", never zero and never truncated (#337).
+pub(crate) fn reported_token_counts(
+    usage: &serde_json::Value,
+    input_key: &str,
+    output_key: &str,
+) -> Option<(u32, u32, u32)> {
+    let tokens = |key: &str| {
+        usage
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let input = tokens(input_key)?;
+    let output = tokens(output_key)?;
+    let total = match usage.get("total_tokens") {
+        None | Some(serde_json::Value::Null) => input.checked_add(output)?,
+        Some(_) => tokens("total_tokens")?,
+    };
+    Some((input, output, total))
+}
+
+fn reported_cost_usd(usage: &serde_json::Value) -> Option<f64> {
+    usage
+        .get("cost")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 fn cached_prompt_tokens(usage: &serde_json::Value) -> Option<u32> {
@@ -797,5 +846,83 @@ mod tests {
                 ..
             })) if r == "error"
         ));
+    }
+
+    fn usage_of(event: Option<StreamEvent>) -> Option<Usage> {
+        match event {
+            Some(StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. })) => usage,
+            _ => None,
+        }
+    }
+
+    /// #337: `stream_options.include_usage` sends usage on a trailing chunk
+    /// whose `choices` is empty; it must not be dropped.
+    #[test]
+    fn include_usage_trailing_chunk_with_empty_choices_yields_usage() {
+        let frame = "data: {\"id\":\"s\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15,\"cost\":0.00042}}\n\n";
+        let usage = usage_of(parse_frame(frame).unwrap()).expect("usage");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (12, 3));
+        assert_eq!(usage.cost_usd, Some(0.00042));
+    }
+
+    #[test]
+    fn usage_on_the_finish_chunk_is_kept() {
+        let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n";
+        let usage = usage_of(parse_frame(frame).unwrap()).expect("usage");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (5, 2, 7)
+        );
+        assert_eq!(usage.cost_usd, None);
+    }
+
+    /// `"usage": null` (sent on every chunk before the trailing one) is not a
+    /// reported zero.
+    #[test]
+    fn null_or_tokenless_usage_is_not_a_zero_usage() {
+        for frame in [
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"cost\":1.0}}\n\n",
+        ] {
+            assert_eq!(usage_of(parse_frame(frame).unwrap()), None, "{frame}");
+        }
+    }
+
+    /// N1: a Responses API `usage` of `null`, without both token counts, or
+    /// with a count above `u32` is "no usage", not 0/0 or a truncated value.
+    #[test]
+    fn responses_usage_null_partial_or_out_of_range_is_no_usage() {
+        for usage in [
+            "null",
+            "{\"cost\":0.0}",
+            "{\"input_tokens\":4}",
+            "{\"input_tokens\":4294967301,\"output_tokens\":2}",
+            "{\"input_tokens\":-1,\"output_tokens\":2}",
+        ] {
+            let frame = format!("data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[],\"usage\":{usage}}}}}\n\n");
+            assert_eq!(usage_of(parse_frame(&frame).unwrap()), None, "{usage}");
+        }
+        let frame = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"cost\":0.5}}}\n\n";
+        let usage = usage_of(parse_frame(frame).unwrap()).expect("usage");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (4, 2, 6)
+        );
+        assert_eq!(usage.cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn chat_usage_above_u32_is_no_usage() {
+        let frame = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1099511627776,\"completion_tokens\":1}}\n\n";
+        assert_eq!(usage_of(parse_frame(frame).unwrap()), None);
     }
 }

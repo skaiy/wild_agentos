@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -8,6 +8,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::config::settings::GatewaySettings;
+use crate::gateway::usage_meter::{CallUsage, RunUsageMeter};
 use crate::llm::stream_processor::MessageStream;
 use crate::CoreError;
 
@@ -178,6 +179,19 @@ pub struct Usage {
     pub total_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_prompt_tokens: Option<u32>,
+    /// Cost the upstream/gateway reported for this call, in USD
+    /// (`usage.cost`). `None` when the upstream reports no cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// Gateway-reported cost of one call (`usage.cost`, USD), when present and
+/// a finite non-negative number.
+pub(crate) fn reported_cost_usd(usage: &Value) -> Option<f64> {
+    usage
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 fn cached_prompt_tokens(usage: &Value) -> Option<u32> {
@@ -206,6 +220,8 @@ impl<'de> Deserialize<'de> for Usage {
             cache_read_input_tokens: Option<u32>,
             #[serde(default)]
             prompt_tokens_details: Option<PromptTokenDetails>,
+            #[serde(default)]
+            cost: Option<f64>,
         }
         #[derive(Deserialize)]
         struct PromptTokenDetails {
@@ -221,6 +237,7 @@ impl<'de> Deserialize<'de> for Usage {
                 .prompt_tokens_details
                 .and_then(|details| details.cached_tokens)
                 .or(raw.cache_read_input_tokens),
+            cost_usd: raw.cost.filter(|cost| cost.is_finite() && *cost >= 0.0),
         })
     }
 }
@@ -251,6 +268,9 @@ pub struct UnifiedGateway {
     /// are sent to `{base_url}/v1/responses`; all other models keep using
     /// `/v1/chat/completions`.
     use_responses_api: RwLock<bool>,
+    /// Per-run usage meter; set only on run-scoped handles created by
+    /// [`Self::with_usage_meter`].
+    usage_meter: Option<Arc<RunUsageMeter>>,
 }
 
 impl UnifiedGateway {
@@ -276,7 +296,61 @@ impl UnifiedGateway {
             providers: RwLock::new(HashMap::new()),
             model_provider: RwLock::new(HashMap::new()),
             use_responses_api: RwLock::new(settings.use_responses_api),
+            usage_meter: None,
         })
+    }
+
+    /// A run-scoped handle that records every call's upstream usage into
+    /// `meter`.
+    ///
+    /// It shares the HTTP client (connection pool) and takes a snapshot of
+    /// the current endpoint, key, model and provider settings; runtime changes
+    /// made afterwards apply to the next run, not to a run already in flight.
+    pub fn with_usage_meter(&self, meter: Arc<RunUsageMeter>) -> Self {
+        Self {
+            base_url: RwLock::new(self.base_url.read().unwrap().clone()),
+            api_key: RwLock::new(self.api_key.read().unwrap().clone()),
+            client: self.client.clone(),
+            model_mapping: RwLock::new(self.model_mapping.read().unwrap().clone()),
+            default_model: RwLock::new(self.default_model.read().unwrap().clone()),
+            timeout_seconds: self.timeout_seconds,
+            max_retries: self.max_retries,
+            retry_base_ms: self.retry_base_ms,
+            providers: RwLock::new(self.providers.read().unwrap().clone()),
+            model_provider: RwLock::new(self.model_provider.read().unwrap().clone()),
+            use_responses_api: RwLock::new(*self.use_responses_api.read().unwrap()),
+            usage_meter: Some(meter),
+        }
+    }
+
+    /// Records one upstream call that returned 2xx (and so may have been
+    /// billed) into the run's meter. `json` is the parsed body, or `None` when
+    /// the body could not be read or parsed; then the call counts as one
+    /// without usage. Token counts follow the stream rules: both present and
+    /// within `u32`, otherwise no usage (never zero).
+    fn record_call_usage(&self, requested_model: &str, json: Option<&Value>) {
+        let Some(meter) = &self.usage_meter else {
+            return;
+        };
+        let usage = json.and_then(|json| {
+            let u = json.get("usage")?;
+            let (input, output, _) =
+                crate::llm::sse::reported_token_counts(u, "prompt_tokens", "completion_tokens")
+                    .or_else(|| {
+                        crate::llm::sse::reported_token_counts(u, "input_tokens", "output_tokens")
+                    })?;
+            let served_model = json
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(requested_model);
+            Some(CallUsage {
+                model: served_model.to_string(),
+                input_tokens: u64::from(input),
+                output_tokens: u64::from(output),
+                reported_cost_usd: reported_cost_usd(u),
+            })
+        });
+        meter.record(requested_model, usage);
     }
 
     pub fn default_model(&self) -> String {
@@ -453,6 +527,11 @@ impl UnifiedGateway {
                         let response_text = match resp.text().await {
                             Ok(t) => t,
                             Err(e) => {
+                                // A 2xx may still have been billed: count it.
+                                self.record_call_usage(
+                                    body["model"].as_str().unwrap_or_default(),
+                                    None,
+                                );
                                 warn!(error = %e, "Failed to read LLM response body");
                                 last_error = Some(CoreError::Internal {
                                     message: format!("Failed to read response body: {}", e),
@@ -463,6 +542,10 @@ impl UnifiedGateway {
                         let json: Value = match serde_json::from_str(&response_text) {
                             Ok(v) => v,
                             Err(e) => {
+                                self.record_call_usage(
+                                    body["model"].as_str().unwrap_or_default(),
+                                    None,
+                                );
                                 warn!(error = %e, response_len = response_text.len(), "Failed to parse LLM response");
                                 last_error = Some(CoreError::Internal {
                                     message: format!(
@@ -474,6 +557,12 @@ impl UnifiedGateway {
                                 continue;
                             }
                         };
+                        // Metered before conversion, so a 2xx body that fails
+                        // to convert (and is retried) is still counted.
+                        self.record_call_usage(
+                            body["model"].as_str().unwrap_or_default(),
+                            Some(&json),
+                        );
                         match parse(&json) {
                             Ok(result) => {
                                 info!(
@@ -519,6 +608,11 @@ impl UnifiedGateway {
         Err(last_error.unwrap_or_else(|| CoreError::Internal {
             message: "LLM API call failed after all retries".to_string(),
         }))
+    }
+
+    /// Current normalized base URL (no credential is part of it).
+    pub fn base_url(&self) -> String {
+        self.base_url.read().unwrap().clone()
     }
 
     pub fn set_base_url(&self, url: String) {
@@ -840,11 +934,18 @@ impl UnifiedGateway {
         } else {
             "tool_calls"
         };
-        let usage = json.get("usage").map(|u| Usage {
-            prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            cached_prompt_tokens: cached_prompt_tokens(u),
+        // Both token counts must be present and fit in u32; otherwise the
+        // call reported no usage (never 0/0, never truncated).
+        let usage = json.get("usage").and_then(|u| {
+            let (prompt_tokens, completion_tokens, total_tokens) =
+                crate::llm::sse::reported_token_counts(u, "input_tokens", "output_tokens")?;
+            Some(Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cached_prompt_tokens: cached_prompt_tokens(u),
+                cost_usd: reported_cost_usd(u),
+            })
         });
 
         Ok(ChatCompletionResponse {
@@ -947,10 +1048,12 @@ impl UnifiedGateway {
         }
 
         let url = format!("{}/v1/chat/completions", base);
+        // OpenAI-compatible upstreams only report usage on a stream when asked.
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if let Some(temp) = temperature {
             body["temperature"] = serde_json::json!(temp);
@@ -989,19 +1092,104 @@ impl UnifiedGateway {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            // An upstream that rejects `stream_options` gets the request once
+            // more without it. That stream then carries no usage, which the
+            // run's usage meter records as a call without usage (fail closed).
+            // Only a 4xx whose body names the option counts as such a
+            // rejection; any other error is returned as is.
+            if body.get("stream_options").is_some() && rejects_stream_options(status, &text) {
+                warn!(
+                    model = %body["model"],
+                    first_status = %status,
+                    "Upstream rejected stream_options.include_usage; retrying once without it (usage will be missing)"
+                );
+                let mut fallback = body.clone();
+                if let Some(map) = fallback.as_object_mut() {
+                    map.remove("stream_options");
+                }
+                return Box::pin(self.send_stream_request(url, api_key, fallback))
+                    .await
+                    .map_err(|error| CoreError::Internal {
+                        message: format!(
+                            "{error} (first attempt with stream_options was rejected with {status})"
+                        ),
+                    });
+            }
             return Err(CoreError::Internal {
                 message: format!("Stream API error ({}): {}", status, text),
             });
         }
 
         info!(model = %body["model"], "Stream request started");
-        Ok(MessageStream::new(response))
+        let stream = MessageStream::new(response);
+        Ok(match &self.usage_meter {
+            Some(meter) => {
+                stream.with_usage_meter(meter.clone(), body["model"].as_str().unwrap_or_default())
+            }
+            None => stream,
+        })
     }
+}
+
+/// Whether an error answer to a streaming request means the upstream does
+/// not accept `stream_options`: a 400 or 422 (the statuses upstreams use
+/// for a request they cannot accept) whose body mentions `stream_options` or
+/// `include_usage`. Other 4xx (auth, not found, rate limit, too large) are
+/// not about the option even when the body echoes it.
+fn rejects_stream_options(status: reqwest::StatusCode, body: &str) -> bool {
+    if !matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("stream_options") || body.contains("include_usage")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_options_rejection_needs_a_400_or_422_naming_the_option() {
+        use reqwest::StatusCode;
+        assert!(rejects_stream_options(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Unknown field: stream_options"}}"#
+        ));
+        assert!(rejects_stream_options(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "include_usage is not supported"
+        ));
+        assert!(!rejects_stream_options(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"context length exceeded"}}"#
+        ));
+        assert!(!rejects_stream_options(
+            StatusCode::UNAUTHORIZED,
+            "invalid api key"
+        ));
+        assert!(!rejects_stream_options(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stream_options crashed the server"
+        ));
+        // Other 4xx are not a rejection of the option, even when the body
+        // names it.
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(
+                !rejects_stream_options(status, "request with stream_options.include_usage"),
+                "{status}"
+            );
+        }
+    }
 
     #[test]
     fn usage_parses_optional_cached_prompt_tokens() {
@@ -1351,6 +1539,40 @@ mod tests {
         assert_eq!(usage.total_tokens, 18);
     }
 
+    /// N1 (#337): a non-streaming Responses API reply reports usage only with
+    /// both token counts within u32; null, partial or out-of-range usage is
+    /// "no usage", never 0/0 and never truncated.
+    #[test]
+    fn responses_reply_usage_needs_both_counts_within_u32() {
+        let reply = |usage: serde_json::Value| {
+            let json = serde_json::json!({
+                "id": "resp_u",
+                "status": "completed",
+                "output": [
+                    {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "hi"}]}
+                ],
+                "usage": usage,
+            });
+            UnifiedGateway::parse_responses_response(&json)
+                .unwrap()
+                .usage
+        };
+        let usage = reply(serde_json::json!({"input_tokens": 7, "output_tokens": 3})).unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (7, 3));
+        for missing in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"input_tokens": 7}),
+            serde_json::json!({"output_tokens": 3}),
+            serde_json::json!({"input_tokens": null, "output_tokens": 3}),
+            serde_json::json!({"input_tokens": 4_294_967_296u64, "output_tokens": 3}),
+            serde_json::json!({"input_tokens": -1, "output_tokens": 3}),
+        ] {
+            assert!(reply(missing.clone()).is_none(), "{missing}");
+        }
+    }
+
     #[test]
     fn test_parse_responses_response_plain_text() {
         let json = serde_json::json!({
@@ -1445,6 +1667,61 @@ mod tests {
             model_mapping: HashMap::from([("default".to_string(), "test-model".to_string())]),
         };
         UnifiedGateway::new(&settings).unwrap()
+    }
+
+    /// N2: 2xx answers that fail to parse (and are retried) may have been
+    /// billed, so the run's meter counts them: a body that is not JSON counts
+    /// as a call without usage, one that fails conversion keeps its usage.
+    #[tokio::test]
+    async fn retried_2xx_parse_failures_are_metered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_handler = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let hits = hits_handler.clone();
+                async move {
+                    match hits.fetch_add(1, Ordering::SeqCst) {
+                        0 => "not json".to_string(),
+                        1 => serde_json::json!({
+                            "model": "served-model",
+                            "usage": {"prompt_tokens": 5, "completion_tokens": 1}
+                        })
+                        .to_string(),
+                        _ => serde_json::json!({
+                            "id": "ok",
+                            "model": "served-model",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "pong"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 7, "completion_tokens": 2}
+                        })
+                        .to_string(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let meter = Arc::new(RunUsageMeter::new());
+        let gateway = gateway_with(&base, "test-key", 2).with_usage_meter(meter.clone());
+        gateway
+            .chat_with_model("test-model", vec![user_msg("hi")])
+            .await
+            .expect("third attempt succeeds");
+        let run = meter.snapshot();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(run.calls, 3);
+        assert_eq!(run.calls_without_usage, 1, "the non-JSON 2xx");
+        assert_eq!(run.input_tokens, 12);
+        assert!(!run.tokens_complete());
+        server.abort();
     }
 
     #[tokio::test]

@@ -768,7 +768,8 @@ pub struct HttpTaskExecutor {
 
 #[async_trait::async_trait]
 impl crate::api::http::TaskExecutor for HttpTaskExecutor {
-    async fn execute(&self, spec: crate::api::http::TaskExecSpec) {
+    async fn execute(&self, spec: crate::api::http::TaskExecSpec) -> crate::api::http::TaskOutcome {
+        use crate::api::http::TaskOutcome;
         let l0 = match self.tenant_l0.get_or_open(&spec.isolation_claims) {
             Ok(l0) => l0,
             Err(error) => {
@@ -785,16 +786,19 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_FAILED",
-                        "SA",
-                        &serde_json::json!({"status": "failed", "summary": error.to_string()})
-                            .to_string(),
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &terminal_payload("failed", &error.to_string(), None),
                     )
                     .await;
-                return;
+                return TaskOutcome::failed(error.to_string(), None);
             }
         };
+        // Every LLM call of this run goes through a gateway handle bound to
+        // this run's own usage meter, so concurrent runs never mix counts.
+        let usage_meter = Arc::new(crate::gateway::usage_meter::RunUsageMeter::new());
+        let run_gateway = Arc::new(self.gateway.with_usage_meter(usage_meter.clone()));
         let mut sa = build_supervisor_agent(
-            self.gateway.clone(),
+            run_gateway,
             self.skills.clone(),
             self.blackboard.clone(),
             l0,
@@ -841,6 +845,8 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
         };
 
         let cancellation = spec.cancellation.clone();
+        // Set only when the caller's token (not our own timeout) stopped the run.
+        let mut cancelled_by_caller = false;
         let execution = if self.settings.agents.timeout_seconds > 0 {
             let timeout = std::time::Duration::from_secs(self.settings.agents.timeout_seconds);
             tokio::select! {
@@ -851,21 +857,38 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                         message: format!("task execution timed out after {} seconds", timeout.as_secs()),
                     })
                 }
-                _ = cancellation.cancelled() => Err(crate::CoreError::Internal {
-                    message: "task execution cancelled".to_string(),
-                }),
+                _ = cancellation.cancelled() => {
+                    cancelled_by_caller = true;
+                    Err(crate::CoreError::Internal {
+                        message: "task execution cancelled".to_string(),
+                    })
+                }
             }
         } else {
             tokio::select! {
                 result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
-                _ = cancellation.cancelled() => Err(crate::CoreError::Internal {
-                    message: "task execution cancelled".to_string(),
-                }),
+                _ = cancellation.cancelled() => {
+                    cancelled_by_caller = true;
+                    Err(crate::CoreError::Internal {
+                        message: "task execution cancelled".to_string(),
+                    })
+                }
             }
         };
 
-        match execution {
+        let mut usage = crate::api::http::invocations_store::usage_from_run(
+            &usage_meter.snapshot(),
+            &self.settings.pricing,
+        );
+        let outcome = match execution {
             Ok(result) => {
+                usage = crate::api::http::invocations_store::record_builtin_tool_calls(
+                    usage,
+                    result
+                        .tracked_actions
+                        .iter()
+                        .map(|action| action.tool_name.as_str()),
+                );
                 emitter.emit_completion(&result.status, &result.summary, result.output.clone());
                 if let Some(client) = &a2a_client {
                     if self.settings.a2a.outbound.enabled
@@ -897,11 +920,11 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                     .emit(
                         &spec.task_iri,
                         event_type,
-                        "SA",
-                        &serde_json::json!({"status": result.status, "summary": result.summary})
-                            .to_string(),
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &terminal_payload(&result.status, &result.summary, usage.clone()),
                     )
                     .await;
+                TaskOutcome::completed(result.status, result.summary, usage)
             }
             Err(e) => {
                 emitter.emit_error("ExecutionError", &e.to_string(), "SA", false);
@@ -910,19 +933,104 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
                     .emit(
                         &spec.task_iri,
                         "TASK_FAILED",
-                        "SA",
-                        &serde_json::json!({"status": "failed", "summary": e.to_string()})
-                            .to_string(),
+                        crate::api::http::TASK_TERMINAL_SOURCE,
+                        &terminal_payload("failed", &e.to_string(), usage.clone()),
                     )
                     .await;
+                if cancelled_by_caller {
+                    TaskOutcome::cancelled(usage)
+                } else {
+                    TaskOutcome::failed(e.to_string(), usage)
+                }
             }
-        }
+        };
 
         // Release this run's clone of the tenant handle, then close tenant
         // handles no other run is still using.
         drop(sa);
         self.tenant_l0.release_idle();
+        outcome
     }
+}
+
+#[cfg(test)]
+impl HttpTaskExecutor {
+    /// The production executor wired the way `AgentOSService` wires it (shared
+    /// startup L0 opened legacy read-only, tenant L0 under
+    /// `settings.memory.l0.path`), on top of an existing core's blackboard,
+    /// projection and event bus. Tests only.
+    pub(crate) fn for_tests(
+        core: &crate::core::core_types::SemanticCore,
+        settings: Settings,
+    ) -> Self {
+        let gateway = Arc::new(UnifiedGateway::new(&settings.gateway).expect("gateway"));
+        let legacy_l0 =
+            Arc::new(L0Store::open_legacy_readonly(&settings.memory.l0.path).expect("legacy L0"));
+        let blackboard = core.blackboard.clone();
+        let projection = core.projection.clone();
+        let event_bus = core.events.clone();
+        let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
+        let consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            legacy_l0.clone(),
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let scheduler = Arc::new(MemoryScheduler::new(
+            legacy_l0.clone(),
+            blackboard.clone(),
+            projection.clone(),
+            consistency,
+            memory_bus.clone(),
+        ));
+        let prefetch = Arc::new(PrefetchEngine::new(
+            memory_bus,
+            blackboard.clone(),
+            projection.clone(),
+        ));
+        let memory_manager = Arc::new(tokio::sync::Mutex::new(MemoryManager::with_scheduler(
+            legacy_l0,
+            blackboard.clone(),
+            projection,
+            CoreConfig::default(),
+            scheduler.clone(),
+        )));
+        Self {
+            gateway,
+            skills: Arc::new(SkillRegistry::new()),
+            blackboard,
+            tenant_l0: Arc::new(TenantL0Registry::new(&settings.memory.l0.path)),
+            memory_manager,
+            templates: Arc::new(
+                TemplateEngine::new(std::path::Path::new("src/templates/templates"))
+                    .expect("templates"),
+            ),
+            scheduler,
+            prefetch,
+            unified_graph: Arc::new(UnifiedGraphStore::new().expect("unified graph")),
+            event_bus,
+            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            settings,
+        }
+    }
+}
+
+/// Payload of the executor's terminal `TASK_COMPLETED` / `TASK_FAILED` event:
+/// `{status, summary}` plus the run's `usage` (same shape as the invocation
+/// `result.usage`, including recorded built-in tool calls) when present.
+/// SSE only: the invocation bridge trusts the `TaskOutcome` `execute` returns.
+fn terminal_payload(
+    status: &str,
+    summary: &str,
+    usage: Option<crate::api::http::invocations_store::InvocationUsage>,
+) -> String {
+    let mut payload = serde_json::json!({"status": status, "summary": summary});
+    if let Some(usage) = usage {
+        if let Ok(value) = serde_json::to_value(usage) {
+            payload["usage"] = value;
+        }
+    }
+    payload.to_string()
 }
 
 trait RequestSettings {
@@ -1630,6 +1738,10 @@ fn clean_content(text: &str) -> String {
         cleaned
     }
 }
+
+#[cfg(test)]
+#[path = "executor_l0_completion_tests.rs"]
+mod executor_l0_completion_tests;
 
 #[cfg(test)]
 #[path = "executor_l0_concurrency_tests.rs"]

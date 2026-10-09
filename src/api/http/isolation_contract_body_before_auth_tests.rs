@@ -154,7 +154,8 @@ fn routes() -> Vec<Route> {
                     S::UNSUPPORTED_MEDIA_TYPE,
                 ),
             ],
-            platform_admin: false,
+            // #303 (#352): the provider probes are platform-admin only.
+            platform_admin: true,
         },
         Route {
             method: Method::POST,
@@ -182,7 +183,8 @@ fn routes() -> Vec<Route> {
                     S::UNSUPPORTED_MEDIA_TYPE,
                 ),
             ],
-            platform_admin: false,
+            // #303 (#352): the provider probes are platform-admin only.
+            platform_admin: true,
         },
     ]
 }
@@ -424,7 +426,7 @@ async fn isolation_contract_authorized_invalid_bodies_keep_json_rejections() {
         "/api/v1/models/test",
         JSON,
         r#"{"resource_id":"missing"}"#,
-        Caller::Bearer(&da),
+        Caller::Bearer(&platform_admin),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
