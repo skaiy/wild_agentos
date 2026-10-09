@@ -409,7 +409,9 @@ fn spawn_runs(
         .cloned()
         .map(|(task_iri, claims)| {
             let executor = harness.executor.clone();
-            tokio::spawn(async move { executor.execute(tagged_spec(&task_iri, &claims)).await })
+            tokio::spawn(async move {
+                let _ = executor.execute(tagged_spec(&task_iri, &claims)).await;
+            })
         })
         .collect()
 }
