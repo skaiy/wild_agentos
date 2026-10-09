@@ -39,13 +39,13 @@ forbidden in coding artifacts", "code": "artifact_plaintext_secret"}`。不回�
 
 | 规则 | 匹配 |
 | --- | --- |
-| `private_key` | `-----BEGIN [A-Z ]*PRIVATE KEY-----` 或 `… PRIVATE KEY BLOCK-----`（证书、公钥不拦） |
+| `private_key` | `-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----` 或 `… PRIVATE KEY BLOCK-----`（证书、公钥不拦） |
 | `aws_access_key_id` | `AKIA` + 16 个 `[0-9A-Z]` |
-| `aws_secret_access_key` | `aws_secret_access_key`（不分大小写），可选引号，`:`/`=`，再跟 40 位 `[A-Za-z0-9/+=]` 值 |
+| `aws_secret_access_key` | `aws_secret_access_key`（不分大小写），可选转义引号，可选空白，分隔符 `=>`、`:` 或 `=`，再可选空白和转义引号，然后是 40 位 `[A-Za-z0-9/+=]` 值 |
 | `github_classic_pat` | `ghp_` + 36 个 `[A-Za-z0-9]` |
 | `github_fine_grained_pat` | `github_pat_` + 82 个 `[A-Za-z0-9_]` |
 | `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + 至少 10 个 `[A-Za-z0-9-]` |
-| `sk_api_key` | 前面不是 `[A-Za-z0-9_-]` 的 `sk-`，后跟至少 20 个 `[A-Za-z0-9_-]`（覆盖 `sk-proj-…`、`sk-ant-…`、`sk-<slug>-<hex>`） |
+| `sk_api_key` | 左边界为文本开头、`[A-Za-z0-9_-]` 以外的字符、转义的 `\n`、`\r`、`\t`、`\b`、`\f`、`\u` 加四位十六进制，或 `%` 加两位十六进制。随后是 `sk-`、可选的 `proj-` 或 `ant-`，以及至少 20 个 `[A-Za-z0-9_-]`。像 `sk-learn-classification-examples-v2` 这样的小写连字符名称不是密钥 |
 
 `task-`、`risk-`、`disk-`、`ask-`、`Slovakia` 等普通文本不会命中；按名字引用凭据
 （`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`、`TOKEN="$TOKEN_FROM_ENV"`）是允许的。

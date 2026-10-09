@@ -25,6 +25,9 @@ fn ordinary_samples() -> Vec<String> {
         cat(&["-----", "BEGIN CERTIFICATE-----\nMIIB", &fake(60)]),
         "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}".to_string(),
         "export TOKEN=\"$TOKEN_FROM_ENV\"; client-sk-integration-handler-v2".to_string(),
+        // Kebab identifiers of 20+ characters are names, not keys.
+        cat(&["s", "k-learn-classification-examples-v2"]),
+        cat(&["note ", "s", "k-my-long-running-service-name end"]),
         // Escaped newlines/tabs and percent-encoding next to ordinary words.
         r#"{"log": "line1\nask-user-for-confirmation-before-continuing\ttask-risk-review-pipeline%20disk-cleanup-schedule-weekly"}"#
             .to_string(),
@@ -220,6 +223,78 @@ fn near_miss_mutations_pass() {
         assert!(
             !contains_plaintext_secret(&sample),
             "must not block: {sample}"
+        );
+    }
+}
+
+/// Raw JSON/text escapes that sit immediately left of an `sk-` key.
+/// `\uXXXX` ends in a hex digit, so a boundary of only `[^A-Za-z0-9_-]` misses
+/// the key. `\b` and `\f` were outside the escaped-whitespace class.
+#[test]
+fn json_unicode_and_control_escapes_are_sk_boundaries() {
+    let sk = cat(&["s", "k-proj-", &fake(48)]);
+    let probes = [
+        // Full-width colon, as emitted when non-ASCII is escaped.
+        cat(&[r"API Key\uff1a", &sk]),
+        cat(&[r"\u3000", &sk]),
+        cat(&[r"\b", &sk]),
+        cat(&[r"\f", &sk]),
+        cat(&[r"line\b", &sk]),
+        cat(&[r"line\f", &sk]),
+    ];
+    for sample in probes {
+        assert_eq!(
+            matched_rules(&sample),
+            vec!["sk_api_key"],
+            "must block: {sample}"
+        );
+    }
+    // The escape is a boundary only when `sk-` follows it. `ask-` does not.
+    let ordinary = cat(&[
+        r"\u3000ask-user-for-confirmation-before-continuing",
+        r" \bask-user-for-confirmation-before-continuing",
+    ]);
+    assert_eq!(matched_rules(&ordinary), Vec::<&str>::new());
+}
+
+/// Requiring a digit in every `sk-` body would drop letter-only regression
+/// samples. Kebab names are excluded instead, and a one-character mutation
+/// back into a credential shape is still rejected.
+#[test]
+fn kebab_identifiers_are_not_secrets_and_mutations_stay_rejected() {
+    assert_eq!(RULES[SK_API_KEY_RULE].0, "sk_api_key");
+    let samples = [
+        cat(&["s", "k-learn-classification-examples-v2"]),
+        cat(&["s", "k-my-long-running-service-name"]),
+        cat(&["s", "k-ant-learn-classification-examples-v2"]),
+    ];
+    for sample in &samples {
+        assert_eq!(
+            matched_rules(sample),
+            Vec::<&str>::new(),
+            "kebab name must pass: {sample}"
+        );
+        assert!(!contains_plaintext_secret(sample));
+    }
+
+    let real = cat(&["s", "k-proj-", &fake(48)]);
+    let mixed = format!("{} {real}", samples[0]);
+    assert_eq!(matched_rules(&mixed), vec!["sk_api_key"]);
+
+    let long_hex = "0123456789abcdef".repeat(2);
+    let mutations = [
+        // Hyphens removed: letter-only body, same shape as the regression samples.
+        cat(&["s", "k-learnclassificationexamplesv2"]),
+        // Uppercase is not a kebab name.
+        cat(&["s", "k-Learn-classification-examples-v2"]),
+        // A long digit segment is a credential body, not a word.
+        cat(&["s", "k-learn-classification-", &long_hex]),
+    ];
+    for sample in &mutations {
+        assert_eq!(
+            matched_rules(sample),
+            vec!["sk_api_key"],
+            "mutation must block: {sample}"
         );
     }
 }

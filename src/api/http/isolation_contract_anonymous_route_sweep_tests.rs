@@ -71,7 +71,6 @@ const INCONCLUSIVE: &[(&str, &str)] = &[
     ("DELETE", "/api/v1/mcp/skill-exposures"),
     ("DELETE", "/api/v1/skills"),
     ("GET", "/api/v1/blackboard/nodes"),
-    ("GET", "/api/v1/ontology/constrained-extractions/:id"),
     ("POST", "/api/v1/agents"),
     ("POST", "/api/v1/agents/:id/chat"),
     ("POST", "/api/v1/api-clients"),
