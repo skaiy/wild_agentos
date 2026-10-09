@@ -1742,7 +1742,7 @@ impl Default for Settings {
             },
             agents: AgentSettings::default(),
             api: ApiSettings {
-                grpc_addr: "0.0.0.0:50051".to_string(),
+                grpc_addr: "127.0.0.1:50051".to_string(),
                 http_addr: "0.0.0.0:8080".to_string(),
                 enable_metrics: true,
                 metrics_port: 9090,
@@ -1915,6 +1915,11 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn grpc_listen_address_defaults_to_loopback() {
+        assert_eq!(Settings::default().api.grpc_addr, "127.0.0.1:50051");
+    }
 
     const FAKE_KEY: &str = "test-fake-gateway-key-278";
 

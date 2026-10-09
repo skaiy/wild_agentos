@@ -35,6 +35,16 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 传入 `IsolationClaims::from_verified`；`.`、`..`、路径分隔符（如 `a/b`）等不安全
 值会 fail closed，`verify_jwt` 不产生 identity。
 
+gRPC 使用同一套校验。每个方法都要求 metadata `authorization: Bearer <jwt>`；
+不接受 `X-Identity`。拦截器与每个方法都会拒绝缺失或无效的 token。方法在读取
+任务、订阅其事件或开始执行之前，任务上持久化的租户和项目必须与已验证 claims
+一致。空 id、不存在的任务，以及作用域之外的任务，都返回 gRPC `NOT_FOUND`，
+消息为 `not found`。该状态不包含 `request_id`。审批结果仅在事件的任务与正在
+等待的任务一致时生效。
+
+`api.grpc_addr` 默认为 `127.0.0.1:50051`。`AGENT_OS_API_GRPC_ADDR` 可覆盖它。
+监听其他网卡必须显式配置；随仓库提供的 `config.yaml` 使用 loopback 默认值。
+
 ## 平台级配置不属于任何租户
 
 `PUT /api/v1/config`（gateway、embedding、models、admin policies）和

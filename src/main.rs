@@ -1,3 +1,4 @@
+use wild_agent_os_core::api::grpc::auth::jwt_interceptor;
 use wild_agent_os_core::api::grpc::server::seapp::se_kernel_service_server::SeKernelServiceServer;
 use wild_agent_os_core::api::grpc::server::AgentOSService;
 use wild_agent_os_core::config::settings::Settings;
@@ -84,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .api
         .grpc_addr
         .parse()
-        .unwrap_or_else(|_| "[::1]:50051".parse().expect("default addr parse"));
+        .unwrap_or_else(|_| "127.0.0.1:50051".parse().expect("default addr parse"));
     let shutdown = CancellationToken::new();
     let agent_os_service = AgentOSService::new_with_shutdown(settings, shutdown.clone())
         .map_err(Box::<dyn std::error::Error>::from)?;
@@ -127,7 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_shutdown = shutdown.clone();
     servers.spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(SeKernelServiceServer::new(agent_os_service))
+            .add_service(SeKernelServiceServer::with_interceptor(
+                agent_os_service,
+                jwt_interceptor,
+            ))
             .serve_with_shutdown(addr, grpc_shutdown.cancelled_owned())
             .await
             .map_err(|error| error.to_string())

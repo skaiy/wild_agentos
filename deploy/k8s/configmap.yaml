@@ -6,6 +6,8 @@ metadata:
   namespace: wild-agentos
 data:
   AGENT_OS_HTTP_PORT: "8080"
+  # Explicit non-loopback bind for the published service port.
+  # The process default is 127.0.0.1:50051.
   AGENT_OS_API_GRPC_ADDR: "0.0.0.0:50051"
   RUST_LOG: "info"
   # 网关端点(非密钥) — DeepSeek OpenAI 兼容

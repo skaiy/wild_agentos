@@ -68,9 +68,11 @@ pub(crate) async fn write_node_handler(
     if let Err(response) = authorize_core_write(&state, &identity, &req.task_iri).await {
         return response;
     }
+    // The server sets NODE_CREATED's source. `created_by` in the body is ignored.
+    let source = external_event_source(&identity);
     match state
         .core
-        .write_node(&req.task_iri, &req.json_ld, None, req.created_by.as_deref())
+        .write_node(&req.task_iri, &req.json_ld, None, Some(source.as_str()))
         .await
     {
         Ok(node_iri) => (
@@ -462,14 +464,8 @@ pub(crate) async fn list_blackboard_nodes_handler(
     }
     match state.core.blackboard.read_node(&task_iri) {
         Ok(Some(task)) if task_is_in_scope(&task.json_ld, claims) => {}
-        Ok(Some(_)) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "task is outside the verified isolation scope"})),
-            )
-                .into_response()
-        }
-        Ok(None) => {
+        // A task outside the caller's scope answers exactly like a missing one.
+        Ok(Some(_)) | Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "task not found"})),
@@ -1509,7 +1505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blackboard_list_and_nodes_require_claims_and_are_scope_limited() {
+    async fn isolation_contract_blackboard_list_and_nodes_require_claims_and_are_scope_limited() {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1618,11 +1614,89 @@ mod tests {
                 )
                 .body(Body::empty())
                 .unwrap();
-            assert_eq!(
-                response_status(&router, request).await,
-                StatusCode::FORBIDDEN
-            );
+            let (status, body) = raw_response(&router, request).await;
+            let missing = Request::builder()
+                .method("GET")
+                .uri("/api/v1/blackboard/nodes?task_iri=iri://task/does-not-exist")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+                )
+                .body(Body::empty())
+                .unwrap();
+            let (missing_status, missing_body) = raw_response(&router, missing).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(missing_status, StatusCode::NOT_FOUND);
+            assert_eq!(body, missing_body);
         }
+
+        match previous_auth_mode {
+            Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),
+            None => std::env::remove_var("AGENTOS_AUTH_MODE"),
+        }
+        match previous_jwt_secret {
+            Some(value) => std::env::set_var("AGENTOS_JWT_SECRET", value),
+            None => std::env::remove_var("AGENTOS_JWT_SECRET"),
+        }
+    }
+
+    /// `created_by` in the body must not become the NODE_CREATED source.
+    #[tokio::test]
+    async fn isolation_contract_node_created_ignores_body_source() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let task_iri = "iri://task/node-source";
+        state
+            .core
+            .blackboard
+            .write_node(
+                task_iri,
+                &json!({
+                    "@id": task_iri,
+                    "@type": "Task",
+                    "tenant_id": "tenant-a",
+                    "project_id": "project-a",
+                })
+                .to_string(),
+                &state.core.config,
+            )
+            .unwrap();
+        let router = Router::new()
+            .route("/api/v1/nodes", post(write_node_handler))
+            .with_state(state.clone());
+        let mut rx = state.core.events.subscribe();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/nodes")
+            .header(
+                "authorization",
+                format!("Bearer {}", jwt("tenant-a", "project-a", vec![])),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "task_iri": task_iri,
+                    "json_ld": "{\"@type\":\"Note\"}",
+                    "created_by": "SA",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(response_status(&router, request).await, StatusCode::CREATED);
+        let event = rx.try_recv().expect("NODE_CREATED");
+        assert_eq!(event.event_type, "NODE_CREATED");
+        assert_eq!(event.source_agent_iri, "external:http:test-user");
+        assert!(!event.source_agent_iri.eq_ignore_ascii_case("SA"));
 
         match previous_auth_mode {
             Some(value) => std::env::set_var("AGENTOS_AUTH_MODE", value),

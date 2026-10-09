@@ -9,6 +9,31 @@ use super::actions::get_action_handler;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+/// An approval result applies only to the task that is waiting and to that
+/// task's request id. A result whose event or payload names another task is
+/// ignored, even when the request id matches.
+pub(crate) fn matching_approval_result(
+    event: &crate::core::event_bus::Event,
+    task_iri: &str,
+    request_id: &str,
+) -> Option<serde_json::Value> {
+    if event.event_type != "HUMAN_APPROVAL_RESULT" || event.task_iri != task_iri {
+        return None;
+    }
+    let result = serde_json::from_str::<serde_json::Value>(&event.payload).ok()?;
+    if result
+        .get("task_iri")
+        .and_then(|value| value.as_str())
+        .is_some_and(|payload_task| payload_task != task_iri)
+    {
+        return None;
+    }
+    if result.get("request_id").and_then(|value| value.as_str()) != Some(request_id) {
+        return None;
+    }
+    Some(result)
+}
+
 impl SupervisorAgent {
     pub(super) async fn execute_intervention(
         &mut self,
@@ -249,20 +274,16 @@ Notes:
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok(event) = receiver.try_recv() {
-                if event.event_type == "HUMAN_APPROVAL_RESULT" {
-                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                        if result.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
-                            let approved = result
-                                .get("approved")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            self.pending_approvals
-                                .lock()
-                                .await
-                                .insert(request_id, approved);
-                            return Ok(approved);
-                        }
-                    }
+                if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
+                    let approved = result
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    self.pending_approvals
+                        .lock()
+                        .await
+                        .insert(request_id, approved);
+                    return Ok(approved);
                 }
             }
         }
@@ -314,28 +335,24 @@ Notes:
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok(event) = receiver.try_recv() {
-                if event.event_type == "HUMAN_APPROVAL_RESULT" {
-                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                        if result.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
-                            let approved = result
-                                .get("approved")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            let comment = result
-                                .get("comment")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            self.pending_approvals
-                                .lock()
-                                .await
-                                .insert(request_id, approved);
-                            return Ok(HumanApprovalNodeResult {
-                                node_id: node_id.to_string(),
-                                approved,
-                                comment,
-                            });
-                        }
-                    }
+                if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
+                    let approved = result
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let comment = result
+                        .get("comment")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    self.pending_approvals
+                        .lock()
+                        .await
+                        .insert(request_id, approved);
+                    return Ok(HumanApprovalNodeResult {
+                        node_id: node_id.to_string(),
+                        approved,
+                        comment,
+                    });
                 }
             }
         }
@@ -742,5 +759,45 @@ Notes:
                 &serde_json::to_string(&event).unwrap_or_default(),
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matching_approval_result;
+    use crate::core::event_bus::{Event, EventPriority};
+    use chrono::Utc;
+
+    fn approval_event(task_iri: &str, payload_task: &str, request_id: &str) -> Event {
+        Event {
+            event_id: "evt".to_string(),
+            task_iri: task_iri.to_string(),
+            event_type: "HUMAN_APPROVAL_RESULT".to_string(),
+            source_agent_iri: "external:http:tester".to_string(),
+            payload: serde_json::json!({
+                "request_id": request_id,
+                "task_iri": payload_task,
+                "approved": true,
+            })
+            .to_string(),
+            payload_json_ld: "{}".to_string(),
+            timestamp: Utc::now(),
+            sequence: 1,
+            type_mask: 0,
+            priority: EventPriority::High,
+        }
+    }
+
+    #[test]
+    fn isolation_contract_approval_result_for_other_task_is_ignored() {
+        let request_id = "approval_same_request";
+        let own = approval_event("iri://task/a", "iri://task/a", request_id);
+        assert!(matching_approval_result(&own, "iri://task/a", request_id).is_some());
+
+        let other_event = approval_event("iri://task/b", "iri://task/b", request_id);
+        assert!(matching_approval_result(&other_event, "iri://task/a", request_id).is_none());
+
+        let other_payload = approval_event("iri://task/a", "iri://task/b", request_id);
+        assert!(matching_approval_result(&other_payload, "iri://task/a", request_id).is_none());
     }
 }

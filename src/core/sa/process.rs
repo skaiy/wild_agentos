@@ -274,24 +274,32 @@ impl SupervisorAgent {
                         warn!("Deadline approaching, marking task as urgent");
                     }
                     "HUMAN_APPROVAL_RESULT" => {
-                        if let Ok(result) =
-                            serde_json::from_str::<serde_json::Value>(&event.payload)
-                        {
-                            let request_id = result
-                                .get("request_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                        let request_id = serde_json::from_str::<serde_json::Value>(&event.payload)
+                            .ok()
+                            .and_then(|result| {
+                                result
+                                    .get("request_id")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_default();
+                        if request_id.is_empty() {
+                            continue;
+                        }
+                        if let Some(result) = super::intervention::matching_approval_result(
+                            &event,
+                            task_iri,
+                            &request_id,
+                        ) {
                             let approved = result
                                 .get("approved")
-                                .and_then(|v| v.as_bool())
+                                .and_then(|value| value.as_bool())
                                 .unwrap_or(false);
-                            if !request_id.is_empty() {
-                                self.pending_approvals
-                                    .lock()
-                                    .await
-                                    .insert(request_id.to_string(), approved);
-                                info!(request_id = %request_id, approved = %approved, "Received human approval result");
-                            }
+                            self.pending_approvals
+                                .lock()
+                                .await
+                                .insert(request_id.clone(), approved);
+                            info!(request_id = %request_id, approved = %approved, "Received human approval result");
                         }
                     }
                     "AGENT_ERROR" => {

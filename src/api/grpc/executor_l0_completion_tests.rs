@@ -14,7 +14,7 @@ use super::*;
 // gets a claims-verified tenant L0 handle from the executor itself. The LLM is
 // a local OpenAI-compatible stub, so no real model or network is involved.
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use crate::api::http::{TaskExecSpec, TaskExecutor};
