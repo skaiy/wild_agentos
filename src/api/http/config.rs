@@ -353,7 +353,7 @@ static CONFIG_OVERRIDE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(
 /// `O_EXCL`), so a leftover from a crashed write (in a container the PID is
 /// always 1) can neither make the next save fail nor be removed by it: on
 /// error only the file this call created is deleted (#303 re-review).
-fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let dir = path

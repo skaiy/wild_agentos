@@ -73,11 +73,42 @@ the same two gates:
   for every tenant). Prompt reads are unchanged.
 - **Tenant-scoped → `require_control_plane_da`** (verified JWT, explicit
   tenant and project, `DA`): `POST /api/v1/market/packages` and
-  `.../:name/{install,rollback,upgrade}`; `POST, DELETE
-  /api/v1/mcp/skill-exposures` (the owning tenant is taken from verified
-  claims, never from `X-Identity`); `POST /api/v1/kb/bases/:id/reindex`.
+  `.../:name/{install,rollback,upgrade}`; `GET, POST, DELETE
+  /api/v1/mcp/skill-exposures` (the owning tenant and project are taken from
+  verified claims, never from `X-Identity` or a defaulted project);
+  `POST /api/v1/kb/bases/:id/reindex`.
 - Another tenant's knowledge base, skill exposure, or private market package
-  answers the same `404` as a missing one.
+  answers the same `404` as a missing one. Another project's skill exposure
+  in the same tenant does too. A `project_id` in the skill-exposure body is
+  ignored. A stored skill exposure with no `project_id`, or with `project_id`
+  empty, is not listed, called, or deleted. Creating it again adds a new row
+  and leaves the old one in the exposure file. Each process start logs a
+  warning when those rows are loaded; an operator removes them by editing
+  the file. `POST /mcp` rejects a verified token with no project claim
+  (`403 mcp_claims_incomplete`). The first successful admission run that
+  records a publisher tenant and project owns the skill IRI. That owner is
+  kept in `skill_iri_owners.json` and is not dropped when admission history
+  is truncated to 200 runs. That copy from admission history runs once and writes
+  `skill_iri_owners.migrated`. After that marker exists, a missing owner file
+  is an error whether or not `pipeline_runs.json` remains, and ownership is
+  not replaced with an empty map. Deleting the marker and the owner file
+  together copies again from the remaining runs, which can reset ownership
+  after the 200-run truncation. Operators back up `skill_iri_owners.json`,
+  `skill_iri_owners.migrated`, and `pipeline_runs.json` together. Another tenant republishing it, including
+  `POST /api/v1/market/packages`, receives `409
+  skill_iri_owned_by_another_tenant` and does not replace that owner. A
+  market publish requires the `skill://` tenant segment to equal the
+  publisher's verified tenant. Platform-admin registration may use another
+  segment and still owns the IRI under the platform tenant. A
+  market package holds at most 32 skills and writes no runs unless every
+  embedded skill passes. Only the owner can expose the Skill, and only while
+  that owner's own latest admission is still a passing tenant-visibility
+  publish. A run with no publisher tenant authorizes none. The first load in
+  a process that finds such runs logs one warning and updates a counter.
+  Platform-admin registration is recorded under the platform
+  tenant, and a customer tenant cannot currently expose those skills.
+  Unauthenticated `GET /api/v1/skills/pipeline-runs` omits the publisher
+  tenant and project. The refusal omits the Skill description and input schema.
 
 ### API client id collisions and recovery
 

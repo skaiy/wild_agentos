@@ -184,7 +184,9 @@ Core 可以接收 JSON 响应，或从 SSE 响应中读取匹配的 JSON-RPC 消
 
 `POST /mcp` 是一个入站 Streamable HTTP 端点，用于向外部 MCP 客户端发布已明确
 暴露的租户 Skill。它**不是** Catalog 注册项的代理，也不会路由 Catalog 工具。
-其 Skill 暴露和写闸策略保持不变。
+该端点上的 Skill 暴露按调用方已验证的 tenant 和 project 隔离。没有 project claim
+的已验证 token 会在读取任何暴露记录之前被拒绝，返回 `403` 和 `mcp_claims_incomplete`。
+本文不改变 Catalog 出站规则。
 
 入站 `IsolationClaims` 只用于授权服务进行 Catalog 查找；它们绝不会作为 Bearer
 凭据转发，但其中已验证的 `tenant_id` 和 `project_id` 会写入签发的出站 JWT。任一
