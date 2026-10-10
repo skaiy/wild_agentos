@@ -468,6 +468,44 @@ async fn verify_jwt(token: &str) -> Option<UserIdentity> {
     }
 }
 
+/// Verify a bearer token with the same HS256 or OIDC rules as HTTP.
+///
+/// The gRPC interceptor is synchronous. HS256 verification does not perform
+/// I/O. OIDC verification is the same async JWKS fetch as HTTP, driven on the
+/// multi-thread server runtime. A current-thread runtime cannot host that
+/// fetch without stalling its only worker, so OIDC fails closed there.
+pub(crate) fn verify_bearer_blocking(token: &str) -> Option<UserIdentity> {
+    match auth_mode() {
+        Ok(AuthMode::Hs256) => verify_hs256_jwt(token),
+        Err(error) => {
+            tracing::warn!("JWT authentication configuration rejected: {}", error);
+            None
+        }
+        Ok(AuthMode::Oidc) => {
+            let token = token.to_owned();
+            let verify = async move { verify_oidc_jwt(&token).await };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    tokio::task::block_in_place(|| handle.block_on(verify))
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "OIDC JWT verification from a gRPC interceptor requires a multi-thread runtime"
+                    );
+                    None
+                }
+                Err(_) => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?
+                    .block_on(verify),
+            }
+        }
+    }
+}
+
 fn verify_hs256_jwt(token: &str) -> Option<UserIdentity> {
     let key = DecodingKey::from_secret(jwt_secret().as_bytes());
     let mut val = Validation::new(Algorithm::HS256);

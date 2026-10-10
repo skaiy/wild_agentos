@@ -351,6 +351,12 @@ pub struct Subscription {
     pub type_mask: u64,
     pub scope_iri: Option<String>,
     pub event_types: Vec<String>,
+    /// When set, an event whose payload names a different tenant is not a match.
+    /// Events that omit `tenant_id` are not rejected by this field.
+    pub tenant_id: Option<String>,
+    /// When set, an event whose payload names a different project is not a match.
+    /// Events that omit `project_id` are not rejected by this field.
+    pub project_id: Option<String>,
 }
 
 impl Subscription {
@@ -360,6 +366,8 @@ impl Subscription {
             type_mask: 0,
             scope_iri: None,
             event_types: Vec::new(),
+            tenant_id: None,
+            project_id: None,
         }
     }
 
@@ -378,6 +386,16 @@ impl Subscription {
         self
     }
 
+    pub fn with_tenant_project(
+        mut self,
+        tenant_id: impl Into<String>,
+        project_id: impl Into<String>,
+    ) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self.project_id = Some(project_id.into());
+        self
+    }
+
     /// O(1) check if event matches subscription
     pub fn matches(&self, event: &Event) -> bool {
         if self.type_mask != 0 && (event.type_mask & self.type_mask) == 0 {
@@ -392,6 +410,29 @@ impl Subscription {
 
         if !self.event_types.is_empty() && !self.event_types.contains(&event.event_type) {
             return false;
+        }
+
+        if self.tenant_id.is_some() || self.project_id.is_some() {
+            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                if let Some(tenant_id) = self.tenant_id.as_deref() {
+                    if payload
+                        .get("tenant_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| value != tenant_id)
+                    {
+                        return false;
+                    }
+                }
+                if let Some(project_id) = self.project_id.as_deref() {
+                    if payload
+                        .get("project_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| value != project_id)
+                    {
+                        return false;
+                    }
+                }
+            }
         }
 
         true

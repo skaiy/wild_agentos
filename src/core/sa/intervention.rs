@@ -9,10 +9,9 @@ use super::actions::get_action_handler;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
-/// A `HUMAN_APPROVAL_RESULT` counts only when it names this task and this
-/// request. Matching `request_id` alone would let the owner of another task
-/// approve this one.
-fn matching_approval_result(
+/// A `HUMAN_APPROVAL_RESULT` counts only when `event_type`, `task_iri`, and
+/// `request_id` all match. A payload that names another task is ignored.
+pub(crate) fn matching_approval_result(
     event: &crate::core::event_bus::Event,
     task_iri: &str,
     request_id: &str,
@@ -20,8 +19,15 @@ fn matching_approval_result(
     if event.event_type != "HUMAN_APPROVAL_RESULT" || event.task_iri != task_iri {
         return None;
     }
-    let result: serde_json::Value = serde_json::from_str(&event.payload).ok()?;
-    if result.get("request_id").and_then(|v| v.as_str()) != Some(request_id) {
+    let result = serde_json::from_str::<serde_json::Value>(&event.payload).ok()?;
+    if result
+        .get("task_iri")
+        .and_then(|value| value.as_str())
+        .is_some_and(|payload_task| payload_task != task_iri)
+    {
+        return None;
+    }
+    if result.get("request_id").and_then(|value| value.as_str()) != Some(request_id) {
         return None;
     }
     Some(result)
@@ -755,5 +761,61 @@ Notes:
                 &serde_json::to_string(&event).unwrap_or_default(),
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matching_approval_result;
+    use crate::core::event_bus::{Event, EventPriority};
+    use chrono::Utc;
+
+    fn approval_event(task_iri: &str, payload_task: &str, request_id: &str) -> Event {
+        Event {
+            event_id: "evt".to_string(),
+            task_iri: task_iri.to_string(),
+            event_type: "HUMAN_APPROVAL_RESULT".to_string(),
+            source_agent_iri: "external:http:tester".to_string(),
+            payload: serde_json::json!({
+                "request_id": request_id,
+                "task_iri": payload_task,
+                "approved": true,
+            })
+            .to_string(),
+            payload_json_ld: "{}".to_string(),
+            timestamp: Utc::now(),
+            sequence: 1,
+            type_mask: 0,
+            priority: EventPriority::High,
+        }
+    }
+
+    #[test]
+    fn isolation_contract_approval_result_for_other_task_is_ignored() {
+        let request_id = "approval_same_request";
+        let own = approval_event("iri://task/a", "iri://task/a", request_id);
+        assert!(matching_approval_result(&own, "iri://task/a", request_id).is_some());
+
+        let other_event = approval_event("iri://task/b", "iri://task/b", request_id);
+        assert!(matching_approval_result(&other_event, "iri://task/a", request_id).is_none());
+
+        let other_payload = approval_event("iri://task/a", "iri://task/b", request_id);
+        assert!(matching_approval_result(&other_payload, "iri://task/a", request_id).is_none());
+    }
+
+    #[test]
+    fn isolation_contract_approval_result_for_other_task_without_payload_task_iri_is_ignored() {
+        let request_id = "approval_same_request";
+        let mut other = approval_event("iri://task/b", "iri://task/b", request_id);
+        other.payload = serde_json::json!({
+            "request_id": request_id,
+            "approved": true,
+        })
+        .to_string();
+        assert!(
+            !other.payload.contains("task_iri"),
+            "this case is the approval whose payload names no task"
+        );
+        assert!(matching_approval_result(&other, "iri://task/a", request_id).is_none());
     }
 }

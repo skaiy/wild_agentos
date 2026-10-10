@@ -142,9 +142,12 @@ do not set either in production.
 ---
 
 The default binary starts the HTTP/SSE server on port `8080` and gRPC on
-`50051`. Prometheus metrics are scraped as `GET /metrics` on that HTTP port
-(not on `api.metrics_port` / 9090, which currently has no listener). Start it
-from a checkout with the provided `config.yaml`:
+`127.0.0.1:50051`. gRPC requires the same verified JWT as HTTP
+(`authorization: Bearer`). Set `api.grpc_addr` or `AGENT_OS_API_GRPC_ADDR` to
+listen on another interface; that override is explicit. Prometheus metrics are
+scraped as `GET /metrics` on that HTTP port (not on `api.metrics_port` / 9090,
+which currently has no listener). Start it from a checkout with the provided
+`config.yaml`:
 
 ```bash
 cargo run --bin wild-agent-os-core
