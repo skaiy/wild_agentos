@@ -225,7 +225,10 @@ fn save_owners_unlocked(owners: &HashMap<String, SkillIriOwnerRecord>) -> std::i
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    super::config::write_file_atomically(&path, &bytes)
+    super::config::write_file_atomically(&path, &bytes)?;
+    // The marker is written with the owner file. A marker without that file
+    // means the owner file was removed and must fail closed.
+    write_owners_migration_marker()
 }
 
 fn path_exists(path: &std::path::Path) -> std::io::Result<bool> {
@@ -253,20 +256,22 @@ fn ensure_owners_migrated() -> std::io::Result<()> {
 
 /// Copy admission history into the owner file a single time.
 ///
-/// After the marker exists, a missing owner file while `pipeline_runs.json`
-/// is still present is an error. Rebuilding from that file would trust a
-/// history that has already been truncated to the latest 200 runs.
+/// The marker records that this copy finished. After it exists, a missing
+/// owner file is an error even when `pipeline_runs.json` is gone. An empty
+/// map would drop ownership. Deleting the marker and the owner file together
+/// runs this copy again from whatever runs remain, and those runs may already
+/// have been truncated to the latest 200, so ownership can be reset.
 fn migrate_owners_from_runs(
     runs: &[crate::tools::skill_pipeline::PipelineRun],
 ) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
     let owners = owners_from_runs(runs);
-    // A rejected request on an empty data dir must not create the owner file.
-    // A runs file with nothing to own still gets an empty owner file, so a
-    // later deletion is distinguishable from "never migrated".
+    // A rejected request on an empty data dir must not create either file.
+    // Writing the marker alone would make the next load look like a deleted
+    // owner file. A runs file with nothing to own still gets an empty owner
+    // file and the marker, so a later deletion is fail-closed.
     if !owners.is_empty() || path_exists(&pipeline_runs_path())? {
         save_owners_unlocked(&owners)?;
     }
-    write_owners_migration_marker()?;
     Ok(owners)
 }
 
@@ -274,21 +279,18 @@ fn load_missing_owner_file(
     runs: &[crate::tools::skill_pipeline::PipelineRun],
 ) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
     if path_exists(&owners_migration_marker_path())? {
-        if path_exists(&pipeline_runs_path())? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "skill owner file is missing after migration",
-            ));
-        }
-        return Ok(HashMap::new());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "skill owner file is missing after migration",
+        ));
     }
     migrate_owners_from_runs(runs)
 }
 
 /// Load the owner file. The first load migrates whatever runs are still on
 /// disk and records that migration. A file that will not parse is an error
-/// and is not replaced. After migration, a missing owner file is not rebuilt
-/// from run history.
+/// and is not replaced. After the marker exists, a missing owner file is an
+/// error and is not rebuilt, whether or not run history is still on disk.
 fn load_owners_unlocked(
     runs: &[crate::tools::skill_pipeline::PipelineRun],
 ) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
@@ -582,6 +584,97 @@ pub(crate) async fn append_pipeline_run_async(
         })
 }
 
+/// Two-party rendezvous. A timeout releases every waiter so a missing peer
+/// cannot leave a worker blocked for the rest of the process.
+#[cfg(test)]
+pub(crate) struct AdmissionBarrier {
+    parties: usize,
+    state: std::sync::Mutex<AdmissionBarrierState>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct AdmissionBarrierState {
+    arrived: usize,
+    released: bool,
+}
+
+#[cfg(test)]
+impl AdmissionBarrier {
+    pub(crate) fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            state: std::sync::Mutex::new(AdmissionBarrierState {
+                arrived: 0,
+                released: false,
+            }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if guard.released {
+            return true;
+        }
+        guard.arrived += 1;
+        if guard.arrived >= self.parties {
+            guard.released = true;
+            self.cv.notify_all();
+            return true;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                guard.released = true;
+                self.cv.notify_all();
+                return false;
+            }
+            let (next, wait) = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            guard = next;
+            if guard.released {
+                return true;
+            }
+            if wait.timed_out() {
+                guard.released = true;
+                self.cv.notify_all();
+                return false;
+            }
+        }
+    }
+}
+
+/// Lets a test release two admission writers into the run/registry section
+/// together. Unset in production builds.
+#[cfg(test)]
+pub(crate) async fn await_admission_write_barrier() {
+    let barrier = ADMISSION_WRITE_BARRIER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if let Some(barrier) = barrier {
+        let _ = tokio::task::spawn_blocking(move || {
+            barrier.wait_timeout(std::time::Duration::from_secs(5));
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+static ADMISSION_WRITE_BARRIER: std::sync::Mutex<Option<std::sync::Arc<AdmissionBarrier>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_admission_write_barrier(barrier: Option<std::sync::Arc<AdmissionBarrier>>) {
+    *ADMISSION_WRITE_BARRIER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = barrier;
+}
+
 pub(crate) async fn append_pipeline_runs_async(
     runs: Vec<crate::tools::skill_pipeline::PipelineRun>,
 ) -> Result<(), PipelineWriteError> {
@@ -780,6 +873,8 @@ pub(crate) async fn register_skill_handler(
         &ctx,
         Box::new(|_| Ok("admission accepted".into())),
     );
+    #[cfg(test)]
+    await_admission_write_barrier().await;
     if let Err(error) = append_pipeline_run_async(run.clone()).await {
         return pipeline_write_response(error);
     }
@@ -1327,6 +1422,8 @@ pub(crate) async fn import_git_skill_handler(
         &ctx,
         Box::new(|_| Ok("admission accepted".into())),
     );
+    #[cfg(test)]
+    await_admission_write_barrier().await;
     if let Err(error) = append_pipeline_run_async(run.clone()).await {
         cleanup(&clone_dir);
         return pipeline_write_response(error);
@@ -1477,6 +1574,8 @@ pub(crate) async fn pipeline_rerun_handler(
         &ctx,
         Box::new(|_| Ok("admission accepted".into())),
     );
+    #[cfg(test)]
+    await_admission_write_barrier().await;
     if let Err(error) = append_pipeline_run_async(run.clone()).await {
         return pipeline_write_response(error);
     }

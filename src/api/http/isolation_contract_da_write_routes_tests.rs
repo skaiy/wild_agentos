@@ -1939,85 +1939,433 @@ async fn isolation_contract_deleted_owner_file_is_not_rebuilt_from_runs() {
     assert!(!text.contains(description));
 }
 
-/// Register and a first market publish of the same IRI race. The registry
-/// changes only after the run is recorded, so the skill description belongs
-/// to whichever caller owns the IRI. Writing the registry first lets the
-/// loser replace that description.
+/// The marker alone is enough to fail closed. Deleting the runs file as well
+/// must not fall back to an empty owner map.
+#[tokio::test]
+async fn isolation_contract_missing_owner_file_fails_closed_without_runs() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-a/secret-skill";
+    let description = "tenant-a classified briefing";
+    publish_exposed_skill_meta(
+        &state,
+        iri,
+        "tenant-a",
+        "project-a",
+        description,
+        json!({"type": "object"}),
+    );
+    let marker = dir
+        .path()
+        .join(super::skills::SKILL_IRI_OWNERS_MIGRATED_FILE);
+    assert!(marker.exists());
+    std::fs::remove_file(dir.path().join("pipeline_runs.json")).unwrap();
+    std::fs::remove_file(dir.path().join("skill_iri_owners.json")).unwrap();
+
+    let app = router(state.clone());
+    let platform_admin = token("platform", &[PLATFORM_ADMIN_ROLE], Some("ops"));
+    let overwrite = "platform claim";
+    let (status, rejected) = call(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        Caller::Bearer(&platform_admin),
+        json!({
+            "skill_iri": iri,
+            "name": "weather",
+            "description": overwrite,
+            "version": "9.9.9",
+            "category": "weather",
+            "security_level": "normal",
+            "allowed_roles": ["DA"],
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "compiled_template": "{}"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{rejected}");
+    assert_eq!(rejected["error"], "pipeline_run_store_failed");
+    assert_eq!(
+        state.core.skills.get_skill(iri).unwrap().description,
+        description
+    );
+    assert!(!dir.path().join("skill_iri_owners.json").exists());
+    assert!(!dir.path().join("pipeline_runs.json").exists());
+    assert!(marker.exists());
+    let text = rejected.to_string();
+    assert!(!text.contains(overwrite));
+    assert!(!text.contains(description));
+}
+
+/// Deleting the marker and the owner file together migrates again from the
+/// runs that are still on disk. A truncated history can name a new owner.
+#[tokio::test]
+async fn isolation_contract_deleted_marker_and_owners_remigrate_truncated_runs() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), false);
+    let state = test_state(dir.path());
+    let iri = "skill://tenant-a/secret-skill";
+    publish_exposed_skill_meta(
+        &state,
+        iri,
+        "tenant-a",
+        "project-a",
+        "tenant-a classified briefing",
+        json!({"type": "object"}),
+    );
+    let marker = dir
+        .path()
+        .join(super::skills::SKILL_IRI_OWNERS_MIGRATED_FILE);
+    assert!(marker.exists());
+
+    use crate::tools::skill_pipeline::{PipelineRun, PipelineSource, SkillVisibility};
+    let truncated = vec![PipelineRun {
+        run_id: "truncated-platform".into(),
+        skill_iri: iri.into(),
+        skill_name: "weather".into(),
+        version: "1.0.0".into(),
+        source: PipelineSource::Manual,
+        visibility: SkillVisibility::Tenant,
+        tenant_promotion_review: None,
+        triggered_by: "ops".into(),
+        repo_url: None,
+        started_at: "2026-02-01T00:00:00Z".into(),
+        duration_ms: 1,
+        stages: vec![],
+        gate_passed: true,
+        published: true,
+        summary: "published".into(),
+        publisher_tenant_id: Some("platform".into()),
+        publisher_project_id: Some("ops".into()),
+    }];
+    std::fs::write(
+        dir.path().join("pipeline_runs.json"),
+        serde_json::to_vec_pretty(&truncated).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(dir.path().join("skill_iri_owners.json")).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+
+    let app = router(state.clone());
+    let platform_admin = token("platform", &[PLATFORM_ADMIN_ROLE], Some("ops"));
+    let overwrite = "platform owns the truncated history";
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        Caller::Bearer(&platform_admin),
+        json!({
+            "skill_iri": iri,
+            "name": "weather",
+            "description": overwrite,
+            "version": "1.0.0",
+            "category": "weather",
+            "security_level": "normal",
+            "allowed_roles": ["DA"],
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "compiled_template": "{}"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let owners: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("skill_iri_owners.json")).unwrap(),
+    )
+    .unwrap();
+    let owner = owners
+        .iter()
+        .find(|owner| owner["skill_iri"] == iri)
+        .unwrap_or_else(|| panic!("missing owner: {owners:?}"));
+    assert_eq!(owner["tenant_id"], "platform");
+    assert!(marker.exists());
+    assert_eq!(
+        state.core.skills.get_skill(iri).unwrap().description,
+        overwrite
+    );
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionWriteRoute {
+    Register,
+    ImportGit,
+    Rerun,
+}
+
+fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_all(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn green_package_repo(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo = dir.join("green-repo");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/skills/package-green");
+    copy_dir_all(&fixture, &repo);
+    let init = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    for (key, value) in [("user.email", "test@example.com"), ("user.name", "test")] {
+        let config = std::process::Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            config.status.success(),
+            "{}",
+            String::from_utf8_lossy(&config.stderr)
+        );
+    }
+    let add = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = std::process::Command::new("git")
+        .args(["commit", "-m", "package"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    repo
+}
+
+/// Register, import-git, and pipeline-rerun each race a first market publish.
+/// Both requests run on their own task and enter the run/registry write
+/// together. The registry description belongs to the IRI owner. Persisting
+/// the registry before the run is recorded lets the loser replace it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn isolation_contract_register_records_the_run_before_the_registry() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let _env = env(dir.path(), false);
+    struct ClearAdmissionBarrier;
+    impl Drop for ClearAdmissionBarrier {
+        fn drop(&mut self) {
+            super::skills::set_admission_write_barrier(None);
+        }
+    }
+    let _clear_barrier = ClearAdmissionBarrier;
+    let previous_ssh = std::env::var_os("GIT_SSH_COMMAND");
+    let repo = green_package_repo(dir.path());
+    let ssh = dir.path().join("upload-pack.sh");
+    std::fs::write(
+        &ssh,
+        format!("#!/bin/sh\nexec git upload-pack '{}'\n", repo.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::env::set_var("GIT_SSH_COMMAND", ssh);
+    struct RestoreSsh(Option<std::ffi::OsString>);
+    impl Drop for RestoreSsh {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("GIT_SSH_COMMAND", value),
+                None => std::env::remove_var("GIT_SSH_COMMAND"),
+            }
+        }
+    }
+    let _restore_ssh = RestoreSsh(previous_ssh);
+
     let state = test_state(dir.path());
     let app = router(state.clone());
     let platform_admin = token("platform", &[PLATFORM_ADMIN_ROLE], Some("ops"));
     let da_a = token("tenant-a", &["DA"], Some("project-a"));
+    let routes = [
+        AdmissionWriteRoute::Register,
+        AdmissionWriteRoute::ImportGit,
+        AdmissionWriteRoute::Rerun,
+    ];
 
-    for index in 0..8 {
-        let iri = format!("skill://tenant-a/race-{index}");
-        let overwrite = format!("platform overwrite {index}");
-        let (registered, published) = tokio::join!(
-            call(
-                &app,
-                Method::POST,
-                "/api/v1/skills",
-                Caller::Bearer(&platform_admin),
-                json!({
-                    "skill_iri": iri,
-                    "name": "weather",
-                    "description": overwrite,
-                    "version": "1.0.0",
-                    "category": "weather",
-                    "security_level": "normal",
-                    "allowed_roles": ["DA"],
-                    "input_schema": {"type": "object"},
-                    "output_schema": {"type": "object"},
-                    "compiled_template": "{}"
-                }),
-            ),
-            call(
-                &app,
-                Method::POST,
-                "/api/v1/market/packages",
-                Caller::Bearer(&da_a),
-                json!({
-                    "name": format!("race-{index}"),
-                    "version": "1.0.0",
-                    "input_schema": {"type": "object"},
-                    "output_schema": {"type": "object"},
-                    "side_effect_level": "none",
-                    "visibility": "private",
-                    "skills": [market_skill(&iri, "tenant skill", json!({"type": "object"}))]
-                }),
-            ),
-        );
-        let register_won = registered.0 == StatusCode::CREATED;
-        let market_won = published.0 == StatusCode::CREATED;
-        assert!(
-            register_won ^ market_won,
-            "register={registered:?} market={published:?}"
-        );
-        let owners: Vec<Value> = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("skill_iri_owners.json")).unwrap(),
-        )
-        .unwrap();
-        let owner = owners
-            .iter()
-            .find(|owner| owner["skill_iri"] == iri)
-            .unwrap_or_else(|| panic!("missing owner for {iri}: {owners:?}"));
-        let stored = state.core.skills.get_skill(&iri);
-        if market_won {
-            assert_eq!(registered.0, StatusCode::CONFLICT, "{registered:?}");
-            assert_eq!(owner["tenant_id"], "tenant-a");
+    for route in routes {
+        for index in 0..30 {
+            let iri = format!("skill://tenant-a/race-{}-{index}", route_label(route));
+            let overwrite = format!("{} overwrite {index}", route_label(route));
+            if matches!(route, AdmissionWriteRoute::Rerun) {
+                std::fs::write(
+                    dir.path().join("skills.json"),
+                    serde_json::to_string_pretty(&json!([{
+                        "skill_iri": iri,
+                        "name": "weather",
+                        "description": overwrite,
+                        "version": "1.0.0",
+                        "category": "weather",
+                        "security_level": "normal",
+                        "allowed_roles": ["DA"],
+                        "input_schema": {"type": "object"},
+                        "output_schema": {"type": "object"},
+                        "compiled_template": "{}"
+                    }]))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let start = std::sync::Arc::new(super::skills::AdmissionBarrier::new(2));
+            super::skills::set_admission_write_barrier(Some(std::sync::Arc::new(
+                super::skills::AdmissionBarrier::new(2),
+            )));
+            let writer_start = std::sync::Arc::clone(&start);
+            let market_start = std::sync::Arc::clone(&start);
+            let writer_app = app.clone();
+            let market_app = app.clone();
+            let writer_admin = platform_admin.clone();
+            let market_da = da_a.clone();
+            let writer_body = writer_body(route, &iri, &overwrite, repo.to_str().unwrap());
+            let market_body = json!({
+                "name": format!("race-{}-{index}", route_label(route)),
+                "version": "1.0.0",
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+                "side_effect_level": "none",
+                "visibility": "private",
+                "skills": [market_skill(&iri, "tenant skill", json!({"type": "object"}))]
+            });
+            let writer_path = writer_path(route);
+            let writer = tokio::spawn(async move {
+                let released = tokio::task::spawn_blocking(move || {
+                    writer_start.wait_timeout(std::time::Duration::from_secs(5))
+                })
+                .await
+                .unwrap();
+                assert!(released, "market request did not start");
+                call(
+                    &writer_app,
+                    Method::POST,
+                    writer_path,
+                    Caller::Bearer(&writer_admin),
+                    writer_body,
+                )
+                .await
+            });
+            let published = tokio::spawn(async move {
+                let released = tokio::task::spawn_blocking(move || {
+                    market_start.wait_timeout(std::time::Duration::from_secs(5))
+                })
+                .await
+                .unwrap();
+                assert!(released, "admission request did not start");
+                call(
+                    &market_app,
+                    Method::POST,
+                    "/api/v1/market/packages",
+                    Caller::Bearer(&market_da),
+                    market_body,
+                )
+                .await
+            });
+            let (writer, published) = tokio::join!(writer, published);
+            let writer = writer.expect("writer task");
+            let published = published.expect("market task");
+            super::skills::set_admission_write_barrier(None);
+
+            let writer_won = writer_succeeded(route, writer.0);
+            let market_won = published.0 == StatusCode::CREATED;
             assert!(
-                stored.is_none(),
-                "register wrote the registry before the run was recorded: {stored:?}"
+                writer_won ^ market_won,
+                "{:?} writer={writer:?} market={published:?}",
+                route_label(route)
             );
-        } else {
-            assert_eq!(published.0, StatusCode::CONFLICT, "{published:?}");
-            assert_eq!(owner["tenant_id"], "platform");
-            assert_eq!(stored.unwrap().description, overwrite);
+            let owners: Vec<Value> = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("skill_iri_owners.json")).unwrap(),
+            )
+            .unwrap();
+            let owner = owners
+                .iter()
+                .find(|owner| owner["skill_iri"] == iri)
+                .unwrap_or_else(|| panic!("missing owner for {iri}: {owners:?}"));
+            let stored = state.core.skills.get_skill(&iri);
+            if market_won {
+                assert_eq!(writer.0, StatusCode::CONFLICT, "{writer:?}");
+                assert_eq!(owner["tenant_id"], "tenant-a");
+                assert!(
+                    stored.is_none(),
+                    "{} wrote the registry before the run was recorded: {stored:?}",
+                    route_label(route)
+                );
+            } else {
+                assert_eq!(published.0, StatusCode::CONFLICT, "{published:?}");
+                assert_eq!(owner["tenant_id"], "platform");
+                assert_eq!(stored.unwrap().description, overwrite);
+            }
         }
+    }
+}
+
+fn route_label(route: AdmissionWriteRoute) -> &'static str {
+    match route {
+        AdmissionWriteRoute::Register => "register",
+        AdmissionWriteRoute::ImportGit => "import-git",
+        AdmissionWriteRoute::Rerun => "rerun",
+    }
+}
+
+fn writer_path(route: AdmissionWriteRoute) -> &'static str {
+    match route {
+        AdmissionWriteRoute::Register => "/api/v1/skills",
+        AdmissionWriteRoute::ImportGit => "/api/v1/skills/import-git",
+        AdmissionWriteRoute::Rerun => "/api/v1/skills/pipeline-rerun",
+    }
+}
+
+fn writer_succeeded(route: AdmissionWriteRoute, status: StatusCode) -> bool {
+    match route {
+        AdmissionWriteRoute::Register | AdmissionWriteRoute::ImportGit => {
+            status == StatusCode::CREATED
+        }
+        AdmissionWriteRoute::Rerun => status == StatusCode::OK,
+    }
+}
+
+fn writer_body(route: AdmissionWriteRoute, iri: &str, overwrite: &str, repo: &str) -> Value {
+    match route {
+        AdmissionWriteRoute::Register => json!({
+            "skill_iri": iri,
+            "name": "weather",
+            "description": overwrite,
+            "version": "1.0.0",
+            "category": "weather",
+            "security_level": "normal",
+            "allowed_roles": ["DA"],
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "compiled_template": "{}"
+        }),
+        AdmissionWriteRoute::ImportGit => json!({
+            "repo_url": format!("git@localhost:{repo}"),
+            "ref": "main",
+            "skill_iri": iri,
+            "description": overwrite
+        }),
+        AdmissionWriteRoute::Rerun => json!({ "skill_iri": iri }),
     }
 }
 

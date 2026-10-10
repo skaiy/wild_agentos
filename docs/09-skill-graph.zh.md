@@ -340,9 +340,12 @@ cargo test --lib skill_package_gate_ --verbose
 列出、创建和删除都要求 control-plane DA（已验证 JWT、显式 project、`DA`）。
 `POST /mcp` 只返回同一已验证 tenant 和 project 的暴露。第一条成功且记录了发布者
 tenant 和 project 的准入运行拥有该 skill IRI。owner 存在 `skill_iri_owners.json`，
-准入历史截断到最近 200 条时不会删掉它。准入历史只向该文件迁移一次。迁移之后，
-如果 `pipeline_runs.json` 还在而 owner 文件不见了，会报错，并且不再从已经截断的
-历史重建归属。其他 tenant 之后的运行，包括
+准入历史截断到最近 200 条时不会删掉它。准入历史只向该文件迁移一次，并写入标记文件 `skill_iri_owners.migrated`。
+标记存在时，owner 文件不见了就会报错，无论 `pipeline_runs.json` 是否还在，
+都不会退回空归属。标记和 owner 文件一起被删除时，会再次从剩余的运行记录迁移。
+这些记录可能已经被截断到最近 200 条，归属因此可能被重置。运维备份时要把
+`skill_iri_owners.json`、`skill_iri_owners.migrated` 和 `pipeline_runs.json`
+三个文件一起备份。其他 tenant 之后的运行，包括
 `POST /api/v1/market/packages`，返回 `409` 和 `skill_iri_owned_by_another_tenant`，
 不会替换 owner，也不会清空 owner 的工具列表。市场发布要求 `skill://` 的 tenant 段等于发布者已验证的 tenant，因此一个
 tenant 不能预先占用另一个 tenant 的命名空间。平台管理员注册可以使用其他段；

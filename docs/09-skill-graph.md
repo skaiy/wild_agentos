@@ -159,9 +159,14 @@ control-plane DA (verified JWT, explicit project, `DA`). `POST /mcp` returns
 only exposures for that same verified tenant and project. The first successful admission run that records a publisher tenant and project
 owns that skill IRI. The owner is stored in `skill_iri_owners.json` and is
 not removed when admission history is truncated to the latest 200 runs.
-Admission history is copied into that file once. After that copy, a missing
-owner file while `pipeline_runs.json` is still present is an error and is not
-rebuilt from the truncated history. A
+Admission history is copied into that file once, and that copy records
+`skill_iri_owners.migrated`. After the marker exists, a missing owner file
+is an error whether or not `pipeline_runs.json` is still present, and is not
+replaced with an empty ownership map. Deleting the marker and the owner file
+together copies again from the runs that remain. Those runs may already have
+been truncated to the latest 200, so ownership can be reset. Operators back
+up `skill_iri_owners.json`, `skill_iri_owners.migrated`, and
+`pipeline_runs.json` together. A
 later run by another tenant, including `POST /api/v1/market/packages`, is
 rejected with `409` and `skill_iri_owned_by_another_tenant` and does not
 replace the owner or clear the owner's tools. A market publish requires the `skill://` tenant segment to equal the

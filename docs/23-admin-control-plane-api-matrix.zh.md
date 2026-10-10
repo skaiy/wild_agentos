@@ -74,8 +74,11 @@ audit/statistics，以及按 claims 作用域的黑板任务和节点浏览（[#
   警告；操作者通过编辑该文件删除它们。`POST /mcp` 会拒绝没有 project claim 的已验证
   token（`403 mcp_claims_incomplete`）。第一条成功且记录了发布者 tenant 和 project
   的准入运行拥有该 skill IRI。该 owner 保存在 `skill_iri_owners.json`，准入历史截断到
-  200 条时不会丢掉。从准入历史复制 owner 只做一次。之后如果 `pipeline_runs.json`
-  还在而 owner 文件不见了，会报错，并且不再重建。其他 tenant 再次发布（包括 `POST /api/v1/market/packages`）
+  200 条时不会丢掉。从准入历史复制 owner 只做一次，并写入 `skill_iri_owners.migrated`。标记存在时，
+  owner 文件不见了就会报错，无论 `pipeline_runs.json` 是否还在，都不会退回空归属。
+  标记和 owner 文件一起被删除时，会再次从剩余运行记录迁移；这些记录可能已被截断到
+  200 条，归属可能被重置。运维备份时要把 `skill_iri_owners.json`、
+  `skill_iri_owners.migrated` 和 `pipeline_runs.json` 一起备份。其他 tenant 再次发布（包括 `POST /api/v1/market/packages`）
   得到 `409 skill_iri_owned_by_another_tenant`，不会替换该 owner。市场发布要求
   `skill://` 的 tenant 段等于发布者已验证的 tenant。平台管理员注册可以使用其他段，
   该 IRI 仍归平台 tenant 所有。一个市场包最多 32 个技能，任一技能未通过则这个包

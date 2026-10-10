@@ -326,6 +326,8 @@ pub(crate) async fn publish_package_handler(
         }
         runs.push(run);
     }
+    #[cfg(test)]
+    super::skills::await_admission_write_barrier().await;
     if let Err(error) = append_pipeline_runs_async(runs).await {
         return pipeline_write_response(error);
     }
