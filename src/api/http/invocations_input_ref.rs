@@ -28,9 +28,11 @@
 //!   `validate` can reject the URI (`422 input_ref_unresolvable`) or flag it
 //!   as outside the caller's project (`422 input_ref_scope_mismatch`).
 //! - Before any routing the kernel checks the URI shape
-//!   ([`check_input_ref_uri`]): lowercase scheme, no control characters or
-//!   line breaks, no empty / `.` / `..` segments, no backslash and no encoded
-//!   `.`, `/` or `\\` (`%2e`, `%2f`, `%5c`, any case). Create answers `400`.
+//!   ([`check_input_ref_uri`]): lowercase scheme, printable ASCII only
+//!   (`0x21..=0x7E`), no `?` / `#` / `;` / `%25`, no empty / `.` / `..`
+//!   segments, no backslash and no encoded `.`, `/` or `\\` (`%2e`, `%2f`,
+//!   `%5c`, any case). Create answers `400`. A missing project segment
+//!   (`scheme:///…`) is an empty segment and is also `400`, not `422`.
 //! - The kernel, not the resolver, enforces the size cap
 //!   (`AGENTOS_INVOCATION_INPUT_REF_MAX_BYTES`, default
 //!   [`DEFAULT_INPUT_REF_MAX_BYTES`], at most [`MAX_INPUT_REF_MAX_BYTES`]),
@@ -39,9 +41,10 @@
 //!   still stop reading as soon as it reaches `max_bytes`.
 //! - Resolved content is untrusted data: any actor of the same project can
 //!   write it, and sha256 pins only the bytes, not their intent. The kernel
-//!   hands it to the task as a delimited, neutralised block after a fixed
-//!   "untrusted data, not instructions" line, in the task goal (user role),
-//!   never in a system prompt.
+//!   hands it to the task as a delimited block after a fixed "untrusted
+//!   data, not instructions" line, in the task goal (user role), never in a
+//!   system prompt. The content escapes `&` and `<` (and fullwidth `＜`) so
+//!   it cannot forge another tag.
 //!   Every runtime failure ends the invocation `failed` /
 //!   `input_ref_fetch_failed` (or `input_digest_mismatch`) with one fixed
 //!   message; logs carry only the invocation id, scheme and failure class.
@@ -56,10 +59,11 @@
 //! [`ArtifactInputRefResolver`] serves `wao-artifact://<project_id>/<artifact-id>`
 //! from the platform's own claims-scoped artifact store (`/api/v1/artifacts`).
 //! It is **off by default** (`AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED`)
-//! and makes no outbound network request. The project segment must equal the
-//! caller's `project_id` (checked at create); the artifact is looked up under
-//! the caller's tenant and project, so another project or tenant gets the same
-//! failure as an unknown id.
+//! and makes no outbound network request. Leave the switch unset: enabling
+//! it requires #378. This build rejects `input_snapshot` uploads. The
+//! project segment must equal the caller's `project_id`
+//! (checked at create); the artifact is looked up under the caller's claims,
+//! so another project or tenant gets the same failure as an unknown id.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -106,6 +110,13 @@ pub const MAX_INPUT_REF_TIMEOUT: Duration = Duration::from_secs(60);
 /// Scheme served by [`ArtifactInputRefResolver`].
 pub const ARTIFACT_INPUT_REF_SCHEME: &str = "wao-artifact";
 /// Env switch for the built-in artifact resolver (default off).
+///
+/// Do not set this. Enabling the switch requires #378 (`input_snapshot`
+/// upload validation). This build rejects those uploads. The resolver still
+/// accepts only an `input_snapshot` whose bytes match both the stored digest
+/// and the caller pin, and that is not enough to enable the switch. The
+/// default remains off. Invocation execution
+/// (`AGENTOS_INVOCATION_EXECUTION_ENABLED`) stays off by default as well.
 pub const ARTIFACT_INPUT_REF_ENABLED_ENV: &str = "AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED";
 
 /// One resolution request, built by the kernel on the execution path.
@@ -151,6 +162,10 @@ pub enum InputRefError {
     Unavailable,
     /// No registered resolver matches the URI.
     NoResolver,
+    /// Fetched bytes do not match a pinned digest. Callers map this to the
+    /// same fixed error as a caller-pin mismatch, so the two are not
+    /// distinguishable.
+    DigestMismatch,
 }
 
 impl InputRefError {
@@ -163,6 +178,9 @@ impl InputRefError {
             Self::Timeout => "timeout",
             Self::Unavailable => "unavailable",
             Self::NoResolver => "no_resolver",
+            // Not logged on its own: fetch maps it to the same line as a
+            // caller-pin mismatch, without saying which digest differed.
+            Self::DigestMismatch => "digest_mismatch",
         }
     }
 }
@@ -178,8 +196,10 @@ pub trait InputRefResolver: Send + Sync {
         Ok(())
     }
 
-    /// Execution-time fetch. Only returns bytes: the kernel checks size,
-    /// sha256 and UTF-8 afterwards and never trusts the resolver for them.
+    /// Execution-time fetch. `request.claims` is the caller's verified
+    /// claims; every implementation must scope its lookup to them. Only
+    /// returns bytes: the kernel checks size, the caller-pinned sha256 and
+    /// UTF-8 afterwards and never trusts the resolver for them.
     /// Must stop reading once `request.max_bytes` is reached (streaming or
     /// a bounded read), so an oversized object never fills memory.
     async fn resolve(&self, request: InputRefRequest<'_>) -> Result<Vec<u8>, InputRefError>;
@@ -195,8 +215,13 @@ pub enum InputRefUriError {
     UppercaseScheme,
     /// Control character or line break anywhere in the URI.
     ControlCharacter,
+    /// A character outside printable ASCII (`0x21..=0x7E`): space, non-ASCII,
+    /// line/paragraph separators, zero-width characters, bidi controls.
+    NotPrintableAscii,
     /// Empty, `.` or `..` segment, backslash, or encoded `.` / `/` / `\`.
     PathTraversal,
+    /// `?`, `#`, `;`, or a percent-encoded percent (`%25`, any case).
+    ReservedDelimiter,
 }
 
 impl InputRefUriError {
@@ -208,20 +233,28 @@ impl InputRefUriError {
             Self::ControlCharacter => {
                 "input_ref.uri must not contain control characters or line breaks"
             }
+            Self::NotPrintableAscii => "input_ref.uri must contain only printable ASCII",
             Self::PathTraversal => {
                 "input_ref.uri must not contain empty, '.' or '..' segments, backslashes, or encoded '.', '/' or '\\'"
+            }
+            Self::ReservedDelimiter => {
+                "input_ref.uri must not contain '?', '#', ';' or '%25'"
             }
         }
     }
 }
 
 /// Kernel URI shape check, run before any routing (create and resolve):
-/// lowercase `<scheme>://`, no control characters, and no path tricks — no
-/// empty, `.` or `..` segment, no backslash, no `%2e` / `%2f` / `%5c` in any
-/// case.
+/// lowercase `<scheme>://`, printable ASCII only (`0x21..=0x7E`), no `?`,
+/// `#`, `;` or `%25`, and no path tricks — no empty, `.` or `..` segment, no
+/// backslash, no `%2e` / `%2f` / `%5c` in any case. A missing project segment
+/// is an empty segment and fails here (`400`), not as a resolver `422`.
 pub fn check_input_ref_uri(uri: &str) -> Result<(), InputRefUriError> {
     if uri.chars().any(char::is_control) {
         return Err(InputRefUriError::ControlCharacter);
+    }
+    if uri.chars().any(|ch| !matches!(u32::from(ch), 0x21..=0x7E)) {
+        return Err(InputRefUriError::NotPrintableAscii);
     }
     let (scheme, rest) = uri.split_once("://").ok_or(InputRefUriError::Shape)?;
     if rest.is_empty() {
@@ -238,7 +271,13 @@ pub fn check_input_ref_uri(uri: &str) -> Result<(), InputRefUriError> {
             },
         );
     }
+    if uri.contains(['?', '#', ';']) {
+        return Err(InputRefUriError::ReservedDelimiter);
+    }
     let lower = rest.to_ascii_lowercase();
+    if lower.contains("%25") {
+        return Err(InputRefUriError::ReservedDelimiter);
+    }
     if rest.contains('\\') || ["%2e", "%2f", "%5c"].iter().any(|e| lower.contains(e)) {
         return Err(InputRefUriError::PathTraversal);
     }
@@ -630,10 +669,22 @@ pub(crate) async fn fetch_and_verify_input_ref(
             INPUT_REF_FETCH_FAILED_MESSAGE,
         )
     };
-    let bytes = registry
+    let bytes = match registry
         .resolve(claims, invocation_id, uri, invocation_deadline)
         .await
-        .map_err(|error| fetch_failed(error.class()))?;
+    {
+        Ok(bytes) => bytes,
+        // Same fixed error and log line as a caller-pin mismatch below, so a
+        // metadata digest failure is not distinguishable from a caller pin.
+        Err(InputRefError::DigestMismatch) => {
+            tracing::warn!(invocation_id, scheme, "input_ref digest mismatch");
+            return Err((
+                INPUT_DIGEST_MISMATCH_ERROR_CODE,
+                INPUT_DIGEST_MISMATCH_MESSAGE,
+            ));
+        }
+        Err(error) => return Err(fetch_failed(error.class())),
+    };
     if sha256_hex(&bytes) != expected_sha256 {
         tracing::warn!(invocation_id, scheme, "input_ref digest mismatch");
         return Err((
@@ -697,11 +748,15 @@ pub(crate) fn input_ref_max_bytes_from_vars(lookup: impl Fn(&str) -> Option<Stri
 /// Built-in resolver for `wao-artifact://<project_id>/<artifact-id>`.
 ///
 /// Create-time `validate` requires the project segment to equal the caller's
-/// `project_id`. `resolve` looks the id up in the caller's claims graph
-/// (tenant + project), then reads the bytes under the caller's tenant blob
-/// prefix. Anything else — malformed id, another project's or tenant's
-/// artifact, missing blob — is [`InputRefError::NotFound`]. Reads only local
-/// platform storage.
+/// `project_id`. `resolve` takes the caller's claims on [`InputRefRequest`]
+/// and looks the id up through the claims-scoped metadata query, then reads
+/// the bytes under the caller's tenant blob prefix. Only an `input_snapshot`
+/// is returned. The bytes must match the SHA-256 stored on that metadata;
+/// a mismatch is [`InputRefError::DigestMismatch`] (the kernel reports it
+/// with the same error as a caller-pin mismatch). Anything else — malformed
+/// id, another kind, another project's or tenant's artifact, a non-canonical
+/// blob key, a missing blob — is [`InputRefError::NotFound`]. Reads only
+/// local storage.
 pub struct ArtifactInputRefResolver {
     kg_store: Arc<oxigraph::store::Store>,
     blob_store: Arc<dyn BlobStore>,
@@ -745,6 +800,9 @@ impl InputRefResolver for ArtifactInputRefResolver {
         let metadata = super::artifacts::load_artifact_metadata(&self.kg_store, request.claims, id)
             .map_err(|_| InputRefError::Unavailable)?
             .ok_or(InputRefError::NotFound)?;
+        if metadata.kind != super::artifacts::ArtifactKind::InputSnapshot {
+            return Err(InputRefError::NotFound);
+        }
         if metadata.size_bytes > request.max_bytes {
             return Err(InputRefError::TooLarge);
         }
@@ -758,6 +816,9 @@ impl InputRefResolver for ArtifactInputRefResolver {
             .map_err(|_| InputRefError::NotFound)?;
         if bytes.len() > request.max_bytes {
             return Err(InputRefError::TooLarge);
+        }
+        if sha256_hex(&bytes) != metadata.sha256 {
+            return Err(InputRefError::DigestMismatch);
         }
         Ok(bytes)
     }

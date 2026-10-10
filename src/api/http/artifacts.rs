@@ -37,6 +37,9 @@ pub enum ArtifactKind {
     Patch,
     RunTranscript,
     ReproduceScript,
+    /// Bytes pinned for later replay. The built-in `input_ref` resolver
+    /// accepts only this kind; every other kind is not found.
+    InputSnapshot,
 }
 
 impl ArtifactKind {
@@ -45,6 +48,7 @@ impl ArtifactKind {
             Self::Patch => "text/x-diff; charset=utf-8",
             Self::RunTranscript => "text/plain; charset=utf-8",
             Self::ReproduceScript => "text/x-shellscript; charset=utf-8",
+            Self::InputSnapshot => "application/json",
         }
     }
 
@@ -53,6 +57,7 @@ impl ArtifactKind {
             Self::Patch => "patch",
             Self::RunTranscript => "log",
             Self::ReproduceScript => "sh",
+            Self::InputSnapshot => "json",
         }
     }
 }
@@ -97,6 +102,12 @@ fn valid_task_iri(task_iri: &str) -> bool {
 /// Stable machine-readable code for a secret-guard rejection. The matched
 /// text and rule are never echoed.
 const ARTIFACT_SECRET_ERROR_CODE: &str = "artifact_plaintext_secret";
+
+/// `input_snapshot` uploads stay refused until #378 adds JSON, depth,
+/// duplicate-key, and escaped-secret checks. The kind remains on the enum
+/// so the resolver can recognize metadata that validation will later allow.
+const INPUT_SNAPSHOT_UPLOAD_ERROR_CODE: &str = "input_snapshot_unsupported";
+const INPUT_SNAPSHOT_UPLOAD_ERROR: &str = "input_snapshot uploads are not accepted";
 
 /// Blocks recognizable credential values before they can be persisted; see
 /// [`crate::utils::secret_scan`] for the shared real-format rules. Replay
@@ -277,6 +288,18 @@ pub(crate) async fn upload_artifact_handler(
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
+    // #378 owns validation of this kind. Until then a fixed rejection, with
+    // no echo of the body, is the only accepted outcome.
+    if request.kind == ArtifactKind::InputSnapshot {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": INPUT_SNAPSHOT_UPLOAD_ERROR,
+                "code": INPUT_SNAPSHOT_UPLOAD_ERROR_CODE,
+            })),
+        )
+            .into_response();
+    }
     if !valid_task_iri(&request.task_iri) {
         return (
             StatusCode::BAD_REQUEST,
@@ -630,6 +653,71 @@ mod tests {
             assert_eq!(body["code"], ARTIFACT_SECRET_ERROR_CODE);
         }
         assert!(load_metadata(&state, &claims, None).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn upload_kind(
+        state: &Arc<AppState>,
+        claims: &IsolationClaims,
+        kind: ArtifactKind,
+        content: &[u8],
+    ) -> (StatusCode, Value) {
+        let identity =
+            crate::api::http::iam::test_identity_from_verified_claims(claims.clone(), vec![]);
+        let response = upload_artifact_handler(
+            State(state.clone()),
+            identity,
+            Json(ArtifactUploadRequest {
+                kind,
+                task_iri: "iri://task/input-snapshot".to_string(),
+                content_base64: STANDARD.encode(content),
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// #429 review: these bodies are not JSON-validated, and the upload must
+    /// refuse `input_snapshot` until #378. None of them may be stored.
+    #[tokio::test]
+    async fn upload_rejects_input_snapshot_payloads_until_validation_lands() {
+        let root = std::env::temp_dir().join(format!("artifact-test-{}", uuid::Uuid::new_v4()));
+        let state = test_state(root.clone());
+        let claims = IsolationClaims::from_verified("tenant-a", "project", "actor-a").unwrap();
+        let payloads: [&[u8]; 3] = [
+            b"not-json",
+            br#"{"key":"\u0073k-proj-FAKEFAKEFAKEFAKEFAKEFAKE"}"#,
+            br#"{"a":1,"a":2}"#,
+        ];
+        for payload in payloads {
+            let (status, body) =
+                upload_kind(&state, &claims, ArtifactKind::InputSnapshot, payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                body,
+                json!({
+                    "error": INPUT_SNAPSHOT_UPLOAD_ERROR,
+                    "code": INPUT_SNAPSHOT_UPLOAD_ERROR_CODE,
+                })
+            );
+            let echoed = String::from_utf8_lossy(payload);
+            assert!(
+                !body.to_string().contains(echoed.as_ref()),
+                "body echoed payload: {body}"
+            );
+        }
+        assert!(load_metadata(&state, &claims, None).unwrap().is_empty());
+        let blobs = root.join("blobs");
+        if blobs.exists() {
+            assert!(
+                std::fs::read_dir(&blobs).unwrap().next().is_none(),
+                "input_snapshot bytes were stored"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

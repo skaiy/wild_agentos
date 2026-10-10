@@ -235,8 +235,25 @@ pub(super) async fn run_and_collect(
     claims: &IsolationClaims,
 ) -> Vec<Event> {
     let mut rx = harness.event_bus.subscribe();
-    harness.executor.execute(spec(task_iri, claims)).await;
+    let outcome = harness.executor.execute(spec(task_iri, claims)).await;
+    assert_execute_outcome(&outcome, task_iri);
     drain(&mut rx, task_iri)
+}
+
+/// The invocation bridge trusts only the `TaskOutcome` `execute` returns.
+fn assert_execute_outcome(outcome: &crate::api::http::TaskOutcome, task_iri: &str) {
+    assert_eq!(
+        outcome.kind,
+        crate::api::http::TaskOutcomeKind::Completed,
+        "{task_iri}: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            outcome.status.as_str(),
+            "completed" | "success" | "succeeded"
+        ),
+        "{task_iri}: {outcome:?}"
+    );
 }
 
 pub(super) fn drain(
@@ -307,7 +324,8 @@ async fn concurrent_runs_of_one_tenant_across_projects_share_the_tenant_l0() {
         joins.push(tokio::spawn(async move {
             let now = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             max_in_flight.fetch_max(now, AtomicOrdering::SeqCst);
-            executor.execute(spec(&task_iri, &claims)).await;
+            let outcome = executor.execute(spec(&task_iri, &claims)).await;
+            assert_execute_outcome(&outcome, &task_iri);
             in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
         }));
     }

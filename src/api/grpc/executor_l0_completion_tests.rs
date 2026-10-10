@@ -283,8 +283,26 @@ pub(super) async fn run_and_collect(
     claims: &IsolationClaims,
 ) -> Vec<Event> {
     let mut rx = harness.event_bus.subscribe();
-    harness.executor.execute(spec(task_iri, claims)).await;
+    let outcome = harness.executor.execute(spec(task_iri, claims)).await;
+    assert_execute_outcome(&outcome, task_iri);
     drain(&mut rx, task_iri)
+}
+
+/// The invocation bridge trusts only the `TaskOutcome` `execute` returns.
+/// A bus `TASK_COMPLETED` from another publisher must not satisfy this.
+fn assert_execute_outcome(outcome: &crate::api::http::TaskOutcome, task_iri: &str) {
+    assert_eq!(
+        outcome.kind,
+        crate::api::http::TaskOutcomeKind::Completed,
+        "{task_iri}: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            outcome.status.as_str(),
+            "completed" | "success" | "succeeded"
+        ),
+        "{task_iri}: {outcome:?}"
+    );
 }
 
 pub(super) fn drain(
@@ -303,11 +321,15 @@ pub(super) fn drain(
     events
 }
 
-/// The terminal `TASK_COMPLETED` / `TASK_FAILED` payloads of a run.
+/// The terminal `TASK_COMPLETED` / `TASK_FAILED` payloads of a run, keeping
+/// only events the executor itself published (`source_agent_iri == "SA"`).
 pub(super) fn terminal_events(events: &[Event]) -> Vec<String> {
     events
         .iter()
-        .filter(|e| e.event_type == "TASK_COMPLETED" || e.event_type == "TASK_FAILED")
+        .filter(|e| {
+            (e.event_type == "TASK_COMPLETED" || e.event_type == "TASK_FAILED")
+                && e.source_agent_iri == crate::api::http::TASK_TERMINAL_SOURCE
+        })
         .map(|e| format!("{}: {}", e.event_type, e.payload))
         .collect()
 }
@@ -410,7 +432,8 @@ fn spawn_runs(
         .map(|(task_iri, claims)| {
             let executor = harness.executor.clone();
             tokio::spawn(async move {
-                let _ = executor.execute(tagged_spec(&task_iri, &claims)).await;
+                let outcome = executor.execute(tagged_spec(&task_iri, &claims)).await;
+                assert_execute_outcome(&outcome, &task_iri);
             })
         })
         .collect()

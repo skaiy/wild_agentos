@@ -278,12 +278,65 @@ fn assert_no_schema_leak(body: &[u8], context: &str) {
     }
 }
 
+/// Relative path plus bytes for every file under `dir`. A rejected request
+/// must not create `config_override.json` or any other file.
+fn files_under(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, &rel, out);
+            } else {
+                out.push((rel, std::fs::read(&path).expect("read data dir file")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out);
+    out.sort();
+    out
+}
+
+fn assert_data_dir_unchanged(dir: &std::path::Path, before: &[(String, Vec<u8>)], context: &str) {
+    let override_path = dir.join("config_override.json");
+    match before
+        .iter()
+        .find(|(name, _)| name == "config_override.json")
+    {
+        None => assert!(
+            !override_path.exists(),
+            "{context}: config_override.json was created"
+        ),
+        Some((_, bytes)) => {
+            let now = std::fs::read(&override_path).unwrap_or_else(|error| {
+                panic!("{context}: config_override.json disappeared: {error}")
+            });
+            assert_eq!(&now, bytes, "{context}: config_override.json bytes changed");
+        }
+    }
+    assert_eq!(
+        files_under(dir),
+        before,
+        "{context}: data dir changed after a rejected request"
+    );
+}
+
 #[tokio::test]
 async fn isolation_contract_unauthenticated_invalid_bodies_get_401_without_schema() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let _env = env(dir.path());
     let router = router(dir.path());
+    let before = files_under(dir.path());
     let x_identity_admin = STANDARD.encode(
         json!({"user_id": "x", "tenant_id": PLATFORM_TENANT, "roles": ["DA", PLATFORM_ADMIN_ROLE]})
             .to_string(),
@@ -319,6 +372,7 @@ async fn isolation_contract_unauthenticated_invalid_bodies_get_401_without_schem
                 .await;
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{context}");
                 assert_no_schema_leak(&response, &context);
+                assert_data_dir_unchanged(dir.path(), &before, &context);
             }
         }
     }
@@ -330,6 +384,9 @@ async fn isolation_contract_forbidden_response_does_not_depend_on_body() {
     let dir = tempfile::tempdir().unwrap();
     let _env = env(dir.path());
     let router = router(dir.path());
+    let seeded = b"seeded-override-must-stay-byte-identical";
+    std::fs::write(dir.path().join("config_override.json"), seeded).unwrap();
+    let before = files_under(dir.path());
     // Not a platform admin: a DA of an ordinary tenant.
     let tenant_da = token("tenant-a", &["DA"]);
     // Verified, but without DA.
@@ -352,6 +409,7 @@ async fn isolation_contract_forbidden_response_does_not_depend_on_body() {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{} valid body", route.uri);
         assert_no_schema_leak(&expected, route.uri);
+        assert_data_dir_unchanged(dir.path(), &before, route.uri);
         for invalid in &route.invalid {
             let (status, body) = send(
                 &router,
@@ -368,6 +426,11 @@ async fn isolation_contract_forbidden_response_does_not_depend_on_body() {
                 "{} {}: 403 must be byte-identical to the valid-body 403",
                 route.uri,
                 invalid.label
+            );
+            assert_data_dir_unchanged(
+                dir.path(),
+                &before,
+                &format!("{} {}", route.uri, invalid.label),
             );
         }
     }
