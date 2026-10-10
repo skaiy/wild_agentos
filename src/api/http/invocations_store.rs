@@ -416,6 +416,7 @@ pub(crate) struct InvocationResult {
 /// Generic usage of one invocation (`result.usage`). Every field is optional;
 /// `cost` is an integer in micro-USD (1 USD = 1_000_000).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InvocationUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -504,10 +505,125 @@ fn price_table_cost(
 
 /// One tool call in [`InvocationUsage::tool_calls`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InvocationToolCallUsage {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_tool_transport"
+    )]
     pub transport: Option<String>,
+}
+
+/// Public vocabulary for `tool_calls[].transport`. This is intentionally a
+/// closed set so persisted usage cannot claim an unclassified integration.
+pub(crate) const TOOL_CALL_TRANSPORTS: &[&str] = &["mcp", "http", "a2a", "local", "unknown"];
+
+fn is_valid_tool_transport(transport: &str) -> bool {
+    TOOL_CALL_TRANSPORTS.contains(&transport)
+}
+
+fn deserialize_tool_transport<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let transport = Option::<String>::deserialize(deserializer)?;
+    match transport {
+        Some(value) if !is_valid_tool_transport(&value) => {
+            // Reads are lenient (#338): a stored transport outside the closed
+            // set must not fail the whole file. The raw value is not logged.
+            tracing::warn!(
+                "invocation usage tool transport is outside the closed set; recording unknown"
+            );
+            Ok(Some("unknown".to_string()))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Transport recorded for a built-in tool. Direct-network built-ins are
+/// `http`; every other in-process built-in is `local`. The recorded entry
+/// is only the name and this transport. Production recording classifies
+/// through the run meter; this helper stays for tests that build usage
+/// directly.
+#[cfg(test)]
+pub(crate) fn built_in_tool_transport(name: &str) -> &'static str {
+    crate::core::tool_controller::recorded_builtin_transport(name)
+}
+
+/// Copies built-in tool names onto `usage.tool_calls`. Only `name` and
+/// `transport` are written. An empty name list leaves `usage` unchanged,
+/// including when it was absent. Test helper: the executor attaches meter
+/// entries instead of calling this.
+#[cfg(test)]
+pub(crate) fn record_builtin_tool_calls(
+    usage: Option<InvocationUsage>,
+    tool_names: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Option<InvocationUsage> {
+    let tool_calls: Vec<InvocationToolCallUsage> = tool_names
+        .into_iter()
+        .filter_map(|name| {
+            let name = name.as_ref();
+            if name.trim().is_empty() {
+                None
+            } else {
+                Some(InvocationToolCallUsage {
+                    name: name.to_string(),
+                    transport: Some(built_in_tool_transport(name).to_string()),
+                })
+            }
+        })
+        .collect();
+    if tool_calls.is_empty() {
+        return usage;
+    }
+    let mut usage = usage.unwrap_or_default();
+    usage.tool_calls = Some(tool_calls);
+    Some(usage)
+}
+
+/// Copies tool attempts already classified on the run meter onto
+/// `usage.tool_calls`. An empty list leaves `usage` unchanged. Names and
+/// transports are stored as recorded; this does not re-classify them.
+pub(crate) fn attach_metered_tool_calls(
+    usage: Option<InvocationUsage>,
+    calls: &[crate::gateway::usage_meter::MeteredToolCall],
+) -> Option<InvocationUsage> {
+    if calls.is_empty() {
+        return usage;
+    }
+    let mut usage = usage.unwrap_or_default();
+    usage.tool_calls = Some(
+        calls
+            .iter()
+            .map(|call| InvocationToolCallUsage {
+                name: call.name.clone(),
+                transport: Some(call.transport.clone()),
+            })
+            .collect(),
+    );
+    Some(usage)
+}
+
+pub(crate) fn validate_usage(usage: &InvocationUsage) -> Result<(), &'static str> {
+    if usage
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| calls.iter().any(|call| call.name.trim().is_empty()))
+    {
+        return Err("tool_calls[].name must not be empty");
+    }
+    if usage.tool_calls.as_ref().is_some_and(|calls| {
+        calls.iter().any(|call| {
+            call.transport
+                .as_deref()
+                .is_some_and(|transport| !is_valid_tool_transport(transport))
+        })
+    }) {
+        return Err("tool_calls[].transport must be mcp, http, a2a, local, or unknown");
+    }
+    Ok(())
 }
 
 /// Lightly redact secret-shaped substrings from persisted free text.
@@ -742,6 +858,8 @@ pub(crate) enum InvocationStoreError {
     IdempotencyKeyConflict,
     /// Another create with the same key in this scope is still in flight.
     IdempotencyKeyInProgress,
+    /// A server-side terminal write carried usage outside the public schema.
+    InvalidUsage(&'static str),
 }
 
 impl std::fmt::Display for InvocationStoreError {
@@ -759,6 +877,7 @@ impl std::fmt::Display for InvocationStoreError {
             Self::Persistence(error) => write!(f, "persist invocations: {error}"),
             Self::IdempotencyKeyConflict => write!(f, "idempotency key bound to another request"),
             Self::IdempotencyKeyInProgress => write!(f, "idempotency key in progress"),
+            Self::InvalidUsage(message) => write!(f, "invalid invocation usage: {message}"),
         }
     }
 }
@@ -865,6 +984,14 @@ impl IntoResponse for InvocationStoreError {
                 );
                 response
             }
+            Self::InvalidUsage(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_usage",
+                    "message": "invocation usage is invalid",
+                })),
+            )
+                .into_response(),
         }
     }
 }
@@ -1367,6 +1494,13 @@ impl InvocationStore {
         next_state: InvocationState,
         patch: TransitionPatch,
     ) -> Result<TransitionOutcome, InvocationStoreError> {
+        if let Some(usage) = patch
+            .result
+            .as_ref()
+            .and_then(|result| result.usage.as_ref())
+        {
+            validate_usage(usage).map_err(InvocationStoreError::InvalidUsage)?;
+        }
         let mut records = self.records.write().await;
         let index = records
             .iter()

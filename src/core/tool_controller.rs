@@ -41,6 +41,47 @@ pub(crate) fn sanitize_reported_tool_names<'a>(
     (reported, omitted)
 }
 
+/// Built-ins that perform a network request. Every other registered
+/// in-process built-in is `local`.
+pub(crate) fn recorded_builtin_transport(name: &str) -> &'static str {
+    match name {
+        "web_search"
+        | "web_fetch"
+        | "http_request"
+        | "knowledge_import_url"
+        | "knowledge_extract"
+        | "create_skill"
+        | "convert_skill"
+        | "bash" => "http",
+        _ => "local",
+    }
+}
+
+/// Name and transport stored for one tool attempt that reached the tracker.
+///
+/// Unregistered names, policy refusals, and calls reported as not found
+/// become [`UNREGISTERED_TOOL_NAME`] with transport `unknown`. The raw model
+/// string is dropped: it can carry argument text. Registered names are
+/// capped at [`MAX_REPORTED_TOOL_NAME_BYTES`].
+pub(crate) fn classify_recorded_tool_call(
+    name: &str,
+    registered: bool,
+    policy_denied: bool,
+) -> (String, &'static str) {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || !registered || policy_denied {
+        return (UNREGISTERED_TOOL_NAME.to_string(), "unknown");
+    }
+    let mut end = trimmed.len().min(MAX_REPORTED_TOOL_NAME_BYTES);
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    (
+        trimmed[..end].to_string(),
+        recorded_builtin_transport(trimmed),
+    )
+}
+
 pub(crate) fn disallowed_pa_tools<'a>(
     role: &AgentRole,
     tool_names: impl IntoIterator<Item = &'a str>,
@@ -333,5 +374,45 @@ mod tests {
         // 42 more registered names + 2 unregistered ones; the repeated
         // tool_0 folds into the kept entry.
         assert_eq!(omitted, 50 - MAX_REPORTED_TOOLS + 2);
+    }
+
+    #[test]
+    fn recorded_tool_call_drops_unregistered_payload_and_caps_names() {
+        let secret = "secret-payload-9f3a {\"path\":\"/etc/passwd\"}";
+        assert_eq!(
+            classify_recorded_tool_call(secret, false, false),
+            (UNREGISTERED_TOOL_NAME.to_string(), "unknown")
+        );
+        assert_eq!(
+            classify_recorded_tool_call("bash", true, true),
+            (UNREGISTERED_TOOL_NAME.to_string(), "unknown")
+        );
+        assert_eq!(
+            classify_recorded_tool_call("bash", true, false),
+            ("bash".to_string(), "http")
+        );
+        assert_eq!(
+            classify_recorded_tool_call("file_read", true, false),
+            ("file_read".to_string(), "local")
+        );
+        for name in [
+            "web_search",
+            "web_fetch",
+            "http_request",
+            "knowledge_import_url",
+            "knowledge_extract",
+            "create_skill",
+            "convert_skill",
+        ] {
+            assert_eq!(recorded_builtin_transport(name), "http", "{name}");
+        }
+        let long = format!("file_read{}", "x".repeat(200));
+        let (name, transport) = classify_recorded_tool_call(&long, true, false);
+        assert_eq!(name.len(), MAX_REPORTED_TOOL_NAME_BYTES);
+        assert!(!name.contains("secret"));
+        assert_eq!(transport, "local");
+        assert!(!classify_recorded_tool_call(secret, false, false)
+            .0
+            .contains("secret-payload"));
     }
 }

@@ -25,9 +25,10 @@ use super::invocations_enforcement::{
     FifoScheduler, InputRefRegistry, RunningScope, BUDGET_EXCEEDED_ERROR_CODE,
 };
 use super::invocations_store::{
-    scrub_secret_shaped_text, Invocation, InvocationErrorInfo, InvocationResult, InvocationState,
-    InvocationStore, InvocationUsage, TransitionPatch, DEADLINE_EXCEEDED_ERROR_CODE,
-    PROJECTION_CONTEXT_MISSING_ERROR_CODE, TASK_INIT_FAILED_ERROR_CODE,
+    scrub_secret_shaped_text, validate_usage, Invocation, InvocationErrorInfo, InvocationResult,
+    InvocationState, InvocationStore, InvocationUsage, TransitionPatch,
+    DEADLINE_EXCEEDED_ERROR_CODE, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
+    TASK_INIT_FAILED_ERROR_CODE,
 };
 use super::{TaskExecSpec, TaskExecutor, TaskOutcome, TaskOutcomeKind};
 use crate::core::core_types::SemanticCore;
@@ -35,6 +36,9 @@ use crate::isolation::IsolationClaims;
 
 /// Incomplete `result.usage` when closing as `succeeded` (VAL-016 / VAL-017).
 pub(crate) const INCOMPLETE_USAGE_ERROR_CODE: &str = "incomplete_usage";
+/// `result.usage` does not match the public contract. Never store it, and
+/// never treat it as absent so the run can succeed.
+pub(crate) const INVALID_USAGE_ERROR_CODE: &str = "invalid_usage";
 /// Executor join failed with a panic / unexpected abort.
 pub(crate) const EXECUTOR_PANIC_ERROR_CODE: &str = "executor_panic";
 /// Soft upper bound for persisted result summaries (#317 scrub).
@@ -817,6 +821,23 @@ async fn run_invocation(
     if outcome.kind == TaskOutcomeKind::Cancelled {
         // Cancelled without a cancel request (for example the executor's own
         // run timeout fired its token): the run did not complete.
+        if let Err(reason) = outcome.usage.as_ref().map(validate_usage).transpose() {
+            tracing::warn!(
+                invocation_id = %invocation.id,
+                reason,
+                "invocation usage invalid; not persisting it"
+            );
+            let _ = fail_running(
+                &store,
+                &claims,
+                &invocation.id,
+                INVALID_USAGE_ERROR_CODE,
+                "invocation usage is invalid",
+                None,
+            )
+            .await;
+            return;
+        }
         let _ = fail_running(
             &store,
             &claims,
@@ -846,6 +867,25 @@ async fn apply_task_outcome(
         usage,
     } = outcome;
     let summary = scrub_result_summary(&summary);
+    // Illegal usage must not be stored and must not be dropped so the run
+    // can still succeed. The store also rejects it at write time.
+    if let Err(reason) = usage.as_ref().map(validate_usage).transpose() {
+        tracing::warn!(
+            invocation_id = %id,
+            reason,
+            "invocation usage invalid; not persisting it"
+        );
+        let _ = fail_running(
+            store,
+            claims,
+            id,
+            INVALID_USAGE_ERROR_CODE,
+            "invocation usage is invalid",
+            None,
+        )
+        .await;
+        return;
+    }
     if kind == TaskOutcomeKind::Completed {
         // The executor completes every pipeline it finishes; only an
         // explicitly successful SA status may become `succeeded` (#337).

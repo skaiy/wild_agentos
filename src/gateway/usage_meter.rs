@@ -88,10 +88,19 @@ impl RunUsageSnapshot {
     }
 }
 
-/// Collects [`CallUsage`] for exactly one run.
+/// One tool attempt recorded for a run. Only the classified name and
+/// transport are kept; arguments and results never enter the meter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeteredToolCall {
+    pub name: String,
+    pub transport: String,
+}
+
+/// Collects [`CallUsage`] and tool attempts for exactly one run.
 #[derive(Debug, Default)]
 pub struct RunUsageMeter {
     state: Mutex<RunUsageSnapshot>,
+    tool_calls: Mutex<Vec<MeteredToolCall>>,
 }
 
 impl RunUsageMeter {
@@ -130,6 +139,25 @@ impl RunUsageMeter {
 
     pub fn snapshot(&self) -> RunUsageSnapshot {
         self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Append one already-classified tool attempt. Callers must pass a
+    /// closed-set transport and a name that does not carry arguments.
+    pub fn record_tool_call(&self, name: impl Into<String>, transport: impl Into<String>) {
+        self.tool_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(MeteredToolCall {
+                name: name.into(),
+                transport: transport.into(),
+            });
+    }
+
+    pub fn tool_calls(&self) -> Vec<MeteredToolCall> {
+        self.tool_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -178,5 +206,28 @@ mod tests {
         let s = RunUsageMeter::new().snapshot();
         assert!(!s.tokens_complete());
         assert_eq!(s.primary_model(), None);
+        assert!(RunUsageMeter::new().tool_calls().is_empty());
+    }
+
+    #[test]
+    fn tool_calls_accumulate_independently_of_token_usage() {
+        let meter = RunUsageMeter::new();
+        meter.record_tool_call("glob_search", "local");
+        meter.record("m", call("m", 1, 1, None));
+        meter.record_tool_call("bash", "http");
+        assert_eq!(meter.snapshot().calls, 1);
+        assert_eq!(
+            meter.tool_calls(),
+            vec![
+                MeteredToolCall {
+                    name: "glob_search".into(),
+                    transport: "local".into(),
+                },
+                MeteredToolCall {
+                    name: "bash".into(),
+                    transport: "http".into(),
+                },
+            ]
+        );
     }
 }

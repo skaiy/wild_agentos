@@ -156,6 +156,10 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
   - 两者都没有 → 不写 `cost` 和 `cost_source`，运行以 `failed` / `incomplete_usage` 结束，错误 message 说明未配置成本来源。
 - **计量方式。** `input_tokens` / `output_tokens` 是本次运行所有模型调用（规划、各 agent、流式与非流式）的总和，按运行分别计数，并发运行互不混算。流式 chat completions 调用会向上游请求 usage（`stream_options.include_usage`）；上游以 400 或 422 拒绝、且错误体里提到 `stream_options` 或 `include_usage` 时，去掉该参数重试一次。上游一旦回了 2xx，这次调用就计入，即使之后响应体解析失败并重试。usage 块必须两项 token 数都在、且是能放进 32 位的整数才算数；`null`、缺一项或越界都按"未回报 usage"处理，绝不当成 0。只要有一次调用没有回报 usage，就不写 token 数（不少报），该运行也不能成功。运行超时或被取消时，仍在跑的 agent 会被中止。`model` 取本次运行中 token 数最多的模型。
 - 在 `failed` / `cancelled` / `interrupted` 路径上，`usage` 可选；若带了，结构仍须合法（未知成员拒绝；有 `cost` 时必须是整数）。`failed` 的调用也可以带 `result`，其中只有 `usage`（例如 `budget_exceeded` 之后），`summary` 为空。
+- **usage 严格形状。** `usage` 只接受 `provider`、`model`、`input_tokens`、
+  `output_tokens`、`cost`、`cost_source` 与 `tool_calls`；每条 tool-call 只接受
+  `name` 和 `transport`。非法 usage 不会被存下来，也绝不静默当作未提供：执行路径以
+  `failed` / `invalid_usage` 结束。
 - `usage` 报告的是服务端为执行 `budget`（`budget_exceeded`）本来就在做的计量，除说明 `cost` 如何得到的 `cost_source` 外，不含任何对合作方、调用方或集成方的归因。
 - **`tool_calls[].transport` 词表（闭集）。** 每条 tool-call 可带 `transport`，取值只能是：
   `mcp` | `http` | `a2a` | `local` | `unknown`。
@@ -163,7 +167,8 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
   - `http` — 直连 HTTP 工具调用（**不是** A2A）。
   - `a2a` — 走 A2A 出站路径的工具调用；**不要用 `http` 兼指 A2A**。A2A 调用使用独立取值 `transport = "a2a"`。
   - `local` — 进程内 / 内置工具，无网络跳转。
-  - `unknown` — 无法判定时使用；已知时优先写明确取值。闭集以外的值在写入时拒绝。
+  - `unknown` — 无法判定时使用。已存记录里闭集以外的值在读取时记为 `unknown`，并打一条警告，不记录原始值。新的写入仍拒绝闭集以外的 transport。
+  执行器把到达本次运行工具跟踪器的每次工具尝试记到它返回的 usage 上，覆盖成功、失败、取消和超时，也包括同一次运行里更早周期的尝试。只存 `name` 和 `transport`，不记录参数或结果。模型给出的名字若不是已注册工具，或调用被策略拒绝、或被报告为找不到，则记为固定名字 `<unregistered>`，transport 为 `unknown`。记下的名字最长 64 字节。会发起网络请求的已注册内置工具（`web_search`、`web_fetch`、`http_request`、`knowledge_import_url`、`knowledge_extract`、`create_skill`、`convert_skill`、`bash`）使用 `http`。其他已注册的进程内内置工具使用 `local`。当 `tool_calls` 存在时，`request.budget.max_tool_calls` 按这份记录强制。共享总线上的任务事件不会追加 tool call。
 
 ### 5.1 列表响应
 
@@ -252,7 +257,7 @@ queued ──► running ──► succeeded
 - `input_ref` 使用可插拔的解析器注册表（按前缀或 scheme，§4.2）。默认什么都没注册（创建 → `422 input_ref_unresolvable`），内置的 `wao-artifact://` 解析器默认关。匹配的解析器在执行路径用创建者的 claims 拉取字节，超时和大小上限由服务端强制；服务端核对 SHA-256 后把文本和 prompt 一起交给任务。取数失败 → `failed` / `input_ref_fetch_failed`，SHA-256 不符 → `failed` / `input_digest_mismatch`，两者都是固定文案。不提供默认外网 resolver。
 - 不支持 `agent_revision`：创建返回 `422 agent_revision_unsupported`（不得静默忽略；不假装已 pin），执行也不读取 agent 定义（§4.1、§4.3）。
 - 终态只来自执行器在运行结束时交还给服务端的结果，从不来自任务事件。共享任务事件总线上的事件（包括 `TASK_COMPLETED` / `TASK_FAILED`）只供 SSE 使用；其他组件和调用方都能往总线上发事件，所以它们永远不会结束调用。`POST /api/v1/events` 只接受 `CUSTOM` 以及以 `EXT_` 开头的事件类型。其余类型一律 `403`：`TASK_*`（不区分大小写）为 `reserved_event_type`，包括 `BATCH_*` 和运行控制类型在内的其他类型为 `event_type_not_allowed`。运行控制事件只能走专用路由（`POST /api/v1/control-events/intervention-required`、`.../user-supplementary-input`、`.../human-approval-result`、`.../threshold-exceeded`、`.../cycle-iteration`），且仅限任务的 `user_id` 或与任务租户及项目一致的控制面 DA。该 DA 必须带显式的项目声明；项目被默认填充时会被拒绝。任务不存在或不在调用方 scope 内返回 `404`，同 scope 的非所有者返回 `403`，payload 超过 64 KiB 返回 `413`。核心写入（`POST /api/v1/events` 与 `POST /api/v1/nodes`）对不存在的任务和超出调用方租户或项目的任务返回同一个 `404`（`not found`），因此状态码不会暴露任务是否存在。平台管理员仍可跨租户写入。`POST /api/v1/tasks`、`POST /api/v1/tasks/stream` 以及调用执行创建的任务，其 `user_id` 取自已验证的调用方，而不是请求体。事件来源由服务端写成 `external:http:<sub>`，请求体里的 `source` 被忽略，也不会留在存下的 payload 里。任务控制台 SSE 和调用 `progress` 事件会丢弃来源以 `external:` 开头的总线事件，因此调用方不能改变界面阶段，也不能注入展示内容。`GET /api/v1/batch/events` 只把 `BATCH_*` 事件发给这样的订阅者：事件的任务节点（若没有任务节点，则 payload 上的 `tenant_id` 与 `project_id`）与订阅者已验证的租户和项目一致。来源以 `batch:` 开头、既没有任务节点也没有这两个 payload 字段的内部事件，只发给平台管理员。流式模型调用的非 2xx 响应只记录状态码、模型和请求 id。执行器上报终态状态：只有明确成功（`completed`、`success`、`succeeded`）才能成为 `succeeded`；其他状态（例如 `timeout`、`partial_failure`）以 `failed` / `task_failed` 结束，并带上实际用量。SSE 订阅者跟不上时收到 `resync` 事件，应重新读取资源；以持久化状态为准。
-- 每次运行都计量，用量随终态迁移写入 `result.usage`。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。
+- 每次运行都计量，用量随终态迁移写入 `result.usage`，其中包括执行器为该次运行记录的工具尝试（§5），成功、失败、取消和超时都带上。落到 `succeeded` 时必须满足 §5 的完整 usage（VAL-016 / VAL-017）；不完整的 usage 不得落成 `succeeded`。不符合 §5 形状的 usage 使运行以 `failed` / `invalid_usage` 结束，且不会被存下来。
 - 执行受配置开关控制，默认**关闭**（`AGENTOS_INVOCATION_EXECUTION_ENABLED`）。生产仅在明确启用 TaskExecutor 桥时打开。桥运行时强制投影按 scope 绑定（#310/#322）与 VAL-PROJ-CTX fail-closed（缺 claims / 空投影 → `failed` / `projection_context_missing`）。
 - 开关关闭时，新的创建请求返回 `503 execution_disabled`，什么都不落盘（没有资源，也没有幂等记录），因此不会有调用永远停在非终态。开关关闭前已登记的 key 重放仍返回 `200` 和原资源。开关在启动时读取；关闭开关需要重启，重启会把执行中的调用改为 `failed/interrupted`。
 
