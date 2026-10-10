@@ -22,7 +22,7 @@ use super::{AppState, TaskExecSpec};
 #[derive(Deserialize)]
 pub struct TaskRequest {
     pub user_input: String,
-    /// 用户态标识，用于会话隔离（可选，缺省为匿名）。
+    /// Ignored. The stored `user_id` is the verified actor (`claims.actor_id()`).
     pub user_id: Option<String>,
     /// 会话标识，用于多轮上下文隔离（可选）。
     pub session_id: Option<String>,
@@ -104,7 +104,7 @@ pub(crate) async fn create_task_handler(
             &req.user_input,
             None,
             None,
-            req.user_id.as_deref(),
+            Some(claims.actor_id()),
             req.session_id.as_deref(),
             claims,
         )
@@ -255,7 +255,14 @@ pub(crate) async fn stream_task_handler(
         Some(task_iri) => task_iri,
         None => match state
             .core
-            .init_task_with_claims(&req.prompt, None, None, None, None, claims)
+            .init_task_with_claims(
+                &req.prompt,
+                None,
+                None,
+                Some(claims.actor_id()),
+                None,
+                claims,
+            )
             .await
         {
             Ok(task_iri) => task_iri,
@@ -359,6 +366,11 @@ pub(crate) async fn stream_task_handler(
                 result = rx.recv() => match result {
                 Ok(event) => {
                     if event.task_iri != task_iri_clone {
+                        continue;
+                    }
+                    // Caller-posted events use `external:*`. They must not move
+                    // the console phase or close the stream (#399).
+                    if event.source_agent_iri.starts_with("external:") {
                         continue;
                     }
 
@@ -613,24 +625,40 @@ fn exec_event_inner(payload: &str, kind: &str) -> Option<Value> {
 }
 
 fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> {
+    let (event_name, mut data) = task_console_sse(event)?;
+    if let Some(object) = data.as_object_mut() {
+        object.insert(
+            "source".to_string(),
+            Value::String(event.source_agent_iri.clone()),
+        );
+    }
+    Some(Event::default().event(event_name).data(data.to_string()))
+}
+
+fn task_console_sse(event: &crate::core::event_bus::Event) -> Option<(&'static str, Value)> {
     use crate::core::event_bus::EventType;
+
+    // Caller-posted events (`external:*`) are not execution state. Drop them
+    // so a forged ACT_COMPLETED / LLM_CONTENT / EXECUTION_ERROR cannot move
+    // the console phase or inject display text (#399).
+    if event.source_agent_iri.starts_with("external:") {
+        return None;
+    }
 
     // 富执行事件（由 AgentRunner 内联发布到总线，payload 为序列化后的 ExecutionEvent）：
     // 解析内层字段，映射为任务控制台可直接消费的干净 SSE 事件（思考/工具调用/逐字输出）。
     match event.event_type.as_str() {
         "THOUGHT" => {
             let inner = exec_event_inner(&event.payload, "Thought")?;
-            return Some(
-                Event::default().event("thought").data(
-                    json!({
-                        "agent_id": inner.get("agent_id"),
-                        "thought": inner.get("thought"),
-                        "action": inner.get("action"),
-                        "emphasis": inner.get("emphasis"),
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "thought",
+                json!({
+                    "agent_id": inner.get("agent_id"),
+                    "thought": inner.get("thought"),
+                    "action": inner.get("action"),
+                    "emphasis": inner.get("emphasis"),
+                }),
+            ));
         }
         "TOOL_CALL" => {
             let inner = exec_event_inner(&event.payload, "ToolCall")?;
@@ -640,89 +668,77 @@ fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> 
                 .unwrap_or("");
             let arguments = serde_json::from_str::<Value>(args_raw)
                 .unwrap_or_else(|_| Value::String(args_raw.to_string()));
-            return Some(
-                Event::default().event("tool_call").data(
-                    json!({
-                        "call_id": inner.get("call_id"),
-                        "tool_name": inner.get("tool_name"),
-                        "arguments": arguments,
-                        "agent_id": inner.get("agent_id"),
-                        "sequence": inner.get("sequence"),
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "tool_call",
+                json!({
+                    "call_id": inner.get("call_id"),
+                    "tool_name": inner.get("tool_name"),
+                    "arguments": arguments,
+                    "agent_id": inner.get("agent_id"),
+                    "sequence": inner.get("sequence"),
+                }),
+            ));
         }
         "TOOL_RESULT" => {
             let inner = exec_event_inner(&event.payload, "ToolResult")?;
-            return Some(
-                Event::default().event("tool_result").data(
-                    json!({
-                        "call_id": inner.get("call_id"),
-                        "tool_name": inner.get("tool_name"),
-                        "result": inner.get("result"),
-                        "success": inner.get("success"),
-                        "agent_id": inner.get("agent_id"),
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "tool_result",
+                json!({
+                    "call_id": inner.get("call_id"),
+                    "tool_name": inner.get("tool_name"),
+                    "result": inner.get("result"),
+                    "success": inner.get("success"),
+                    "agent_id": inner.get("agent_id"),
+                }),
+            ));
         }
         "LLM_CONTENT" => {
             let inner = exec_event_inner(&event.payload, "LlmContent")?;
-            return Some(
-                Event::default().event("llm_content").data(
-                    json!({
-                        "agent_id": inner.get("agent_id"),
-                        "role": inner.get("role"),
-                        "delta": inner.get("content_delta"),
-                        "is_reasoning": inner.get("is_reasoning"),
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "llm_content",
+                json!({
+                    "agent_id": inner.get("agent_id"),
+                    "role": inner.get("role"),
+                    "delta": inner.get("content_delta"),
+                    "is_reasoning": inner.get("is_reasoning"),
+                }),
+            ));
         }
         "PHASE_CHANGE" => {
             let inner = exec_event_inner(&event.payload, "PhaseChange")?;
-            return Some(
-                Event::default().event("phase_change").data(
-                    json!({
-                        "from_phase": inner.get("from_phase"),
-                        "to_phase": inner.get("to_phase"),
-                        "agent_role": inner.get("agent_role"),
-                        "reason": inner.get("reason"),
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "phase_change",
+                json!({
+                    "from_phase": inner.get("from_phase"),
+                    "to_phase": inner.get("to_phase"),
+                    "agent_role": inner.get("agent_role"),
+                    "reason": inner.get("reason"),
+                }),
+            ));
         }
         "AGENT_STATUS" => {
             let inner = exec_event_inner(&event.payload, "AgentStatus")?;
-            return Some(
-                Event::default().event("agent_status").data(
-                    json!({
-                        "agent_id": inner.get("agent_id"),
-                        "role": inner.get("role"),
-                        "status": inner.get("status"),
-                        "turn": inner.get("turn"),
-                        "iteration": inner.get("iteration"),
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "agent_status",
+                json!({
+                    "agent_id": inner.get("agent_id"),
+                    "role": inner.get("role"),
+                    "status": inner.get("status"),
+                    "turn": inner.get("turn"),
+                    "iteration": inner.get("iteration"),
+                }),
+            ));
         }
         "EXECUTION_ERROR" => {
             let inner = exec_event_inner(&event.payload, "Error")?;
-            return Some(
-                Event::default().event("error").data(
-                    json!({
-                        "error_type": inner.get("error_type"),
-                        "message": inner.get("message"),
-                        "agent_id": inner.get("agent_id"),
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "error",
+                json!({
+                    "error_type": inner.get("error_type"),
+                    "message": inner.get("message"),
+                    "agent_id": inner.get("agent_id"),
+                }),
+            ));
         }
         // SA 逐阶段派发事件（Debug 角色名，如 "Plan_STARTED"）→ 相位指示。
         "Plan_STARTED" | "Do_STARTED" | "Check_STARTED" | "Act_STARTED" => {
@@ -732,15 +748,13 @@ fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> 
                 "Check_STARTED" => ("check", "CA"),
                 _ => ("act", "AA"),
             };
-            return Some(
-                Event::default().event("phase_change").data(
-                    json!({
-                        "to_phase": to_phase,
-                        "agent_role": role,
-                    })
-                    .to_string(),
-                ),
-            );
+            return Some((
+                "phase_change",
+                json!({
+                    "to_phase": to_phase,
+                    "agent_role": role,
+                }),
+            ));
         }
         _ => {}
     }
@@ -849,7 +863,7 @@ fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> 
         _ => return None,
     };
 
-    Some(Event::default().event(event_name).data(data.to_string()))
+    Some((event_name, data))
 }
 
 #[cfg(test)]
@@ -862,7 +876,8 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
-        routing::get,
+        response::IntoResponse,
+        routing::{get, post},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -1515,6 +1530,130 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(!String::from_utf8_lossy(&body).contains(&tenant_b_task));
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
+    }
+
+    fn bus_event(event_type: &str, source: &str) -> crate::core::event_bus::Event {
+        use crate::core::event_bus::{Event, EventPriority};
+        Event {
+            event_id: "evt".into(),
+            task_iri: "iri://task/t".into(),
+            event_type: event_type.into(),
+            source_agent_iri: source.into(),
+            payload: "{}".into(),
+            payload_json_ld: String::new(),
+            timestamp: chrono::Utc::now(),
+            sequence: 1,
+            type_mask: 0,
+            priority: EventPriority::Normal,
+        }
+    }
+
+    async fn rendered_sse(event: axum::response::sse::Event) -> String {
+        let response = axum::response::sse::Sse::new(tokio_stream::once(Ok::<
+            _,
+            std::convert::Infallible,
+        >(event)))
+        .into_response();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// #399: a forged external ACT_COMPLETED must not emit phase_change, and
+    /// external LLM_CONTENT / EXECUTION_ERROR must not inject display text.
+    /// An executor-sourced ACT_COMPLETED still moves the phase and carries source.
+    #[tokio::test]
+    async fn external_source_display_events_do_not_change_ui_phase() {
+        assert!(
+            convert_event_to_sse(&bus_event("ACT_COMPLETED", "external:http:mallory")).is_none()
+        );
+        assert!(convert_event_to_sse(&bus_event("LLM_CONTENT", "external:http:mallory")).is_none());
+        assert!(
+            convert_event_to_sse(&bus_event("EXECUTION_ERROR", "external:http:mallory")).is_none()
+        );
+        let internal = convert_event_to_sse(&bus_event("ACT_COMPLETED", "AA"))
+            .expect("executor ACT_COMPLETED is a phase change");
+        let body = rendered_sse(internal).await;
+        assert!(body.contains("event: phase_change"), "{body}");
+        assert!(body.contains("\"to_phase\":\"completed\""), "{body}");
+        assert!(body.contains("\"source\":\"AA\""), "{body}");
+    }
+
+    /// #427 N4: the stored user id is the verified actor, not the request body.
+    /// The stream path that creates a task does the same.
+    #[tokio::test]
+    async fn created_tasks_store_the_actor_id_not_the_body_user_id() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let saved_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let state = test_state();
+        let router = Router::new()
+            .route("/api/v1/tasks", post(create_task_handler))
+            .route("/api/v1/tasks/stream", post(stream_task_handler))
+            .with_state(state.clone());
+        let token = jwt("tenant-a", "project-a");
+        let created = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "user_input": "hello",
+                            "user_id": "someone-else",
+                            "tenant_id": "tenant-a",
+                            "project_id": "project-a",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let iri = created_body["task_iri"].as_str().unwrap();
+        let node = state.core.read_node(iri).await.unwrap().unwrap();
+        let stored: Value = serde_json::from_str(&node.json_ld).unwrap();
+        assert_eq!(stored["user_id"], "test-user");
+
+        let streamed = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks/stream")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"prompt": "streamed hello"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let streamed_body = to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
+        let streamed_text = String::from_utf8_lossy(&streamed_body);
+        let stream_iri = streamed_text
+            .split("\"task_iri\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("stream announces a task_iri");
+        let stream_node = state.core.read_node(stream_iri).await.unwrap().unwrap();
+        let stream_stored: Value = serde_json::from_str(&stream_node.json_ld).unwrap();
+        assert_eq!(stream_stored["user_id"], "test-user");
 
         restore_env("AGENTOS_AUTH_MODE", saved_mode);
         restore_env("AGENTOS_JWT_SECRET", saved_secret);
