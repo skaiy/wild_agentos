@@ -694,7 +694,7 @@ async fn run_invocation(
 
     let prompt = prompt_from_invocation(&invocation, input_ref_text.as_deref());
     let task_iri = match core
-        .init_task_with_claims(&prompt, None, None, None, None, &claims)
+        .init_task_with_claims(&prompt, None, None, Some(claims.actor_id()), None, &claims)
         .await
     {
         Ok(task_iri) => task_iri,

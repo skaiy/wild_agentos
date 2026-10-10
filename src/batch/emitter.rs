@@ -11,6 +11,10 @@ use crate::core::event_bus::{EventBus, EventPriority};
 pub struct BatchEventEmitter {
     event_bus: Arc<EventBus>,
     config: HashMap<String, Vec<EmitCondition>>,
+    /// Tenant and project stamped onto every payload so batch SSE can filter
+    /// the event. Unset events carry no scope and are visible only to a
+    /// platform admin.
+    scope: Option<(String, String)>,
 }
 
 impl BatchEventEmitter {
@@ -32,7 +36,32 @@ impl BatchEventEmitter {
         Self {
             event_bus,
             config: HashMap::new(),
+            scope: None,
         }
+    }
+
+    /// Attach the tenant and project written onto every emitted payload.
+    pub fn with_scope(
+        mut self,
+        tenant_id: impl Into<String>,
+        project_id: impl Into<String>,
+    ) -> Self {
+        self.set_scope(tenant_id, project_id);
+        self
+    }
+
+    pub fn set_scope(&mut self, tenant_id: impl Into<String>, project_id: impl Into<String>) {
+        self.scope = Some((tenant_id.into(), project_id.into()));
+    }
+
+    fn body(&self, mut value: serde_json::Value) -> String {
+        if let Some((tenant_id, project_id)) = &self.scope {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("tenant_id".to_string(), json!(tenant_id));
+                object.insert("project_id".to_string(), json!(project_id));
+            }
+        }
+        value.to_string()
     }
 
     pub fn set_agent_config(&mut self, agent_name: &str, emit_on: Vec<EmitCondition>) {
@@ -50,12 +79,11 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_AGENT_REGISTERED",
                 "batch:manager",
-                &json!({
+                &self.body(json!({
                     "agent_name": agent_name,
                     "config": config_summary,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-                .to_string(),
+                })),
             )
             .await;
     }
@@ -67,11 +95,10 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_AGENT_STARTED",
                 "batch:manager",
-                &json!({
+                &self.body(json!({
                     "agent_name": agent_name,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-                .to_string(),
+                })),
             )
             .await;
     }
@@ -83,12 +110,11 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_AGENT_STOPPED",
                 "batch:manager",
-                &json!({
+                &self.body(json!({
                     "agent_name": agent_name,
                     "reason": reason,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-                .to_string(),
+                })),
             )
             .await;
     }
@@ -105,13 +131,12 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_EXTRACTION_STARTED",
                 &format!("batch:{}", agent_name),
-                &json!({
+                &self.body(json!({
                     "agent_name": agent_name,
                     "batch_id": batch_id,
                     "window_size": window_size,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-                .to_string(),
+                })),
             )
             .await;
     }
@@ -142,7 +167,7 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_EXTRACTION_COMPLETED",
                 &format!("batch:{}", agent_name),
-                &payload.to_string(),
+                &self.body(payload),
             )
             .await;
     }
@@ -154,13 +179,12 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_EXTRACTION_FAILED",
                 &format!("batch:{}", agent_name),
-                &json!({
+                &self.body(json!({
                     "agent_name": agent_name,
                     "batch_id": batch_id,
                     "error": error,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-                .to_string(),
+                })),
             )
             .await;
     }
@@ -201,7 +225,7 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_ENTITY_DETECTED",
                 &format!("batch:{}", agent_name),
-                &payload.to_string(),
+                &self.body(payload),
                 EventPriority::Normal,
             )
             .await;
@@ -232,7 +256,7 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_RELATION_DETECTED",
                 &format!("batch:{}", agent_name),
-                &payload.to_string(),
+                &self.body(payload),
                 EventPriority::Normal,
             )
             .await;
@@ -272,7 +296,7 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_INTENT_DETECTED",
                 &format!("batch:{}", agent_name),
-                &payload.to_string(),
+                &self.body(payload),
                 EventPriority::Normal,
             )
             .await;
@@ -302,7 +326,7 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_DECISION_DETECTED",
                 &format!("batch:{}", agent_name),
-                &payload.to_string(),
+                &self.body(payload),
                 EventPriority::Normal,
             )
             .await;
@@ -320,13 +344,12 @@ impl BatchEventEmitter {
                 &format!("batch://{}", agent_name),
                 "BATCH_CONTEXT_INJECTED",
                 &format!("batch:{}", agent_name),
-                &json!({
+                &self.body(json!({
                     "agent_name": agent_name,
                     "context_type": context_type,
                     "items_count": items_count,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-                .to_string(),
+                })),
             )
             .await;
     }
