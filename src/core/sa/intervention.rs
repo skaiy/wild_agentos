@@ -9,9 +9,8 @@ use super::actions::get_action_handler;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
-/// An approval result applies only to the task that is waiting and to that
-/// task's request id. A result whose event or payload names another task is
-/// ignored, even when the request id matches.
+/// A `HUMAN_APPROVAL_RESULT` counts only when `event_type`, `task_iri`, and
+/// `request_id` all match. A payload that names another task is ignored.
 pub(crate) fn matching_approval_result(
     event: &crate::core::event_bus::Event,
     task_iri: &str,
@@ -245,6 +244,10 @@ Notes:
             _ => return Ok(true),
         };
 
+        // Subscribe before publishing so an approval that arrives with the
+        // request is not dropped, and so a result for another task cannot
+        // match on request_id alone.
+        let mut receiver = self.event_bus.subscribe();
         self.event_bus
             .emit_with_priority(
                 task_iri,
@@ -269,11 +272,10 @@ Notes:
             .insert(request_id.clone(), false);
 
         // Wait briefly for any instant approval result
-        let mut receiver = self.event_bus.subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok(event) = receiver.try_recv() {
+            while let Ok(event) = receiver.try_recv() {
                 if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
                     let approved = result
                         .get("approved")
@@ -309,6 +311,7 @@ Notes:
             "status": "pending",
         });
 
+        let mut receiver = self.event_bus.subscribe();
         self.event_bus
             .emit_with_priority(
                 task_iri,
@@ -330,11 +333,10 @@ Notes:
             .insert(request_id.clone(), false);
 
         // Wait briefly for any instant approval result
-        let mut receiver = self.event_bus.subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok(event) = receiver.try_recv() {
+            while let Ok(event) = receiver.try_recv() {
                 if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
                     let approved = result
                         .get("approved")

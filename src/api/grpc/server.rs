@@ -278,6 +278,12 @@ impl AgentOSService {
             let mut mgr = BatchAgentManager::new()
                 .with_event_bus(event_bus.clone())
                 .with_graph_store(skill_graph.clone());
+            if let (Some(tenant_id), Some(project_id)) = (
+                settings.batch_agents.event_tenant_id.clone(),
+                settings.batch_agents.event_project_id.clone(),
+            ) {
+                mgr = mgr.with_event_scope(tenant_id, project_id);
+            }
 
             let agent_settings = &settings.batch_agents.agents;
             if !agent_settings.is_empty() {
