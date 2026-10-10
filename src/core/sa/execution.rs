@@ -11,6 +11,35 @@ use crate::CoreError;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+/// Keep tool calls from earlier steps on the `TaskResult` the executor sees.
+/// A later step replaces `last_result`; without this, its empty tracker would
+/// drop built-in calls the invocation usage is supposed to record.
+fn carry_tracked_actions(result: &mut TaskResult, prior: &mut Option<TaskResult>) {
+    let Some(prior) = prior.as_mut() else {
+        return;
+    };
+    if prior.tracked_actions.is_empty() {
+        return;
+    }
+    let mut actions = std::mem::take(&mut prior.tracked_actions);
+    actions.append(&mut result.tracked_actions);
+    result.tracked_actions = actions;
+}
+
+fn collect_tracked_actions(
+    prior: &Option<TaskResult>,
+    results: &[TaskResult],
+) -> Vec<crate::core::tracked_action::TrackedAction> {
+    let mut actions = prior
+        .as_ref()
+        .map(|result| result.tracked_actions.clone())
+        .unwrap_or_default();
+    for result in results {
+        actions.extend(result.tracked_actions.iter().cloned());
+    }
+    actions
+}
+
 impl SupervisorAgent {
     fn create_agent(&self, role: AgentRole, cycle_id: &str) -> AgentInstance {
         let agent_id = format!(
@@ -587,7 +616,7 @@ impl SupervisorAgent {
                         },
                     );
 
-                    let ha_result = TaskResult {
+                    let mut ha_result = TaskResult {
                         task_iri: task_iri.to_string(),
                         status: status.to_string(),
                         verdict: None,
@@ -603,6 +632,7 @@ impl SupervisorAgent {
                         archive_iri: None,
                     };
                     prev_summary = Some(format!("## Human Approval Result\n{}", summary));
+                    carry_tracked_actions(&mut ha_result, &mut last_result);
                     last_result = Some(ha_result);
 
                     // Branch jump handling (rejected → skip to reject target)
@@ -741,6 +771,7 @@ impl SupervisorAgent {
                     let failed = results.iter().find(|r| r.status == "failed");
                     if let Some(f) = failed {
                         warn!(role = ?step.role, step_id = %step.step_id, "Parallel agent failed");
+                        let tracked_actions = collect_tracked_actions(&last_result, &results);
                         return Ok(TaskResult {
                             task_iri: task_iri.to_string(),
                             status: "partial_failure".to_string(),
@@ -753,7 +784,7 @@ impl SupervisorAgent {
                             turn_count: results.iter().map(|r| r.turn_count).sum(),
                             tool_call_count: results.iter().map(|r| r.tool_call_count).sum(),
                             five_w2h_updates: None,
-                            tracked_actions: Vec::new(),
+                            tracked_actions,
                             archive_iri: None,
                         });
                     }
@@ -771,7 +802,13 @@ impl SupervisorAgent {
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     prev_summary = Some(combined_summary);
-                    last_result = results.into_iter().last();
+                    let tracked_actions = collect_tracked_actions(&last_result, &results);
+                    if let Some(mut result) = results.into_iter().last() {
+                        result.tracked_actions = tracked_actions;
+                        last_result = Some(result);
+                    } else if let Some(prior) = last_result.as_mut() {
+                        prior.tracked_actions = tracked_actions;
+                    }
                     continue;
                 }
 
@@ -925,7 +962,7 @@ impl SupervisorAgent {
                                 turn_count: 0,
                                 tool_call_count: 0,
                                 five_w2h_updates: None,
-                                tracked_actions: vec![],
+                                tracked_actions: collect_tracked_actions(&last_result, &[]),
                                 archive_iri: None,
                             });
                         }
@@ -1030,7 +1067,7 @@ impl SupervisorAgent {
     #[allow(clippy::too_many_arguments)]
     async fn handle_step_result(
         &self,
-        result: TaskResult,
+        mut result: TaskResult,
         step: PlanStep,
         _node_idx: NodeIndex,
         i: usize,
@@ -1062,6 +1099,8 @@ impl SupervisorAgent {
                 .first()
                 .map(|e| format!("\n\n**Error details**: {}", e))
                 .unwrap_or_default();
+            let tracked_actions =
+                collect_tracked_actions(last_result, std::slice::from_ref(&result));
             return Ok(Some(TaskResult {
                 task_iri: task_iri.to_string(),
                 status: "failed".to_string(),
@@ -1077,7 +1116,7 @@ impl SupervisorAgent {
                 turn_count: result.turn_count,
                 tool_call_count: result.tool_call_count,
                 five_w2h_updates: None,
-                tracked_actions: Vec::new(),
+                tracked_actions,
                 archive_iri: None,
             }));
         }
@@ -1241,6 +1280,7 @@ impl SupervisorAgent {
             });
         }
 
+        carry_tracked_actions(&mut result, last_result);
         *last_result = Some(result);
 
         // Track Do agent output separately
@@ -1854,6 +1894,73 @@ mod plan_policy_tests {
             assert!(completed.is_empty());
             assert!(da_output.is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod tracked_action_carry_tests {
+    use super::{carry_tracked_actions, collect_tracked_actions};
+    use crate::core::agent_runner::TaskResult;
+    use crate::core::tracked_action::{ActionStatus, TrackedAction};
+
+    fn action(name: &str) -> TrackedAction {
+        TrackedAction {
+            action_id: name.into(),
+            tool_name: name.into(),
+            agent_role: "do".into(),
+            duration_secs: 0.0,
+            status: ActionStatus::Success,
+            files_created: vec![],
+            files_modified: vec![],
+            files_read: vec![],
+            error: Some("secret result".into()),
+            tool_args: [("query".into(), serde_json::json!("never persist this"))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn result(name: &str) -> TaskResult {
+        TaskResult {
+            task_iri: "iri://task/t".into(),
+            status: "success".into(),
+            verdict: None,
+            summary: String::new(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: vec![action(name)],
+            archive_iri: None,
+        }
+    }
+
+    #[test]
+    fn later_step_keeps_earlier_tool_calls() {
+        let mut prior = Some(result("web_search"));
+        let mut current = result("file_read");
+        carry_tracked_actions(&mut current, &mut prior);
+        let names: Vec<_> = current
+            .tracked_actions
+            .iter()
+            .map(|action| action.tool_name.as_str())
+            .collect();
+        assert_eq!(names, ["web_search", "file_read"]);
+    }
+
+    #[test]
+    fn parallel_results_keep_every_tool_call() {
+        let prior = Some(result("file_read"));
+        let results = vec![result("web_search"), result("web_fetch")];
+        let actions = collect_tracked_actions(&prior, &results);
+        let names: Vec<_> = actions
+            .iter()
+            .map(|action| action.tool_name.as_str())
+            .collect();
+        assert_eq!(names, ["file_read", "web_search", "web_fetch"]);
     }
 }
 

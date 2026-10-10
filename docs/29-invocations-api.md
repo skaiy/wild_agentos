@@ -332,6 +332,11 @@ scope and server fields → `400 field_not_allowed` (§3).
   its shape must still be valid (unknown members rejected; `cost` integer when
   set). A `failed` invocation can carry `result` with only `usage` (for example
   after `budget_exceeded`) and an empty `summary`.
+- **Strict usage shape.** `usage` accepts only `provider`, `model`,
+  `input_tokens`, `output_tokens`, `cost`, `cost_source`, and `tool_calls`;
+  each tool-call entry accepts only `name` and `transport`. Invalid usage is
+  never stored and never silently treated as absent: the execution path ends
+  the run `failed` with `error.code = "invalid_usage"`.
 - `usage` reports the metering the server already does to enforce `budget`
   (`budget_exceeded`). Apart from `cost_source`, which says how `cost` was
   obtained, it carries no attribution to partners, callers or integrators.
@@ -343,8 +348,22 @@ scope and server fields → `400 field_not_allowed` (§3).
   - `a2a` — tool call that went through the A2A outbound path; **do not overload
     `http` for A2A**. A2A invocations use `transport = "a2a"` as a distinct value.
   - `local` — in-process / built-in tool with no network hop.
-  - `unknown` — transport could not be classified; prefer an explicit value when
-    known. Values outside this set are rejected at write time.
+  - `unknown` — transport could not be classified. A stored value outside this
+    set is read back as `unknown`, and a warning is logged without the raw
+    value. New writes still reject a transport outside the set.
+  The executor records each tool attempt that reached the run's tool tracker,
+  on the usage it returns for every terminal outcome (succeeded, failed,
+  cancelled, and timed out), including attempts from earlier cycles of the
+  same run. Only `name` and `transport` are stored. Arguments and results are
+  not persisted. A name the model supplied that is not a registered tool, or
+  a call refused by policy or reported as not found, is stored as the fixed
+  name `<unregistered>` with transport `unknown`. Recorded names are capped
+  at 64 bytes. Registered built-ins that make a network request
+  (`web_search`, `web_fetch`, `http_request`, `knowledge_import_url`,
+  `knowledge_extract`, `create_skill`, `convert_skill`, `bash`) use `http`.
+  Other registered in-process built-ins use `local`. `request.budget.max_tool_calls`
+  is enforced against that recorded list when `tool_calls` is present. Task
+  events on the shared bus do not add tool calls.
 
 ### 5.1 List response
 
@@ -519,17 +538,44 @@ entered the executor path).
   server when the run ends, never from task events. Events on the shared task
   event bus (including `TASK_COMPLETED` / `TASK_FAILED`) feed SSE streams only;
   other components and callers can publish there, so they never end an
-  invocation. `POST /api/v1/events` rejects every `TASK_*` event type
-  (case-insensitive) with `403 reserved_event_type` for every role, and sets
-  the event source to `external:http:<sub>` itself; a `source` member in the
-  body is ignored and dropped from the stored payload. The executor reports a terminal status: only an explicit success (`completed`, `success`,
+  invocation. `POST /api/v1/events` accepts only `CUSTOM` and types that start
+  with `EXT_`. Every other type is `403`: `TASK_*` (case-insensitive) is
+  `reserved_event_type`, and the rest — including `BATCH_*` and run-control
+  types — is `event_type_not_allowed`. Run-control events are posted on
+  dedicated routes (`POST /api/v1/control-events/intervention-required`,
+  `.../user-supplementary-input`, `.../human-approval-result`,
+  `.../threshold-exceeded`, `.../cycle-iteration`) and only by the task
+  `user_id` or a control-plane DA in the task's tenant and project. That DA
+  must have an explicit project claim; a defaulted project is rejected. A
+  missing or out-of-scope task is `404`, a same-scope non-owner is `403`, and
+  a payload over 64 KiB is `413`. Core writes (`POST /api/v1/events` and
+  `POST /api/v1/nodes`) use that same `404` (`not found`) for a missing task
+  and for a task outside the caller's tenant or project, so the status does
+  not reveal that the task exists. A platform admin may still write across
+  tenants. Tasks created by `POST /api/v1/tasks`, `POST /api/v1/tasks/stream`,
+  and invocation execution store `user_id` from the verified actor, not from
+  the request body. The server
+  sets the source to `external:http:<sub>`; a `source` member in the body is
+  ignored and dropped from the stored payload. Task console SSE and invocation
+  `progress` events drop any bus event whose source starts with `external:`,
+  so a caller cannot change the displayed phase or inject display text.
+  `GET /api/v1/batch/events` delivers a `BATCH_*` event only when its task
+  node — or, if that node is absent, `tenant_id` and `project_id` on the
+  payload — matches the subscriber's verified tenant and project. An internal
+  event whose source starts with `batch:` and which has neither a task node
+  nor those payload fields is delivered only to a platform admin. A non-2xx
+  answer from a streaming model call records only the status, model, and a
+  request id. The executor reports a terminal status: only an explicit success (`completed`, `success`,
   `succeeded`) can become `succeeded`; any other status (for example `timeout`
   or `partial_failure`) ends `failed` / `task_failed`, with the actual usage
   attached. A lagging SSE subscriber receives a `resync` event and should
   re-read the resource; the persisted state is authoritative.
 - Usage is metered per run and written to `result.usage` with the terminal
-  transition. A `succeeded` write requires complete usage per §5 (VAL-016 /
-  VAL-017); incomplete usage must not be persisted as `succeeded`.
+  transition, including tool attempts the executor recorded for that run
+  (§5) on success, failure, cancellation, and timeout.
+  A `succeeded` write requires complete usage per §5 (VAL-016 / VAL-017);
+  incomplete usage must not be persisted as `succeeded`. Usage that does not
+  match the §5 shape ends the run `failed` / `invalid_usage` and is not stored.
 - Execution is behind a configuration switch that defaults to **off**
   (`AGENTOS_INVOCATION_EXECUTION_ENABLED`). Keep it off in production until you
   intentionally enable the TaskExecutor bridge. Projection scoping (#310/#322)
@@ -556,7 +602,7 @@ entered the executor path).
 | `event` | When | Extra `data` members |
 | --- | --- | --- |
 | `state` | First event (snapshot), then every state transition | `state`, `previous_state` (null in the snapshot), `snapshot` (true only on the first event), `invocation` (full resource, snapshot only) |
-| `progress` | Execution progress; not persisted, `revision` unchanged | `phase` (optional), `message` (optional, safe text) |
+| `progress` | Execution progress; not persisted, `revision` unchanged. Events whose source starts with `external:` are not sent | `phase` (optional), `message` (optional, safe text), `source` |
 | `result` | Once, on `succeeded` | `state`, `result` (with `usage`) |
 | `error` | Once, on `failed` | `state`, `error` (`{code, message}`), `usage` (optional) |
 | `resync` | Subscriber lagged and events were dropped | none; re-read the resource |

@@ -1,8 +1,18 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::core::tool_controller::{classify_recorded_tool_call, UNREGISTERED_TOOL_NAME};
+use crate::gateway::usage_meter::RunUsageMeter;
+
+/// How a tool attempt should be classified into the run's usage meter.
+pub struct ToolUsageClass {
+    pub registered: bool,
+    pub policy_denied: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
@@ -38,6 +48,7 @@ pub struct ActionTracker {
     pub task_iri: String,
     pub agent_role: String,
     pub started_at: DateTime<Utc>,
+    usage_meter: Option<Arc<RunUsageMeter>>,
 }
 
 impl ActionTracker {
@@ -47,10 +58,70 @@ impl ActionTracker {
             task_iri: task_iri.to_string(),
             agent_role: agent_role.to_string(),
             started_at: Utc::now(),
+            usage_meter: None,
+        }
+    }
+
+    pub fn with_usage_meter(mut self, meter: Option<Arc<RunUsageMeter>>) -> Self {
+        self.usage_meter = meter;
+        self
+    }
+
+    /// Records a policy refusal that never reached [`Self::record`]. The raw
+    /// model name is not stored.
+    pub fn note_unregistered_attempt(&self) {
+        if let Some(meter) = &self.usage_meter {
+            meter.record_tool_call(UNREGISTERED_TOOL_NAME, "unknown");
         }
     }
 
     pub fn record(&mut self, tool_name: &str, args: &Value, result: &Value, duration_secs: f64) {
+        self.record_classified(
+            tool_name,
+            args,
+            result,
+            duration_secs,
+            ToolUsageClass {
+                registered: true,
+                policy_denied: false,
+            },
+        );
+    }
+
+    /// Records the action and, when this tracker is bound to a run meter,
+    /// the classified name and transport. Arguments stay on the in-memory
+    /// action only.
+    pub fn record_classified(
+        &mut self,
+        tool_name: &str,
+        args: &Value,
+        result: &Value,
+        duration_secs: f64,
+        class: ToolUsageClass,
+    ) {
+        self.meter_tool_call(tool_name, &class, result);
+        self.record_action(tool_name, args, result, duration_secs);
+    }
+
+    fn meter_tool_call(&self, tool_name: &str, class: &ToolUsageClass, result: &Value) {
+        let Some(meter) = &self.usage_meter else {
+            return;
+        };
+        let reported_missing = result
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|msg| {
+                msg.contains("Tool not found") || msg.contains("no registered executable skill")
+            });
+        let (name, transport) = classify_recorded_tool_call(
+            tool_name,
+            class.registered && !reported_missing,
+            class.policy_denied || reported_missing,
+        );
+        meter.record_tool_call(name, transport);
+    }
+
+    fn record_action(&mut self, tool_name: &str, args: &Value, result: &Value, duration_secs: f64) {
         let mut action = TrackedAction {
             action_id: format!("act_{}", uuid::Uuid::new_v4().hyphenated()),
             tool_name: tool_name.to_string(),

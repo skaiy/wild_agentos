@@ -15,13 +15,16 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::api::http::control_plane_route_auth_tests::{test_state_with_invocations, EnvGuard};
-use crate::api::http::invocations_enforcement::{FifoScheduler, InputRefRegistry};
+use crate::api::http::invocations_enforcement::{
+    FifoScheduler, InputRefRegistry, BUDGET_EXCEEDED_ERROR_CODE,
+};
 use crate::api::http::invocations_execution::{
     claims_from_invocation, projection_context_is_nonempty, InvocationExecutionBridge,
     ProjectionContextGate, ScopedProjectionGate, PROJECTION_GATE_FRAME,
 };
 use crate::api::http::invocations_store::{
-    InvocationStoreConfig, PROJECTION_CONTEXT_MISSING_ERROR_CODE,
+    record_builtin_tool_calls, InvocationStoreConfig, InvocationToolCallUsage,
+    PROJECTION_CONTEXT_MISSING_ERROR_CODE,
 };
 use crate::api::http::{TaskExecSpec, TaskExecutor, TaskOutcome, TEST_ENV_LOCK};
 use crate::core::core_types::SemanticCore;
@@ -39,6 +42,9 @@ struct MockExecutor {
 #[derive(Clone, Copy)]
 enum MockMode {
     SucceedWithUsage,
+    SucceedWithWebSearch,
+    SucceedWithTwoWebSearches,
+    SucceedWithMalformedUsage,
     SucceedWithoutUsage,
     Fail,
     HangUntilCancel,
@@ -91,6 +97,56 @@ impl TaskExecutor for MockExecutor {
                 )
                 .await;
                 TaskOutcome::completed("succeeded", "mock-ok", usage_value(full_usage()))
+            }
+            MockMode::SucceedWithWebSearch => {
+                // Bus TOOL_CALL is display-only. The bridge records the calls
+                // on the returned usage, which never includes arguments.
+                let arguments = json!({"query": "never persist this"});
+                self.events
+                    .emit(
+                        &spec.task_iri,
+                        "TOOL_CALL",
+                        "mock",
+                        &json!({
+                            "event": {
+                                "ToolCall": {
+                                    "tool_name": "web_search",
+                                    "arguments_json": arguments
+                                }
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                let usage = record_builtin_tool_calls(usage_value(full_usage()), ["web_search"]);
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_COMPLETED",
+                    json!({"status": "succeeded", "summary": "mock-ok", "usage": usage.clone()}),
+                )
+                .await;
+                TaskOutcome::completed("succeeded", "mock-ok", usage)
+            }
+            MockMode::SucceedWithTwoWebSearches => {
+                let usage = record_builtin_tool_calls(
+                    usage_value(full_usage()),
+                    ["web_search", "web_search"],
+                );
+                self.emit_terminal(
+                    &spec.task_iri,
+                    "TASK_COMPLETED",
+                    json!({"status": "succeeded", "summary": "mock-ok", "usage": usage.clone()}),
+                )
+                .await;
+                TaskOutcome::completed("succeeded", "mock-ok", usage)
+            }
+            MockMode::SucceedWithMalformedUsage => {
+                let mut usage = usage_value(full_usage()).expect("usage");
+                usage.tool_calls = Some(vec![InvocationToolCallUsage {
+                    name: "web_search".into(),
+                    transport: Some("smtp".into()),
+                }]);
+                TaskOutcome::completed("succeeded", "must-not-succeed", Some(usage))
             }
             MockMode::SucceedWithoutUsage => {
                 self.emit_terminal(
@@ -339,6 +395,78 @@ async fn bridge_incomplete_usage_fails_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_malformed_usage_fails_closed() {
+    let h = make_bridge_harness(
+        MockMode::SucceedWithMalformedUsage,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(inv.state, InvocationState::Failed);
+    assert_eq!(
+        inv.error.as_ref().map(|error| error.code.as_str()),
+        Some("invalid_usage")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_records_builtin_tool_calls_without_arguments_or_results() {
+    let h = make_bridge_harness(
+        MockMode::SucceedWithWebSearch,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(&h.router, &alice(), body()).await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(inv.state, InvocationState::Succeeded);
+    let tool_calls = inv
+        .result
+        .as_ref()
+        .and_then(|result| result.usage.as_ref())
+        .and_then(|usage| usage.tool_calls.as_ref())
+        .expect("built-in tool call usage");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].name, "web_search");
+    assert_eq!(tool_calls[0].transport.as_deref(), Some("http"));
+    let persisted = serde_json::to_string(&tool_calls).unwrap();
+    assert!(!persisted.contains("arguments_json"));
+    assert!(!persisted.contains("never persist this"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_max_tool_calls_fails_after_recorded_builtin_calls() {
+    let h = make_bridge_harness(
+        MockMode::SucceedWithTwoWebSearches,
+        Arc::new(ScopedProjectionGate),
+    );
+    let created = create_inv(
+        &h.router,
+        &alice(),
+        json!({"prompt": "search", "budget": {"max_tool_calls": 1}}),
+    )
+    .await;
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(inv.state, InvocationState::Failed);
+    assert_eq!(
+        inv.error.as_ref().map(|error| error.code.as_str()),
+        Some(BUDGET_EXCEEDED_ERROR_CODE)
+    );
+    assert_eq!(
+        inv.result
+            .as_ref()
+            .and_then(|result| result.usage.as_ref())
+            .and_then(|usage| usage.tool_calls.as_ref())
+            .map(Vec::len),
+        Some(2)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bridge_task_failed_path() {
     let h = make_bridge_harness(MockMode::Fail, Arc::new(ScopedProjectionGate));
     let created = create_inv(&h.router, &alice(), body()).await;
@@ -576,15 +704,26 @@ async fn running_invocation(h: &BridgeHarness) -> (String, String) {
 /// after a real cancel it ends `cancelled`, never `succeeded`.
 async fn assert_not_closed_by_forgery(h: &BridgeHarness, id: &str) {
     let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let inv = h.store.get_for_claims(&claims, id).await.unwrap();
-    assert_eq!(
-        inv.state,
-        InvocationState::Running,
-        "forged event must not end the run: {:?} {:?}",
-        inv.result,
-        inv.error
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let inv = h.store.get_for_claims(&claims, id).await.unwrap();
+        if inv.state == InvocationState::Running {
+            break;
+        }
+        assert!(
+            !inv.state.is_terminal(),
+            "forged event must not end the run: {:?} {:?}",
+            inv.result,
+            inv.error
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never running: {:?} {:?}",
+            inv.state,
+            inv.error
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let cancel = call(
         &h.router,
         "POST",
@@ -629,15 +768,16 @@ async fn forged_terminal_event_from_same_scope_member_is_rejected() {
     assert_not_closed_by_forgery(&h, &id).await;
 }
 
-/// B1 layer 1: a DA of another tenant (which `authorize_core_write` still lets
-/// through, #395) cannot post a terminal event either.
+/// B1 layer 1: a DA of another tenant cannot post a terminal event.
+/// Out-of-scope core writes return the same 404 as a missing task (#395),
+/// so the reserved `TASK_*` check is never reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forged_terminal_event_from_cross_tenant_da_is_rejected() {
     let h = make_bridge_harness(MockMode::HangUntilCancel, Arc::new(ScopedProjectionGate));
     let (id, task_iri) = running_invocation(&h).await;
     let mallory = super::tests::token("mallory", "tenant-b", Some("project-z"), &["DA"]);
     let status = post_event(&h, &mallory, forged_terminal_body(&task_iri)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_not_closed_by_forgery(&h, &id).await;
 }
 
