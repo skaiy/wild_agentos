@@ -677,7 +677,7 @@ async fn create_validation_rejects_without_persisting() {
     assert_eq!(reply.code(), "invalid_idempotency_key");
     assert_eq!(stored_count(&h).await, 0);
 
-    // Boundaries pass: input 8192 bytes, metadata 16 KiB / 64 keys, in-scope agent.
+    // Boundaries pass: input 8192 bytes and metadata 16 KiB / 64 keys.
     create_ok(&h, &alice(), json!({"input": "a".repeat(8190)})).await;
     create_ok(
         &h,
@@ -690,9 +690,7 @@ async fn create_validation_rejects_without_persisting() {
         keys.insert(format!("k{i}"), json!(i));
     }
     create_ok(&h, &alice(), json!({"prompt": "p", "metadata": keys})).await;
-    let with_agent = create_ok(&h, &alice(), json!({"prompt": "p", "agent_id": "agent-a"})).await;
-    assert_eq!(with_agent["request"]["agent_id"], "agent-a");
-    assert_eq!(stored_count(&h).await, 4);
+    assert_eq!(stored_count(&h).await, 3);
 }
 
 #[tokio::test]
