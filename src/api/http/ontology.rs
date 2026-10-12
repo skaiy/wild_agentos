@@ -8,11 +8,12 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::error;
@@ -713,10 +714,17 @@ fn default_stale_draft_hours() -> i64 {
 pub(crate) async fn ontology_health_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Query(query): Query<OntologyHealthQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
+    // Authenticate before the query string is parsed. A repeated or unknown
+    // key such as `?kind=a&kind=b` must be 401 for an anonymous caller, not
+    // the query parser's 400.
     let Some(claims) = identity.isolation_claims() else {
         return unauthorized_isolation_claims().into_response();
+    };
+    let query: OntologyHealthQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
     };
     if query.stale_draft_hours < 0 {
         return (
@@ -913,10 +921,14 @@ pub(crate) async fn constrained_extraction_query_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     Path(extraction_id): Path<String>,
-    Query(query): Query<StagingQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     let Some(claims) = identity.isolation_claims() else {
         return unauthorized_isolation_claims().into_response();
+    };
+    let query: StagingQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
     };
     let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
         Ok(kg) => kg,
@@ -2318,6 +2330,30 @@ fn unauthorized_isolation_claims() -> (StatusCode, Json<Value>) {
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "verified JWT isolation claims are required" })),
     )
+}
+
+/// Parses a query string only after the caller has been authenticated.
+/// Failures use a fixed body so the parameter schema is not echoed.
+fn parse_verified_query<T: DeserializeOwned>(raw: Option<&str>) -> Result<T, Box<Response>> {
+    let uri = match raw {
+        Some(query) if !query.is_empty() => format!("http://localhost/?{query}"),
+        _ => "http://localhost/".to_string(),
+    };
+    let uri: axum::http::Uri = uri
+        .parse()
+        .map_err(|_| Box::new(invalid_query_response()))?;
+    match Query::<T>::try_from_uri(&uri) {
+        Ok(Query(value)) => Ok(value),
+        Err(_) => Err(Box::new(invalid_query_response())),
+    }
+}
+
+fn invalid_query_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "invalid query string"})),
+    )
+        .into_response()
 }
 
 /// 本体实例 IRI：https://agentos.ontology/ev/{ObjectType}/{key}
@@ -4971,6 +5007,93 @@ mod ontology_crud_tests {
             "reject must discard staged writes"
         );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Anonymous callers are authenticated before the query string is parsed.
+    /// `?kind=a&kind=b` used to be a 400 from the query extractor, and the body
+    /// named the expected fields.
+    #[tokio::test]
+    async fn anonymous_duplicate_kind_query_is_unauthorized_before_parse() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_query_auth_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _env = super::super::control_plane_route_auth_tests::EnvGuard::set(&[
+            ("AGENTOS_AUTH_MODE", "hs256".into()),
+            (
+                "AGENTOS_JWT_SECRET",
+                "test-hs256-secret-at-least-32-bytes-long".into(),
+            ),
+            ("AGENTOS_DATA_DIR", tmp.to_string_lossy().into_owned()),
+        ]);
+        let state = make_state(&tmp);
+        let app = Router::new()
+            .route("/api/v1/ontology/health", get(ontology_health_handler))
+            .route(
+                "/api/v1/ontology/constrained-extractions/:id",
+                get(constrained_extraction_query_handler),
+            )
+            .with_state(state);
+
+        let probe = |uri: &str, token: Option<&str>| {
+            let mut request = axum::http::Request::builder().uri(uri);
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            request.body(axum::body::Body::empty()).unwrap()
+        };
+        let text_of = |response: axum::response::Response| async move {
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+
+        for uri in [
+            "/api/v1/ontology/health?kind=a&kind=b",
+            "/api/v1/ontology/health",
+            "/api/v1/ontology/constrained-extractions/extraction-1?kind=a&kind=b",
+        ] {
+            let (status, body) =
+                text_of(app.clone().oneshot(probe(uri, None)).await.unwrap()).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} -> {body}");
+            assert!(
+                body.contains("verified JWT isolation claims are required"),
+                "{uri} -> {body}"
+            );
+            assert!(
+                !body.contains("sparse_type_threshold") && !body.contains("sparql"),
+                "query schema leaked: {uri} -> {body}"
+            );
+        }
+
+        let token = test_jwt("tenant-a");
+        let (status, body) = text_of(
+            app.clone()
+                .oneshot(probe("/api/v1/ontology/health?kind=a&kind=b", Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid query string"), "{body}");
+        assert!(!body.contains("sparse_type_threshold"), "{body}");
+
+        let (status, body) = text_of(
+            app.clone()
+                .oneshot(probe(
+                    "/api/v1/ontology/constrained-extractions/extraction-1?kind=a&kind=b",
+                    Some(&token),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("invalid query string"), "{body}");
+        assert!(!body.contains("sparql"), "{body}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
