@@ -1279,6 +1279,179 @@ async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
     assert!(no_usage.get("usage").is_none());
 }
 
+#[tokio::test]
+async fn invocation_usage_rejects_unknown_members_and_invalid_transport_at_write_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    let running = invocation_in(&store, &claims, InvocationState::Running).await;
+    let before = store.get_for_claims(&claims, &running.id).await.unwrap();
+    let invalid = InvocationUsage {
+        model: Some("model".into()),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+        cost: Some(1),
+        tool_calls: Some(vec![InvocationToolCallUsage {
+            name: "tool".into(),
+            transport: Some("smtp".into()),
+        }]),
+        ..InvocationUsage::default()
+    };
+    assert_eq!(
+        store
+            .transition_for_claims(
+                &claims,
+                &running.id,
+                None,
+                InvocationState::Succeeded,
+                TransitionPatch {
+                    result: Some(InvocationResult {
+                        summary: "nope".into(),
+                        artifacts: vec![],
+                        usage: Some(invalid),
+                    }),
+                    ..TransitionPatch::default()
+                },
+            )
+            .await,
+        Err(InvocationStoreError::InvalidUsage(
+            "tool_calls[].transport must be mcp, http, a2a, local, or unknown"
+        ))
+    );
+    assert_eq!(
+        store.get_for_claims(&claims, &running.id).await.unwrap(),
+        before
+    );
+
+    let malformed = serde_json::json!({
+        "model": "model",
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cost": 1,
+        "extra": true
+    });
+    assert!(serde_json::from_value::<InvocationUsage>(malformed).is_err());
+
+    let legacy = serde_json::json!({
+        "tool_calls": [{ "name": "t", "transport": "grpc" }]
+    });
+    let parsed: InvocationUsage = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        parsed.tool_calls.unwrap()[0].transport.as_deref(),
+        Some("unknown")
+    );
+}
+
+/// A pre-upgrade row whose transport is outside the closed set must still
+/// open. The value is read as `unknown`; writes of that value stay rejected.
+#[tokio::test]
+async fn poc424_legacy_row_with_non_closed_transport_blocks_store_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let claims = alice();
+    let id = {
+        let store = open_store(&dir);
+        let running = invocation_in(&store, &claims, InvocationState::Running).await;
+        store
+            .transition_for_claims(
+                &claims,
+                &running.id,
+                None,
+                InvocationState::Succeeded,
+                TransitionPatch {
+                    result: Some(InvocationResult {
+                        summary: "ok".into(),
+                        artifacts: vec![],
+                        usage: Some(InvocationUsage {
+                            model: Some("m".into()),
+                            input_tokens: Some(1),
+                            output_tokens: Some(1),
+                            cost: Some(1),
+                            cost_source: Some(CostSource::Gateway),
+                            tool_calls: Some(vec![InvocationToolCallUsage {
+                                name: "t".into(),
+                                transport: Some("http".into()),
+                            }]),
+                            ..InvocationUsage::default()
+                        }),
+                    }),
+                    ..TransitionPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        running.id
+    };
+    let path = dir.path().join("invocations.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("\"transport\":\"http\""), "{raw}");
+    std::fs::write(
+        &path,
+        raw.replace("\"transport\":\"http\"", "\"transport\":\"grpc\""),
+    )
+    .unwrap();
+    let (reopened, _) = InvocationStore::open(&path).expect("legacy row must not block open");
+    let loaded = reopened.get_for_claims(&claims, &id).await.unwrap();
+    let transport = loaded
+        .result
+        .unwrap()
+        .usage
+        .unwrap()
+        .tool_calls
+        .unwrap()
+        .pop()
+        .unwrap()
+        .transport;
+    assert_eq!(transport.as_deref(), Some("unknown"));
+}
+
+#[test]
+fn builtin_tool_calls_record_name_and_transport_only() {
+    assert!(record_builtin_tool_calls(None, ["", "  "]).is_none());
+    let usage = record_builtin_tool_calls(
+        Some(InvocationUsage {
+            model: Some("model".into()),
+            ..InvocationUsage::default()
+        }),
+        [
+            "web_search",
+            "web_fetch",
+            "http_request",
+            "knowledge_import_url",
+            "knowledge_extract",
+            "create_skill",
+            "convert_skill",
+            "bash",
+            "file_read",
+        ],
+    )
+    .unwrap();
+    let calls = usage.tool_calls.expect("tool calls");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.transport.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("web_search", Some("http")),
+            ("web_fetch", Some("http")),
+            ("http_request", Some("http")),
+            ("knowledge_import_url", Some("http")),
+            ("knowledge_extract", Some("http")),
+            ("create_skill", Some("http")),
+            ("convert_skill", Some("http")),
+            ("bash", Some("http")),
+            ("file_read", Some("local")),
+        ]
+    );
+    let persisted = serde_json::to_value(&calls).unwrap();
+    for call in persisted.as_array().unwrap() {
+        let object = call.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        assert!(object.contains_key("name"));
+        assert!(object.contains_key("transport"));
+    }
+}
+
 /// Fills the store with terminal (`succeeded`) records, all inside the
 /// retention window, until it holds exactly [`MAX_STORED_INVOCATIONS`].
 /// Writes memory and disk directly: 10 000 single creates would rewrite the

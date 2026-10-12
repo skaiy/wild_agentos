@@ -665,8 +665,8 @@ pub(crate) async fn activate_embedding_handler(
                 kbs,
             )
         }
-        Err(e) => (
-            format!("配置已持久化，但向量库热切换失败：{e}"),
+        Err(error) => (
+            format!("配置已持久化，但向量库热切换失败：{error}"),
             false,
             0usize,
         ),

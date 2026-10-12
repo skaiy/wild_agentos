@@ -2,7 +2,7 @@
 //! the real `HttpTaskExecutor` (not a mock executor) → a local
 //! OpenAI-compatible stub LLM that reports `usage`. No real model or network.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -625,4 +625,351 @@ async fn production_run_meters_a_2xx_reply_that_failed_to_parse() {
     assert_eq!(usage.output_tokens, Some(calls * COMPLETION_TOKENS));
     assert_eq!(usage.cost, Some(calls * CALL_COST_MICRO_USD));
     assert_eq!(usage.cost_source, Some(CostSource::Gateway));
+}
+
+// ── PoC #424: tool attempts survive retries and drop argument text ────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum ToolStubMode {
+    /// Cycle 1 Do: two glob_search calls, then finish.
+    SingleCycle,
+    /// Cycle 1 Do: two glob_search + one failing file_write, then finish.
+    /// partial_success makes the outer PDCA loop retry; cycle 2 finishes
+    /// without tools.
+    RetryCycle,
+    /// One call whose name is not registered and embeds argument text.
+    StuffedName,
+}
+
+struct ToolStub {
+    mode: ToolStubMode,
+    served: AtomicBool,
+    tool_calls_served: AtomicUsize,
+}
+
+const STUFFED_TOOL_SECRET: &str = "secret-payload-9f3a-do-not-persist";
+
+fn tool_stub_reply(stub: &ToolStub, body: &Value) -> (String, Option<Value>) {
+    if body["messages"]
+        .to_string()
+        .contains("task planning expert")
+    {
+        return (stub_content(body), None);
+    }
+    let has_tools = body["tools"].as_array().is_some_and(|t| !t.is_empty());
+    let has_tool_msgs = body["messages"]
+        .as_array()
+        .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"));
+    if has_tools && !has_tool_msgs && !stub.served.swap(true, Ordering::SeqCst) {
+        let calls = match stub.mode {
+            ToolStubMode::StuffedName => vec![json!({
+                "id": "c1",
+                "type": "function",
+                "function": {
+                    "name": format!("{STUFFED_TOOL_SECRET} {{\"path\":\"/etc/passwd\"}}"),
+                    "arguments": format!("{{\"{STUFFED_TOOL_SECRET}\":\"*.nothing\"}}"),
+                }
+            })],
+            ToolStubMode::SingleCycle | ToolStubMode::RetryCycle => {
+                let mut calls = vec![
+                    json!({"id":"c1","type":"function","function":{"name":"glob_search","arguments":"{\"pattern\":\"*.nothing\"}"}}),
+                    json!({"id":"c2","type":"function","function":{"name":"glob_search","arguments":"{\"pattern\":\"*.nothing2\"}"}}),
+                ];
+                if stub.mode == ToolStubMode::RetryCycle {
+                    calls.push(json!({"id":"c3","type":"function","function":{"name":"file_write","arguments":"{}"}}));
+                }
+                calls
+            }
+        };
+        stub.tool_calls_served
+            .fetch_add(calls.len(), Ordering::SeqCst);
+        return (
+            r#"{"action":"tool_call","content":"","summary":"calling tools"}"#.to_string(),
+            Some(Value::Array(calls)),
+        );
+    }
+    if has_tools {
+        return (
+            r#"{"action":"finish","content":"Done","summary":"Done"}"#.to_string(),
+            None,
+        );
+    }
+    ("Done.".to_string(), None)
+}
+
+fn tool_stub_sse(content: &str, calls: &Option<Value>, finish: &str) -> String {
+    let usage = stub_usage(COST_AND_USAGE);
+    let mut frames = vec![json!({
+        "id": "s",
+        "model": STUB_MODEL,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": content},
+            "finish_reason": null
+        }],
+        "usage": null
+    })];
+    if let Some(Value::Array(calls)) = calls {
+        for (i, call) in calls.iter().enumerate() {
+            frames.push(json!({
+                "id": "s",
+                "model": STUB_MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": i,
+                            "id": call["id"],
+                            "type": "function",
+                            "function": call["function"]
+                        }]
+                    },
+                    "finish_reason": null
+                }],
+                "usage": null
+            }));
+        }
+    }
+    frames.push(json!({
+        "id": "s",
+        "model": STUB_MODEL,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+        "usage": null
+    }));
+    frames.push(json!({
+        "id": "s",
+        "model": STUB_MODEL,
+        "choices": [],
+        "usage": usage
+    }));
+    let mut sse: String = frames
+        .into_iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+    sse.push_str("data: [DONE]\n\n");
+    sse
+}
+
+async fn spawn_tool_stub(mode: ToolStubMode) -> (String, Arc<ToolStub>) {
+    let stub = Arc::new(ToolStub {
+        mode,
+        served: AtomicBool::new(false),
+        tool_calls_served: AtomicUsize::new(0),
+    });
+    let shared = stub.clone();
+    let handler = move |axum::Json(body): axum::Json<Value>| {
+        let stub = shared.clone();
+        async move {
+            let (content, calls) = tool_stub_reply(&stub, &body);
+            let finish = if calls.is_some() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            if body["stream"].as_bool() == Some(true) {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    tool_stub_sse(&content, &calls, finish),
+                )
+                    .into_response()
+            } else {
+                axum::Json(json!({
+                    "id": "c",
+                    "model": STUB_MODEL,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                            "tool_calls": calls
+                        },
+                        "finish_reason": finish
+                    }],
+                    "usage": stub_usage(COST_AND_USAGE),
+                }))
+                .into_response()
+            }
+        }
+    };
+    let app = Router::new().route("/v1/chat/completions", axum::routing::post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), stub)
+}
+
+async fn tool_harness(mode: ToolStubMode) -> (UsageHarness, Arc<ToolStub>) {
+    let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let env_guard = env(true);
+    let dir = tempfile::tempdir().unwrap();
+    let (base_url, stub) = spawn_tool_stub(mode).await;
+    let (store, _) = InvocationStore::open_with_config(
+        dir.path().join("invocations.json"),
+        InvocationStoreConfig::default(),
+    )
+    .unwrap();
+    let store = Arc::new(store);
+    let bootstrap = test_state_with_invocations(
+        dir.path(),
+        InvocationsRuntime::new(Some(store.clone()), true),
+    );
+    let settings = settings_for(&base_url, dir.path(), false);
+    let executor = Arc::new(HttpTaskExecutor::for_tests(&bootstrap.core, settings));
+    let input_refs = InputRefRegistry::new();
+    let runtime =
+        InvocationsRuntime::new(Some(store.clone()), true).with_input_refs(input_refs.clone());
+    let bridge = Arc::new(InvocationExecutionBridge::new_with_enforcement(
+        store.clone(),
+        runtime.cancellations().clone(),
+        bootstrap.core.clone(),
+        executor,
+        bootstrap.shutdown.clone(),
+        Arc::new(ScopedProjectionGate),
+        Arc::new(FifoScheduler::with_defaults()),
+        input_refs,
+    ));
+    let runtime = runtime.with_dispatcher(bridge);
+    let state = Arc::new(AppState {
+        core: bootstrap.core.clone(),
+        gateway: bootstrap.gateway.clone(),
+        kg_store: bootstrap.kg_store.clone(),
+        config_info: bootstrap.config_info.clone(),
+        agents_info: bootstrap.agents_info.clone(),
+        mcp_servers: bootstrap.mcp_servers.clone(),
+        user_agents: bootstrap.user_agents.clone(),
+        prompts: bootstrap.prompts.clone(),
+        kb_categories: bootstrap.kb_categories.clone(),
+        knowledge_bases: bootstrap.knowledge_bases.clone(),
+        knowledge_packs: bootstrap.knowledge_packs.clone(),
+        vector_store: bootstrap.vector_store.clone(),
+        blob_store: None,
+        task_executor: None,
+        batch_manager: None,
+        api_clients: bootstrap.api_clients.clone(),
+        api_keys: bootstrap.api_keys.clone(),
+        api_usage: bootstrap.api_usage.clone(),
+        online_corpus_jobs: bootstrap.online_corpus_jobs.clone(),
+        online_corpus_queue_capacity: bootstrap.online_corpus_queue_capacity,
+        invocations: runtime,
+        shutdown: bootstrap.shutdown.clone(),
+    });
+    (
+        UsageHarness {
+            router: router(state),
+            store,
+            stats: Arc::new(StubStats::default()),
+            _dir: dir,
+            _env: env_guard,
+            _lock: lock,
+        },
+        stub,
+    )
+}
+
+fn tool_names_of(inv: &Invocation) -> Option<Vec<(String, Option<String>)>> {
+    inv.result
+        .as_ref()
+        .and_then(|r| r.usage.as_ref())
+        .and_then(|u| u.tool_calls.as_ref())
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|call| (call.name.clone(), call.transport.clone()))
+                .collect()
+        })
+}
+
+fn assert_usage_omits_argument_text(inv: &Invocation) {
+    let usage = serde_json::to_string(usage_of(inv)).unwrap();
+    assert!(!usage.contains("*.nothing"), "{usage}");
+    assert!(!usage.contains(STUFFED_TOOL_SECRET), "{usage}");
+    assert!(!usage.contains("/etc/passwd"), "{usage}");
+}
+
+/// Control: one PDCA cycle records both calls and `max_tool_calls=1` trips.
+/// Deleting the executor's meter attach leaves `tool_calls` empty, so this
+/// run would succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poc424_single_cycle_records_calls_and_trips_budget() {
+    let (h, stub) = tool_harness(ToolStubMode::SingleCycle).await;
+    let id = create(
+        &h,
+        &alice(),
+        json!({"prompt":"list files","budget":{"max_tool_calls":1}}),
+    )
+    .await;
+    let inv = wait_terminal(&h, &id, &alice_claims()).await;
+    assert_eq!(stub.tool_calls_served.load(Ordering::SeqCst), 2);
+    assert_eq!(inv.state, InvocationState::Failed, "{inv:?}");
+    assert_eq!(inv.error.as_ref().unwrap().code, "budget_exceeded");
+    assert_eq!(
+        tool_names_of(&inv).as_deref(),
+        Some(
+            [
+                ("glob_search".to_string(), Some("local".to_string())),
+                ("glob_search".to_string(), Some("local".to_string())),
+            ]
+            .as_slice()
+        )
+    );
+    assert_usage_omits_argument_text(&inv);
+}
+
+/// A later PDCA cycle must not drop tool attempts recorded on an earlier
+/// cycle. Three calls with `max_tool_calls=1` end `failed` / `budget_exceeded`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poc424_pdca_retry_drops_earlier_cycle_calls() {
+    let (h, stub) = tool_harness(ToolStubMode::RetryCycle).await;
+    let id = create(
+        &h,
+        &alice(),
+        json!({"prompt":"list files","budget":{"max_tool_calls":1}}),
+    )
+    .await;
+    let inv = wait_terminal(&h, &id, &alice_claims()).await;
+    assert_eq!(stub.tool_calls_served.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        inv.state,
+        InvocationState::Failed,
+        "tool_calls={:?}",
+        tool_names_of(&inv)
+    );
+    assert_eq!(inv.error.as_ref().unwrap().code, "budget_exceeded");
+    assert_eq!(
+        tool_names_of(&inv).as_deref(),
+        Some(
+            [
+                ("glob_search".to_string(), Some("local".to_string())),
+                ("glob_search".to_string(), Some("local".to_string())),
+                ("file_write".to_string(), Some("local".to_string())),
+            ]
+            .as_slice()
+        )
+    );
+    assert_usage_omits_argument_text(&inv);
+}
+
+/// Stuffing argument text into an unregistered tool name must not persist.
+/// The attempt is `<unregistered>` / `unknown`. This goes through
+/// `HttpTaskExecutor`, so removing the meter attach in the executor drops
+/// the entry and this assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poc424_unregistered_name_is_placeholder_and_drops_payload() {
+    let (h, stub) = tool_harness(ToolStubMode::StuffedName).await;
+    let id = create(&h, &alice(), json!({"prompt":"list files"})).await;
+    let inv = wait_terminal(&h, &id, &alice_claims()).await;
+    assert_eq!(stub.tool_calls_served.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        inv.state,
+        InvocationState::Succeeded,
+        "error={:?}",
+        inv.error
+    );
+    assert_eq!(
+        tool_names_of(&inv).as_deref(),
+        Some([("<unregistered>".to_string(), Some("unknown".to_string()))].as_slice())
+    );
+    assert_usage_omits_argument_text(&inv);
 }

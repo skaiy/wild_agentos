@@ -1556,6 +1556,12 @@ pub struct BatchSettings {
     pub inject_related_entities: bool,
     #[serde(default)]
     pub agents: Vec<BatchAgentSettings>,
+    /// When both are set, batch events carry this tenant and project so SSE
+    /// subscribers in that scope can see them. Unset events stay unscoped.
+    #[serde(default)]
+    pub event_tenant_id: Option<String>,
+    #[serde(default)]
+    pub event_project_id: Option<String>,
 }
 
 fn default_batch_default_model() -> String {

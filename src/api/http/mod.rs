@@ -124,8 +124,10 @@ use api_clients::{
 use config::{config_handler, hot_reload_models, update_config_handler};
 pub(crate) use core_ops::expand_iri;
 use core_ops::{
-    control_batch_agent_handler, emit_event_handler, get_projection_handler, kg_import_handler,
-    kg_query_handler, list_batch_agents_handler, list_blackboard_nodes_handler,
+    control_batch_agent_handler, emit_cycle_iteration_handler, emit_event_handler,
+    emit_human_approval_result_handler, emit_intervention_required_handler,
+    emit_threshold_exceeded_handler, emit_user_supplementary_input_handler, get_projection_handler,
+    kg_import_handler, kg_query_handler, list_batch_agents_handler, list_blackboard_nodes_handler,
     list_blackboard_tasks_handler, read_node_handler, stream_batch_events_handler,
     write_node_handler,
 };
@@ -495,6 +497,26 @@ pub fn build_router(
         .route("/api/v1/nodes/:node_iri", get(read_node_handler))
         .route("/api/v1/projections", post(get_projection_handler))
         .route("/api/v1/events", post(emit_event_handler))
+        .route(
+            "/api/v1/control-events/intervention-required",
+            post(emit_intervention_required_handler),
+        )
+        .route(
+            "/api/v1/control-events/user-supplementary-input",
+            post(emit_user_supplementary_input_handler),
+        )
+        .route(
+            "/api/v1/control-events/human-approval-result",
+            post(emit_human_approval_result_handler),
+        )
+        .route(
+            "/api/v1/control-events/threshold-exceeded",
+            post(emit_threshold_exceeded_handler),
+        )
+        .route(
+            "/api/v1/control-events/cycle-iteration",
+            post(emit_cycle_iteration_handler),
+        )
         .route("/api/v1/batch/events", get(stream_batch_events_handler))
         // ── 方案A 平台运维态：L2 黑板浏览器（只读）+ 批处理 Agent 运维台 ──
         .route(
