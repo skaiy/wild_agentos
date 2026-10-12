@@ -60,6 +60,7 @@ impl SystemPromptRegion {
             Self::OutputManagement => "# Output Management",
             Self::Tools => "# Tools",
             Self::ExtractionPrompt => "# Emphasized Content",
+            Self::DefinitionInstructions => "# Definition Instructions",
         }
     }
 }

@@ -13,13 +13,36 @@
 //! | Anonymous 401 on all 5 routes × STRICT on/off | partial (#317 events) | `invocations_routes_reject_unverified_callers_with_401` in `invocations_tests` |
 //! | Cross-tenant / cross-project / missing id → byte-identical 404 | partial | `cross_scope_get_and_cancel_are_byte_identical_404`, `events_cross_scope_is_byte_identical_404` |
 //! | Switch off → 503 `execution_disabled`, nothing persisted | done (#314) | `create_is_503_execution_disabled_by_default_and_persists_nothing` |
-//! | Idempotent replay / conflict / concurrent create | TODO (#315) | — |
+//! | Idempotent replay / conflict / concurrent create | done | `invocations_idempotency_tests::*` |
 //! | Illegal transition / If-Match | partial (#316/#314) | `cancel_rules_owner_da_if_match_and_lifecycle` |
 //! | SSE snapshot + terminal close | partial (#317) | `events_route_emits_snapshot_and_closes_on_terminal` |
 //! | VAL-016 / VAL-017 usage on succeeded | partial (#317 helper) | `invocations_execution::tests::*` |
 
 #![allow(dead_code)]
 
-// Intentionally no executable tests yet in this file: the named coverage above
-// already lives next to the handlers. Add new integrator-facing cases here as
-// #315 / the full #317 bridge land, and keep the mapping table in sync.
+use serde_json::json;
+
+use super::agents::{resolve_definition_revision, AgentDefinitionLookupError};
+
+/// Definition targets follow the same no-cross-scope-disclosure rule as
+/// invocation resources: a resolver can distinguish the condition internally
+/// only to map it to the public 404 contract.
+#[test]
+fn definition_target_cross_scope_is_not_resolvable() {
+    let agents = vec![json!({
+        "id": "scoped_agent",
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "active_revision": "1",
+        "revisions": [{
+            "revision": "1",
+            "system_prompt": "system",
+            "model": "model",
+            "created_at": "2026-01-01T00:00:00Z"
+        }]
+    })];
+    assert_eq!(
+        resolve_definition_revision(&agents, "tenant-b", "project-a", "scoped_agent", Some("1")),
+        Err(AgentDefinitionLookupError::OutOfScope)
+    );
+}

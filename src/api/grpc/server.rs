@@ -818,7 +818,11 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             &self.settings,
         );
         sa = sa.with_isolation_claims(spec.isolation_claims.clone());
-        if let Some(model) = spec.model.as_deref().filter(|model| !model.trim().is_empty()) {
+        if let Some(model) = spec
+            .model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+        {
             sa.set_model(model);
         }
         if let Some(system_prompt) = spec
