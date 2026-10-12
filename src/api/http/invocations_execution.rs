@@ -926,7 +926,7 @@ async fn apply_task_outcome(
         }
         let usage_for_log = usage.clone();
         let result = InvocationResult {
-            artifacts: structured_artifacts(&invocation, &summary),
+            artifacts: structured_artifacts(invocation, &summary),
             summary,
             usage,
         };
