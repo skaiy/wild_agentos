@@ -1043,7 +1043,7 @@ graph TB
     end
     
     subgraph API["API Layer"]
-        GRPC["gRPC Server<br/>tonic [::1]:50051"]
+        GRPC["gRPC Server<br/>tonic 127.0.0.1:50051"]
         HTTP["HTTP Edge Daemon<br/>axum :8080"]
     end
     
@@ -1089,6 +1089,8 @@ graph TB
     Core --> Infra
     Tools --> Memory
 ```
+
+The gRPC server listens on `127.0.0.1:50051` unless `api.grpc_addr` names another socket address. A bare-metal or systemd deployment must set `AGENT_OS_API_GRPC_ADDR` itself when the process should accept connections on another address. Every gRPC client must send `authorization: Bearer <jwt>` metadata. That token is checked when the call is accepted and is not checked again if it expires while a stream is open. An unparseable address fails process startup.
 
 ### 11.2 Data Flow: The Modern Wild AgentOS in Action
 
