@@ -280,6 +280,7 @@ fn invocations_lifecycle_audit_events_are_capped() {
         state: InvocationState::Queued,
         revision: 1,
         request: InvocationRequest::default(),
+        agent_definition: None,
         task_iri: None,
         result: None,
         error: None,

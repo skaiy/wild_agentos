@@ -569,6 +569,7 @@ fn claims_from_invocation_round_trips_scope() {
         state: InvocationState::Queued,
         revision: 1,
         request: Default::default(),
+        agent_definition: None,
         task_iri: None,
         result: None,
         error: None,

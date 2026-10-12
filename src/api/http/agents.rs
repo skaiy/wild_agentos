@@ -344,6 +344,7 @@ pub(crate) async fn create_agent_handler(
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "verified isolation claims required for agent creation" })),
             )
+                .into_response()
         }
     };
     let is_definition = req.id.is_some()
@@ -418,6 +419,7 @@ pub(crate) async fn create_agent_handler(
         StatusCode::CREATED,
         Json(json!({ "id": id, "status": "created", "agent": agent })),
     )
+        .into_response()
 }
 
 #[derive(Deserialize)]
