@@ -287,6 +287,8 @@ pub(crate) async fn stream_task_handler(
         Some(executor) => {
             let spec = TaskExecSpec {
                 prompt: req.prompt.clone(),
+                system_prompt: None,
+                model: None,
                 task_iri: task_iri.clone(),
                 include_thought: req.include_thought.unwrap_or(true),
                 include_tool_calls: req.include_tool_calls.unwrap_or(true),

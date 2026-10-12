@@ -818,6 +818,16 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             &self.settings,
         );
         sa = sa.with_isolation_claims(spec.isolation_claims.clone());
+        if let Some(model) = spec.model.as_deref().filter(|model| !model.trim().is_empty()) {
+            sa.set_model(model);
+        }
+        if let Some(system_prompt) = spec
+            .system_prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        {
+            sa = sa.with_system_prompt(system_prompt.to_string());
+        }
 
         let emitter = ExecutionEventEmitter::with_options(
             &spec.task_iri,

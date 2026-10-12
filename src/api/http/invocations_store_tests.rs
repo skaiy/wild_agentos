@@ -24,6 +24,7 @@ fn new_invocation() -> NewInvocation {
             metadata: Map::new(),
             ..InvocationRequest::default()
         },
+        agent_definition: None,
         task_iri: None,
         idempotency: None,
     }

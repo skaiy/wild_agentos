@@ -14,6 +14,7 @@ pub enum SystemPromptRegion {
     OutputManagement,
     Tools,
     ExtractionPrompt,
+    DefinitionInstructions,
 }
 
 /// Return the stable platform note that belongs in the environment region.
@@ -43,6 +44,7 @@ impl SystemPromptRegion {
             Self::OutputManagement => 8,
             Self::Tools => 9,
             Self::ExtractionPrompt => 10,
+            Self::DefinitionInstructions => 11,
         }
     }
 

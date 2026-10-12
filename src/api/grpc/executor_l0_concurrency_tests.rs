@@ -216,6 +216,8 @@ pub(super) async fn production_harness(llm_delay: Duration) -> Harness {
 pub(super) fn spec(task_iri: &str, claims: &IsolationClaims) -> TaskExecSpec {
     TaskExecSpec {
         prompt: "Say hello.".to_string(),
+        system_prompt: None,
+        model: None,
         task_iri: task_iri.to_string(),
         include_thought: false,
         include_tool_calls: false,

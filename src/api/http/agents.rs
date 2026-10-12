@@ -5,11 +5,88 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::iam::UserIdentity;
 use super::{data_dir, AppState};
+
+const MAX_AGENT_ID_BYTES: usize = 64;
+
+/// An immutable, executable snapshot of an agent definition.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub(crate) struct AgentDefinitionRevision {
+    pub revision: String,
+    pub system_prompt: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentDefinitionLookupError {
+    Missing,
+    OutOfScope,
+}
+
+/// Resolve one immutable definition snapshot. The caller maps `OutOfScope` to
+/// 404 so an id in another tenant or project is never observable.
+pub(crate) fn resolve_definition_revision(
+    agents: &[Value],
+    tenant_id: &str,
+    project_id: &str,
+    agent_id: &str,
+    requested_revision: Option<&str>,
+) -> Result<AgentDefinitionRevision, AgentDefinitionLookupError> {
+    let Some(agent) = agents
+        .iter()
+        .find(|agent| agent.get("id").and_then(Value::as_str) == Some(agent_id))
+    else {
+        return Err(AgentDefinitionLookupError::Missing);
+    };
+    if agent.get("tenant_id").and_then(Value::as_str) != Some(tenant_id)
+        || agent.get("project_id").and_then(Value::as_str) != Some(project_id)
+    {
+        return Err(AgentDefinitionLookupError::OutOfScope);
+    }
+    let revisions = agent
+        .get("revisions")
+        .and_then(Value::as_array)
+        .ok_or(AgentDefinitionLookupError::Missing)?;
+    let revision = requested_revision
+        .map(str::to_owned)
+        .or_else(|| {
+            agent
+                .get("active_revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or(AgentDefinitionLookupError::Missing)?;
+    revisions
+        .iter()
+        .find(|candidate| candidate.get("revision").and_then(Value::as_str) == Some(&revision))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or(AgentDefinitionLookupError::Missing)
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_AGENT_ID_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))
+}
+
+fn definition_request_error(message: &str) -> impl IntoResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid_agent_definition", "message": message })),
+    )
+}
 
 /// 用户态 Agent 的持久化文件路径。
 fn agents_store_path() -> std::path::PathBuf {
@@ -234,6 +311,8 @@ pub(crate) async fn list_agents_handler(
 
 #[derive(Deserialize)]
 pub struct AgentCreateRequest {
+    /// A tenant/project-local identifier. Omitted only for legacy user agents.
+    pub id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub business_domain: Option<String>,
@@ -245,6 +324,11 @@ pub struct AgentCreateRequest {
     pub enabled: Option<bool>,
     pub icon: Option<String>,
     pub color: Option<String>,
+    pub system_prompt: Option<String>,
+    pub model: Option<String>,
+    /// Stored verbatim. Terminal output validation is deliberately outside this
+    /// definition-layer contract.
+    pub output_schema: Option<Value>,
 }
 
 /// POST /api/v1/agents — 创建用户态 Agent 并持久化
@@ -262,8 +346,41 @@ pub(crate) async fn create_agent_handler(
             )
         }
     };
-    let agent = json!({
-        "id": uuid::Uuid::new_v4().hyphenated().to_string(),
+    let is_definition = req.id.is_some()
+        || req.system_prompt.is_some()
+        || req.model.is_some()
+        || req.output_schema.is_some();
+    let id = req
+        .id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
+    if is_definition && !valid_agent_id(&id) {
+        return definition_request_error(
+            "agent id must start with a lowercase letter and contain only lowercase letters, digits, hyphens, or underscores (maximum 64 bytes)",
+        )
+        .into_response();
+    }
+    let definition = match (req.system_prompt, req.model) {
+        (Some(system_prompt), Some(model))
+            if !system_prompt.trim().is_empty() && !model.trim().is_empty() =>
+        {
+            Some(AgentDefinitionRevision {
+                revision: "1".into(),
+                system_prompt,
+                model,
+                output_schema: req.output_schema,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+        }
+        (None, None) if !is_definition => None,
+        _ => {
+            return definition_request_error(
+                "agent definitions require non-empty system_prompt and model",
+            )
+            .into_response()
+        }
+    };
+    let mut agent = json!({
+        "id": id,
         "name": req.name,
         "description": req.description.unwrap_or_default(),
         "business_domain": req.business_domain.unwrap_or_default(),
@@ -277,14 +394,163 @@ pub(crate) async fn create_agent_handler(
         "project_id": claims.project_id(),
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
-    let id = agent["id"].as_str().unwrap_or("").to_string();
     let mut guard = state.user_agents.write().await;
+    if guard.iter().any(|existing| {
+        existing.get("id").and_then(Value::as_str) == agent.get("id").and_then(Value::as_str)
+            && existing.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && existing.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "agent_id_conflict", "message": "agent id already exists in this tenant and project" })),
+        )
+            .into_response();
+    }
+    if let Some(definition) = definition {
+        let definition = serde_json::to_value(definition).expect("definition serializes");
+        agent["active_revision"] = json!("1");
+        agent["revisions"] = json!([definition]);
+    }
+    let id = agent["id"].as_str().unwrap_or("").to_string();
     guard.push(agent.clone());
     persist_user_agents(&guard);
     (
         StatusCode::CREATED,
         Json(json!({ "id": id, "status": "created", "agent": agent })),
     )
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentRevisionCreateRequest {
+    pub system_prompt: String,
+    pub model: String,
+    pub output_schema: Option<Value>,
+}
+
+/// GET /api/v1/agents/:id/revisions — list immutable definition snapshots.
+pub(crate) async fn list_agent_revisions_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
+    let guard = state.user_agents.read().await;
+    let Some(agent) = guard.iter().find(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "agent not found" }))).into_response();
+    };
+    let Some(revisions) = agent.get("revisions").and_then(Value::as_array) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "agent not found" }))).into_response();
+    };
+    Json(json!({
+        "agent_id": id,
+        "active_revision": agent.get("active_revision").cloned().unwrap_or(Value::Null),
+        "revisions": revisions,
+    }))
+    .into_response()
+}
+
+/// POST /api/v1/agents/:id/revisions — append an immutable definition snapshot.
+pub(crate) async fn create_agent_revision_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<AgentRevisionCreateRequest>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
+    if req.system_prompt.trim().is_empty() || req.model.trim().is_empty() {
+        return definition_request_error("agent definitions require non-empty system_prompt and model")
+            .into_response();
+    }
+    let mut guard = state.user_agents.write().await;
+    let Some(agent) = guard.iter_mut().find(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "agent not found" }))).into_response();
+    };
+    let Some(revisions) = agent.get_mut("revisions").and_then(Value::as_array_mut) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "agent not found" }))).into_response();
+    };
+    let next = revisions
+        .iter()
+        .filter_map(|revision| revision.get("revision").and_then(Value::as_str))
+        .filter_map(|revision| revision.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let revision = AgentDefinitionRevision {
+        revision: next.to_string(),
+        system_prompt: req.system_prompt,
+        model: req.model,
+        output_schema: req.output_schema,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let revision_value = serde_json::to_value(&revision).expect("definition serializes");
+    revisions.push(revision_value);
+    if let Some(object) = agent.as_object_mut() {
+        object.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+    }
+    persist_user_agents(&guard);
+    (StatusCode::CREATED, Json(json!({ "agent_id": id, "revision": revision }))).into_response()
+}
+
+/// POST /api/v1/agents/:id/revisions/:revision/activate — select a previous
+/// immutable snapshot as the active revision.
+pub(crate) async fn activate_agent_revision_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path((id, revision)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
+    let mut guard = state.user_agents.write().await;
+    let Some(agent) = guard.iter_mut().find(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "agent not found" }))).into_response();
+    };
+    let found = agent
+        .get("revisions")
+        .and_then(Value::as_array)
+        .is_some_and(|revisions| {
+            revisions.iter().any(|candidate| {
+                candidate.get("revision").and_then(Value::as_str) == Some(revision.as_str())
+            })
+        });
+    if !found {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "agent revision not found" }))).into_response();
+    }
+    if let Some(object) = agent.as_object_mut() {
+        object.insert("active_revision".into(), json!(revision));
+        object.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+    }
+    let active_revision = agent["active_revision"].clone();
+    persist_user_agents(&guard);
+    Json(json!({ "agent_id": id, "active_revision": active_revision })).into_response()
 }
 
 /// PUT /api/v1/agents/:id — 更新用户态 Agent 并持久化
@@ -316,6 +582,15 @@ pub(crate) async fn update_agent_handler(
                         "id" | "source" | "created_at" | "tenant_id" | "project_id"
                     ) {
                         continue;
+                    }
+                    if matches!(
+                        k.as_str(),
+                        "active_revision" | "revisions" | "system_prompt" | "model" | "output_schema"
+                    ) {
+                        return definition_request_error(
+                            "agent revisions are immutable; create a revision or activate an existing revision",
+                        )
+                        .into_response();
                     }
                     obj.insert(k.clone(), v.clone());
                 }

@@ -832,6 +832,17 @@ Output the summary report directly, not in JSON format."#,
             }
         }
 
+        if let Some(system_prompt) = self
+            .system_prompt_override
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        {
+            prompt_builder.set_region(
+                SystemPromptRegion::DefinitionInstructions,
+                system_prompt.to_string(),
+            );
+        }
+
         // Build system prompt (relatively static, placed in system role)
         let system_content = prompt_builder.build();
 
