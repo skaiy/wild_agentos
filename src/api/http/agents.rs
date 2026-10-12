@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -474,7 +474,7 @@ pub(crate) async fn create_agent_revision_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
-    Json(req): Json<AgentRevisionCreateRequest>,
+    body: Bytes,
 ) -> impl IntoResponse {
     let Some(claims) = identity.isolation_claims() else {
         return (
@@ -482,6 +482,15 @@ pub(crate) async fn create_agent_revision_handler(
             Json(json!({ "error": "verified isolation claims are required" })),
         )
             .into_response();
+    };
+    let req: AgentRevisionCreateRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return definition_request_error(
+                "agent revision request must contain system_prompt and model strings",
+            )
+            .into_response()
+        }
     };
     if req.system_prompt.trim().is_empty() || req.model.trim().is_empty() {
         return definition_request_error(
