@@ -398,9 +398,10 @@ fn parse_input_ref(value: &Value) -> Result<InvocationInputRef, ApiError> {
     let (Some(uri), Some(sha256)) = (uri, sha256) else {
         return Err(invalid_request("input_ref requires uri and sha256 strings"));
     };
-    // Kernel shape check before any resolver routing: lowercase scheme, no
-    // control characters / line breaks, no dot / empty segments, backslash
-    // or encoded dot / slash / backslash (#347 review).
+    // Kernel shape check before any resolver routing: lowercase scheme,
+    // printable ASCII only, no `?` `#` `;` `%25`, no dot / empty segments,
+    // backslash or encoded dot / slash / backslash. A missing project
+    // segment is an empty segment and is `400`, not `422`.
     if let Err(error) = super::invocations_input_ref::check_input_ref_uri(uri) {
         return Err(invalid_request(error.message()));
     }

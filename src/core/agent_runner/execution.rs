@@ -980,7 +980,8 @@ Output the summary report directly, not in JSON format."#,
         let mut tool_recovery_injected: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut action_tracker =
-            crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string());
+            crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string())
+                .with_usage_meter(self.gateway.usage_meter());
         let checkpoint_manager =
             crate::core::checkpoint::CheckpointManager::with_persistence(self.l0_store.clone());
 
@@ -1767,6 +1768,9 @@ Output the summary report directly, not in JSON format."#,
                     .map(|c| c.function.name.as_str()),
             );
             if !disallowed_tools.is_empty() {
+                for _ in &disallowed_tools {
+                    action_tracker.note_unregistered_attempt();
+                }
                 errs.push(
                     self.report_pa_disallowed_tools(agent, &ctx.task_iri, &disallowed_tools)
                         .await,
@@ -2156,11 +2160,17 @@ Output the summary report directly, not in JSON format."#,
                                     }
                                 }
                             }
-                            action_tracker.record(
+                            let registered = executor.is_registered_tool(name)
+                                || executor.has_micro_reader(&micro_owner, name);
+                            action_tracker.record_classified(
                                 name,
                                 &args_clone,
                                 &result,
                                 started_at.elapsed().as_secs_f64(),
+                                crate::core::tracked_action::ToolUsageClass {
+                                    registered,
+                                    policy_denied: policy_denied_by.is_some(),
+                                },
                             );
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
