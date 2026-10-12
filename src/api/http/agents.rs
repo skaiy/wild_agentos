@@ -623,7 +623,7 @@ pub(crate) async fn create_agent_revision_handler(
     if revisions.len() >= MAX_AGENT_REVISIONS {
         return definition_payload_too_large("agent cannot have more than 100 revisions");
     }
-    let next = revisions
+    let next_revision = revisions
         .iter()
         .filter_map(|revision| revision.get("revision").and_then(Value::as_str))
         .filter_map(|revision| revision.parse::<u64>().ok())
@@ -631,7 +631,7 @@ pub(crate) async fn create_agent_revision_handler(
         .unwrap_or(0)
         + 1;
     let revision = AgentDefinitionRevision {
-        revision: next.to_string(),
+        revision: next_revision.to_string(),
         system_prompt: req.system_prompt,
         model: req.model,
         output_schema: req.output_schema,
