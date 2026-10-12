@@ -639,14 +639,14 @@ async fn create_validation_rejects_without_persisting() {
         (
             "agent other scope",
             json!({"prompt": "p", "agent_id": "agent-b"}),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "agent_not_found",
+            StatusCode::NOT_FOUND,
+            "not_found",
         ),
         (
             "agent revision",
             json!({"prompt": "p", "agent_id": "agent-a", "agent_revision": "r1"}),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "agent_revision_unsupported",
+            "agent_not_found",
         ),
     ];
     let mut agent_not_found_bodies = Vec::new();
@@ -659,6 +659,7 @@ async fn create_validation_rejects_without_persisting() {
         }
         assert_eq!(stored_count(&h).await, 0, "{name} persisted");
     }
+    assert_eq!(agent_not_found_bodies.len(), 2);
     assert_eq!(agent_not_found_bodies[0], agent_not_found_bodies[1]);
 
     // A malformed Idempotency-Key is rejected before anything is stored
