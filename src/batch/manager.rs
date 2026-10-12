@@ -29,6 +29,7 @@ pub struct BatchAgentManager {
     agents: HashMap<String, BatchAgentInstance>,
     event_bus: Option<Arc<EventBus>>,
     emitter: Option<BatchEventEmitter>,
+    event_scope: Option<(String, String)>,
     graph_store: Option<Arc<SkillGraphStore>>,
     running: bool,
 }
@@ -39,15 +40,33 @@ impl BatchAgentManager {
             agents: HashMap::new(),
             event_bus: None,
             emitter: None,
+            event_scope: None,
             graph_store: None,
             running: false,
         }
     }
 
     pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
-        let emitter = BatchEventEmitter::new(event_bus.clone());
+        let mut emitter = BatchEventEmitter::new(event_bus.clone());
+        if let Some((tenant_id, project_id)) = &self.event_scope {
+            emitter.set_scope(tenant_id.clone(), project_id.clone());
+        }
         self.event_bus = Some(event_bus);
         self.emitter = Some(emitter);
+        self
+    }
+
+    /// Scope stamped on batch events. Call before or after `with_event_bus`.
+    pub fn with_event_scope(
+        mut self,
+        tenant_id: impl Into<String>,
+        project_id: impl Into<String>,
+    ) -> Self {
+        let scope = (tenant_id.into(), project_id.into());
+        if let Some(emitter) = self.emitter.as_mut() {
+            emitter.set_scope(scope.0.clone(), scope.1.clone());
+        }
+        self.event_scope = Some(scope);
         self
     }
 

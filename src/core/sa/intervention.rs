@@ -9,6 +9,24 @@ use super::actions::get_action_handler;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+/// A `HUMAN_APPROVAL_RESULT` counts only when it names this task and this
+/// request. Matching `request_id` alone would let the owner of another task
+/// approve this one.
+fn matching_approval_result(
+    event: &crate::core::event_bus::Event,
+    task_iri: &str,
+    request_id: &str,
+) -> Option<serde_json::Value> {
+    if event.event_type != "HUMAN_APPROVAL_RESULT" || event.task_iri != task_iri {
+        return None;
+    }
+    let result: serde_json::Value = serde_json::from_str(&event.payload).ok()?;
+    if result.get("request_id").and_then(|v| v.as_str()) != Some(request_id) {
+        return None;
+    }
+    Some(result)
+}
+
 impl SupervisorAgent {
     pub(super) async fn execute_intervention(
         &mut self,
@@ -220,6 +238,10 @@ Notes:
             _ => return Ok(true),
         };
 
+        // Subscribe before publishing so an approval that arrives with the
+        // request is not dropped, and so a result for another task cannot
+        // match on request_id alone.
+        let mut receiver = self.event_bus.subscribe();
         self.event_bus
             .emit_with_priority(
                 task_iri,
@@ -244,25 +266,20 @@ Notes:
             .insert(request_id.clone(), false);
 
         // Wait briefly for any instant approval result
-        let mut receiver = self.event_bus.subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok(event) = receiver.try_recv() {
-                if event.event_type == "HUMAN_APPROVAL_RESULT" {
-                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                        if result.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
-                            let approved = result
-                                .get("approved")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            self.pending_approvals
-                                .lock()
-                                .await
-                                .insert(request_id, approved);
-                            return Ok(approved);
-                        }
-                    }
+            while let Ok(event) = receiver.try_recv() {
+                if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
+                    let approved = result
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    self.pending_approvals
+                        .lock()
+                        .await
+                        .insert(request_id, approved);
+                    return Ok(approved);
                 }
             }
         }
@@ -288,6 +305,7 @@ Notes:
             "status": "pending",
         });
 
+        let mut receiver = self.event_bus.subscribe();
         self.event_bus
             .emit_with_priority(
                 task_iri,
@@ -309,33 +327,28 @@ Notes:
             .insert(request_id.clone(), false);
 
         // Wait briefly for any instant approval result
-        let mut receiver = self.event_bus.subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok(event) = receiver.try_recv() {
-                if event.event_type == "HUMAN_APPROVAL_RESULT" {
-                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                        if result.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
-                            let approved = result
-                                .get("approved")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            let comment = result
-                                .get("comment")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            self.pending_approvals
-                                .lock()
-                                .await
-                                .insert(request_id, approved);
-                            return Ok(HumanApprovalNodeResult {
-                                node_id: node_id.to_string(),
-                                approved,
-                                comment,
-                            });
-                        }
-                    }
+            while let Ok(event) = receiver.try_recv() {
+                if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
+                    let approved = result
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let comment = result
+                        .get("comment")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    self.pending_approvals
+                        .lock()
+                        .await
+                        .insert(request_id, approved);
+                    return Ok(HumanApprovalNodeResult {
+                        node_id: node_id.to_string(),
+                        approved,
+                        comment,
+                    });
                 }
             }
         }

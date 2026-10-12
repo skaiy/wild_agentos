@@ -75,6 +75,70 @@ mod tests {
         (sa, dir)
     }
 
+    /// An owner of task B cannot satisfy task A's approval by reusing its
+    /// request id. The wait accepts only a result whose task_iri matches.
+    #[tokio::test]
+    async fn approval_from_another_task_owner_is_ignored() {
+        let (sa, _dir) = make_sa_with_tempdir();
+        let bus = sa.event_bus.clone();
+        let mut watch = bus.subscribe();
+        let task_a = "iri://task/a";
+        let task_b = "iri://task/b";
+        let pending = tokio::spawn(async move {
+            sa.request_human_approval_general("approve the budget?", "node-1", task_a)
+                .await
+        });
+
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = watch.recv().await.expect("event bus open");
+                if event.event_type == "HUMAN_APPROVAL_REQUIRED" && event.task_iri == task_a {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&event.payload).expect("approval request payload");
+                    return payload["request_id"]
+                        .as_str()
+                        .expect("request_id")
+                        .to_string();
+                }
+            }
+        })
+        .await
+        .expect("approval request");
+
+        bus.emit(
+            task_b,
+            "HUMAN_APPROVAL_RESULT",
+            "external:http:owner-b",
+            &serde_json::json!({
+                "request_id": request_id,
+                "approved": true,
+                "comment": "owner of task B",
+            })
+            .to_string(),
+        )
+        .await;
+        bus.emit(
+            task_a,
+            "HUMAN_APPROVAL_RESULT",
+            "external:http:owner-a",
+            &serde_json::json!({
+                "request_id": request_id,
+                "approved": false,
+                "comment": "owner of task A",
+            })
+            .to_string(),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+            .await
+            .expect("approval wait")
+            .expect("join")
+            .expect("approval result");
+        assert!(!result.approved, "task B must not approve task A");
+        assert_eq!(result.comment.as_deref(), Some("owner of task A"));
+    }
+
     #[test]
     fn test_classify_simple() {
         let (sa, _dir) = make_sa_with_tempdir();

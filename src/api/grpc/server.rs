@@ -281,6 +281,12 @@ impl AgentOSService {
             let mut mgr = BatchAgentManager::new()
                 .with_event_bus(event_bus.clone())
                 .with_graph_store(skill_graph.clone());
+            if let (Some(tenant_id), Some(project_id)) = (
+                settings.batch_agents.event_tenant_id.clone(),
+                settings.batch_agents.event_project_id.clone(),
+            ) {
+                mgr = mgr.with_event_scope(tenant_id, project_id);
+            }
 
             let agent_settings = &settings.batch_agents.agents;
             if !agent_settings.is_empty() {
@@ -876,9 +882,16 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             }
         };
 
-        let usage = crate::api::http::invocations_store::usage_from_run(
+        let mut usage = crate::api::http::invocations_store::usage_from_run(
             &usage_meter.snapshot(),
             &self.settings.pricing,
+        );
+        // Tool attempts accumulate on this run's meter as they reach the
+        // tracker, including earlier PDCA cycles and calls whose TaskResult
+        // was dropped. Success, error, timeout, and cancel all carry them.
+        usage = crate::api::http::invocations_store::attach_metered_tool_calls(
+            usage,
+            &usage_meter.tool_calls(),
         );
         let outcome = match execution {
             Ok(result) => {
@@ -1010,7 +1023,8 @@ impl HttpTaskExecutor {
 
 /// Payload of the executor's terminal `TASK_COMPLETED` / `TASK_FAILED` event:
 /// `{status, summary}` plus the run's `usage` (same shape as the invocation
-/// `result.usage`) when the run made any LLM call.
+/// `result.usage`, including recorded built-in tool calls) when present.
+/// SSE only: the invocation bridge trusts the `TaskOutcome` `execute` returns.
 fn terminal_payload(
     status: &str,
     summary: &str,
