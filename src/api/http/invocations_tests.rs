@@ -195,6 +195,90 @@ const ROUTES: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
+async fn invocation_pins_agent_revision_replays_idempotently_and_hides_other_scopes() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = env(true);
+    let h = harness();
+    h.state.user_agents.write().await.push(json!({
+        "id": "scoped_agent",
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "active_revision": "2",
+        "revisions": [
+            {
+                "revision": "1",
+                "system_prompt": "First instructions.",
+                "model": "model-one",
+                "created_at": "2026-01-01T00:00:00Z"
+            },
+            {
+                "revision": "2",
+                "system_prompt": "Second instructions.",
+                "model": "model-two",
+                "created_at": "2026-01-02T00:00:00Z"
+            }
+        ]
+    }));
+    let body = json!({
+        "prompt": "Do the work.",
+        "agent_id": "scoped_agent",
+        "agent_revision": "1"
+    })
+    .to_string();
+
+    let first = call(
+        &h.router,
+        "POST",
+        "/v1/invocations",
+        Some(&alice()),
+        &[("idempotency-key", "agent-revision-replay")],
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.json());
+    assert_eq!(first.json()["request"]["agent_revision"], "1");
+    assert!(first.json().get("agent_definition").is_none());
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let stored = h
+        .store
+        .get_for_claims(&claims, first.json()["id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.agent_definition.as_ref().unwrap().system_prompt,
+        "First instructions."
+    );
+    assert_eq!(stored.agent_definition.as_ref().unwrap().model, "model-one");
+
+    let replay = call(
+        &h.router,
+        "POST",
+        "/v1/invocations",
+        Some(&alice()),
+        &[("idempotency-key", "agent-revision-replay")],
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.json());
+    assert_eq!(replay.headers[IDEMPOTENT_REPLAYED_HEADER], "true");
+    assert_eq!(replay.json()["id"], first.json()["id"]);
+    assert_eq!(stored_count(&h).await, 1);
+
+    let other_scope = token("bob", "tenant-b", Some("project-a"), &[]);
+    let cross_scope = call(
+        &h.router,
+        "POST",
+        "/v1/invocations",
+        Some(&other_scope),
+        &[],
+        Some(body),
+    )
+    .await;
+    assert_eq!(cross_scope.status, StatusCode::NOT_FOUND);
+    assert_eq!(cross_scope.code(), "not_found");
+}
+
+#[tokio::test]
 async fn invocations_routes_reject_unverified_callers_with_401() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for strict in [true, false] {
