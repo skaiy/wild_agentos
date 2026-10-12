@@ -1339,7 +1339,7 @@ mod tests {
             Err(err) => err,
             Ok(_) => panic!("tenant B accessed tenant A's agent"),
         };
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
