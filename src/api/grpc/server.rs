@@ -462,6 +462,9 @@ impl AgentOSService {
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "models": models,
+            "pricing": {
+                "models": self.settings.pricing.models.keys().map(|model| serde_json::json!({"model": model})).collect::<Vec<_>>(),
+            },
             "gateway": {
                 "base_url": g.base_url,
                 "default_model": g.default_model,
@@ -803,6 +806,19 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
         // this run's own usage meter, so concurrent runs never mix counts.
         let usage_meter = Arc::new(crate::gateway::usage_meter::RunUsageMeter::new());
         let run_gateway = Arc::new(self.gateway.with_usage_meter(usage_meter.clone()));
+        if let Some(model) = spec.model.as_deref() {
+            let configured = self.settings.gateway.default_model == model
+                || self
+                    .settings
+                    .gateway
+                    .model_mapping
+                    .values()
+                    .any(|configured| configured == model)
+                || self.settings.pricing.models.contains_key(model);
+            if !configured {
+                return TaskOutcome::failed("agent model is not configured", None);
+            }
+        }
         let mut sa = build_supervisor_agent(
             run_gateway,
             self.skills.clone(),

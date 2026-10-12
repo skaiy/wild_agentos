@@ -58,7 +58,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | 字段 | 规则 | 错误 |
 | --- | --- | --- |
 | `prompt` / `input` / `input_ref` | 至少出现一个 | `400 invalid_request` |
-| `agent_revision` | 精确、不可变的定义 revision，必须同时带 `agent_id`；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析。省略时解析 active revision 并写入调用记录。 | 浮动词或缺 `agent_id` → `400 invalid_request`；revision 不存在 → `422 agent_not_found`；其他 scope 的 agent id → `404 not_found` |
+| `agent_revision` | 精确、不可变的定义 revision，必须同时带 `agent_id`；浮动词（`latest`、`current`、`head`、`tip`、`active`、`default`、`*`，不分大小写）一律不解析。省略时解析 active revision 并写入调用记录。 | 浮动词或缺 `agent_id` → `400 invalid_request`；未知 id/revision 和其他 scope 的 id 都返回完全相同的 `422 agent_not_found` |
 | `input` | 任意 JSON 值，紧凑序列化 ≤ 8192 字节 | 超限 → `413 payload_too_large` |
 | `input_ref` | `uri` 与 `sha256` 都必填；`uri` 形如 `<scheme>://…`，scheme 小写，并通过形状检查（§4.2）；`sha256` 为 64 位小写十六进制；必须有已注册的解析器匹配并接受该 `uri`（§4.2） | 同时带 `input` 和 `input_ref`，或 `uri` 未通过形状检查（没有 `<scheme>://`、scheme 含大写、含可打印 ASCII `0x21`–`0x7E` 以外的字符、含 `?` / `#` / `;` / `%25`、有点段或空段——包括缺少 project 段的 `scheme:///…`、含反斜杠、含 `%2e` / `%2f` / `%5c`）→ `400 invalid_request`（缺少 project 段是 `400`，不是 `422`）；没有匹配的解析器，或解析器不接受该 `uri` → `422 input_ref_unresolvable`；`uri` 指向别的项目 → `422 input_ref_scope_mismatch` |
 | `budget.*` | 正整数（≥ 1）；`max_cost` 单位为微美元；未知成员拒绝 | `400 invalid_request` |
@@ -67,6 +67,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 | 整个请求体 | ≤ 64 KiB | `413 payload_too_large` |
 
 - `agent_id` 在调用方 scope 内找不到对应定义 → `422 agent_not_found`，不存在的 id 与其他 scope 的 id 返回相同。
+- 没有 revision 的旧 agent 不是 invocation definition；将它作为 `agent_id` 使用同样返回 `422 agent_not_found`。
 - 调用按 `(agent_id, agent_revision)` 解析并持久化一个不可变定义快照。省略 revision 时，在创建时解析 active revision；之后切换 active revision 不会改变已有调用。
 - `input_ref` 的内容只由执行桥用创建者的 claims 拉取；SHA-256 由服务端自己核对，不一致时调用以 `failed` 结束，`error.code = "input_digest_mismatch"`（§4.2）。取到的文本和 prompt 一起交给任务。
 - 触达预算上限时停止执行，调用以 `failed` 结束，`error.code = "budget_exceeded"`。
@@ -81,6 +82,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 - `agent_id` 由调用方自定义：以小写字母开头，只能包含小写字母、数字、连字符和下划线，最长 64 字节；在 tenant/project scope 内唯一。
 - 定义 revision 含非空 `system_prompt`、`model` 与可选 `output_schema`；后者原样存储，不在这里校验。revision 永不修改；可新建 revision，并激活任一已有 revision 来回滚。定义读取与 revision 操作按 tenant/project 隔离，跨 scope 返回 `404`。
 - 执行会套用所选 revision 的 system prompt 与 model。
+- `system_prompt` 最大 32 KiB，并拒绝可识别的明文凭证；`model` 最大 128 字节，且必须是已配置的映射或定价模型；`output_schema` 只存储，最大 16 KiB。每个 agent 最多 100 个 revision；触及这些上限返回 `413 payload_too_large`。
 
 ### 4.2 `input_ref` 解析器
 
@@ -101,6 +103,7 @@ Invocations API 原生建立在现有 claims-only 身份栈上（由已校验的
 - `POST /api/v1/agents/:id/revisions` 创建下一个 revision。
 - `POST /api/v1/agents/:id/revisions/:revision/activate` 切换 active revision，也可回滚到旧 revision。
 - 不能通过 `PUT /api/v1/agents/:id` 修改定义字段或既有 revision 快照。
+- `sa`、`pa`、`supervisor` 和 `default` 是保留 id。服务端自动生成的 id 同样符合公开格式。
 
 ## 5. 资源（草案）
 

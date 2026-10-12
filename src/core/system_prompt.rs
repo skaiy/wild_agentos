@@ -34,6 +34,7 @@ pub fn platform_environment_hint() -> &'static str {
 impl SystemPromptRegion {
     pub fn order(&self) -> usize {
         match self {
+            Self::DefinitionInstructions => 0,
             Self::RoleDefinition => 1,
             Self::TimeAwareness => 2,
             Self::EnvironmentInfo => 3,
@@ -44,7 +45,6 @@ impl SystemPromptRegion {
             Self::OutputManagement => 8,
             Self::Tools => 9,
             Self::ExtractionPrompt => 10,
-            Self::DefinitionInstructions => 11,
         }
     }
 

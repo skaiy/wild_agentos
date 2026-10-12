@@ -72,7 +72,7 @@ scope and server fields → `400 field_not_allowed` (§3).
 | Field | Rule | Error |
 | --- | --- | --- |
 | `prompt` / `input` / `input_ref` | At least one must be present | `400 invalid_request` |
-| `agent_revision` | Exact immutable definition revision. It needs `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved. When omitted, the active revision is resolved and persisted on the invocation. | Floating word or missing `agent_id` → `400 invalid_request`; missing revision → `422 agent_not_found`; an agent id in another scope → `404 not_found` |
+| `agent_revision` | Exact immutable definition revision. It needs `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved. When omitted, the active revision is resolved and persisted on the invocation. | Floating word or missing `agent_id` → `400 invalid_request`; an unknown id/revision and an id in another scope both return identical `422 agent_not_found` |
 | `input` | Any JSON value, ≤ 8192 bytes as compact JSON | Over limit → `413 payload_too_large` |
 | `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…` with a lowercase scheme and passes the shape check (§4.2); `sha256` is 64 lowercase hex; a registered resolver must match and accept the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` that fails the shape check (no `<scheme>://`, uppercase scheme, any character outside printable ASCII `0x21`–`0x7E`, `?` / `#` / `;` / `%25`, dot / empty segments including a missing project segment such as `scheme:///…`, backslash, `%2e` / `%2f` / `%5c`) → `400 invalid_request` (a missing project segment is `400`, not `422`); no matching resolver, or the resolver rejects the `uri` → `422 input_ref_unresolvable`; `uri` names another project → `422 input_ref_scope_mismatch` |
 | `budget.*` | Positive integers (≥ 1); `max_cost` is micro-USD; unknown members rejected | `400 invalid_request` |
@@ -82,6 +82,8 @@ scope and server fields → `400 field_not_allowed` (§3).
 
 - `agent_id` that does not resolve to a definition in the caller's scope →
   `422 agent_not_found`, identical for unknown ids and other scopes.
+- A legacy agent without revisions is not an invocation definition and also
+  returns `422 agent_not_found`.
 - An invocation resolves and persists one immutable definition snapshot by
   `(agent_id, agent_revision)`. An omitted revision resolves the active
   revision at creation time; later activation does not change the invocation.
@@ -125,6 +127,11 @@ scope and server fields → `400 field_not_allowed` (§3).
   roll back. Definition reads and revision operations are scoped to the same
   tenant/project and return `404` across scopes.
 - Execution applies the selected revision's system prompt and model.
+- `system_prompt` is limited to 32 KiB and rejects recognizable plaintext
+  credentials; `model` is limited to 128 bytes and must name a configured
+  mapping or priced model; `output_schema` is stored only and limited to 16
+  KiB. An agent can have at most 100 revisions; these limits return
+  `413 payload_too_large`.
 
 ### 4.2 `input_ref` resolvers
 
@@ -229,6 +236,8 @@ scope and server fields → `400 field_not_allowed` (§3).
   revision, including rollback to an earlier one.
 - Definition fields and existing revision snapshots cannot be changed through
   `PUT /api/v1/agents/:id`.
+- The ids `sa`, `pa`, `supervisor`, and `default` are reserved. Server-created
+  ids use the same public id format.
 
 ## 5. Resource (draft)
 

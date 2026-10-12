@@ -208,13 +208,13 @@ async fn invocation_pins_agent_revision_replays_idempotently_and_hides_other_sco
             {
                 "revision": "1",
                 "system_prompt": "First instructions.",
-                "model": "model-one",
+                "model": "test-model",
                 "created_at": "2026-01-01T00:00:00Z"
             },
             {
                 "revision": "2",
                 "system_prompt": "Second instructions.",
-                "model": "model-two",
+                "model": "test-model",
                 "created_at": "2026-01-02T00:00:00Z"
             }
         ]
@@ -248,7 +248,10 @@ async fn invocation_pins_agent_revision_replays_idempotently_and_hides_other_sco
         stored.agent_definition.as_ref().unwrap().system_prompt,
         "First instructions."
     );
-    assert_eq!(stored.agent_definition.as_ref().unwrap().model, "model-one");
+    assert_eq!(
+        stored.agent_definition.as_ref().unwrap().model,
+        "test-model"
+    );
 
     let replay = call(
         &h.router,
@@ -274,8 +277,8 @@ async fn invocation_pins_agent_revision_replays_idempotently_and_hides_other_sco
         Some(body),
     )
     .await;
-    assert_eq!(cross_scope.status, StatusCode::NOT_FOUND);
-    assert_eq!(cross_scope.code(), "not_found");
+    assert_eq!(cross_scope.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(cross_scope.code(), "agent_not_found");
 }
 
 #[tokio::test]
@@ -639,8 +642,8 @@ async fn create_validation_rejects_without_persisting() {
         (
             "agent other scope",
             json!({"prompt": "p", "agent_id": "agent-b"}),
-            StatusCode::NOT_FOUND,
-            "not_found",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "agent_not_found",
         ),
         (
             "agent revision",

@@ -478,24 +478,29 @@ async fn build_chat_context_with_fallback(
     claims: Option<&IsolationClaims>,
     fallback: VisionFallback,
 ) -> Result<ChatContext, (StatusCode, Value)> {
-    // Locate user-state Agent first, then the static batch configuration.
+    // Locate a user-state agent only within the caller's tenant/project.
+    // A same-id record in another scope must not shadow the caller's own
+    // definition or disclose that the foreign record exists.
     let agent = {
         let guard = state.user_agents.read().await;
-        guard
+        let scoped_user_agent = guard
             .iter()
-            .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
-            .cloned()
-            .or_else(|| {
-                state
-                    .agents_info
-                    .get("agents")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| {
-                        arr.iter()
-                            .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
-                            .cloned()
-                    })
+            .find(|agent| {
+                agent.get("id").and_then(Value::as_str) == Some(id)
+                    && claims.is_none_or(|claims| agent_matches_claims(agent, claims))
             })
+            .cloned();
+        scoped_user_agent.or_else(|| {
+            state
+                .agents_info
+                .get("agents")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
+                        .cloned()
+                })
+        })
     };
     let agent = match agent {
         Some(a) => a,
@@ -1293,6 +1298,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(b.messages[0].content.as_text(), "P0A80");
+    }
+
+    #[tokio::test]
+    async fn chat_same_id_resolves_the_callers_project_agent() {
+        let state = make_state();
+        state.user_agents.write().await.push(json!({
+            "id": "agent-a",
+            "name": "Tenant B duplicate id",
+            "tenant_id": "tenant-b",
+            "project_id": "project-1",
+            "model": "tenant-b-model"
+        }));
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
+
+        let context = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("hello", &[]),
+            Some(&tenant_b),
+        )
+        .await
+        .unwrap();
+        assert_eq!(context.model, "tenant-b-model");
     }
 
     #[tokio::test]

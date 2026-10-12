@@ -24,25 +24,48 @@ use serde_json::json;
 
 use super::agents::{resolve_definition_revision, AgentDefinitionLookupError};
 
-/// Definition targets follow the same no-cross-scope-disclosure rule as
-/// invocation resources: a resolver can distinguish the condition internally
-/// only to map it to the public 404 contract.
+/// Reused ids in different scopes resolve only the caller's own definition;
+/// a foreign-only id is indistinguishable from a missing id.
 #[test]
 fn definition_target_cross_scope_is_not_resolvable() {
-    let agents = vec![json!({
-        "id": "scoped_agent",
-        "tenant_id": "tenant-a",
-        "project_id": "project-a",
-        "active_revision": "1",
-        "revisions": [{
-            "revision": "1",
-            "system_prompt": "system",
-            "model": "model",
-            "created_at": "2026-01-01T00:00:00Z"
-        }]
-    })];
+    let agents = vec![
+        json!({
+            "id": "scoped_agent",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "active_revision": "1",
+            "revisions": [{
+                "revision": "1",
+                "system_prompt": "system",
+                "model": "model",
+                "created_at": "2026-01-01T00:00:00Z"
+            }]
+        }),
+        json!({
+            "id": "scoped_agent",
+            "tenant_id": "tenant-b",
+            "project_id": "project-a",
+            "active_revision": "1",
+            "revisions": [{
+                "revision": "1",
+                "system_prompt": "tenant-b",
+                "model": "model",
+                "created_at": "2026-01-01T00:00:00Z"
+            }]
+        }),
+    ];
     assert_eq!(
         resolve_definition_revision(&agents, "tenant-b", "project-a", "scoped_agent", Some("1")),
-        Err(AgentDefinitionLookupError::OutOfScope)
+        Ok(super::agents::AgentDefinitionRevision {
+            revision: "1".into(),
+            system_prompt: "tenant-b".into(),
+            model: "model".into(),
+            output_schema: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+    );
+    assert_eq!(
+        resolve_definition_revision(&agents, "tenant-c", "project-a", "scoped_agent", Some("1")),
+        Err(AgentDefinitionLookupError::Missing)
     );
 }

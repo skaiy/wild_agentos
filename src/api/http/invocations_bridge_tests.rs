@@ -37,6 +37,7 @@ struct MockExecutor {
     calls: Arc<AtomicUsize>,
     events: Arc<crate::core::event_bus::EventBus>,
     seen_claims: Arc<std::sync::Mutex<Option<IsolationClaims>>>,
+    seen_system_prompt: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +89,7 @@ impl TaskExecutor for MockExecutor {
     async fn execute(&self, spec: TaskExecSpec) -> TaskOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.seen_claims.lock().unwrap() = Some(spec.isolation_claims.clone());
+        *self.seen_system_prompt.lock().unwrap() = spec.system_prompt.clone();
         match self.mode {
             MockMode::SucceedWithUsage => {
                 self.emit_terminal(
@@ -227,6 +229,7 @@ struct BridgeHarness {
     state: Arc<AppState>,
     calls: Arc<AtomicUsize>,
     seen_claims: Arc<std::sync::Mutex<Option<IsolationClaims>>>,
+    seen_system_prompt: Arc<std::sync::Mutex<Option<String>>>,
     _dir: tempfile::TempDir,
     _env: EnvGuard,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -244,6 +247,7 @@ fn make_bridge_harness(mode: MockMode, gate: Arc<dyn ProjectionContextGate>) -> 
     let store = Arc::new(store);
     let calls = Arc::new(AtomicUsize::new(0));
     let seen_claims = Arc::new(std::sync::Mutex::new(None));
+    let seen_system_prompt = Arc::new(std::sync::Mutex::new(None));
 
     let bootstrap = test_state_with_invocations(
         dir.path(),
@@ -261,6 +265,7 @@ fn make_bridge_harness(mode: MockMode, gate: Arc<dyn ProjectionContextGate>) -> 
             calls: calls.clone(),
             events: bootstrap.core.events.clone(),
             seen_claims: seen_claims.clone(),
+            seen_system_prompt: seen_system_prompt.clone(),
         }),
         bootstrap.shutdown.clone(),
         gate,
@@ -300,6 +305,7 @@ fn make_bridge_harness(mode: MockMode, gate: Arc<dyn ProjectionContextGate>) -> 
         state,
         calls,
         seen_claims,
+        seen_system_prompt,
         _dir: dir,
         _env: env_guard,
         _lock: lock,
@@ -374,6 +380,45 @@ async fn bridge_succeeds_with_usage_and_task_iri_and_claims() {
     assert!(
         projection_context_is_nonempty(&projected),
         "expected non-empty projection, got {projected}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_applies_the_pinned_definition_system_prompt() {
+    let h = make_bridge_harness(MockMode::SucceedWithUsage, Arc::new(ScopedProjectionGate));
+    h.state.user_agents.write().await.push(json!({
+        "id": "definition_agent",
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "active_revision": "1",
+        "revisions": [{
+            "revision": "1",
+            "system_prompt": "Use the pinned definition instructions.",
+            "model": "test-model",
+            "output_schema": {"$id": "example-output"},
+            "created_at": "2026-01-01T00:00:00Z"
+        }]
+    }));
+    let created = create_inv(
+        &h.router,
+        &alice(),
+        json!({"prompt": "bridge-test-prompt", "agent_id": "definition_agent"}),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.json());
+    let id = created.json()["id"].as_str().unwrap().to_string();
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let inv = wait_terminal(&h.store, &id, &claims).await;
+    assert_eq!(
+        h.seen_system_prompt.lock().unwrap().as_deref(),
+        Some("Use the pinned definition instructions.")
+    );
+    assert_eq!(
+        inv.result.as_ref().unwrap().artifacts,
+        vec![json!({
+            "schema_id": "example-output",
+            "data": {"summary": "mock-ok"}
+        })]
     );
 }
 

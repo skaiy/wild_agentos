@@ -686,15 +686,12 @@ async fn resolve_agent(
         agent_id,
         request.agent_revision.as_deref(),
     )
-    .map_err(|error| match error {
-        super::agents::AgentDefinitionLookupError::OutOfScope => {
-            ApiError::new(StatusCode::NOT_FOUND, "not_found", "not found")
-        }
-        super::agents::AgentDefinitionLookupError::Missing => ApiError::new(
+    .map_err(|_error| {
+        ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "agent_not_found",
             "agent_id and agent_revision do not name an agent definition in this scope",
-        ),
+        )
     })?;
     request.agent_revision = Some(definition.revision.clone());
     Ok(Some(definition))
