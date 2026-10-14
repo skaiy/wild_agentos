@@ -22,7 +22,7 @@ use super::{AppState, TaskExecSpec};
 #[derive(Deserialize)]
 pub struct TaskRequest {
     pub user_input: String,
-    /// 用户态标识，用于会话隔离（可选，缺省为匿名）。
+    /// Ignored. The stored `user_id` is the verified actor (`claims.actor_id()`).
     pub user_id: Option<String>,
     /// 会话标识，用于多轮上下文隔离（可选）。
     pub session_id: Option<String>,
@@ -104,7 +104,7 @@ pub(crate) async fn create_task_handler(
             &req.user_input,
             None,
             None,
-            req.user_id.as_deref(),
+            Some(claims.actor_id()),
             req.session_id.as_deref(),
             claims,
         )
@@ -378,6 +378,10 @@ pub(crate) async fn stream_task_handler(
                     if event.task_iri != task_iri_clone {
                         continue;
                     }
+                    // Caller-posted events are not execution state.
+                    if event.source_agent_iri.starts_with("external:") {
+                        continue;
+                    }
 
                     if let Some(sse_event) = convert_event_to_sse(&event) {
                         yield Ok(sse_event);
@@ -632,6 +636,11 @@ fn exec_event_inner(payload: &str, kind: &str) -> Option<Value> {
 fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> {
     use crate::core::event_bus::EventType;
 
+    // Caller-posted events cannot move the console phase or inject display text.
+    if event.source_agent_iri.starts_with("external:") {
+        return None;
+    }
+
     // 富执行事件（由 AgentRunner 内联发布到总线，payload 为序列化后的 ExecutionEvent）：
     // 解析内层字段，映射为任务控制台可直接消费的干净 SSE 事件（思考/工具调用/逐字输出）。
     match event.event_type.as_str() {
@@ -825,7 +834,8 @@ fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> 
             json!({
                 "from_phase": "act",
                 "to_phase": "completed",
-                "agent_role": "AA"
+                "agent_role": "AA",
+                "source": event.source_agent_iri,
             }),
         ),
         EventType::AgentStarted => (
