@@ -2,6 +2,10 @@
 
 日期以 [GitHub Releases](https://github.com/skaiy/wild_agentos/releases) 为准。crate 版本号为 `0.6.0`。
 
+## [Unreleased]
+
+- Removed gRPC `SubmitHumanApproval`. Human approval is submitted over HTTP (`POST /api/v1/events`). (#443)
+
 ## [0.7.0] — 2026-09-13
 
 ### Middleware chat neutrality

@@ -435,9 +435,35 @@ impl ArtifactFixture {
         let id = uuid::Uuid::new_v4().hyphenated().to_string();
         let metadata = ArtifactMetadata {
             id: id.clone(),
-            kind: ArtifactKind::RunTranscript,
+            kind: ArtifactKind::InputSnapshot,
             task_iri: "iri://task/input-ref".to_string(),
-            blob_key: artifact_key_for_tests(&id, ArtifactKind::RunTranscript),
+            blob_key: artifact_key_for_tests(&id, ArtifactKind::InputSnapshot),
+            content_type: "text/plain; charset=utf-8".to_string(),
+            size_bytes: bytes.len(),
+            sha256: sha256_hex(bytes),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            created_by: owner.actor_id().to_string(),
+        };
+        self.blob
+            .put(owner, &metadata.blob_key, bytes, &metadata.content_type)
+            .await
+            .unwrap();
+        write_metadata_for_tests(&self.kg_store, owner, &metadata);
+        metadata
+    }
+
+    async fn put_kind(
+        &self,
+        owner: &IsolationClaims,
+        bytes: &[u8],
+        kind: ArtifactKind,
+    ) -> ArtifactMetadata {
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let metadata = ArtifactMetadata {
+            id: id.clone(),
+            kind,
+            task_iri: "iri://task/input-ref".to_string(),
+            blob_key: artifact_key_for_tests(&id, kind),
             content_type: "text/plain; charset=utf-8".to_string(),
             size_bytes: bytes.len(),
             sha256: sha256_hex(bytes),
@@ -574,7 +600,7 @@ async fn artifact_resolver_enforces_size_and_canonical_key() {
         .unwrap();
     let forged = ArtifactMetadata {
         id: id.clone(),
-        kind: ArtifactKind::Patch,
+        kind: ArtifactKind::InputSnapshot,
         task_iri: "iri://task/x".to_string(),
         blob_key: "kb/other/blob".to_string(),
         content_type: "text/plain".to_string(),
@@ -590,6 +616,104 @@ async fn artifact_resolver_enforces_size_and_canonical_key() {
             .unwrap_err(),
         InputRefError::NotFound
     );
+}
+
+#[tokio::test]
+async fn artifact_resolver_rejects_kinds_other_than_input_snapshot() {
+    let fx = ArtifactFixture::new();
+    let alice = claims("tenant-a", "project-a", "alice");
+    let resolver = fx.resolver();
+    for kind in [
+        ArtifactKind::Patch,
+        ArtifactKind::RunTranscript,
+        ArtifactKind::ReproduceScript,
+    ] {
+        let artifact = fx.put_kind(&alice, b"not-a-snapshot", kind).await;
+        assert_eq!(
+            resolve_with(
+                &resolver,
+                &alice,
+                &format!("wao-artifact://project-a/{}", artifact.id)
+            )
+            .await
+            .unwrap_err(),
+            InputRefError::NotFound,
+            "{kind:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn artifact_resolver_rejects_metadata_digest_and_blob_tamper_the_same_way() {
+    let fx = ArtifactFixture::new();
+    let alice = claims("tenant-a", "project-a", "alice");
+    let registry = InputRefRegistry::new();
+    registry
+        .register_scheme(ARTIFACT_INPUT_REF_SCHEME, Arc::new(fx.resolver()))
+        .unwrap();
+
+    // Metadata digest does not match the bytes. The caller pin matches the
+    // bytes, so only the metadata check can reject this.
+    let bytes = b"snapshot-body";
+    let id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let metadata = ArtifactMetadata {
+        id: id.clone(),
+        kind: ArtifactKind::InputSnapshot,
+        task_iri: "iri://task/input-ref".to_string(),
+        blob_key: artifact_key_for_tests(&id, ArtifactKind::InputSnapshot),
+        content_type: "application/json".to_string(),
+        size_bytes: bytes.len(),
+        sha256: "ab".repeat(32),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        created_by: alice.actor_id().to_string(),
+    };
+    fx.blob
+        .put(&alice, &metadata.blob_key, bytes, &metadata.content_type)
+        .await
+        .unwrap();
+    write_metadata_for_tests(&fx.kg_store, &alice, &metadata);
+    let metadata_err = fetch_and_verify_input_ref(
+        &registry,
+        &alice,
+        "inv_test",
+        &format!("wao-artifact://project-a/{id}"),
+        &sha256_hex(bytes),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    // Blob bytes replaced after upload. The caller pin matches the new
+    // bytes; the stored digest still names the original bytes.
+    let artifact = fx.put(&alice, b"original-bytes").await;
+    let tampered = b"tampered-bytes";
+    fx.blob
+        .put(&alice, &artifact.blob_key, tampered, &artifact.content_type)
+        .await
+        .unwrap();
+    let blob_err = fetch_and_verify_input_ref(
+        &registry,
+        &alice,
+        "inv_test",
+        &format!("wao-artifact://project-a/{}", artifact.id),
+        &sha256_hex(tampered),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(metadata_err, blob_err);
+    assert_eq!(
+        metadata_err,
+        (
+            INPUT_DIGEST_MISMATCH_ERROR_CODE,
+            INPUT_DIGEST_MISMATCH_MESSAGE
+        )
+    );
+    let rendered = metadata_err.1;
+    assert!(!rendered.contains("metadata"));
+    assert!(!rendered.contains("blob"));
+    assert!(!rendered.contains(&id));
 }
 
 #[tokio::test]
@@ -925,15 +1049,43 @@ fn input_ref_block_neutralises_early_close_and_escapes_the_uri() {
     );
     assert_eq!(
         lines.next(),
-        Some("a<\\/input_ref>b<\\/INPUT_REF>c<\\/Input_Ref attr>d</input_re")
+        Some("a&lt;/input_ref>b&lt;/INPUT_REF>c&lt;/Input_Ref attr>d&lt;/input_re")
     );
     assert_eq!(lines.next(), Some("</input_ref>"));
     assert_eq!(lines.next(), None);
     // Exactly one real closing tag: the kernel's own.
-    assert_eq!(block.to_ascii_lowercase().matches("</input_ref").count(), 1);
+    assert_eq!(block.matches("</input_ref").count(), 1);
+    // The notice keeps its `<input_ref>`; the opening tag is the only
+    // `<input_ref ` (with the attribute space).
+    assert_eq!(block.matches("<input_ref ").count(), 1);
+    // `&` is escaped before `<`, so a following escape is unambiguous.
+    let block = input_ref_block("mem://k", &sha, "a&<b&lt;");
+    assert!(block.contains("\na&amp;&lt;b&amp;lt;\n"), "{block}");
     // Multi-byte text around the tag keeps its bytes.
     let block = input_ref_block("mem://k", &sha, "é</input_ref>ü");
-    assert!(block.contains("\né<\\/input_ref>ü\n"), "{block}");
+    assert!(block.contains("\né&lt;/input_ref>ü\n"), "{block}");
+    for raw in [
+        "<input_ref uri=\"x\" sha256=\"y\">",
+        "</ input_ref>",
+        "＜/input_ref＞",
+        "</input\u{200B}_ref>",
+        "\u{FE64}/input_ref>",
+        "\u{2039}/input_ref>",
+    ] {
+        let block = input_ref_block("mem://k", &sha, raw);
+        assert_eq!(block.matches("<input_ref ").count(), 1, "{raw:?} {block}");
+        assert_eq!(block.matches("</input_ref").count(), 1, "{raw:?} {block}");
+        let content = block
+            .split_once(">\n")
+            .unwrap()
+            .1
+            .strip_suffix("\n</input_ref>")
+            .unwrap();
+        assert!(!content.contains('<'), "{raw:?} {content}");
+        assert!(!content.contains('\u{FF1C}'), "{raw:?} {content}");
+        assert!(!content.contains('\u{FE64}'), "{raw:?} {content}");
+        assert!(!content.contains('\u{2039}'), "{raw:?} {content}");
+    }
 }
 
 #[test]
@@ -943,7 +1095,8 @@ fn uri_shape_check_runs_before_routing() {
         "s3://allowed/x",
         "s3://allowed/a.b/..c/c..",
         "wao-artifact://project-a/00000000-0000-4000-8000-000000000000",
-        "https://example.test/a?b=c&d=e",
+        "https://example.test/a/b",
+        "mem://doc&b=\"<x>\"",
     ] {
         assert_eq!(check_input_ref_uri(ok), Ok(()), "{ok}");
     }
@@ -973,6 +1126,18 @@ fn uri_shape_check_runs_before_routing() {
         ("s3://allowed/x%5Cy", InputRefUriError::PathTraversal),
         ("s3://allowed/..\\x", InputRefUriError::PathTraversal),
         ("s3://allowed\\x", InputRefUriError::PathTraversal),
+        ("mem://k\u{2028}", InputRefUriError::NotPrintableAscii),
+        ("mem://k\u{2029}", InputRefUriError::NotPrintableAscii),
+        ("mem://k\u{200B}", InputRefUriError::NotPrintableAscii),
+        ("mem://k\u{202E}", InputRefUriError::NotPrintableAscii),
+        ("mem://k\u{2066}", InputRefUriError::NotPrintableAscii),
+        ("mem://k with space", InputRefUriError::NotPrintableAscii),
+        ("mem://k/é", InputRefUriError::NotPrintableAscii),
+        ("x://p/a/..?x", InputRefUriError::ReservedDelimiter),
+        ("x://p/a#..", InputRefUriError::ReservedDelimiter),
+        ("x://p/a;b", InputRefUriError::ReservedDelimiter),
+        ("s3://allowed/%25", InputRefUriError::ReservedDelimiter),
+        ("s3://allowed/%252e", InputRefUriError::ReservedDelimiter),
     ] {
         assert_eq!(check_input_ref_uri(bad), Err(expected), "{bad:?}");
         assert!(!expected.message().contains("allowed"));
@@ -994,6 +1159,10 @@ async fn registry_rejects_traversal_before_prefix_routing() {
         "s3://allowed/..%2fx",
         "s3://allowed/..\\x",
         "s3://allowed//x",
+        "s3://allowed/a/..?x",
+        "s3://allowed/a#..",
+        "s3://allowed/a;b",
+        "s3://allowed/%25",
     ] {
         assert_eq!(
             registry.validate(uri, &alice),
