@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::tools::skill_pipeline::TenantPromotionReview;
@@ -76,45 +76,632 @@ pub(crate) fn pipeline_runs_path() -> std::path::PathBuf {
 }
 
 /// 保留的最近流水线运行记录条数上限（超出则裁剪最早记录）。
-const PIPELINE_RUNS_CAP: usize = 200;
+/// Owner 记录不在这个上限里，截断运行历史不会丢掉 skill IRI 的归属。
+pub(crate) const PIPELINE_RUNS_CAP: usize = 200;
 
-/// 从磁盘加载流水线运行记录（最新在前）；文件不存在或解析失败时返回空列表。
-fn load_pipeline_runs() -> Vec<crate::tools::skill_pipeline::PipelineRun> {
+/// One market package cannot fill the whole admission history by itself.
+pub(crate) const MARKET_PACKAGE_SKILL_CAP: usize = 32;
+
+/// Serializes pipeline-run read-modify-write in this process.
+static PIPELINE_RUNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_pipeline_runs() -> std::sync::MutexGuard<'static, ()> {
+    PIPELINE_RUNS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// 从磁盘加载流水线运行记录（最新在前）。文件不存在时为空；解析失败是错误，
+/// 调用方不得把它写成空列表。
+fn load_pipeline_runs_unlocked() -> std::io::Result<Vec<crate::tools::skill_pipeline::PipelineRun>>
+{
     match std::fs::read_to_string(pipeline_runs_path()) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(content) => serde_json::from_str(&content).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
 }
 
-/// A Skill is externally publishable only when its most recent admission run
-/// succeeded with tenant visibility. This makes an MCP exposure fail closed if
-/// the Skill is later replaced by session-scoped authoring or a failed rerun.
-pub(crate) fn is_tenant_published_skill(skill_iri: &str) -> bool {
-    load_pipeline_runs()
-        .into_iter()
-        .find(|run| run.skill_iri == skill_iri)
-        .is_some_and(|run| {
-            run.published
-                && run.gate_passed
-                && run.visibility == crate::tools::skill_pipeline::SkillVisibility::Tenant
-        })
+#[derive(Debug)]
+pub(crate) enum PipelineWriteError {
+    Io(std::io::Error),
+    /// The skill IRI is already owned by another tenant. The run was not written.
+    OwnedByAnotherTenant,
 }
 
-/// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。best-effort。
-pub(crate) fn append_pipeline_run(
+impl From<std::io::Error> for PipelineWriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+fn publisher_tenant(run: &crate::tools::skill_pipeline::PipelineRun) -> Option<&str> {
+    run.publisher_tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|tenant_id| !tenant_id.is_empty())
+}
+
+fn publisher_project(run: &crate::tools::skill_pipeline::PipelineRun) -> Option<&str> {
+    run.publisher_project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+}
+
+fn skill_iri_owners_path() -> std::path::PathBuf {
+    data_dir().join("skill_iri_owners.json")
+}
+
+/// Written once, beside the owner file. Deleting the owner file does not
+/// clear it, so a later load cannot rebuild owners from truncated runs.
+pub(crate) const SKILL_IRI_OWNERS_MIGRATED_FILE: &str = "skill_iri_owners.migrated";
+
+fn owners_migration_marker_path() -> std::path::PathBuf {
+    data_dir().join(SKILL_IRI_OWNERS_MIGRATED_FILE)
+}
+
+/// Durable owner of one skill IRI. Run history is capped; this record is not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SkillIriOwnerRecord {
+    pub skill_iri: String,
+    pub tenant_id: String,
+    pub project_id: String,
+    /// Latest admission written by this owner. Survives run-history truncation.
+    pub published: bool,
+    pub gate_passed: bool,
+    #[serde(default = "default_owner_visibility")]
+    pub visibility: crate::tools::skill_pipeline::SkillVisibility,
+}
+
+fn default_owner_visibility() -> crate::tools::skill_pipeline::SkillVisibility {
+    crate::tools::skill_pipeline::SkillVisibility::Session
+}
+
+pub(crate) struct AdmissionSnapshot {
+    pub runs: Vec<crate::tools::skill_pipeline::PipelineRun>,
+    pub owners: HashMap<String, SkillIriOwnerRecord>,
+}
+
+fn publisher_pair(run: &crate::tools::skill_pipeline::PipelineRun) -> Option<(&str, &str)> {
+    Some((publisher_tenant(run)?, publisher_project(run)?))
+}
+
+/// Fold one run into the owner map. A conflicting tenant does not move the owner.
+fn replay_owner_run(
+    owners: &mut HashMap<String, SkillIriOwnerRecord>,
     run: &crate::tools::skill_pipeline::PipelineRun,
-) -> std::io::Result<()> {
-    let mut runs = load_pipeline_runs();
-    runs.insert(0, run.clone());
-    if runs.len() > PIPELINE_RUNS_CAP {
-        runs.truncate(PIPELINE_RUNS_CAP);
+) -> Result<(), PipelineWriteError> {
+    let Some((tenant_id, project_id)) = publisher_pair(run) else {
+        if owners.contains_key(&run.skill_iri) {
+            return Err(PipelineWriteError::OwnedByAnotherTenant);
+        }
+        return Ok(());
+    };
+    if let Some(owner) = owners.get_mut(&run.skill_iri) {
+        if owner.tenant_id != tenant_id {
+            return Err(PipelineWriteError::OwnedByAnotherTenant);
+        }
+        owner.published = run.published;
+        owner.gate_passed = run.gate_passed;
+        owner.visibility = run.visibility;
+        return Ok(());
     }
+    if run.published && run.gate_passed {
+        owners.insert(
+            run.skill_iri.clone(),
+            SkillIriOwnerRecord {
+                skill_iri: run.skill_iri.clone(),
+                tenant_id: tenant_id.to_string(),
+                project_id: project_id.to_string(),
+                published: true,
+                gate_passed: true,
+                visibility: run.visibility,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn owners_from_runs(
+    runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> HashMap<String, SkillIriOwnerRecord> {
+    let mut owners = HashMap::new();
+    // Newest-first storage: the oldest qualifying run is the owner.
+    for run in runs.iter().rev() {
+        let _ = replay_owner_run(&mut owners, run);
+    }
+    owners
+}
+
+fn save_owners_unlocked(owners: &HashMap<String, SkillIriOwnerRecord>) -> std::io::Result<()> {
+    let mut records: Vec<_> = owners.values().cloned().collect();
+    records.sort_by(|left, right| left.skill_iri.cmp(&right.skill_iri));
+    let bytes = serde_json::to_vec_pretty(&records)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let path = skill_iri_owners_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::config::write_file_atomically(&path, &bytes)?;
+    // The marker is written with the owner file. A marker without that file
+    // means the owner file was removed and must fail closed.
+    write_owners_migration_marker()
+}
+
+fn path_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_owners_migration_marker() -> std::io::Result<()> {
+    let path = owners_migration_marker_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::config::write_file_atomically(&path, br#"{"version":1}"#)
+}
+
+fn ensure_owners_migrated() -> std::io::Result<()> {
+    if path_exists(&owners_migration_marker_path())? {
+        return Ok(());
+    }
+    write_owners_migration_marker()
+}
+
+/// Copy admission history into the owner file a single time.
+///
+/// The marker records that this copy finished. After it exists, a missing
+/// owner file is an error even when `pipeline_runs.json` is gone. An empty
+/// map would drop ownership. Deleting the marker and the owner file together
+/// runs this copy again from whatever runs remain, and those runs may already
+/// have been truncated to the latest 200, so ownership can be reset.
+fn migrate_owners_from_runs(
+    runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
+    let owners = owners_from_runs(runs);
+    // A rejected request on an empty data dir must not create either file.
+    // Writing the marker alone would make the next load look like a deleted
+    // owner file. A runs file with nothing to own still gets an empty owner
+    // file and the marker, so a later deletion is fail-closed.
+    if !owners.is_empty() || path_exists(&pipeline_runs_path())? {
+        save_owners_unlocked(&owners)?;
+    }
+    Ok(owners)
+}
+
+fn load_missing_owner_file(
+    runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
+    if path_exists(&owners_migration_marker_path())? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "skill owner file is missing after migration",
+        ));
+    }
+    migrate_owners_from_runs(runs)
+}
+
+/// Load the owner file. The first load migrates whatever runs are still on
+/// disk and records that migration. A file that will not parse is an error
+/// and is not replaced. After the marker exists, a missing owner file is an
+/// error and is not rebuilt, whether or not run history is still on disk.
+fn load_owners_unlocked(
+    runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> std::io::Result<HashMap<String, SkillIriOwnerRecord>> {
+    match std::fs::read_to_string(skill_iri_owners_path()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => load_missing_owner_file(runs),
+        Err(error) => Err(error),
+        Ok(content) => {
+            let records: Vec<SkillIriOwnerRecord> =
+                serde_json::from_str(&content).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                })?;
+            ensure_owners_migrated()?;
+            let mut owners = HashMap::new();
+            for record in records {
+                owners.insert(record.skill_iri.clone(), record);
+            }
+            let known = owners.len();
+            for run in runs.iter().rev() {
+                if owners.contains_key(&run.skill_iri) {
+                    continue;
+                }
+                let _ = replay_owner_run(&mut owners, run);
+            }
+            if owners.len() != known {
+                save_owners_unlocked(&owners)?;
+            }
+            Ok(owners)
+        }
+    }
+}
+
+/// Exposure follows the stored owner, not the newest run still inside the cap.
+///
+/// A later run can revoke publication only when that same tenant wrote it.
+/// Another project in the owner tenant may still create its own exposure.
+/// A run with no publisher tenant does not grant ownership.
+pub(crate) fn skill_published_for_tenant(
+    owner: Option<&SkillIriOwnerRecord>,
+    tenant_id: &str,
+    project_id: &str,
+) -> bool {
+    use crate::tools::skill_pipeline::SkillVisibility;
+    let tenant_id = tenant_id.trim();
+    if tenant_id.is_empty() || project_id.trim().is_empty() {
+        return false;
+    }
+    owner.is_some_and(|owner| {
+        owner.tenant_id == tenant_id
+            && owner.published
+            && owner.gate_passed
+            && owner.visibility == SkillVisibility::Tenant
+            && !owner.project_id.trim().is_empty()
+    })
+}
+
+/// Count of the most recently loaded admission file. Updated on every read.
+static RUNS_WITHOUT_PUBLISHER_TENANT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn runs_without_publisher_tenant_count() -> usize {
+    RUNS_WITHOUT_PUBLISHER_TENANT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_runs_without_publisher_tenant(runs: &[crate::tools::skill_pipeline::PipelineRun]) {
+    let count = runs
+        .iter()
+        .filter(|run| publisher_tenant(run).is_none())
+        .count();
+    RUNS_WITHOUT_PUBLISHER_TENANT.store(count, std::sync::atomic::Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            runs_without_publisher_tenant = count,
+            "pipeline runs without publisher_tenant_id do not grant skill ownership and stay on disk"
+        );
+    });
+}
+
+pub(crate) fn admission_snapshot() -> std::io::Result<AdmissionSnapshot> {
+    let _guard = lock_pipeline_runs();
+    let runs = load_pipeline_runs_unlocked()?;
+    note_runs_without_publisher_tenant(&runs);
+    let owners = load_owners_unlocked(&runs)?;
+    Ok(AdmissionSnapshot { runs, owners })
+}
+
+pub(crate) fn pipeline_runs_snapshot(
+) -> std::io::Result<Vec<crate::tools::skill_pipeline::PipelineRun>> {
+    Ok(admission_snapshot()?.runs)
+}
+
+pub(crate) fn is_tenant_published_skill(
+    skill_iri: &str,
+    tenant_id: &str,
+    project_id: &str,
+) -> bool {
+    match admission_snapshot() {
+        Ok(view) => skill_published_for_tenant(view.owners.get(skill_iri), tenant_id, project_id),
+        Err(error) => {
+            tracing::error!(error = %error, "pipeline run store is unreadable");
+            false
+        }
+    }
+}
+
+pub(crate) async fn is_tenant_published_skill_async(
+    skill_iri: String,
+    tenant_id: String,
+    project_id: String,
+) -> bool {
+    tokio::task::spawn_blocking(move || {
+        is_tenant_published_skill(&skill_iri, &tenant_id, &project_id)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+pub(crate) fn skill_iri_owned_by_other_tenant(
+    skill_iri: &str,
+    tenant_id: &str,
+) -> std::io::Result<bool> {
+    let view = admission_snapshot()?;
+    Ok(view
+        .owners
+        .get(skill_iri)
+        .is_some_and(|owner| owner.tenant_id != tenant_id.trim()))
+}
+
+/// `skill://{tenant}/...` must name the publisher's verified tenant.
+pub(crate) fn skill_iri_matches_publisher(skill_iri: &str, tenant_id: &str) -> bool {
+    let Some(rest) = skill_iri.strip_prefix("skill://") else {
+        return false;
+    };
+    let Some((segment, name)) = rest.split_once('/') else {
+        return false;
+    };
+    !segment.is_empty() && !name.is_empty() && segment == tenant_id.trim()
+}
+
+pub(crate) fn skill_iri_mismatch_response() -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": "skill_iri_tenant_mismatch"})),
+    )
+        .into_response()
+}
+
+/// Ownership wins over the namespace check, so a foreign republish of an
+/// owned IRI is 409. An unowned IRI outside the caller's namespace is 403.
+///
+/// Platform-admin register, import, and rerun pass `require_tenant_segment:
+/// false`. Those routes already require the platform tenant, and they register
+/// product namespaces such as `skill://battery/...`. The run is still owned by
+/// the platform tenant, so a customer tenant cannot republish or expose it.
+/// Market publish passes `true`: a customer tenant cannot pre-claim
+/// `skill://other-tenant/...`.
+pub(crate) async fn reject_skill_iri_write(
+    skill_iri: &str,
+    tenant_id: &str,
+    require_tenant_segment: bool,
+) -> Result<(), axum::response::Response> {
+    match skill_iri_blocked_for_tenant(skill_iri, tenant_id).await? {
+        true => Err(skill_iri_conflict_response()),
+        false if require_tenant_segment && !skill_iri_matches_publisher(skill_iri, tenant_id) => {
+            Err(skill_iri_mismatch_response())
+        }
+        false => Ok(()),
+    }
+}
+
+pub(crate) fn skill_iri_conflict_response() -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error": "skill_iri_owned_by_another_tenant"})),
+    )
+        .into_response()
+}
+
+fn pipeline_store_failure(error: impl std::fmt::Display) -> axum::response::Response {
+    tracing::error!(error = %error, "pipeline run store failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "pipeline_run_store_failed"})),
+    )
+        .into_response()
+}
+
+/// `Err` is an HTTP response. `Ok(false)` means this tenant may write a run.
+pub(crate) async fn skill_iri_blocked_for_tenant(
+    skill_iri: &str,
+    tenant_id: &str,
+) -> Result<bool, axum::response::Response> {
+    let skill_iri = skill_iri.to_string();
+    let tenant_id = tenant_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        skill_iri_owned_by_other_tenant(&skill_iri, &tenant_id)
+    })
+    .await
+    {
+        Ok(Ok(blocked)) => Ok(blocked),
+        Ok(Err(error)) => Err(pipeline_store_failure(error)),
+        Err(error) => Err(pipeline_store_failure(error)),
+    }
+}
+
+pub(crate) fn verified_publisher_tenant(identity: &UserIdentity) -> String {
+    use crate::isolation::IsolationScopeProvenance;
+    identity
+        .isolation_claims()
+        .filter(|claims| claims.provenance() == IsolationScopeProvenance::VerifiedExplicit)
+        .map(|claims| claims.tenant_id().trim().to_string())
+        .filter(|tenant_id| !tenant_id.is_empty())
+        .unwrap_or_default()
+}
+
+/// Copy an explicit verified publisher onto a pipeline context. A defaulted
+/// or missing project is left unset so the run cannot authorize exposure.
+fn record_publisher_from_identity(
+    ctx: &mut crate::tools::skill_pipeline::PipelineContext,
+    identity: &UserIdentity,
+) {
+    use crate::isolation::IsolationScopeProvenance;
+
+    let Some(claims) = identity.isolation_claims() else {
+        return;
+    };
+    if claims.provenance() != IsolationScopeProvenance::VerifiedExplicit {
+        return;
+    }
+    ctx.record_publisher(claims.tenant_id(), claims.project_id());
+}
+
+fn save_pipeline_runs_unlocked(
+    runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> std::io::Result<()> {
     let path = pipeline_runs_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = serde_json::to_string_pretty(&runs).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(&path, content)
+    let bytes = serde_json::to_vec_pretty(runs)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    super::config::write_file_atomically(&path, &bytes)
+}
+
+/// Append every run or none. Owner records are updated under the same lock
+/// and are not truncated with the run history.
+pub(crate) fn append_pipeline_runs(
+    new_runs: &[crate::tools::skill_pipeline::PipelineRun],
+) -> Result<(), PipelineWriteError> {
+    let _guard = lock_pipeline_runs();
+    let mut runs = load_pipeline_runs_unlocked()?;
+    let mut owners = load_owners_unlocked(&runs)?;
+    for run in new_runs {
+        replay_owner_run(&mut owners, run)?;
+    }
+    for run in new_runs.iter().rev() {
+        runs.insert(0, run.clone());
+    }
+    if runs.len() > PIPELINE_RUNS_CAP {
+        runs.truncate(PIPELINE_RUNS_CAP);
+    }
+    note_runs_without_publisher_tenant(&runs);
+    save_owners_unlocked(&owners)?;
+    save_pipeline_runs_unlocked(&runs)?;
+    Ok(())
+}
+
+/// 追加一条运行记录并持久化（最新在前，超上限裁剪最早）。
+/// 读-改-写持有进程锁，落盘走临时文件 + fsync + rename。解析失败时不写。
+/// 其他租户不能改写已有 owner 的 skill IRI。
+pub(crate) fn append_pipeline_run(
+    run: &crate::tools::skill_pipeline::PipelineRun,
+) -> Result<(), PipelineWriteError> {
+    append_pipeline_runs(std::slice::from_ref(run))
+}
+
+pub(crate) async fn append_pipeline_run_async(
+    run: crate::tools::skill_pipeline::PipelineRun,
+) -> Result<(), PipelineWriteError> {
+    tokio::task::spawn_blocking(move || append_pipeline_run(&run))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "pipeline run writer task failed");
+            Err(PipelineWriteError::Io(std::io::Error::other(
+                "pipeline run writer failed",
+            )))
+        })
+}
+
+/// Two-party rendezvous. A timeout releases every waiter so a missing peer
+/// cannot leave a worker blocked for the rest of the process.
+#[cfg(test)]
+pub(crate) struct AdmissionBarrier {
+    parties: usize,
+    state: std::sync::Mutex<AdmissionBarrierState>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct AdmissionBarrierState {
+    arrived: usize,
+    released: bool,
+}
+
+#[cfg(test)]
+impl AdmissionBarrier {
+    pub(crate) fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            state: std::sync::Mutex::new(AdmissionBarrierState {
+                arrived: 0,
+                released: false,
+            }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if guard.released {
+            return true;
+        }
+        guard.arrived += 1;
+        if guard.arrived >= self.parties {
+            guard.released = true;
+            self.cv.notify_all();
+            return true;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                guard.released = true;
+                self.cv.notify_all();
+                return false;
+            }
+            let (next, wait) = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            guard = next;
+            if guard.released {
+                return true;
+            }
+            if wait.timed_out() {
+                guard.released = true;
+                self.cv.notify_all();
+                return false;
+            }
+        }
+    }
+}
+
+/// Lets a test release two admission writers into the run/registry section
+/// together. Unset in production builds.
+#[cfg(test)]
+pub(crate) async fn await_admission_write_barrier() {
+    let barrier = ADMISSION_WRITE_BARRIER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if let Some(barrier) = barrier {
+        let _ = tokio::task::spawn_blocking(move || {
+            barrier.wait_timeout(std::time::Duration::from_secs(5));
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+static ADMISSION_WRITE_BARRIER: std::sync::Mutex<Option<std::sync::Arc<AdmissionBarrier>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_admission_write_barrier(barrier: Option<std::sync::Arc<AdmissionBarrier>>) {
+    *ADMISSION_WRITE_BARRIER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = barrier;
+}
+
+pub(crate) async fn append_pipeline_runs_async(
+    runs: Vec<crate::tools::skill_pipeline::PipelineRun>,
+) -> Result<(), PipelineWriteError> {
+    tokio::task::spawn_blocking(move || append_pipeline_runs(&runs))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "pipeline run writer task failed");
+            Err(PipelineWriteError::Io(std::io::Error::other(
+                "pipeline run writer failed",
+            )))
+        })
+}
+
+pub(crate) fn persist_admitted_skill(
+    registry: &crate::tools::skill_registry::SkillRegistry,
+    skill: &SkillMeta,
+) -> Result<(), String> {
+    save_user_skill(skill).map_err(|error| error.to_string())?;
+    registry.register_skill(skill.clone());
+    Ok(())
+}
+
+pub(crate) fn pipeline_write_response(error: PipelineWriteError) -> axum::response::Response {
+    match error {
+        PipelineWriteError::OwnedByAnotherTenant => skill_iri_conflict_response(),
+        PipelineWriteError::Io(error) => pipeline_store_failure(error),
+    }
 }
 
 pub(crate) async fn list_skills_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -272,19 +859,30 @@ pub(crate) async fn register_skill_handler(
     // 仅当门禁放行时 publish 回调才会真正持久化并注册技能。
     use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
     let iri = skill.skill_iri.clone();
-    let ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
-    let registry = state.core.skills.clone();
+    let mut ctx = PipelineContext::local(PipelineSource::Manual, identity.user_id.clone());
+    record_publisher_from_identity(&mut ctx, &identity);
+    let publisher = verified_publisher_tenant(&identity);
+    if let Err(response) = reject_skill_iri_write(&iri, &publisher, false).await {
+        return response;
+    }
+    // Claim the owner record before touching the registry. A losing racer
+    // gets 409 and leaves the registered skill unchanged.
     let run = run_pipeline(
         &state.core.skills,
         &skill,
         &ctx,
-        Box::new(move |s| {
-            save_user_skill(s).map_err(|e| e.to_string())?;
-            registry.register_skill(s.clone());
-            Ok(format!("已注册并持久化技能 {}", s.skill_iri))
-        }),
+        Box::new(|_| Ok("admission accepted".into())),
     );
-    let _ = append_pipeline_run(&run);
+    #[cfg(test)]
+    await_admission_write_barrier().await;
+    if let Err(error) = append_pipeline_run_async(run.clone()).await {
+        return pipeline_write_response(error);
+    }
+    if run.published {
+        if let Err(error) = persist_admitted_skill(&state.core.skills, &skill) {
+            return pipeline_store_failure(error);
+        }
+    }
 
     let sig_status = state.core.skills.verify_skill_signature(&skill);
     let code = if run.published {
@@ -550,6 +1148,20 @@ pub(crate) async fn import_git_skill_handler(
     if let Err(e) = identity.require_platform_admin("skill registry writes") {
         return e.into_response();
     }
+    // When the caller names the IRI, reject a foreign owner before cloning.
+    // A test that supplies an owned IRI and an unusable repository URL stays
+    // 409; deleting this check lets the clone fail instead.
+    if let Some(skill_iri) = req
+        .skill_iri
+        .as_deref()
+        .filter(|skill_iri| !skill_iri.is_empty())
+    {
+        if let Err(response) =
+            reject_skill_iri_write(skill_iri, &verified_publisher_tenant(&identity), false).await
+        {
+            return response;
+        }
+    }
     let git_source = match validate_git_clone_source(&req.repo_url, &req.r#ref) {
         Ok(source) => source,
         Err(error) => {
@@ -783,7 +1395,7 @@ pub(crate) async fn import_git_skill_handler(
     // 走技能准入流水线（Git 来源）：Security/Test 阶段会对克隆目录做敏感扫描与示例夹具校验，
     // 因此流水线必须在 cleanup 清理克隆目录之前执行。
     use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
-    let ctx = PipelineContext {
+    let mut ctx = PipelineContext {
         source: PipelineSource::Git,
         triggered_by: identity.user_id.clone(),
         repo_url: Some(req.repo_url.trim().to_string()),
@@ -794,19 +1406,34 @@ pub(crate) async fn import_git_skill_handler(
         // pipeline refuses system visibility and persists only after all gates.
         visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
         tenant_promotion_review: Some(TenantPromotionReview::completed(identity.user_id.clone())),
+        publisher_tenant_id: None,
+        publisher_project_id: None,
     };
-    let registry = state.core.skills.clone();
+    record_publisher_from_identity(&mut ctx, &identity);
+    if let Err(response) =
+        reject_skill_iri_write(&skill_iri, &verified_publisher_tenant(&identity), false).await
+    {
+        cleanup(&clone_dir);
+        return response;
+    }
     let run = run_pipeline(
         &state.core.skills,
         &skill,
         &ctx,
-        Box::new(move |s| {
-            save_user_skill(s).map_err(|e| e.to_string())?;
-            registry.register_skill(s.clone());
-            Ok(format!("已注册并持久化技能 {}", s.skill_iri))
-        }),
+        Box::new(|_| Ok("admission accepted".into())),
     );
-    let _ = append_pipeline_run(&run);
+    #[cfg(test)]
+    await_admission_write_barrier().await;
+    if let Err(error) = append_pipeline_run_async(run.clone()).await {
+        cleanup(&clone_dir);
+        return pipeline_write_response(error);
+    }
+    if run.published {
+        if let Err(error) = persist_admitted_skill(&state.core.skills, &skill) {
+            cleanup(&clone_dir);
+            return pipeline_store_failure(error);
+        }
+    }
 
     let sig_status = state.core.skills.verify_skill_signature(&skill);
     cleanup(&clone_dir);
@@ -850,21 +1477,36 @@ pub(crate) struct PipelineRunsQuery {
 }
 
 /// GET /api/v1/skills/pipeline-runs — 查询技能准入流水线运行记录（只读，无需鉴权）。
-/// 记录仅含文件名/命中计数等非敏感信息，可安全对管理台展示。
+/// 匿名响应去掉发布者 tenant/project；磁盘上的记录仍保留这两项。
+fn redact_pipeline_run(run: &crate::tools::skill_pipeline::PipelineRun) -> Value {
+    let mut value = serde_json::to_value(run).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("publisher_tenant_id");
+        object.remove("publisher_project_id");
+    }
+    value
+}
+
 pub(crate) async fn list_pipeline_runs_handler(
     Query(q): Query<PipelineRunsQuery>,
 ) -> impl IntoResponse {
-    let mut runs = load_pipeline_runs();
+    let mut runs = match tokio::task::spawn_blocking(pipeline_runs_snapshot).await {
+        Ok(Ok(runs)) => runs,
+        Ok(Err(error)) => return pipeline_store_failure(error),
+        Err(error) => return pipeline_store_failure(error),
+    };
     if let Some(iri) = q.iri.filter(|s| !s.is_empty()) {
         runs.retain(|r| r.skill_iri == iri);
     }
     if let Some(limit) = q.limit {
         runs.truncate(limit);
     }
+    let runs: Vec<Value> = runs.iter().map(redact_pipeline_run).collect();
     Json(json!({
         "count": runs.len(),
         "runs": runs,
     }))
+    .into_response()
 }
 
 /// POST /api/v1/skills/pipeline-rerun 的请求体。
@@ -901,6 +1543,11 @@ pub(crate) async fn pipeline_rerun_handler(
         )
             .into_response();
     }
+    if let Err(response) =
+        reject_skill_iri_write(&req.skill_iri, &verified_publisher_tenant(&identity), false).await
+    {
+        return response;
+    }
     // 以持久化的用户态技能为准（含完整 schema/template/签名）。
     let skill = match load_user_skills()
         .into_iter()
@@ -919,19 +1566,24 @@ pub(crate) async fn pipeline_rerun_handler(
     };
 
     use crate::tools::skill_pipeline::{run_pipeline, PipelineContext, PipelineSource};
-    let ctx = PipelineContext::local(PipelineSource::Rerun, identity.user_id.clone());
-    let registry = state.core.skills.clone();
+    let mut ctx = PipelineContext::local(PipelineSource::Rerun, identity.user_id.clone());
+    record_publisher_from_identity(&mut ctx, &identity);
     let run = run_pipeline(
         &state.core.skills,
         &skill,
         &ctx,
-        Box::new(move |s| {
-            save_user_skill(s).map_err(|e| e.to_string())?;
-            registry.register_skill(s.clone());
-            Ok(format!("已重新注册技能 {}", s.skill_iri))
-        }),
+        Box::new(|_| Ok("admission accepted".into())),
     );
-    let _ = append_pipeline_run(&run);
+    #[cfg(test)]
+    await_admission_write_barrier().await;
+    if let Err(error) = append_pipeline_run_async(run.clone()).await {
+        return pipeline_write_response(error);
+    }
+    if run.published {
+        if let Err(error) = persist_admitted_skill(&state.core.skills, &skill) {
+            return pipeline_store_failure(error);
+        }
+    }
 
     (
         StatusCode::OK,
@@ -1061,6 +1713,8 @@ mod tests {
             require_package: true,
             visibility: crate::tools::skill_pipeline::SkillVisibility::Tenant,
             tenant_promotion_review: Some(TenantPromotionReview::completed("reviewer:tester")),
+            publisher_tenant_id: Some("tenant-a".into()),
+            publisher_project_id: Some("project-a".into()),
         };
         let published = crate::tools::skill_pipeline::run_pipeline(
             &registry,
@@ -1069,7 +1723,15 @@ mod tests {
             Box::new(|_| Ok("published".into())),
         );
         append_pipeline_run(&published).unwrap();
-        assert!(is_tenant_published_skill(&skill.skill_iri));
+        assert!(is_tenant_published_skill(
+            &skill.skill_iri,
+            "tenant-a",
+            "project-b"
+        ));
+        assert!(
+            !is_tenant_published_skill(&skill.skill_iri, "tenant-b", "project-b"),
+            "another tenant must not inherit this publication"
+        );
 
         ctx.visibility = crate::tools::skill_pipeline::SkillVisibility::Session;
         ctx.require_package = false;
@@ -1083,13 +1745,380 @@ mod tests {
         );
         append_pipeline_run(&session_update).unwrap();
         assert!(
-            !is_tenant_published_skill(&skill.skill_iri),
+            !is_tenant_published_skill(&skill.skill_iri, "tenant-a", "project-a"),
             "a later session update must revoke external publication"
         );
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
+
+    fn sample_pipeline_run(index: usize) -> crate::tools::skill_pipeline::PipelineRun {
+        use crate::tools::skill_pipeline::{PipelineRun, PipelineSource, SkillVisibility};
+        PipelineRun {
+            run_id: format!("run-{index}"),
+            skill_iri: format!("skill://test/parallel-{index}"),
+            skill_name: "parallel".into(),
+            version: "1.0.0".into(),
+            source: PipelineSource::Manual,
+            visibility: SkillVisibility::Tenant,
+            tenant_promotion_review: None,
+            triggered_by: "tester".into(),
+            repo_url: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            duration_ms: 1,
+            stages: vec![],
+            gate_passed: true,
+            published: true,
+            summary: "published".into(),
+            publisher_tenant_id: Some("tenant-a".into()),
+            publisher_project_id: Some("project-a".into()),
+        }
+    }
+
+    /// #430: concurrent appends keep every row, and a corrupt file is not rewritten.
+    #[test]
+    fn pipeline_runs_keep_concurrent_appends_and_do_not_rewrite_a_corrupt_file() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        const N: usize = 40;
+        std::thread::scope(|scope| {
+            for index in 0..N {
+                scope.spawn(move || {
+                    append_pipeline_run(&sample_pipeline_run(index)).unwrap();
+                });
+            }
+        });
+        let stored: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("pipeline_runs.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.len(), N);
+        let ids: std::collections::HashSet<_> = stored
+            .iter()
+            .map(|run| run["run_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids.len(), N);
+
+        let path = dir.path().join("pipeline_runs.json");
+        let garbage = b"[{";
+        std::fs::write(&path, garbage).unwrap();
+        assert!(append_pipeline_run(&sample_pipeline_run(99)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), garbage);
+        assert!(!is_tenant_published_skill(
+            "skill://test/parallel-0",
+            "tenant-a",
+            "project-a"
+        ));
+    }
+
+    #[test]
+    fn skill_published_for_tenant_uses_the_stored_owner() {
+        use crate::tools::skill_pipeline::SkillVisibility;
+        let owner = SkillIriOwnerRecord {
+            skill_iri: "skill://tenant-a/owned".into(),
+            tenant_id: "tenant-a".into(),
+            project_id: "project-a".into(),
+            published: true,
+            gate_passed: true,
+            visibility: SkillVisibility::Tenant,
+        };
+        assert!(skill_published_for_tenant(
+            Some(&owner),
+            "tenant-a",
+            "project-b"
+        ));
+        assert!(!skill_published_for_tenant(
+            Some(&owner),
+            "tenant-b",
+            "project-b"
+        ));
+    }
+
+    /// #431: flooding past the run cap must not drop the owner or exposure.
+    #[test]
+    fn owner_record_survives_run_history_truncation() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let mut owned = sample_pipeline_run(0);
+        owned.skill_iri = "skill://tenant-a/secret-skill".into();
+        append_pipeline_run(&owned).unwrap();
+        for index in 0..PIPELINE_RUNS_CAP {
+            let mut junk = sample_pipeline_run(index + 1);
+            junk.skill_iri = format!("skill://tenant-b/junk-{index}");
+            junk.publisher_tenant_id = Some("tenant-b".into());
+            junk.publisher_project_id = Some("project-b".into());
+            append_pipeline_run(&junk).unwrap();
+        }
+        let stored: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("pipeline_runs.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.len(), PIPELINE_RUNS_CAP);
+        assert!(
+            stored
+                .iter()
+                .all(|run| run["skill_iri"] != "skill://tenant-a/secret-skill"),
+            "the owner run was not evicted, so this does not test the owner file"
+        );
+        assert!(is_tenant_published_skill(
+            "skill://tenant-a/secret-skill",
+            "tenant-a",
+            "project-a"
+        ));
+        let mut hostile = owned.clone();
+        hostile.run_id = "hostile".into();
+        hostile.publisher_tenant_id = Some("tenant-b".into());
+        hostile.publisher_project_id = Some("project-b".into());
+        let error = append_pipeline_run(&hostile).unwrap_err();
+        assert!(matches!(error, PipelineWriteError::OwnedByAnotherTenant));
+        let owners: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("skill_iri_owners.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(owners.iter().any(|owner| {
+            owner["skill_iri"] == "skill://tenant-a/secret-skill"
+                && owner["tenant_id"] == "tenant-a"
+        }));
+    }
+
+    /// Migration from admission history happens once. Deleting the owner file
+    /// afterwards must not rebuild it from the remaining runs.
+    #[test]
+    fn owner_file_is_not_rebuilt_after_migration() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let mut owned = sample_pipeline_run(0);
+        owned.skill_iri = "skill://tenant-a/secret-skill".into();
+        let path = pipeline_runs_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&[owned]).unwrap()).unwrap();
+        assert!(!skill_iri_owners_path().exists());
+        assert!(!owners_migration_marker_path().exists());
+
+        let migrated = admission_snapshot().unwrap();
+        assert_eq!(
+            migrated.owners["skill://tenant-a/secret-skill"].tenant_id,
+            "tenant-a"
+        );
+        assert!(owners_migration_marker_path().exists());
+
+        std::fs::remove_file(skill_iri_owners_path()).unwrap();
+        std::fs::write(&path, b"[]").unwrap();
+        assert!(admission_snapshot().is_err());
+        let mut claim = sample_pipeline_run(1);
+        claim.skill_iri = "skill://tenant-a/secret-skill".into();
+        claim.publisher_tenant_id = Some("platform".into());
+        claim.publisher_project_id = Some("ops".into());
+        assert!(append_pipeline_run(&claim).is_err());
+        assert!(!skill_iri_owners_path().exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+    }
+
+    #[test]
+    fn foreign_tenant_append_is_rejected_and_leaves_the_file_unchanged() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let mut owned = sample_pipeline_run(1);
+        owned.skill_iri = "skill://tenant-a/owned".into();
+        append_pipeline_run(&owned).unwrap();
+        let before = std::fs::read(dir.path().join("pipeline_runs.json")).unwrap();
+
+        let mut hostile = owned.clone();
+        hostile.run_id = "hostile".into();
+        hostile.publisher_tenant_id = Some("tenant-b".into());
+        hostile.publisher_project_id = Some("project-b".into());
+        let error = append_pipeline_run(&hostile).unwrap_err();
+        assert!(matches!(error, PipelineWriteError::OwnedByAnotherTenant));
+        assert_eq!(
+            std::fs::read(dir.path().join("pipeline_runs.json")).unwrap(),
+            before
+        );
+        assert!(is_tenant_published_skill(
+            &owned.skill_iri,
+            "tenant-a",
+            "project-a"
+        ));
+        assert!(!is_tenant_published_skill(
+            &owned.skill_iri,
+            "tenant-b",
+            "project-b"
+        ));
+    }
+
+    #[test]
+    fn runs_without_publisher_tenant_are_counted() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let mut unscoped = sample_pipeline_run(7);
+        unscoped.publisher_tenant_id = None;
+        unscoped.publisher_project_id = None;
+        append_pipeline_run(&unscoped).unwrap();
+        let loaded = pipeline_runs_snapshot().unwrap();
+        let missing = loaded
+            .iter()
+            .filter(|run| publisher_tenant(run).is_none())
+            .count();
+        assert_eq!(missing, 1);
+        assert_eq!(runs_without_publisher_tenant_count(), missing);
+        assert!(!is_tenant_published_skill(
+            &unscoped.skill_iri,
+            "tenant-a",
+            "project-a"
+        ));
+    }
+
+    /// A non-atomic overwrite of pipeline_runs.json is visible to a reader as
+    /// invalid JSON. Atomic rename keeps every read parseable.
+    #[test]
+    fn pipeline_runs_concurrent_readers_never_see_a_partial_file() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", dir.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+                    None => std::env::remove_var("AGENTOS_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let torn = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    let torn = torn.clone();
+                    let stop = stop.clone();
+                    scope.spawn(move || {
+                        let path = pipeline_runs_path();
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            match std::fs::read(&path) {
+                                Ok(bytes) => {
+                                    if serde_json::from_slice::<Vec<Value>>(&bytes).is_err() {
+                                        torn.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(_) => {
+                                    torn.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let writers: Vec<_> = (0..8)
+                .map(|writer| {
+                    scope.spawn(move || {
+                        for index in 0..8 {
+                            append_pipeline_run(&sample_pipeline_run(writer * 8 + index)).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for reader in readers {
+                reader.join().unwrap();
+            }
+        });
+        assert!(
+            !torn.load(std::sync::atomic::Ordering::Relaxed),
+            "a reader observed a partial pipeline_runs.json"
+        );
+        let stored: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("pipeline_runs.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.len(), 64);
+    }
+
     // ── 纯函数单元测试 ────────────────────────────────────────────────────────
 
     #[test]
@@ -1505,7 +2534,7 @@ version: \"2.0.0\"\n\
         let _auth = platform_admin_env();
         let ident = platform_admin_bearer();
         let skill = serde_json::json!({
-            "skill_iri": "skill://test/ok", "name": "合法技能", "description": "有效",
+            "skill_iri": "skill://platform/ok", "name": "合法技能", "description": "有效",
             "version": "1.0.0", "category": "test", "security_level": "standard",
             "allowed_roles": ["DA"], "input_schema": {"type": "object"},
             "output_schema": {"type": "object"}, "compiled_template": "{{x}}"
@@ -1515,18 +2544,28 @@ version: \"2.0.0\"\n\
         assert_eq!(body["gate_passed"], true);
         assert_eq!(body["published"], true);
         assert_eq!(body["pipeline_run"]["source"], "manual");
-        assert_eq!(body["pipeline_run"]["skill_iri"], "skill://test/ok");
+        assert_eq!(body["pipeline_run"]["skill_iri"], "skill://platform/ok");
 
         // 运行记录已持久化落盘。
         let disk = std::fs::read_to_string(pipeline_runs_path()).unwrap();
-        assert!(disk.contains("skill://test/ok"), "运行记录应落盘");
+        assert!(disk.contains("skill://platform/ok"), "运行记录应落盘");
 
         // 查询接口（按 iri 过滤）应可检索到该运行。
-        let (st, listed) =
-            get_json(&router, "/api/v1/skills/pipeline-runs?iri=skill://test/ok").await;
+        let (st, listed) = get_json(
+            &router,
+            "/api/v1/skills/pipeline-runs?iri=skill://platform/ok",
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(listed["count"], 1);
         assert_eq!(listed["runs"][0]["published"], true);
+        assert!(
+            disk.contains("publisher_tenant_id"),
+            "the admission file keeps the publisher tenant"
+        );
+        assert!(listed["runs"][0].get("publisher_tenant_id").is_none());
+        assert!(listed["runs"][0].get("publisher_project_id").is_none());
+        assert_eq!(body["pipeline_run"]["publisher_tenant_id"], "platform");
 
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
@@ -1554,7 +2593,7 @@ version: \"2.0.0\"\n\
         let ident = platform_admin_bearer();
         // type 必须是字符串/数组；此处为数字 → JSON Schema 编译失败 → Lint 阶段 Failed。
         let skill = serde_json::json!({
-            "skill_iri": "skill://test/bad", "name": "非法技能", "description": "无效",
+            "skill_iri": "skill://platform/bad", "name": "非法技能", "description": "无效",
             "version": "1.0.0", "category": "test", "security_level": "standard",
             "allowed_roles": ["DA"], "input_schema": {"type": 123},
             "output_schema": {"type": "object"}, "compiled_template": "{{x}}"
@@ -1570,13 +2609,20 @@ version: \"2.0.0\"\n\
 
         // 技能不得被真正注册。
         assert!(
-            state.core.skills.get_skill("skill://test/bad").is_none(),
+            state
+                .core
+                .skills
+                .get_skill("skill://platform/bad")
+                .is_none(),
             "门禁拦截后不应注册"
         );
 
         // 失败运行记录仍持久化，且门禁字段为 false。
-        let (st, listed) =
-            get_json(&router, "/api/v1/skills/pipeline-runs?iri=skill://test/bad").await;
+        let (st, listed) = get_json(
+            &router,
+            "/api/v1/skills/pipeline-runs?iri=skill://platform/bad",
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(listed["count"], 1);
         assert_eq!(listed["runs"][0]["gate_passed"], false);
@@ -1610,7 +2656,7 @@ version: \"2.0.0\"\n\
         let _auth = platform_admin_env();
         let ident = platform_admin_bearer();
         let skill = serde_json::json!({
-            "skill_iri": "skill://test/rerun", "name": "可重跑技能", "description": "有效",
+            "skill_iri": "skill://platform/rerun", "name": "可重跑技能", "description": "有效",
             "version": "1.0.0", "category": "test", "security_level": "standard",
             "allowed_roles": ["DA"], "input_schema": {"type": "object"},
             "output_schema": {"type": "object"}, "compiled_template": "{{x}}"
@@ -1622,7 +2668,7 @@ version: \"2.0.0\"\n\
         let (st, body) = post_json(
             &router,
             "/api/v1/skills/pipeline-rerun",
-            serde_json::json!({"skill_iri": "skill://test/rerun"}),
+            serde_json::json!({"skill_iri": "skill://platform/rerun"}),
             Some(&ident),
         )
         .await;
@@ -1633,7 +2679,7 @@ version: \"2.0.0\"\n\
         // 两条运行记录（注册 + 重跑）。
         let (st, listed) = get_json(
             &router,
-            "/api/v1/skills/pipeline-runs?iri=skill://test/rerun",
+            "/api/v1/skills/pipeline-runs?iri=skill://platform/rerun",
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -1664,7 +2710,7 @@ version: \"2.0.0\"\n\
         let (st, _) = post_json(
             &router,
             "/api/v1/skills/pipeline-rerun",
-            serde_json::json!({"skill_iri": "skill://test/nope"}),
+            serde_json::json!({"skill_iri": "skill://platform/nope"}),
             Some(&ident),
         )
         .await;
