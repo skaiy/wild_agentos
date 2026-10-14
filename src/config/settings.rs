@@ -1556,6 +1556,12 @@ pub struct BatchSettings {
     pub inject_related_entities: bool,
     #[serde(default)]
     pub agents: Vec<BatchAgentSettings>,
+    /// When both are set, batch events carry this tenant and project so SSE
+    /// subscribers in that scope can see them. Unset events stay unscoped.
+    #[serde(default)]
+    pub event_tenant_id: Option<String>,
+    #[serde(default)]
+    pub event_project_id: Option<String>,
 }
 
 fn default_batch_default_model() -> String {
@@ -1742,7 +1748,7 @@ impl Default for Settings {
             },
             agents: AgentSettings::default(),
             api: ApiSettings {
-                grpc_addr: "0.0.0.0:50051".to_string(),
+                grpc_addr: "127.0.0.1:50051".to_string(),
                 http_addr: "0.0.0.0:8080".to_string(),
                 enable_metrics: true,
                 metrics_port: 9090,
@@ -1882,6 +1888,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        parse_grpc_listen_addr(&self.api.grpc_addr)?;
         if self.gateway.base_url.is_empty() {
             tracing::warn!("gateway.base_url is not set. LLM features will be unavailable until configured via UI.");
         }
@@ -1910,11 +1917,39 @@ impl Settings {
     }
 }
 
+/// Parse `api.grpc_addr`. An unparseable value is a startup error.
+pub fn parse_grpc_listen_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
+    addr.parse::<std::net::SocketAddr>()
+        .map_err(|error| format!("api.grpc_addr {addr:?} is not a socket address: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn grpc_listen_address_defaults_to_loopback() {
+        assert_eq!(Settings::default().api.grpc_addr, "127.0.0.1:50051");
+        let addr = parse_grpc_listen_addr(&Settings::default().api.grpc_addr).unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 50051);
+    }
+
+    #[test]
+    fn grpc_listen_address_parse_failure_is_rejected() {
+        let error = parse_grpc_listen_addr("not-a-socket").expect_err("unparseable address");
+        assert!(error.contains("grpc_addr"));
+        assert!(error.contains("not-a-socket"));
+        assert!(parse_grpc_listen_addr("").is_err());
+        assert!(parse_grpc_listen_addr("127.0.0.1").is_err());
+
+        let mut settings = Settings::default();
+        settings.api.grpc_addr = "not-a-socket".to_string();
+        let error = settings.validate().expect_err("startup must fail");
+        assert!(error.contains("not-a-socket"));
+    }
 
     const FAKE_KEY: &str = "test-fake-gateway-key-278";
 

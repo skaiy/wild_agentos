@@ -74,7 +74,7 @@ scope and server fields → `400 field_not_allowed` (§3).
 | `prompt` / `input` / `input_ref` | At least one must be present | `400 invalid_request` |
 | `agent_revision` | Not supported in this version (§4.3). Syntax is still checked: needs `agent_id`; floating words (`latest`, `current`, `head`, `tip`, `active`, `default`, `*`, any case) are never resolved | Floating word or missing `agent_id` → `400 invalid_request`; otherwise any value → `422 agent_revision_unsupported` (after the `agent_id` check, so an unknown `agent_id` is `422 agent_not_found` first) |
 | `input` | Any JSON value, ≤ 8192 bytes as compact JSON | Over limit → `413 payload_too_large` |
-| `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…` with a lowercase scheme and passes the shape check (§4.2); `sha256` is 64 lowercase hex; a registered resolver must match and accept the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` that fails the shape check (no `<scheme>://`, uppercase scheme, control characters, dot / empty segments, backslash, `%2e` / `%2f` / `%5c`) → `400 invalid_request`; no matching resolver, or the resolver rejects the `uri` → `422 input_ref_unresolvable`; `uri` names another project → `422 input_ref_scope_mismatch` |
+| `input_ref` | Both `uri` and `sha256` required; `uri` is `<scheme>://…` with a lowercase scheme and passes the shape check (§4.2); `sha256` is 64 lowercase hex; a registered resolver must match and accept the `uri` (§4.2) | Both `input` and `input_ref`, or a `uri` that fails the shape check (no `<scheme>://`, uppercase scheme, any character outside printable ASCII `0x21`–`0x7E`, `?` / `#` / `;` / `%25`, dot / empty segments including a missing project segment such as `scheme:///…`, backslash, `%2e` / `%2f` / `%5c`) → `400 invalid_request` (a missing project segment is `400`, not `422`); no matching resolver, or the resolver rejects the `uri` → `422 input_ref_unresolvable`; `uri` names another project → `422 input_ref_scope_mismatch` |
 | `budget.*` | Positive integers (≥ 1); `max_cost` is micro-USD; unknown members rejected | `400 invalid_request` |
 | `deadline` | RFC 3339 with offset, later than server time at create | `400 invalid_request` |
 | `metadata` | JSON object, ≤ 16 KiB compact JSON, ≤ 64 top-level keys | `413 payload_too_large` |
@@ -140,9 +140,14 @@ scope and server fields → `400 field_not_allowed` (§3).
 - Create checks, in order, with nothing persisted on failure. First the
   server checks the `uri` shape, before any resolver routing, and answers
   `400 invalid_request` for: no `<scheme>://`; a scheme with uppercase
-  letters; any control character or line break; an empty, `.` or `..` path
-  segment (including a trailing `/`); a backslash; or `%2e`, `%2f`, `%5c` in
-  any case. Then: no registered resolver matches →
+  letters; any character outside printable ASCII (`0x21`–`0x7E`), including
+  spaces, non-ASCII letters, line/paragraph separators (U+2028, U+2029),
+  zero-width characters and bidi controls; `?`, `#`, `;` or `%25` (any case);
+  an empty, `.` or `..` path segment (including a trailing `/` and a missing
+  project segment such as `scheme:///…`, which is `400`, not `422`); a
+  backslash; or `%2e`, `%2f`, `%5c` in any case. `?`, `#` and `;` are rejected
+  before prefix routing, so a segment such as `..?x` cannot be matched as a
+  prefix. Then: no registered resolver matches →
   `422 input_ref_unresolvable`; the resolver's create-time check (no I/O)
   rejects the `uri` → `422 input_ref_unresolvable`, or finds that it names
   another project than the caller's → `422 input_ref_scope_mismatch`. With
@@ -156,7 +161,8 @@ scope and server fields → `400 field_not_allowed` (§3).
 - The server, not the resolver, enforces the limits and checks the
   content: at most `AGENTOS_INVOCATION_INPUT_REF_MAX_BYTES` bytes (default
   65536 = 64 KiB, hard ceiling 1048576 = 1 MiB; invalid values fall back to
-  the default); a timeout of
+  the default). A 1 MiB body can be larger than the context window of the
+  model that will read it; set the cap for the model you deploy. A timeout of
   `AGENTOS_INVOCATION_INPUT_REF_TIMEOUT_MS` (default 10000, 1–60000; invalid
   values fall back to the default), cut short by the invocation `deadline`;
   the SHA-256 is computed by the server and compared with
@@ -177,10 +183,12 @@ scope and server fields → `400 field_not_allowed` (§3).
   then `<input_ref uri="…" sha256="…">` + newline + content + newline +
   `</input_ref>`; without a prompt the block alone is the prompt, so the
   prompt is never empty. The `uri` attribute is XML-escaped (`&`, `"`, `'`,
-  `<`, `>`), and every `</input_ref` in the content (any letter case) is
-  rewritten as `<\/input_ref`, so the content cannot close the block early.
-  The block goes only into the task prompt (task goal / user turn), never
-  into a system prompt.
+  `<`, `>`). In the content, every `&` becomes `&amp;` and every `<`,
+  fullwidth `＜` (U+FF1C), small less-than `﹤` (U+FE64), and `‹` (U+2039)
+  becomes `&lt;` (`&` first), so the content cannot
+  open or close an `input_ref` tag. The notice line and the outer tags are
+  left as written. The block goes only into the task prompt (task goal /
+  user turn), never into a system prompt.
 - **Referenced content is untrusted.** Whoever can write to the source can
   shape what the task reads; for the built-in resolver that is any actor in
   the same tenant and project. `input_ref.sha256` pins the bytes, not their
@@ -188,15 +196,23 @@ scope and server fields → `400 field_not_allowed` (§3).
   not that it is safe to follow. Treat it like user-supplied text.
 - **Built-in resolver `wao-artifact://<project_id>/<artifact-id>` (off by
   default).** It reads coding artifacts uploaded through `/api/v1/artifacts`
-  from the platform's own claims-scoped storage, and makes no outbound
+  from the server's own claims-scoped storage, and makes no outbound
   network request. `<project_id>` must equal the caller's project (otherwise
   create returns `422 input_ref_scope_mismatch`); `<artifact-id>` is the
-  lowercase hyphenated UUID returned by the upload. Any actor in the same
-  tenant and project can reference an artifact; another project or tenant
-  gets the same `input_ref_fetch_failed` as an unknown id. It is registered
-  only when `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` is truthy (`1`,
+  lowercase hyphenated UUID returned by the upload. Resolve loads metadata
+  with the caller's claims and accepts only kind `input_snapshot`; any other
+  kind is the same failure as an unknown id. The fetched bytes' SHA-256 must
+  equal both the digest stored on that metadata and the caller-pinned
+  `input_ref.sha256`. Either mismatch ends `failed` / `input_digest_mismatch`
+  with the same fixed message, which does not say which digest differed.
+  Any actor in the same tenant and project can reference an `input_snapshot`;
+  another project in the same tenant, or another tenant, gets the same
+  `input_ref_fetch_failed` as an unknown id. The resolver is registered only
+  when `AGENTOS_INVOCATION_INPUT_REF_ARTIFACTS_ENABLED` is truthy (`1`,
   `true`, `yes`, `on`) and a blob store is configured; it is read at startup.
-  Turning it on in production is a separate decision.
+  **Leave the variable unset.** Enabling the switch requires #378.
+  This build rejects `input_snapshot` uploads. Invocation execution
+  (`AGENTOS_INVOCATION_EXECUTION_ENABLED`) also stays off by default.
 - Configuration can only switch on resolvers compiled into the server; it
   never loads code. Deployments that embed the server register their own
   resolvers in code (by scheme or prefix) before startup; see
@@ -316,6 +332,11 @@ scope and server fields → `400 field_not_allowed` (§3).
   its shape must still be valid (unknown members rejected; `cost` integer when
   set). A `failed` invocation can carry `result` with only `usage` (for example
   after `budget_exceeded`) and an empty `summary`.
+- **Strict usage shape.** `usage` accepts only `provider`, `model`,
+  `input_tokens`, `output_tokens`, `cost`, `cost_source`, and `tool_calls`;
+  each tool-call entry accepts only `name` and `transport`. Invalid usage is
+  never stored and never silently treated as absent: the execution path ends
+  the run `failed` with `error.code = "invalid_usage"`.
 - `usage` reports the metering the server already does to enforce `budget`
   (`budget_exceeded`). Apart from `cost_source`, which says how `cost` was
   obtained, it carries no attribution to partners, callers or integrators.
@@ -327,8 +348,22 @@ scope and server fields → `400 field_not_allowed` (§3).
   - `a2a` — tool call that went through the A2A outbound path; **do not overload
     `http` for A2A**. A2A invocations use `transport = "a2a"` as a distinct value.
   - `local` — in-process / built-in tool with no network hop.
-  - `unknown` — transport could not be classified; prefer an explicit value when
-    known. Values outside this set are rejected at write time.
+  - `unknown` — transport could not be classified. A stored value outside this
+    set is read back as `unknown`, and a warning is logged without the raw
+    value. New writes still reject a transport outside the set.
+  The executor records each tool attempt that reached the run's tool tracker,
+  on the usage it returns for every terminal outcome (succeeded, failed,
+  cancelled, and timed out), including attempts from earlier cycles of the
+  same run. Only `name` and `transport` are stored. Arguments and results are
+  not persisted. A name the model supplied that is not a registered tool, or
+  a call refused by policy or reported as not found, is stored as the fixed
+  name `<unregistered>` with transport `unknown`. Recorded names are capped
+  at 64 bytes. Registered built-ins that make a network request
+  (`web_search`, `web_fetch`, `http_request`, `knowledge_import_url`,
+  `knowledge_extract`, `create_skill`, `convert_skill`, `bash`) use `http`.
+  Other registered in-process built-ins use `local`. `request.budget.max_tool_calls`
+  is enforced against that recorded list when `tool_calls` is present. Task
+  events on the shared bus do not add tool calls.
 
 ### 5.1 List response
 
@@ -515,17 +550,44 @@ entered the executor path).
   server when the run ends, never from task events. Events on the shared task
   event bus (including `TASK_COMPLETED` / `TASK_FAILED`) feed SSE streams only;
   other components and callers can publish there, so they never end an
-  invocation. `POST /api/v1/events` rejects every `TASK_*` event type
-  (case-insensitive) with `403 reserved_event_type` for every role, and sets
-  the event source to `external:http:<sub>` itself; a `source` member in the
-  body is ignored and dropped from the stored payload. The executor reports a terminal status: only an explicit success (`completed`, `success`,
+  invocation. `POST /api/v1/events` accepts only `CUSTOM` and types that start
+  with `EXT_`. Every other type is `403`: `TASK_*` (case-insensitive) is
+  `reserved_event_type`, and the rest — including `BATCH_*` and run-control
+  types — is `event_type_not_allowed`. Run-control events are posted on
+  dedicated routes (`POST /api/v1/control-events/intervention-required`,
+  `.../user-supplementary-input`, `.../human-approval-result`,
+  `.../threshold-exceeded`, `.../cycle-iteration`) and only by the task
+  `user_id` or a control-plane DA in the task's tenant and project. That DA
+  must have an explicit project claim; a defaulted project is rejected. A
+  missing or out-of-scope task is `404`, a same-scope non-owner is `403`, and
+  a payload over 64 KiB is `413`. Core writes (`POST /api/v1/events` and
+  `POST /api/v1/nodes`) use that same `404` (`not found`) for a missing task
+  and for a task outside the caller's tenant or project, so the status does
+  not reveal that the task exists. A platform admin may still write across
+  tenants. Tasks created by `POST /api/v1/tasks`, `POST /api/v1/tasks/stream`,
+  and invocation execution store `user_id` from the verified actor, not from
+  the request body. The server
+  sets the source to `external:http:<sub>`; a `source` member in the body is
+  ignored and dropped from the stored payload. Task console SSE and invocation
+  `progress` events drop any bus event whose source starts with `external:`,
+  so a caller cannot change the displayed phase or inject display text.
+  `GET /api/v1/batch/events` delivers a `BATCH_*` event only when its task
+  node — or, if that node is absent, `tenant_id` and `project_id` on the
+  payload — matches the subscriber's verified tenant and project. An internal
+  event whose source starts with `batch:` and which has neither a task node
+  nor those payload fields is delivered only to a platform admin. A non-2xx
+  answer from a streaming model call records only the status, model, and a
+  request id. The executor reports a terminal status: only an explicit success (`completed`, `success`,
   `succeeded`) can become `succeeded`; any other status (for example `timeout`
   or `partial_failure`) ends `failed` / `task_failed`, with the actual usage
   attached. A lagging SSE subscriber receives a `resync` event and should
   re-read the resource; the persisted state is authoritative.
 - Usage is metered per run and written to `result.usage` with the terminal
-  transition. A `succeeded` write requires complete usage per §5 (VAL-016 /
-  VAL-017); incomplete usage must not be persisted as `succeeded`.
+  transition, including tool attempts the executor recorded for that run
+  (§5) on success, failure, cancellation, and timeout.
+  A `succeeded` write requires complete usage per §5 (VAL-016 / VAL-017);
+  incomplete usage must not be persisted as `succeeded`. Usage that does not
+  match the §5 shape ends the run `failed` / `invalid_usage` and is not stored.
 - Execution is behind a configuration switch that defaults to **off**
   (`AGENTOS_INVOCATION_EXECUTION_ENABLED`). Keep it off in production until you
   intentionally enable the TaskExecutor bridge. Projection scoping (#310/#322)
@@ -552,7 +614,7 @@ entered the executor path).
 | `event` | When | Extra `data` members |
 | --- | --- | --- |
 | `state` | First event (snapshot), then every state transition | `state`, `previous_state` (null in the snapshot), `snapshot` (true only on the first event), `invocation` (full resource, snapshot only) |
-| `progress` | Execution progress; not persisted, `revision` unchanged | `phase` (optional), `message` (optional, safe text) |
+| `progress` | Execution progress; not persisted, `revision` unchanged. Events whose source starts with `external:` are not sent | `phase` (optional), `message` (optional, safe text), `source` |
 | `result` | Once, on `succeeded` | `state`, `result` (with `usage`) |
 | `error` | Once, on `failed` | `state`, `error` (`{code, message}`), `usage` (optional) |
 | `resync` | Subscriber lagged and events were dropped | none; re-read the resource |

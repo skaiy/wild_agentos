@@ -879,6 +879,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
+        response::IntoResponse,
         routing::{get, post},
         Router,
     };
@@ -1549,6 +1550,119 @@ mod tests {
             "test-hs256-secret-at-least-32-bytes-long",
         );
         (saved_mode, saved_secret)
+    }
+
+    fn bus_event(event_type: &str, source: &str) -> crate::core::event_bus::Event {
+        use crate::core::event_bus::{Event, EventPriority};
+        Event {
+            event_id: "evt".into(),
+            task_iri: "iri://task/t".into(),
+            event_type: event_type.into(),
+            source_agent_iri: source.into(),
+            payload: "{}".into(),
+            payload_json_ld: String::new(),
+            timestamp: chrono::Utc::now(),
+            sequence: 1,
+            type_mask: 0,
+            priority: EventPriority::Normal,
+        }
+    }
+
+    async fn rendered_sse(event: axum::response::sse::Event) -> String {
+        let response = axum::response::sse::Sse::new(tokio_stream::once(Ok::<
+            _,
+            std::convert::Infallible,
+        >(event)))
+        .into_response();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn external_source_display_events_do_not_change_ui_phase() {
+        assert!(
+            convert_event_to_sse(&bus_event("ACT_COMPLETED", "external:http:mallory")).is_none()
+        );
+        assert!(convert_event_to_sse(&bus_event("LLM_CONTENT", "external:http:mallory")).is_none());
+        assert!(
+            convert_event_to_sse(&bus_event("EXECUTION_ERROR", "external:http:mallory")).is_none()
+        );
+        let internal = convert_event_to_sse(&bus_event("ACT_COMPLETED", "AA"))
+            .expect("executor ACT_COMPLETED is a phase change");
+        let body = rendered_sse(internal).await;
+        assert!(body.contains("event: phase_change"), "{body}");
+        assert!(body.contains("\"to_phase\":\"completed\""), "{body}");
+        assert!(body.contains("\"source\":\"AA\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn created_tasks_store_the_actor_id_not_the_body_user_id() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (saved_mode, saved_secret) = hs256_env();
+        let state = test_state();
+        let router = Router::new()
+            .route("/api/v1/tasks", post(create_task_handler))
+            .route("/api/v1/tasks/stream", post(stream_task_handler))
+            .with_state(state.clone());
+        let token = jwt("tenant-a", "project-a");
+        let created = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "user_input": "hello",
+                            "user_id": "someone-else",
+                            "tenant_id": "tenant-a",
+                            "project_id": "project-a",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body: Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let iri = created_body["task_iri"].as_str().unwrap();
+        let node = state.core.read_node(iri).await.unwrap().unwrap();
+        let stored: Value = serde_json::from_str(&node.json_ld).unwrap();
+        assert_eq!(stored["user_id"], "test-user");
+
+        let streamed = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks/stream")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"prompt": "streamed hello"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let streamed_body = to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
+        let streamed_text = String::from_utf8_lossy(&streamed_body);
+        let stream_iri = streamed_text
+            .split("\"task_iri\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("stream announces a task_iri");
+        let stream_node = state.core.read_node(stream_iri).await.unwrap().unwrap();
+        let stream_stored: Value = serde_json::from_str(&stream_node.json_ld).unwrap();
+        assert_eq!(stream_stored["user_id"], "test-user");
+
+        restore_env("AGENTOS_AUTH_MODE", saved_mode);
+        restore_env("AGENTOS_JWT_SECRET", saved_secret);
     }
 
     fn encode_path_segment(value: &str) -> String {

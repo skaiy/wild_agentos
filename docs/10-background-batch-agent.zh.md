@@ -182,6 +182,8 @@ batch_agents:
     # ... 其他字段与上面结构相同，值不同
 ```
 
+当 `batch_agents.event_tenant_id` 与 `batch_agents.event_project_id` 同时设置时，每条批处理事件的 payload 都会带上这两个字段。批处理事件流只把它发给该租户和项目的订阅者。任一字段未设置时，事件没有 scope，只有平台管理员能收到。
+
 ---
 
 ## 3. 统一执行流程

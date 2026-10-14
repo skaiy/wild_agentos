@@ -406,6 +406,11 @@ impl ToolExecutor {
             .collect()
     }
 
+    /// Whether `name` is a resident tool (not a run-local micro reader).
+    pub fn is_registered_tool(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     #[cfg(test)]
     pub(crate) fn builtin_tool_names(&self) -> &BTreeSet<String> {
         &self.builtin_tool_names

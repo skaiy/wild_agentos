@@ -1001,3 +1001,176 @@ async fn isolation_contract_config_persist_failure_does_not_leak_paths() {
     }
     assert!(!read_only.join("config_override.json").exists());
 }
+
+/// #400: an embedding hot-reload failure is copied into the PUT config body.
+/// The body carries a fixed phrase plus the I/O kind (or `open_failed`),
+/// never the data-directory path, `/tmp`, or `os error`.
+#[cfg(unix)]
+#[tokio::test]
+async fn isolation_contract_embedding_reload_failure_does_not_leak_paths() {
+    use std::os::unix::fs::symlink;
+
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let router = app(test_state(dir.path()));
+    // A broken symlink: `create_dir_all` fails with an error whose Display
+    // includes `os error` and, on some platforms, the absolute path.
+    symlink(
+        "/no/such/vector-store-target",
+        dir.path().join("vector_store"),
+    )
+    .unwrap();
+
+    let (status, text) = send(
+        &router,
+        Method::PUT,
+        "/api/v1/config",
+        json!({ "embedding": { "enabled": false, "fallback": { "dimension": 8 } } }),
+        Some(&admin_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["persisted"], json!(true));
+    assert_eq!(body["embedding_reloaded"], json!(false));
+    assert_eq!(
+        body["message"],
+        json!(format!(
+            "配置已持久化，但向量库热切换失败：{}（重启后仍会按新配置生效）",
+            std::io::ErrorKind::AlreadyExists
+        ))
+    );
+    for leaked in [
+        dir.path().to_string_lossy().as_ref(),
+        "/tmp",
+        "os error",
+        "vector_store",
+        "no/such",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "reload body leaks {leaked:?}: {text}"
+        );
+    }
+}
+
+#[cfg(unix)]
+struct RestoreMode {
+    path: std::path::PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+    }
+}
+
+#[cfg(unix)]
+fn assert_embedding_reload_hides_cause(text: &str, dir: &std::path::Path, detail: &str) {
+    let body: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(body["persisted"], json!(true), "{text}");
+    assert_eq!(body["embedding_reloaded"], json!(false), "{text}");
+    assert_eq!(
+        body["message"],
+        json!(format!(
+            "配置已持久化，但向量库热切换失败：{detail}（重启后仍会按新配置生效）"
+        )),
+        "{text}"
+    );
+    for leaked in [
+        dir.to_string_lossy().as_ref(),
+        "/tmp",
+        "os error",
+        "vector_store",
+        "HyperspaceEngine",
+        "Permission denied",
+        "active.wal",
+        "index.snapshot",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "reload body leaks {leaked:?}: {text}"
+        );
+    }
+}
+
+/// #400: `HyperspaceStore::open` fails after `create_dir_all` (the fresh
+/// directory is not writable) and the HTTP body is `open_failed`.
+#[cfg(unix)]
+#[tokio::test]
+async fn isolation_contract_embedding_reload_open_failure_does_not_leak_paths() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let _fixture = EnvGuard::set(&[("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE", "open".into())]);
+    let _restore = RestoreMode {
+        path: dir.path().join("vector_store"),
+        mode: 0o755,
+    };
+    if permissions_ignored(dir.path()) {
+        eprintln!("skipping: running with permission override");
+        return;
+    }
+    let router = app(test_state(dir.path()));
+
+    let (status, text) = send(
+        &router,
+        Method::PUT,
+        "/api/v1/config",
+        json!({ "embedding": { "enabled": false, "fallback": { "dimension": 8 } } }),
+        Some(&admin_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_embedding_reload_hides_cause(&text, dir.path(), "open_failed");
+}
+
+/// #400: store open reads `active.wal`. An unreadable WAL fails that read;
+/// the body stays `open_failed`.
+#[cfg(unix)]
+#[tokio::test]
+async fn isolation_contract_embedding_reload_read_failure_does_not_leak_paths() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = setup(dir.path());
+    let _fixture = EnvGuard::set(&[("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE", "read".into())]);
+    let _restore = RestoreMode {
+        path: dir.path().join("vector_store").join("active.wal"),
+        mode: 0o644,
+    };
+    if permissions_ignored(dir.path()) {
+        eprintln!("skipping: running with permission override");
+        return;
+    }
+    let router = app(test_state(dir.path()));
+
+    let (status, text) = send(
+        &router,
+        Method::PUT,
+        "/api/v1/config",
+        json!({ "embedding": { "enabled": false, "fallback": { "dimension": 8 } } }),
+        Some(&admin_token()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_embedding_reload_hides_cause(&text, dir.path(), "open_failed");
+}
+
+/// Root and other privileged users ignore mode `0o000` / `0o555`.
+#[cfg(unix)]
+fn permissions_ignored(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = dir.join("perm-probe");
+    if std::fs::write(&probe, b"x").is_err() {
+        return true;
+    }
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read(&probe).is_ok();
+    let _ = std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o644));
+    let _ = std::fs::remove_file(&probe);
+    readable
+}
