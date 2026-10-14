@@ -272,7 +272,14 @@ pub(crate) async fn stream_task_handler(
         Some(task_iri) => task_iri,
         None => match state
             .core
-            .init_task_with_claims(&req.prompt, None, None, None, None, claims)
+            .init_task_with_claims(
+                &req.prompt,
+                None,
+                None,
+                Some(claims.actor_id()),
+                None,
+                claims,
+            )
             .await
         {
             Ok(task_iri) => task_iri,
