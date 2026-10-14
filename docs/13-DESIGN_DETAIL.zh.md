@@ -1028,7 +1028,7 @@ graph TB
     end
     
     subgraph API["API 层"]
-        GRPC["gRPC 服务器<br/>tonic [::1]:50051"]
+        GRPC["gRPC 服务器<br/>tonic 127.0.0.1:50051"]
         HTTP["HTTP Edge 守护进程<br/>axum :8080"]
     end
     
@@ -1074,6 +1074,8 @@ graph TB
     Core --> Infra
     Tools --> Memory
 ```
+
+gRPC 服务器默认监听 `127.0.0.1:50051`，除非 `api.grpc_addr` 写了另一个套接字地址。裸机或 systemd 部署如果要在其他地址接受连接，必须自行设置 `AGENT_OS_API_GRPC_ADDR`。所有 gRPC 客户端都必须携带 `authorization: Bearer <jwt>`。该令牌在调用被接受时校验；流已经打开后，令牌过期不会再次校验。无法解析为套接字地址的值会导致进程启动失败。
 
 ### 11.2 数据流：现代流马在行动
 

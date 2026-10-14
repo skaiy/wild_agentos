@@ -97,7 +97,8 @@ agents:
   embedding_timeout_secs: 30
 
 api:
-  grpc_addr: "0.0.0.0:50051"
+  # Loopback unless this field or AGENT_OS_API_GRPC_ADDR names another address.
+  grpc_addr: "127.0.0.1:50051"
   http_addr: "0.0.0.0:8080"
   enable_metrics: true
   # Unused: no process listens here. Scrape GET /metrics on http_addr instead (#324).
