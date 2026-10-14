@@ -5,6 +5,7 @@
 //! the run's own claims-verified tenant L0 and must not fail the run with
 //! `PermissionDenied`.
 
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Duration;
 
 use crate::api::http::TaskExecutor;

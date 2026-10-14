@@ -5,7 +5,7 @@
 //! the same or in different projects, must share one tenant L0 handle instead
 //! of each opening the file (and failing on the lock).
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use crate::api::http::TaskExecutor;
