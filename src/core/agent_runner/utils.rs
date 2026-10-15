@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -208,14 +209,44 @@ impl super::AgentRunner {
         None
     }
 
+    /// Archive one turn into this run's tenant L0. Without verified claims the
+    /// write fails closed and is counted, and nothing is stored.
+    pub(super) async fn archive_turn_to_tenant_l0(
+        &self,
+        session: &L1Session,
+        role: &str,
+        thought: &str,
+        content: &str,
+        task_iri: &str,
+        claims: Option<&crate::isolation::IsolationClaims>,
+    ) -> Option<String> {
+        if claims.is_none() {
+            self.report_l0_write_rejected("archive", task_iri).await;
+            return None;
+        }
+        match session.archive_full_to_l0(&self.l0_store, role, thought, content) {
+            Ok(iri) => Some(iri),
+            Err(error) => {
+                warn!(error = %error, "L0 turn archive rejected");
+                self.report_l0_write_rejected("archive", task_iri).await;
+                None
+            }
+        }
+    }
+
     pub(super) async fn save_emphasis_to_l0(
         &self,
         emphasis_items: &[String],
         task_iri: &str,
         agent_id: &str,
         dedup_threshold: f64,
+        claims: Option<&crate::isolation::IsolationClaims>,
     ) {
         if emphasis_items.is_empty() {
+            return;
+        }
+        if claims.is_none() {
+            self.report_l0_write_rejected("emphasis", task_iri).await;
             return;
         }
 
@@ -261,7 +292,8 @@ impl super::AgentRunner {
             });
 
             if let Err(e) = self.l0_store.store(&iri, &node.to_string()) {
-                warn!("Failed to save emphasis content to L0: {}", e);
+                warn!(error = %e, "L0 emphasis write rejected");
+                self.report_l0_write_rejected("emphasis", task_iri).await;
             } else {
                 info!("[L0] Saved emphasis content: {} -> {}", agent_id, &iri);
             }
@@ -532,6 +564,7 @@ impl super::AgentRunner {
         agent.status = AgentStatus::Running;
 
         let task_iri_for_guard = ctx.task_iri.clone();
+        let has_claims = ctx.isolation_claims.is_some();
         let mut session = self
             .memory_manager
             .lock()
@@ -562,9 +595,16 @@ impl super::AgentRunner {
 
         session = result.1;
 
-        {
+        let l0 = Arc::clone(&self.l0_store);
+        let rejected = {
             let mut mm = self.memory_manager.lock().await;
-            let _ = mm.finalize_session(session, &task_iri_for_guard);
+            let target = if has_claims { Some(l0.as_ref()) } else { None };
+            mm.finalize_session_in(session, &task_iri_for_guard, target)
+        };
+        if let Err(error) = rejected {
+            warn!(error = %error, "L0 session archive rejected");
+            self.report_l0_write_rejected("archive", &task_iri_for_guard)
+                .await;
         }
 
         result.0
@@ -1265,14 +1305,16 @@ impl super::AgentRunner {
             last_summary.clone()
         };
 
-        let l0_iri = session
-            .archive_full_to_l0(
-                &self.l0_store,
+        let l0_iri = self
+            .archive_turn_to_tenant_l0(
+                &session,
                 &agent.role.to_string(),
                 &last_thought,
                 &last_content,
+                &ctx.task_iri,
+                ctx.isolation_claims.as_ref(),
             )
-            .ok();
+            .await;
 
         let l1_turn = session.add_summary(&agent.role.to_string(), &last_summary, l0_iri.clone());
         // Compute turn embedding and relevance_score
@@ -1475,12 +1517,20 @@ impl super::AgentRunner {
                         };
                         match engine_result {
                             Ok(mut engine) => {
-                                let graphify_result = engine.graphify_json_for_claims(
+                                let graphify_result = engine.graphify_json_for_run(
                                     claims,
                                     &json_val,
                                     &g_call_id,
                                     settings.max_graph_entities,
+                                    Some(owner.run_id.as_str()),
                                 );
+                                if self.unified_graph_store.is_some() {
+                                    self.graphify_ledger.record(
+                                        owner.run_id.as_str(),
+                                        claims,
+                                        graphify_result.written_quads.clone(),
+                                    );
+                                }
                                 let analysis = crate::tools::result_router::SchemaAnalysis {
                                     entity_types: graphify_result
                                         .entity_types
