@@ -749,6 +749,14 @@ async fn run_invocation(
 
     let spec = TaskExecSpec {
         prompt,
+        system_prompt: invocation
+            .agent_definition
+            .as_ref()
+            .map(|definition| definition.system_prompt.clone()),
+        model: invocation
+            .agent_definition
+            .as_ref()
+            .map(|definition| definition.model.clone()),
         task_iri: task_iri.clone(),
         include_thought: true,
         include_tool_calls: true,
@@ -918,8 +926,8 @@ async fn apply_task_outcome(
         }
         let usage_for_log = usage.clone();
         let result = InvocationResult {
+            artifacts: structured_artifacts(invocation, &summary),
             summary,
-            artifacts: vec![],
             usage,
         };
         match succeeded_patch_or_reject(result) {
@@ -975,6 +983,29 @@ async fn apply_task_outcome(
         )
         .await;
     }
+}
+
+/// Generic, definition-driven structured output envelope. The schema itself is
+/// intentionally not validated here; validation belongs to a later terminal
+/// output-validation contract.
+fn structured_artifacts(invocation: &Invocation, summary: &str) -> Vec<Value> {
+    let Some(schema) = invocation
+        .agent_definition
+        .as_ref()
+        .and_then(|definition| definition.output_schema.as_ref())
+    else {
+        return Vec::new();
+    };
+    let schema_id = schema
+        .get("$id")
+        .or_else(|| schema.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or("agent_output");
+    vec![serde_json::json!({
+        "schema_id": schema_id,
+        "data": { "summary": summary },
+    })]
 }
 
 fn usage_ref_missing(usage: &Option<InvocationUsage>) -> Vec<&'static str> {

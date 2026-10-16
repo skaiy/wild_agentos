@@ -5,15 +5,14 @@
 //! the run's own claims-verified tenant L0 and must not fail the run with
 //! `PermissionDenied`.
 
+use super::executor_l0_test_support::*;
+use super::*;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Duration;
 
 use crate::api::http::TaskExecutor;
 use crate::core::event_bus::Event;
 use crate::isolation::IsolationClaims;
-
-use super::executor_l0_test_support::*;
-use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_run_flushes_into_its_tenant_l0_not_the_read_only_shared_l0() {

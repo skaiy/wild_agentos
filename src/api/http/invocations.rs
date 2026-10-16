@@ -21,9 +21,6 @@
 //! while execution is switched off, still replays the original.
 //!
 //! Gaps still tracked elsewhere:
-//! - Agent definition revision registry / topology dispatch (follow-up). The
-//!   agent store has no revisions, so a create carrying `agent_revision` is
-//!   still `422 agent_revision_unsupported` (never silently ignored).
 //! - FIFO running caps, deadline / budget / `input_ref` enforcement: #331
 //!   (`invocations_enforcement` + execution bridge).
 //!
@@ -352,6 +349,7 @@ fn resource_view(invocation: &Invocation) -> Value {
     if let Value::Object(map) = &mut value {
         map.remove("audit_events");
         map.remove("idempotency");
+        map.remove("agent_definition");
     }
     value
 }
@@ -670,39 +668,33 @@ fn insert_location(response: &mut Response, invocation: &Invocation) {
     }
 }
 
-/// `agent_id` must name a user agent definition in the caller's scope.
-/// Unknown ids and other scopes get the same body.
+/// Resolves an exact immutable definition snapshot. Omitting a revision pins
+/// the definition active at creation, then records the concrete revision.
 async fn resolve_agent(
     state: &AppState,
     claims: &IsolationClaims,
-    request: &InvocationRequest,
-) -> Result<(), ApiError> {
+    request: &mut InvocationRequest,
+) -> Result<Option<super::agents::AgentDefinitionRevision>, ApiError> {
     let Some(agent_id) = request.agent_id.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
-    let found = state.user_agents.read().await.iter().any(|agent| {
-        agent.get("id").and_then(Value::as_str) == Some(agent_id)
-            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
-            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
-    });
-    if !found {
-        return Err(ApiError::new(
+    let agents = state.user_agents.read().await;
+    let definition = super::agents::resolve_definition_revision(
+        &agents,
+        claims.tenant_id(),
+        claims.project_id(),
+        agent_id,
+        request.agent_revision.as_deref(),
+    )
+    .map_err(|_error| {
+        ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "agent_not_found",
-            "agent_id does not name an agent definition in this scope",
-        ));
-    }
-    if request.agent_revision.is_some() {
-        // Agent definitions still carry no revision field in-tree (#331): a
-        // pin can neither match nor be checked. Reject rather than ignore it
-        // (never invent fake revision pinning).
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "agent_revision_unsupported",
-            "agent revisions are not available yet",
-        ));
-    }
-    Ok(())
+            "agent_id and agent_revision do not name an agent definition in this scope",
+        )
+    })?;
+    request.agent_revision = Some(definition.revision.clone());
+    Ok(Some(definition))
 }
 
 /// `POST /v1/invocations` with optional `Idempotency-Key`.
@@ -764,7 +756,7 @@ pub(crate) async fn create_invocation_handler(
             fingerprint,
         });
     }
-    let request = match parse_create_request(&body) {
+    let mut request = match parse_create_request(&body) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -779,9 +771,10 @@ pub(crate) async fn create_invocation_handler(
             return input_ref_create_error(error).into_response();
         }
     }
-    if let Err(error) = resolve_agent(&state, claims, &request).await {
-        return error.into_response();
-    }
+    let agent_definition = match resolve_agent(&state, claims, &mut request).await {
+        Ok(definition) => definition,
+        Err(error) => return error.into_response(),
+    };
     let store = match store_of(&state) {
         Ok(store) => store,
         Err(error) => return error.into_response(),
@@ -795,6 +788,7 @@ pub(crate) async fn create_invocation_handler(
     }
     let new = NewInvocation {
         request,
+        agent_definition,
         task_iri: None,
         idempotency: registration,
     };

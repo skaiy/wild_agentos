@@ -4,12 +4,172 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use serde::Deserialize;
+use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse, Json};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::iam::UserIdentity;
 use super::{data_dir, AppState};
+
+const MAX_AGENT_ID_BYTES: usize = 64;
+const MAX_SYSTEM_PROMPT_BYTES: usize = 32 * 1024;
+const MAX_MODEL_BYTES: usize = 128;
+const MAX_OUTPUT_SCHEMA_BYTES: usize = 16 * 1024;
+const MAX_AGENT_REVISIONS: usize = 100;
+const RESERVED_AGENT_IDS: &[&str] = &["sa", "pa", "supervisor", "default"];
+
+/// An immutable, executable snapshot of an agent definition.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct AgentDefinitionRevision {
+    pub revision: String,
+    pub system_prompt: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentDefinitionLookupError {
+    Missing,
+}
+
+/// Resolve one immutable definition snapshot within one tenant/project scope.
+pub(crate) fn resolve_definition_revision(
+    agents: &[Value],
+    tenant_id: &str,
+    project_id: &str,
+    agent_id: &str,
+    requested_revision: Option<&str>,
+) -> Result<AgentDefinitionRevision, AgentDefinitionLookupError> {
+    let agent = agents
+        .iter()
+        .find(|agent| {
+            agent.get("id").and_then(Value::as_str) == Some(agent_id)
+                && agent.get("tenant_id").and_then(Value::as_str) == Some(tenant_id)
+                && agent.get("project_id").and_then(Value::as_str) == Some(project_id)
+        })
+        .ok_or(AgentDefinitionLookupError::Missing)?;
+    let revisions = agent
+        .get("revisions")
+        .and_then(Value::as_array)
+        .ok_or(AgentDefinitionLookupError::Missing)?;
+    let revision = requested_revision
+        .map(str::to_owned)
+        .or_else(|| {
+            agent
+                .get("active_revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or(AgentDefinitionLookupError::Missing)?;
+    revisions
+        .iter()
+        .find(|candidate| candidate.get("revision").and_then(Value::as_str) == Some(&revision))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or(AgentDefinitionLookupError::Missing)
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_AGENT_ID_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+        && !RESERVED_AGENT_IDS.contains(&id)
+}
+
+fn definition_request_error(message: &str) -> impl IntoResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid_agent_definition", "message": message })),
+    )
+}
+
+fn definition_payload_too_large(message: &str) -> axum::response::Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({ "error": "payload_too_large", "message": message })),
+    )
+        .into_response()
+}
+
+fn definition_model_error() -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "agent_model_not_configured",
+            "message": "model must be configured by the server",
+        })),
+    )
+        .into_response()
+}
+
+fn persist_error_response() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "agent_persistence_failed",
+            "message": "agent definition could not be persisted",
+        })),
+    )
+        .into_response()
+}
+
+async fn model_is_configured(state: &AppState, model: &str) -> bool {
+    if state
+        .gateway
+        .configured_models()
+        .iter()
+        .any(|configured| configured == model)
+    {
+        return true;
+    }
+    let config = state.config_info.read().await;
+    config
+        .get("pricing")
+        .and_then(|pricing| pricing.get("models"))
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models
+                .iter()
+                .any(|entry| entry.get("model").and_then(Value::as_str) == Some(model))
+        })
+}
+
+async fn validate_definition(
+    state: &AppState,
+    system_prompt: &str,
+    model: &str,
+    output_schema: Option<&Value>,
+) -> Result<(), axum::response::Response> {
+    if system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
+        return Err(definition_payload_too_large("system_prompt exceeds 32 KiB"));
+    }
+    if model.len() > MAX_MODEL_BYTES {
+        return Err(definition_payload_too_large("model exceeds 128 bytes"));
+    }
+    if output_schema.is_some_and(|schema| {
+        serde_json::to_vec(schema)
+            .map(|bytes| bytes.len() > MAX_OUTPUT_SCHEMA_BYTES)
+            .unwrap_or(true)
+    }) {
+        return Err(definition_payload_too_large("output_schema exceeds 16 KiB"));
+    }
+    if crate::utils::secret_scan::contains_plaintext_secret(system_prompt) {
+        return Err(definition_request_error(
+            "system_prompt must not contain plaintext credentials",
+        )
+        .into_response());
+    }
+    if !model_is_configured(state, model).await {
+        return Err(definition_model_error());
+    }
+    Ok(())
+}
 
 /// 用户态 Agent 的持久化文件路径。
 fn agents_store_path() -> std::path::PathBuf {
@@ -70,13 +230,10 @@ fn sync_directory(_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Persists the agent list after a mutation. A failed write is logged rather
-/// than surfaced so the HTTP contract of the CRUD routes stays unchanged; the
-/// previous file on disk is intact because the write is atomic.
-fn persist_user_agents(agents: &[Value]) {
-    if let Err(error) = save_user_agents(agents) {
-        tracing::error!(error = %error, "failed to persist user agents");
-    }
+/// Persists a staged agent list. Callers publish the staged value in memory
+/// only after this succeeds, so an API success always survives a restart.
+fn persist_user_agents(agents: &[Value]) -> std::io::Result<()> {
+    save_user_agents(agents)
 }
 
 /// 从旧 knowledge_graph 值中解析知识库 uuid（形如 .../kb/{uuid}）。
@@ -234,6 +391,8 @@ pub(crate) async fn list_agents_handler(
 
 #[derive(Deserialize)]
 pub struct AgentCreateRequest {
+    /// A tenant/project-local identifier. Omitted only for legacy user agents.
+    pub id: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub business_domain: Option<String>,
@@ -245,6 +404,11 @@ pub struct AgentCreateRequest {
     pub enabled: Option<bool>,
     pub icon: Option<String>,
     pub color: Option<String>,
+    pub system_prompt: Option<String>,
+    pub model: Option<String>,
+    /// Stored verbatim. Terminal output validation is deliberately outside this
+    /// definition-layer contract.
+    pub output_schema: Option<Value>,
 }
 
 /// POST /api/v1/agents — 创建用户态 Agent 并持久化
@@ -260,10 +424,50 @@ pub(crate) async fn create_agent_handler(
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "verified isolation claims required for agent creation" })),
             )
+                .into_response()
         }
     };
-    let agent = json!({
-        "id": uuid::Uuid::new_v4().hyphenated().to_string(),
+    let is_definition = req.id.is_some()
+        || req.system_prompt.is_some()
+        || req.model.is_some()
+        || req.output_schema.is_some();
+    let id = req
+        .id
+        .unwrap_or_else(|| format!("agent_{}", uuid::Uuid::new_v4().simple()));
+    if is_definition && !valid_agent_id(&id) {
+        return definition_request_error(
+            "agent id must start with a lowercase letter and contain only lowercase letters, digits, hyphens, or underscores (maximum 64 bytes)",
+        )
+        .into_response();
+    }
+    let definition = match (req.system_prompt, req.model) {
+        (Some(system_prompt), Some(model))
+            if !system_prompt.trim().is_empty() && !model.trim().is_empty() =>
+        {
+            if let Err(response) =
+                validate_definition(&state, &system_prompt, &model, req.output_schema.as_ref())
+                    .await
+            {
+                return response;
+            }
+            Some(AgentDefinitionRevision {
+                revision: "1".into(),
+                system_prompt,
+                model,
+                output_schema: req.output_schema,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+        }
+        (None, None) if !is_definition => None,
+        _ => {
+            return definition_request_error(
+                "agent definitions require non-empty system_prompt and model",
+            )
+            .into_response()
+        }
+    };
+    let mut agent = json!({
+        "id": id,
         "name": req.name,
         "description": req.description.unwrap_or_default(),
         "business_domain": req.business_domain.unwrap_or_default(),
@@ -277,14 +481,233 @@ pub(crate) async fn create_agent_handler(
         "project_id": claims.project_id(),
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
-    let id = agent["id"].as_str().unwrap_or("").to_string();
     let mut guard = state.user_agents.write().await;
-    guard.push(agent.clone());
-    persist_user_agents(&guard);
+    if guard.iter().any(|existing| {
+        existing.get("id").and_then(Value::as_str) == agent.get("id").and_then(Value::as_str)
+            && existing.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && existing.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "agent_id_conflict", "message": "agent id already exists in this tenant and project" })),
+        )
+            .into_response();
+    }
+    if let Some(definition) = definition {
+        let definition = serde_json::to_value(definition).expect("definition serializes");
+        agent["active_revision"] = json!("1");
+        agent["revisions"] = json!([definition]);
+    }
+    let id = agent["id"].as_str().unwrap_or("").to_string();
+    let mut next = guard.clone();
+    next.push(agent.clone());
+    if let Err(error) = persist_user_agents(&next) {
+        tracing::error!(error = %error, "failed to persist created agent");
+        return persist_error_response();
+    }
+    *guard = next;
     (
         StatusCode::CREATED,
         Json(json!({ "id": id, "status": "created", "agent": agent })),
     )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentRevisionCreateRequest {
+    pub system_prompt: String,
+    pub model: String,
+    pub output_schema: Option<Value>,
+}
+
+/// GET /api/v1/agents/:id/revisions — list immutable definition snapshots.
+pub(crate) async fn list_agent_revisions_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
+    let guard = state.user_agents.read().await;
+    let Some(agent) = guard.iter().find(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent not found" })),
+        )
+            .into_response();
+    };
+    let Some(revisions) = agent.get("revisions").and_then(Value::as_array) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent not found" })),
+        )
+            .into_response();
+    };
+    Json(json!({
+        "agent_id": id,
+        "active_revision": agent.get("active_revision").cloned().unwrap_or(Value::Null),
+        "revisions": revisions,
+    }))
+    .into_response()
+}
+
+/// POST /api/v1/agents/:id/revisions — append an immutable definition snapshot.
+pub(crate) async fn create_agent_revision_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
+    let req: AgentRevisionCreateRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return definition_request_error(
+                "agent revision request must contain system_prompt and model strings",
+            )
+            .into_response()
+        }
+    };
+    if req.system_prompt.trim().is_empty() || req.model.trim().is_empty() {
+        return definition_request_error(
+            "agent definitions require non-empty system_prompt and model",
+        )
+        .into_response();
+    }
+    if let Err(response) = validate_definition(
+        &state,
+        &req.system_prompt,
+        &req.model,
+        req.output_schema.as_ref(),
+    )
+    .await
+    {
+        return response;
+    }
+    let mut guard = state.user_agents.write().await;
+    let Some(index) = guard.iter().position(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent not found" })),
+        )
+            .into_response();
+    };
+    let mut next = guard.clone();
+    let agent = &mut next[index];
+    let Some(revisions) = agent.get_mut("revisions").and_then(Value::as_array_mut) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent not found" })),
+        )
+            .into_response();
+    };
+    if revisions.len() >= MAX_AGENT_REVISIONS {
+        return definition_payload_too_large("agent cannot have more than 100 revisions");
+    }
+    let next_revision = revisions
+        .iter()
+        .filter_map(|revision| revision.get("revision").and_then(Value::as_str))
+        .filter_map(|revision| revision.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let revision = AgentDefinitionRevision {
+        revision: next_revision.to_string(),
+        system_prompt: req.system_prompt,
+        model: req.model,
+        output_schema: req.output_schema,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let revision_value = serde_json::to_value(&revision).expect("definition serializes");
+    revisions.push(revision_value);
+    if let Some(object) = agent.as_object_mut() {
+        object.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+    }
+    if let Err(error) = persist_user_agents(&next) {
+        tracing::error!(error = %error, "failed to persist agent revision");
+        return persist_error_response();
+    }
+    *guard = next;
+    (
+        StatusCode::CREATED,
+        Json(json!({ "agent_id": id, "revision": revision })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/agents/:id/revisions/:revision/activate — select a previous
+/// immutable snapshot as the active revision.
+pub(crate) async fn activate_agent_revision_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path((id, revision)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(claims) = identity.isolation_claims() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "verified isolation claims are required" })),
+        )
+            .into_response();
+    };
+    let mut guard = state.user_agents.write().await;
+    let Some(index) = guard.iter().position(|agent| {
+        agent.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+            && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent not found" })),
+        )
+            .into_response();
+    };
+    let mut next = guard.clone();
+    let agent = &mut next[index];
+    let found = agent
+        .get("revisions")
+        .and_then(Value::as_array)
+        .is_some_and(|revisions| {
+            revisions.iter().any(|candidate| {
+                candidate.get("revision").and_then(Value::as_str) == Some(revision.as_str())
+            })
+        });
+    if !found {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "agent revision not found" })),
+        )
+            .into_response();
+    }
+    if let Some(object) = agent.as_object_mut() {
+        object.insert("active_revision".into(), json!(revision));
+        object.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+    }
+    let active_revision = agent["active_revision"].clone();
+    if let Err(error) = persist_user_agents(&next) {
+        tracing::error!(error = %error, "failed to persist activated agent revision");
+        return persist_error_response();
+    }
+    *guard = next;
+    Json(json!({ "agent_id": id, "active_revision": active_revision })).into_response()
 }
 
 /// PUT /api/v1/agents/:id — 更新用户态 Agent 并持久化
@@ -302,13 +725,28 @@ pub(crate) async fn update_agent_handler(
             .into_response();
     };
     let mut guard = state.user_agents.write().await;
-    let found = guard.iter_mut().find(|agent| {
+    let found = guard.iter().position(|agent| {
         agent.get("id").and_then(Value::as_str) == Some(id.as_str())
             && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
             && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
     });
     match found {
-        Some(agent) => {
+        Some(index) => {
+            if patch.as_object().is_some_and(|patch_obj| {
+                patch_obj.keys().any(|key| {
+                    matches!(
+                        key.as_str(),
+                        "active_revision" | "revisions" | "system_prompt" | "model" | "output_schema"
+                    )
+                })
+            }) {
+                return definition_request_error(
+                    "agent revisions are immutable; create a revision or activate an existing revision",
+                )
+                .into_response();
+            }
+            let mut next = guard.clone();
+            let agent = &mut next[index];
             if let (Some(obj), Some(patch_obj)) = (agent.as_object_mut(), patch.as_object()) {
                 for (k, v) in patch_obj {
                     if matches!(
@@ -322,7 +760,11 @@ pub(crate) async fn update_agent_handler(
                 obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
             }
             let updated = agent.clone();
-            persist_user_agents(&guard);
+            if let Err(error) = persist_user_agents(&next) {
+                tracing::error!(error = %error, "failed to persist updated agent");
+                return persist_error_response();
+            }
+            *guard = next;
             (
                 StatusCode::OK,
                 Json(json!({ "status": "updated", "agent": updated })),
@@ -351,19 +793,24 @@ pub(crate) async fn delete_agent_handler(
     };
     let mut guard = state.user_agents.write().await;
     let before = guard.len();
-    guard.retain(|agent| {
+    let mut next = guard.clone();
+    next.retain(|agent| {
         !(agent.get("id").and_then(Value::as_str) == Some(id.as_str())
             && agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
             && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id()))
     });
-    if guard.len() == before {
+    if next.len() == before {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "agent not found" })),
         )
             .into_response();
     }
-    persist_user_agents(&guard);
+    if let Err(error) = persist_user_agents(&next) {
+        tracing::error!(error = %error, "failed to persist deleted agent");
+        return persist_error_response();
+    }
+    *guard = next;
     (
         StatusCode::OK,
         Json(json!({ "status": "deleted", "id": id })),
@@ -378,7 +825,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
-        routing::{get, put},
+        routing::{get, post, put},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -578,6 +1025,288 @@ mod tests {
         restore_env("AGENTOS_AUTH_MODE", previous_auth_mode);
         restore_env("AGENTOS_JWT_SECRET", previous_jwt_secret);
         restore_env("AGENTOS_DATA_DIR", previous_data_dir);
+    }
+
+    #[tokio::test]
+    async fn definitions_are_scoped_immutable_and_can_roll_back() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", temp.path());
+
+        let state = test_state(temp.path());
+        let router = Router::new()
+            .route("/api/v1/agents", post(create_agent_handler))
+            .route("/api/v1/agents/:id", put(update_agent_handler))
+            .route(
+                "/api/v1/agents/:id/revisions",
+                get(list_agent_revisions_handler).post(create_agent_revision_handler),
+            )
+            .route(
+                "/api/v1/agents/:id/revisions/:revision/activate",
+                post(activate_agent_revision_handler),
+            )
+            .with_state(state.clone());
+        let tenant_a = jwt("tenant-a", "project-a");
+        let tenant_b = jwt("tenant-b", "project-a");
+
+        let (status, created) = request(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents")
+                .header("authorization", format!("Bearer {tenant_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "research_agent",
+                        "name": "Research",
+                        "system_prompt": "Use concise answers.",
+                        "model": "test-model",
+                        "output_schema": {"$id": "result-v1"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["agent"]["active_revision"], "1");
+
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents")
+                .header("authorization", format!("Bearer {tenant_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "research_agent",
+                        "name": "Duplicate",
+                        "system_prompt": "Use concise answers.",
+                        "model": "test-model"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, revised) = request(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents/research_agent/revisions")
+                .header("authorization", format!("Bearer {tenant_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"system_prompt": "Use detailed answers.", "model": "test-model"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(revised["revision"]["revision"], "2");
+
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents/research_agent/revisions")
+                .header("authorization", format!("Bearer {tenant_b}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"system_prompt": "foreign", "model": "test-model"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents/research_agent/revisions/1/activate")
+                .header("authorization", format!("Bearer {tenant_b}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/agents/research_agent")
+                .header("authorization", format!("Bearer {tenant_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"name": "must-not-persist", "model": "changed"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .user_agents
+                .read()
+                .await
+                .iter()
+                .find(|agent| agent["id"] == "research_agent")
+                .unwrap()["name"],
+            "Research",
+        );
+
+        let (status, rolled_back) = request(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents/research_agent/revisions/1/activate")
+                .header("authorization", format!("Bearer {tenant_a}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rolled_back["active_revision"], "1");
+
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/agents/research_agent/revisions")
+                .header("authorization", format!("Bearer {tenant_b}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let definitions = state.user_agents.read().await;
+        let revision = resolve_definition_revision(
+            &definitions,
+            "tenant-a",
+            "project-a",
+            "research_agent",
+            None,
+        )
+        .unwrap();
+        assert_eq!(revision.revision, "1");
+        assert_eq!(revision.model, "test-model");
+        drop(definitions);
+
+        let revisions: Vec<Value> = (1..=MAX_AGENT_REVISIONS)
+            .map(|number| {
+                json!({
+                    "revision": number.to_string(),
+                    "system_prompt": "bounded",
+                    "model": "test-model",
+                    "created_at": "2026-01-01T00:00:00Z"
+                })
+            })
+            .collect();
+        state.user_agents.write().await.push(json!({
+            "id": "capped_agent",
+            "tenant_id": "tenant-a",
+            "project_id": "project-a",
+            "active_revision": "100",
+            "revisions": revisions
+        }));
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/agents/capped_agent/revisions")
+                .header("authorization", format!("Bearer {tenant_a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"system_prompt": "one more", "model": "test-model"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        restore_env("AGENTOS_AUTH_MODE", previous_auth_mode);
+        restore_env("AGENTOS_JWT_SECRET", previous_jwt_secret);
+        restore_env("AGENTOS_DATA_DIR", previous_data_dir);
+    }
+
+    #[tokio::test]
+    async fn definition_validation_bounds_models_and_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(temp.path());
+
+        assert!(validate_definition(&state, "safe", "test-model", None)
+            .await
+            .is_ok());
+        assert_eq!(
+            validate_definition(
+                &state,
+                &"x".repeat(MAX_SYSTEM_PROMPT_BYTES + 1),
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap_err()
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            validate_definition(&state, "safe", &"m".repeat(MAX_MODEL_BYTES + 1), None)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            validate_definition(
+                &state,
+                "safe",
+                "test-model",
+                Some(&json!({"value": "x".repeat(MAX_OUTPUT_SCHEMA_BYTES)})),
+            )
+            .await
+            .unwrap_err()
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            validate_definition(
+                &state,
+                "credential ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap_err()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            validate_definition(&state, "safe", "unpriced-model", None)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(!valid_agent_id("sa"));
+        assert!(!valid_agent_id("default"));
+        assert!(valid_agent_id("agent_123"));
     }
 
     fn leftover_temporaries(dir: &std::path::Path) -> Vec<String> {

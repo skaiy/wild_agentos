@@ -390,6 +390,10 @@ pub struct AgentRunner {
     pub relevance_tracker: Option<Arc<std::sync::Mutex<RelevanceTracker>>>,
     /// Workspace root directory path (all Agent file operations are restricted to this scope)
     pub workspace_root: Option<PathBuf>,
+    /// Per-run definition-owned instructions appended to the system message.
+    /// The runner is cloned for each invocation, so this never changes another
+    /// run's prompt.
+    pub system_prompt_override: Option<String>,
     /// Trusted supervisor restrictions keyed by a unique active run id.
     /// This is deliberately runner-owned, never shared executor or global state.
     pub run_tool_restrictions: Arc<dashmap::DashMap<String, Vec<String>>>,
@@ -469,6 +473,13 @@ impl ToolRestrictionRunGuard {
 }
 
 impl AgentRunner {
+    /// Adds trusted, definition-owned instructions to this runner's system
+    /// message. Callers must keep the runner scoped to one execution.
+    pub fn with_system_prompt_override(mut self, system_prompt: String) -> Self {
+        self.system_prompt_override = Some(system_prompt);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         gateway: Arc<UnifiedGateway>,
@@ -546,6 +557,7 @@ impl AgentRunner {
             embedder: None,
             relevance_tracker: None,
             workspace_root: None,
+            system_prompt_override: None,
             run_tool_restrictions: Arc::new(dashmap::DashMap::new()),
             active_tool_runs: Arc::new(dashmap::DashMap::new()),
             graphify_ledger: Arc::new(crate::tools::result_router::GraphifyRunLedger::default()),
