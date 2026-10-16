@@ -195,6 +195,93 @@ const ROUTES: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
+async fn invocation_pins_agent_revision_replays_idempotently_and_hides_other_scopes() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = env(true);
+    let h = harness();
+    h.state.user_agents.write().await.push(json!({
+        "id": "scoped_agent",
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "active_revision": "2",
+        "revisions": [
+            {
+                "revision": "1",
+                "system_prompt": "First instructions.",
+                "model": "test-model",
+                "created_at": "2026-01-01T00:00:00Z"
+            },
+            {
+                "revision": "2",
+                "system_prompt": "Second instructions.",
+                "model": "test-model",
+                "created_at": "2026-01-02T00:00:00Z"
+            }
+        ]
+    }));
+    let body = json!({
+        "prompt": "Do the work.",
+        "agent_id": "scoped_agent",
+        "agent_revision": "1"
+    })
+    .to_string();
+
+    let first = call(
+        &h.router,
+        "POST",
+        "/v1/invocations",
+        Some(&alice()),
+        &[("idempotency-key", "agent-revision-replay")],
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.json());
+    assert_eq!(first.json()["request"]["agent_revision"], "1");
+    assert!(first.json().get("agent_definition").is_none());
+    let claims = IsolationClaims::from_verified("tenant-a", "project-a", "alice").unwrap();
+    let stored = h
+        .store
+        .get_for_claims(&claims, first.json()["id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.agent_definition.as_ref().unwrap().system_prompt,
+        "First instructions."
+    );
+    assert_eq!(
+        stored.agent_definition.as_ref().unwrap().model,
+        "test-model"
+    );
+
+    let replay = call(
+        &h.router,
+        "POST",
+        "/v1/invocations",
+        Some(&alice()),
+        &[("idempotency-key", "agent-revision-replay")],
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.json());
+    assert_eq!(replay.headers[IDEMPOTENT_REPLAYED_HEADER], "true");
+    assert_eq!(replay.json()["id"], first.json()["id"]);
+    assert_eq!(stored_count(&h).await, 1);
+
+    let other_scope = token("bob", "tenant-b", Some("project-a"), &[]);
+    let cross_scope = call(
+        &h.router,
+        "POST",
+        "/v1/invocations",
+        Some(&other_scope),
+        &[],
+        Some(body),
+    )
+    .await;
+    assert_eq!(cross_scope.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(cross_scope.code(), "agent_not_found");
+}
+
+#[tokio::test]
 async fn invocations_routes_reject_unverified_callers_with_401() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for strict in [true, false] {
@@ -562,7 +649,7 @@ async fn create_validation_rejects_without_persisting() {
             "agent revision",
             json!({"prompt": "p", "agent_id": "agent-a", "agent_revision": "r1"}),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "agent_revision_unsupported",
+            "agent_not_found",
         ),
     ];
     let mut agent_not_found_bodies = Vec::new();
@@ -575,7 +662,9 @@ async fn create_validation_rejects_without_persisting() {
         }
         assert_eq!(stored_count(&h).await, 0, "{name} persisted");
     }
+    assert_eq!(agent_not_found_bodies.len(), 3);
     assert_eq!(agent_not_found_bodies[0], agent_not_found_bodies[1]);
+    assert_eq!(agent_not_found_bodies[1], agent_not_found_bodies[2]);
 
     // A malformed Idempotency-Key is rejected before anything is stored
     // (full coverage in invocations_idempotency_tests.rs, #315).
@@ -592,7 +681,7 @@ async fn create_validation_rejects_without_persisting() {
     assert_eq!(reply.code(), "invalid_idempotency_key");
     assert_eq!(stored_count(&h).await, 0);
 
-    // Boundaries pass: input 8192 bytes, metadata 16 KiB / 64 keys, in-scope agent.
+    // Boundaries pass: input 8192 bytes and metadata 16 KiB / 64 keys.
     create_ok(&h, &alice(), json!({"input": "a".repeat(8190)})).await;
     create_ok(
         &h,
@@ -605,9 +694,7 @@ async fn create_validation_rejects_without_persisting() {
         keys.insert(format!("k{i}"), json!(i));
     }
     create_ok(&h, &alice(), json!({"prompt": "p", "metadata": keys})).await;
-    let with_agent = create_ok(&h, &alice(), json!({"prompt": "p", "agent_id": "agent-a"})).await;
-    assert_eq!(with_agent["request"]["agent_id"], "agent-a");
-    assert_eq!(stored_count(&h).await, 4);
+    assert_eq!(stored_count(&h).await, 3);
 }
 
 #[tokio::test]

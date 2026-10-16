@@ -682,6 +682,11 @@ pub(crate) struct Invocation {
     pub state: InvocationState,
     pub revision: u64,
     pub request: InvocationRequest,
+    /// The exact immutable definition snapshot selected at creation time.
+    /// This is persisted for execution/restart correctness and removed from
+    /// the public resource view.
+    #[serde(default)]
+    pub agent_definition: Option<super::agents::AgentDefinitionRevision>,
     #[serde(default)]
     pub task_iri: Option<String>,
     #[serde(default)]
@@ -813,6 +818,7 @@ impl Drop for IdempotencyReservation {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NewInvocation {
     pub request: InvocationRequest,
+    pub agent_definition: Option<super::agents::AgentDefinitionRevision>,
     pub task_iri: Option<String>,
     /// Registered in the same atomic write as the record.
     pub idempotency: Option<IdempotencyRegistration>,
@@ -1277,6 +1283,7 @@ impl InvocationStore {
             state: InvocationState::Queued,
             revision: 1,
             request: new.request,
+            agent_definition: new.agent_definition,
             task_iri: new.task_iri,
             result: None,
             error: None,

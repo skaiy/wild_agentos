@@ -54,7 +54,8 @@ pub mod skills;
 pub mod tasks;
 
 use agents::{
-    create_agent_handler, delete_agent_handler, list_agents_handler, load_user_agents,
+    activate_agent_revision_handler, create_agent_handler, create_agent_revision_handler,
+    delete_agent_handler, list_agent_revisions_handler, list_agents_handler, load_user_agents,
     migrate_legacy_agent_graphs, save_user_agents, update_agent_handler,
 };
 use artifacts::{
@@ -198,6 +199,10 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct TaskExecSpec {
     pub prompt: String,
+    /// An optional definition-owned system prompt for this isolated run.
+    pub system_prompt: Option<String>,
+    /// An optional definition-owned model for this isolated run.
+    pub model: Option<String>,
     pub task_iri: String,
     pub include_thought: bool,
     pub include_tool_calls: bool,
@@ -779,6 +784,14 @@ pub fn build_router(
         .route(
             "/api/v1/agents/:id",
             put(update_agent_handler).delete(delete_agent_handler),
+        )
+        .route(
+            "/api/v1/agents/:id/revisions",
+            get(list_agent_revisions_handler).post(create_agent_revision_handler),
+        )
+        .route(
+            "/api/v1/agents/:id/revisions/:revision/activate",
+            post(activate_agent_revision_handler),
         )
         .route("/api/v1/agents/:id/chat", post(agent_chat_handler))
         // ── 对外发布：Public API（入站密钥鉴权 + scope + 限流/配额 + 审计）──

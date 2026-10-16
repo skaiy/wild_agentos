@@ -363,6 +363,23 @@ impl UnifiedGateway {
         self.default_model.read().unwrap().clone()
     }
 
+    /// Models configured for runtime selection, including the fallback
+    /// default. The returned snapshot is safe to use for admission checks.
+    pub fn configured_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .model_mapping
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let default = self.default_model();
+        if !default.is_empty() && !models.contains(&default) {
+            models.push(default);
+        }
+        models
+    }
+
     pub async fn chat(
         &self,
         messages: Vec<ChatMessage>,

@@ -14,6 +14,7 @@ pub enum SystemPromptRegion {
     OutputManagement,
     Tools,
     ExtractionPrompt,
+    DefinitionInstructions,
 }
 
 /// Return the stable platform note that belongs in the environment region.
@@ -33,6 +34,7 @@ pub fn platform_environment_hint() -> &'static str {
 impl SystemPromptRegion {
     pub fn order(&self) -> usize {
         match self {
+            Self::DefinitionInstructions => 0,
             Self::RoleDefinition => 1,
             Self::TimeAwareness => 2,
             Self::EnvironmentInfo => 3,
@@ -58,6 +60,7 @@ impl SystemPromptRegion {
             Self::OutputManagement => "# Output Management",
             Self::Tools => "# Tools",
             Self::ExtractionPrompt => "# Emphasized Content",
+            Self::DefinitionInstructions => "# Definition Instructions",
         }
     }
 }
