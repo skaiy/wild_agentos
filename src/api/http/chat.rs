@@ -1528,7 +1528,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(cross_tenant.0, StatusCode::FORBIDDEN);
+        // Scoped lookups make a foreign agent indistinguishable from a missing
+        // one, so callers cannot enumerate agents outside their scope.
+        assert_eq!(cross_tenant.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
