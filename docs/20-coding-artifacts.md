@@ -2,6 +2,10 @@
 
 Replayable outputs from coding agents are stored through the claims-scoped
 artifact API. It supports `patch`, `run_transcript`, and `reproduce_script`.
+`input_snapshot` is the kind the built-in invocation `input_ref` resolver
+reads; `POST /api/v1/artifacts` rejects that kind until #378, and the
+resolver stays off by default (see
+[29-invocations-api.md](29-invocations-api.md)).
 Each upload requires JWT-verified `IsolationClaims`; development `X-Identity`,
 API keys, and anonymous requests receive `401`.
 
@@ -30,6 +34,35 @@ creator, time, and blob key. Client data never selects either storage target.
 
 `task_iri` links the patch, transcript, or script to its checkpoint/task
 execution. Reproduction scripts must obtain credentials from environment
-variables or a secret manager. Upload rejects recognizable plaintext private
-keys and common access-token forms; secrets are never returned in metadata.
+variables or a secret manager; secrets are never returned in metadata.
 Historical blob objects are neither read nor migrated by this API.
+
+### Plaintext-secret guard
+
+Upload rejects content that embeds a credential *value* with `400` and a fixed
+body `{"error": "plaintext secrets are forbidden in coding artifacts", "code":
+"artifact_plaintext_secret"}`; neither the matched text nor the rule is echoed,
+and nothing is stored. Rules match real credential formats, not bare
+substrings, and are case-sensitive like the issued format. The same detector
+(`utils::secret_scan`) drives the skill pipeline's file scan, where private
+keys fail the gate and other formats warn.
+
+| Rule | Matches |
+| --- | --- |
+| `private_key` | `-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----` or `… PRIVATE KEY BLOCK-----` (certificates and public keys pass) |
+| `aws_access_key_id` | `AKIA` + 16 `[0-9A-Z]` |
+| `aws_secret_access_key` | `aws_secret_access_key` (any case), optional quote, escaped (`\"`, `\'`) or unescaped (`"`, `'`), optional whitespace, separator `=>`, `:`, or `=`, optional whitespace, optional escaped or unescaped quote, then a 40-character `[A-Za-z0-9/+=]` value |
+| `github_classic_pat` | `ghp_` + 36 `[A-Za-z0-9]` |
+| `github_fine_grained_pat` | `github_pat_` + 82 `[A-Za-z0-9_]` |
+| `slack_token` | `xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-` + at least 10 `[A-Za-z0-9-]` |
+| `sk_api_key` | Left boundary is the start of text, a character outside `[A-Za-z0-9_-]`, an escaped `\n`, `\r`, `\t`, `\b`, or `\f`, a `\u` plus four hex digits, or `%` plus two hex digits. Then `sk-`, optional `proj-` or `ant-`, and at least 20 `[A-Za-z0-9_-]`. That match is a name, not a key, only when the text after `sk-` splits on `-` into at least three segments, at least two segments are one or more `[a-z]`, and every segment is one or more `[a-z]` except that the final segment may be `v` plus 1 to 4 digits. `sk-learn-classification-examples-v2` and `sk-my-long-running-service-name` are names. A digit in any other segment, a longer digit run, an uppercase letter, or `_` keeps the match a key. An all-letter key is let through; that is an accepted risk |
+
+An all-letter key is let through: when every segment after `sk-` is `[a-z]+`
+and the segment counts above are met, the match is treated as a name. That is
+an accepted risk.
+
+Ordinary words such as `task-`, `risk-`, `disk-`, `ask-` or `Slovakia` never
+match, and referencing a credential by name
+(`AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}`, `TOKEN="$TOKEN_FROM_ENV"`)
+is allowed.
+

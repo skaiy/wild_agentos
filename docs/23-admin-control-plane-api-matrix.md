@@ -20,10 +20,10 @@ inferred from a screen name.
 | Runs | `#/runs` | `GET /api/v1/tasks` | Verified tenant/project `IsolationClaims`; lists only the caller’s persisted scope. | **Existing** |
 | Runs — task detail | `#/runs` | `GET /api/v1/tasks/:task_iri`, `GET /api/v1/tasks/:task_iri/status`, `GET /api/v1/tasks/:task_iri/details`, `GET /api/v1/tasks/trends` | Verified tenant/project `IsolationClaims`; detail reads require the same persisted task scope as the Runs list, and trends aggregate only that scope. | **Existing** |
 | Agents | `#/agents` | `GET, POST /api/v1/agents`; `PUT, DELETE /api/v1/agents/:id`; `POST /api/v1/agents/:id/chat` | Verified tenant/project `IsolationClaims`; user Agents are listed and mutated only in the caller’s persisted scope. The unscoped platform catalog remains shared runtime metadata. | **Existing** |
-| Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`; `GET /api/v1/skills/manifest`; `POST /api/v1/skills/import-git`; `GET /api/v1/skills/pipeline-runs`; `POST /api/v1/skills/pipeline-rerun` | Skill mutations require `DA`; reads do not have a uniform `IsolationClaims` gate. | **Existing** |
+| Skills | `#/skills` | `GET, POST, DELETE /api/v1/skills`; `GET /api/v1/skills/manifest`; `POST /api/v1/skills/import-git`; `GET /api/v1/skills/pipeline-runs`; `POST /api/v1/skills/pipeline-rerun` | Skill mutations (`POST`/`DELETE /api/v1/skills`, `import-git`, `pipeline-rerun`) change the process-global skill registry and require `require_platform_admin` (#302); a tenant `DA` gets `403 platform_admin_required`. Reads do not have a uniform `IsolationClaims` gate. | **Existing** |
 | KB · Ontology | `#/kb-ontology` | `GET, POST /api/v1/kb/bases`; `GET, POST /api/v1/kb/categories`; `GET, POST /api/v1/knowledge-packs`; `GET /api/v1/ontology/types`; `GET /api/v1/ontology/health` | KB graph/vector ingestion, catalog CRUD, and ontology writes use verified tenant/project `IsolationClaims`; missing claims fail closed. | **Existing** |
 | Isolation | `#/isolation` | No create-tenant HTTP path. Local read-only diagnostic: `scripts/isolation-diagnose --data-root <path>` | JWT verification mints tenant/project claims. The diagnostic CLI needs no JWT and remains a read-only local import/inventory aid; it is not an HTTP endpoint. | **Existing** — no Admin create-tenant form |
-| Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`; `PUT, DELETE /api/v1/api-clients/:id`; `POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`; `GET /api/v1/api-audit`; `GET, PUT /api/v1/config`; `POST /api/v1/models/test`; `POST /api/v1/providers/models`; `POST /api/v1/embedding/activate` | API clients, keys, and audit require verified explicit claims plus `DA` and are isolated by verified tenant; cross-tenant mutations return the same 404 as missing records. `PUT /api/v1/config` (all sections) and `POST /api/v1/embedding/activate` require `require_platform_admin`: verified JWT with explicit non-empty tenant/project, exact `PLATFORM_ADMIN` role, and tenant matching the non-default `AGENTOS_PLATFORM_ADMIN_TENANT` (fail-closed if unset). No `DA` needed. `GET /api/v1/config` requires a verified JWT plus either `require_control_plane_da` (verified explicit tenant/project + DA) or `require_platform_admin`; the response omits secret-looking fields (names normalized by lowercasing and dropping `_`/`-`, e.g. `api_key`, `accessToken`, `client_secret`, `private_key`, `authorization`, `credentials`) and exposes credentials only as `*_configured` booleans. The Admin config page needs a DA token with tenant and project, or a platform-admin token; model test/provider discovery retain their DA gate. | **Wired** |
+| Keys · Models | `#/keys-models` | `GET, POST /api/v1/api-clients`; `PUT, DELETE /api/v1/api-clients/:id`; `POST, DELETE /api/v1/api-clients/:id/keys[/:kid]`; `GET /api/v1/api-audit`; `GET, PUT /api/v1/config`; `POST /api/v1/models/test`; `POST /api/v1/providers/models`; `POST /api/v1/embedding/activate` | API clients, keys, and audit require verified explicit claims plus `DA` and are isolated by verified tenant; cross-tenant mutations return the same 404 as missing records. `PUT /api/v1/config` (all sections) and `POST /api/v1/embedding/activate` require `require_platform_admin`: verified JWT with explicit non-empty tenant/project, exact `PLATFORM_ADMIN` role, and tenant matching the non-default `AGENTOS_PLATFORM_ADMIN_TENANT` (fail-closed if unset). No `DA` needed. `GET /api/v1/config` requires a verified JWT plus either `require_control_plane_da` (verified explicit tenant/project + DA) or `require_platform_admin`; the response omits secret-looking fields (names normalized by lowercasing and dropping `_`/`-`, e.g. `api_key`, `accessToken`, `client_secret`, `private_key`, `authorization`, `credentials`) and exposes credentials only as `*_configured` booleans. The Admin config page needs a DA token with tenant and project, or a platform-admin token; `POST /api/v1/models/test` and `POST /api/v1/providers/models` also require `require_platform_admin` (#303) and pass the provider outbound guard (#267); see "Provider probes and the gateway key" below. | **Wired** |
 | Memory · Blackboard | `#/memory` (also deep-link `#/blackboard`) | `GET /api/v1/blackboard/tasks`; `GET /api/v1/blackboard/nodes?task_iri=…` | Verified tenant/project `IsolationClaims`; legacy records without persisted scope are not returned. | **Existing** |
 | Ops | `#/ops` | `GET /api/v1/batch/agents`; `POST /api/v1/batch/agents/:name/control`; `GET /api/v1/guard/audit`; `GET /api/v1/guard/stats`; `GET /metrics` | Batch list/control require verified isolation claims plus `DA`. Guard audit/stats require verified tenant/project claims, use the same scoped set, and redact sensitive values. `GET /metrics` is a process-global scrape endpoint on the **HTTP API address** (`api.http_addr`, often `:8080` or `:8081` in demos)—not on `api.metrics_port` (default 9090), which has no listener (#324). | **Wired** — batch claims + DA |
 | Online corpus | `#/online-corpus-jobs` | `GET, POST /api/v1/online-corpus-jobs`; `GET /api/v1/online-corpus-jobs/observability`; `GET /api/v1/online-corpus-jobs/:id`; `POST /api/v1/online-corpus-jobs/:id/cancel`; `POST /api/v1/online-corpus-jobs/:id/run` | Verified tenant/project `IsolationClaims`; list, read, transition, runner, and observability data are scoped. | **Existing** |
@@ -50,9 +50,65 @@ browsing ([#221](https://github.com/skaiy/wild_agentos/issues/221),
 [#223](https://github.com/skaiy/wild_agentos/issues/223), and
 [#224](https://github.com/skaiy/wild_agentos/issues/224)).
 
+Control-plane write routes authorize before they read the request body
+(#312): `PUT /api/v1/config`, `POST /api/v1/models/test`,
+`POST /api/v1/providers/models` and `POST /api/v1/embedding/activate` answer
+`401` to unauthenticated callers and `403` to callers that fail the gate, with
+the same bytes whatever the body is. Body errors (`422` for a schema error,
+`400` for malformed JSON, `415` for a non-JSON content type) are returned only
+to authorized callers, so field names never reach anyone else.
+
 The isolation diagnostic is intentionally still usable
 without a token because it is a local, read-only filesystem tool. It neither
 creates tenants nor grants HTTP access.
+
+### Write routes outside the matrix (#302)
+
+These kernel write routes have no dedicated Admin screen row above, but follow
+the same two gates:
+
+- **Process-global → `require_platform_admin`.** `POST /api/v1/prompts`,
+  `POST /api/v1/prompts/:id/activate`, `PUT /api/v1/prompts/:id/canary`,
+  `DELETE /api/v1/prompts/:id` (one prompt registry and one active version
+  for every tenant). Prompt reads are unchanged.
+- **Tenant-scoped → `require_control_plane_da`** (verified JWT, explicit
+  tenant and project, `DA`): `POST /api/v1/market/packages` and
+  `.../:name/{install,rollback,upgrade}`; `GET, POST, DELETE
+  /api/v1/mcp/skill-exposures` (the owning tenant and project are taken from
+  verified claims, never from `X-Identity` or a defaulted project);
+  `POST /api/v1/kb/bases/:id/reindex`.
+- Another tenant's knowledge base, skill exposure, or private market package
+  answers the same `404` as a missing one. Another project's skill exposure
+  in the same tenant does too. A `project_id` in the skill-exposure body is
+  ignored. A stored skill exposure with no `project_id`, or with `project_id`
+  empty, is not listed, called, or deleted. Creating it again adds a new row
+  and leaves the old one in the exposure file. Each process start logs a
+  warning when those rows are loaded; an operator removes them by editing
+  the file. `POST /mcp` rejects a verified token with no project claim
+  (`403 mcp_claims_incomplete`). The first successful admission run that
+  records a publisher tenant and project owns the skill IRI. That owner is
+  kept in `skill_iri_owners.json` and is not dropped when admission history
+  is truncated to 200 runs. That copy from admission history runs once and writes
+  `skill_iri_owners.migrated`. After that marker exists, a missing owner file
+  is an error whether or not `pipeline_runs.json` remains, and ownership is
+  not replaced with an empty map. Deleting the marker and the owner file
+  together copies again from the remaining runs, which can reset ownership
+  after the 200-run truncation. Operators back up `skill_iri_owners.json`,
+  `skill_iri_owners.migrated`, and `pipeline_runs.json` together. Another tenant republishing it, including
+  `POST /api/v1/market/packages`, receives `409
+  skill_iri_owned_by_another_tenant` and does not replace that owner. A
+  market publish requires the `skill://` tenant segment to equal the
+  publisher's verified tenant. Platform-admin registration may use another
+  segment and still owns the IRI under the platform tenant. A
+  market package holds at most 32 skills and writes no runs unless every
+  embedded skill passes. Only the owner can expose the Skill, and only while
+  that owner's own latest admission is still a passing tenant-visibility
+  publish. A run with no publisher tenant authorizes none. The first load in
+  a process that finds such runs logs one warning and updates a counter.
+  Platform-admin registration is recorded under the platform
+  tenant, and a customer tenant cannot currently expose those skills.
+  Unauthenticated `GET /api/v1/skills/pipeline-runs` omits the publisher
+  tenant and project. The refusal omits the Skill description and input schema.
 
 ### API client id collisions and recovery
 
@@ -93,6 +149,78 @@ administrator must resolve the collision first. While the id is shared, active
 keys under it fail authentication with `401`; a revoked key fails with `403`
 `key_revoked` instead, shared id or not. Each tenant should revoke its keys
 before the collision is cleared—otherwise they become usable again once it is.
+
+### Provider probes and the gateway key (#267, #303)
+
+`POST /api/v1/models/test` and `POST /api/v1/providers/models` read global
+provider configuration and may use saved provider keys, so they require a
+platform administrator; a tenant `DA` gets `403 platform_admin_required`
+before any outbound request.
+
+Every probe target, caller-supplied or saved, passes the provider outbound
+guard before a connection is made:
+
+- absolute `http`/`https` URL without user credentials;
+- `PROVIDER_OUTBOUND_ALLOWED_ORIGINS` (comma-separated origins, e.g.
+  `https://llm.example.test,http://10.20.0.5:3000`), when set, is an exact
+  allowlist; a listed origin may resolve to private or loopback addresses;
+  a malformed entry denies everything. **A hostname on the allowlist may
+  resolve to an internal address**: whoever controls that name's DNS
+  decides where probes go, so list only names you control (or IP literals);
+- without the allowlist only public addresses are allowed (documentation
+  ranges, Teredo addresses, and 6to4 addresses that tunnel to a non-public
+  IPv4 address count as non-public; decimal/octal/hex IPv4 spellings are normalized first); with
+  `AGENTOS_AUTH_STRICT=true` the allowlist is required and every probe is
+  refused while it is unset;
+- link-local / cloud metadata, unspecified, multicast and broadcast
+  addresses are never allowed, even for a listed origin;
+- the host is resolved once and the request is pinned to the vetted
+  addresses with proxies disabled (resolution times out after 5 s);
+  redirects are not followed; response bodies are capped at 1 MiB.
+
+A refused target gets `400 provider_outbound_not_allowed` with a fixed body
+that never echoes the URL. Deployments that probe a provider on a private or
+loopback address (for example a local model server) must list its origin.
+
+`PUT /api/v1/config` that moves `gateway.base_url` to a different endpoint
+while a gateway key is configured must also send a non-empty
+`gateway.api_key`; otherwise it returns `400 explicit_api_key_required` and
+nothing is saved or applied. The configured key is never carried to the new
+endpoint. Keeping the same endpoint (equivalent spelling included), clearing
+the base URL, or a gateway without a key are unaffected.
+
+The same holds across restarts. `config_override.json` never stores the
+gateway key, and at startup a deployment key (`config.yaml` or
+`AGENT_OS_GATEWAY_API_KEY`) is dropped, with a warning that does not include
+the key, when the override's `gateway.base_url` is a different endpoint than
+the deployment's and `AGENT_OS_GATEWAY_BASE_URL` is not set. Only a key stored
+in the override itself is used with the override's endpoint. The same rule
+applies to `embedding.oneapi.base_url` and `AGENT_OS_EMBEDDING_ONEAPI_API_KEY`,
+both after a restart and when an embedding change is hot-reloaded.
+To move the gateway durably, set `AGENT_OS_GATEWAY_BASE_URL` together with
+`AGENT_OS_GATEWAY_API_KEY` in the deployment.
+
+The configuration loader treats key names case-insensitively, so this check
+reads the override the same way: `BASE_URL`, `OneApi.Base_Url` and `base_url`
+are the same field. The `gateway` and `embedding` sections of
+`PUT /api/v1/config` are typed and accept only the documented lowercase field
+names; any other field, including a differently cased spelling, returns `422`
+and nothing is saved or applied.
+
+Each load (startup or hot reload) reads `config_override.json` once, and the
+key check uses that same read, so the endpoint it checks is the endpoint the
+loaded configuration uses. An override written before these sections were
+typed may still hold other spellings. If any key under `gateway` or `embedding`
+is not lowercase, or the section appears under two spellings (`embedding` and
+`Embedding`, or `embedding.oneapi`), the deployment key for that section is
+always dropped, whatever endpoint the section names, and a warning names the
+section (no key, no path). The file is not rewritten. Rewrite the section in
+lowercase to restore the deployment key. Model names under
+`gateway.model_mapping` are not affected. Embedding hot reloads run one at a
+time, and each moves the previous vector store to its own
+`vector_store.bak-<timestamp>-<n>` directory. The file is replaced
+atomically: a new owner-only (`0600`) file is written and renamed over the old
+one.
 
 See [Isolation Contract](17-isolation-contract.md), [Isolation Matrix](17-isolation-matrix.md),
 [Knowledge Ingestion](16-knowledge-ingest-import-graph.md), and

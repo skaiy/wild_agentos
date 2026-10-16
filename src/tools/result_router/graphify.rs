@@ -7,7 +7,11 @@ use std::sync::Arc;
 use crate::isolation::IsolationClaims;
 use crate::knowledge_graph::rdf_mapper::RdfMapper;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
-use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
+use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef, RdfQuad, RdfValue};
+
+/// Marks a quad as written by one run's graphify. The run guard deletes the
+/// recorded quads, including this marker, and leaves every other triple.
+pub(crate) const GENERATED_BY_RUN: &str = "https://agentos.ontology/prov/generatedByRun";
 
 use super::{GraphifyResult, SchemaAnalysis};
 
@@ -45,7 +49,7 @@ impl GraphifyEngine {
         max_entities: usize,
     ) -> GraphifyResult {
         let graph_name = format!("graph:tool-result:{}", call_id);
-        self.graphify_json_in_graph(json, graph_name, call_id, max_entities, None)
+        self.graphify_json_in_graph(json, graph_name, call_id, max_entities, None, None)
     }
 
     /// Converts a tool result into the graph minted from verified claims.
@@ -55,6 +59,19 @@ impl GraphifyEngine {
         json: &Value,
         call_id: &str,
         max_entities: usize,
+    ) -> GraphifyResult {
+        self.graphify_json_for_run(claims, json, call_id, max_entities, None)
+    }
+
+    /// Like [`Self::graphify_json_for_claims`], and tags every written quad set
+    /// with `run_id` so the run guard can delete exactly those quads.
+    pub fn graphify_json_for_run(
+        &mut self,
+        claims: &IsolationClaims,
+        json: &Value,
+        call_id: &str,
+        max_entities: usize,
+        run_id: Option<&str>,
     ) -> GraphifyResult {
         let graph_name = match claims.graph_iri() {
             Ok(graph_name) => graph_name,
@@ -66,10 +83,18 @@ impl GraphifyEngine {
                     entity_types: vec![],
                     summary: format!("Graphify failed: invalid claims graph: {}", e),
                     micro_tools: vec![],
+                    written_quads: vec![],
                 }
             }
         };
-        self.graphify_json_in_graph(json, graph_name, call_id, max_entities, Some(claims))
+        self.graphify_json_in_graph(
+            json,
+            graph_name,
+            call_id,
+            max_entities,
+            Some(claims),
+            run_id,
+        )
     }
 
     fn graphify_json_in_graph(
@@ -79,6 +104,7 @@ impl GraphifyEngine {
         call_id: &str,
         max_entities: usize,
         claims: Option<&IsolationClaims>,
+        run_id: Option<&str>,
     ) -> GraphifyResult {
         let (mut nodes, mut edges) = Self::json_to_graph(json, call_id, max_entities);
 
@@ -89,13 +115,17 @@ impl GraphifyEngine {
 
         let output = LLMExtractionOutput { nodes, edges };
         let mapping = RdfMapper::map_extraction(&output, &graph_name);
+        let mut quads = mapping.quads;
+        if let Some(run_id) = run_id.filter(|run_id| !run_id.is_empty()) {
+            quads.push(Self::run_marker_quad(run_id, call_id));
+        }
 
         let write_result = match claims {
             Some(claims) => self
                 .store
-                .write_quads_for_claims(claims, &mapping.quads)
+                .write_quads_for_claims(claims, &quads)
                 .map_err(|error| error.to_string()),
-            None => self.store.write_quads(&mapping.quads, &graph_name),
+            None => self.store.write_quads(&quads, &graph_name),
         };
         if let Err(e) = write_result {
             return GraphifyResult {
@@ -105,10 +135,11 @@ impl GraphifyEngine {
                 entity_types: vec![],
                 summary: format!("Graphify failed: {}", e),
                 micro_tools: vec![],
+                written_quads: vec![],
             };
         }
 
-        let analysis = Self::analyze_schema(&mapping.quads);
+        let analysis = Self::analyze_schema(&quads);
         let summary = Self::generate_data_summary(&analysis);
 
         GraphifyResult {
@@ -122,7 +153,33 @@ impl GraphifyEngine {
                 .collect(),
             summary,
             micro_tools: vec![],
+            written_quads: quads,
         }
+    }
+
+    fn run_marker_quad(run_id: &str, call_id: &str) -> RdfQuad {
+        RdfQuad {
+            subject: format!(
+                "iri://graphify-run/{}/{}",
+                Self::escape_marker_segment(run_id),
+                Self::escape_marker_segment(call_id)
+            ),
+            predicate: GENERATED_BY_RUN.to_string(),
+            object: RdfValue::Literal(run_id.to_string()),
+            graph: None,
+        }
+    }
+
+    fn escape_marker_segment(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+                out.push(byte as char);
+            } else {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        out
     }
 
     fn json_to_graph(

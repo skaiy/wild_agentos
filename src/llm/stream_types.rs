@@ -8,6 +8,9 @@ pub struct Usage {
     pub total_tokens: u32,
     #[serde(default)]
     pub cached_prompt_tokens: Option<u32>,
+    /// Cost the upstream/gateway reported for the call, in USD (`usage.cost`).
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

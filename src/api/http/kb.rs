@@ -1646,10 +1646,9 @@ pub(crate) async fn reindex_knowledge_base_handler(
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = identity.require_verified_isolation_claims("KB reindex") {
-        return e.into_response();
-    }
-    if let Err(e) = identity.require_role("DA") {
+    // #302: explicit verified scope + DA (the old role-only check had the
+    // non-strict bypass and accepted a defaulted project).
+    if let Err(e) = identity.require_control_plane_da("KB reindex") {
         return e.into_response();
     }
     let claims = match identity.isolation_claims() {
@@ -1662,11 +1661,16 @@ pub(crate) async fn reindex_knowledge_base_handler(
                 .into_response()
         }
     };
+    // #302: another tenant's knowledge base is reported exactly like a
+    // missing one, and is never marked, reindexed or written back.
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, &claims)
+            })
             .cloned()
     };
     let kb = match kb {
@@ -1717,7 +1721,10 @@ pub(crate) async fn reindex_knowledge_base_handler(
         let mut guard = state.knowledge_bases.write().await;
         if let Some(o) = guard
             .iter_mut()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, &claims)
+            })
             .and_then(|b| b.as_object_mut())
         {
             o.insert("reindex_status".into(), json!("reindexing"));
@@ -1851,7 +1858,10 @@ async fn run_kb_reindex(
         let mut guard = state.knowledge_bases.write().await;
         if let Some(o) = guard
             .iter_mut()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, &claims)
+            })
             .and_then(|b| b.as_object_mut())
         {
             o.insert("documents".into(), json!(updated));

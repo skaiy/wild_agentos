@@ -132,6 +132,22 @@ graph TB
 
 This ensures **strong eventual consistency** across all agent instances without expensive distributed locks.
 
+### 2.2.1 Completed-task retention and archive
+
+The working blackboard is a cache. When a task reaches a terminal state:
+
+1. Dirty nodes that belong to that task are written back through the run's verified tenant handle.
+2. The task document is stored in the persistent knowledge graph as a read-only record. The record keeps the terminal status, timestamps, and any summary, verdict, artifact references, and usage already present on the task. It is scoped by that task's tenant and project. The archived record also keeps the task prompt and its arguments. Those values stay in the persistent graph for the life of the record; completion does not remove them.
+3. The working-cache subtree is evicted. Eviction does not delete the task record from the persistent graph.
+
+`GET /api/v1/tasks/{task_iri}` and `GET /api/v1/tasks` read the working cache and, on a cache miss, the persistent graph (including the read-only archive). Both paths return only records whose tenant and project match the caller's verified scope. A task in another tenant, or another project of the same tenant, is not found — the same response as a task that does not exist. The response does not reveal that the other record exists. List reads only server-written records for that scope, at most 1024 of them. A list does not parse other scopes' documents and does not copy the matches back into the working cache. Retention cleanup for records past that bound is a follow-up.
+
+Once a record is terminal or read-only, starting it again and writing nodes or events are rejected. Those routes use the same not-found response as a task that does not exist.
+
+On process startup, task records that carry both a tenant and a project are loaded from the persistent graph back into the working cache. A restart does not empty `GET /api/v1/tasks` for the owning scope.
+
+The record stays readable until an explicit retention cleanup deletes it. Completing a task is not that cleanup. Intermediate nodes may leave the working cache with the subtree; the task read routes do not require them.
+
 ### 2.3 Intelligent Prefetching: Diffusion Activation Algorithm
 
 The **Prefetch Engine** monitors agent intent and proactively loads likely-needed knowledge:
@@ -1043,7 +1059,7 @@ graph TB
     end
     
     subgraph API["API Layer"]
-        GRPC["gRPC Server<br/>tonic [::1]:50051"]
+        GRPC["gRPC Server<br/>tonic 127.0.0.1:50051"]
         HTTP["HTTP Edge Daemon<br/>axum :8080"]
     end
     
@@ -1089,6 +1105,8 @@ graph TB
     Core --> Infra
     Tools --> Memory
 ```
+
+The gRPC server listens on `127.0.0.1:50051` unless `api.grpc_addr` names another socket address. A bare-metal or systemd deployment must set `AGENT_OS_API_GRPC_ADDR` itself when the process should accept connections on another address. Every gRPC client must send `authorization: Bearer <jwt>` metadata. That token is checked when the call is accepted and is not checked again if it expires while a stream is open. An unparseable address fails process startup.
 
 ### 11.2 Data Flow: The Modern Wild AgentOS in Action
 
