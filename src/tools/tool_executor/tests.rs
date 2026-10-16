@@ -1917,6 +1917,39 @@ mod tests {
     }
 
     #[test]
+    fn isolation_contract_tenant_quota_evicts_only_that_tenant() {
+        let executor = ToolExecutor::new();
+        executor.micro_tool_store().set_tenant_quota_for_test(2);
+        let tenant_b = test_owner("tenant-b", "run-b", "agent:test");
+        register_reader(
+            &executor,
+            &tenant_b,
+            "read_full_result_b",
+            "cb",
+            canary("B"),
+        );
+        for i in 0..4 {
+            let tenant_a = test_owner("tenant-a", &format!("run-{i}"), "agent:test");
+            register_reader(
+                &executor,
+                &tenant_a,
+                &format!("read_full_result_{i}"),
+                &format!("c{i}"),
+                canary("A"),
+            );
+        }
+        assert!(executor.has_micro_reader(&tenant_b, "read_full_result_b"));
+        let oldest = test_owner("tenant-a", "run-0", "agent:test");
+        let newest = test_owner("tenant-a", "run-3", "agent:test");
+        assert!(!executor.has_micro_reader(&oldest, "read_full_result_0"));
+        assert!(executor.has_micro_reader(&newest, "read_full_result_3"));
+        let (readers, data) = executor.micro_tool_store().counts();
+        assert!(readers <= 3, "{readers}");
+        assert!(data <= 3, "{data}");
+        assert!(readers <= micro_store::MAX_MICRO_TOOL_ENTRIES);
+    }
+
+    #[test]
     fn isolation_contract_storage_key_segments_cannot_collide() {
         let a = MicroToolOwner {
             tenant_id: "t/a".to_string(),

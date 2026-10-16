@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
@@ -39,8 +38,6 @@ pub mod seapp {
 }
 
 use seapp::*;
-
-static TASK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct AgentOSService {
     settings: Settings,
@@ -779,6 +776,9 @@ pub struct HttpTaskExecutor {
 impl crate::api::http::TaskExecutor for HttpTaskExecutor {
     async fn execute(&self, spec: crate::api::http::TaskExecSpec) -> crate::api::http::TaskOutcome {
         use crate::api::http::TaskOutcome;
+        // Declared before the handle clone so a panic or early return drops
+        // the clone first and then releases the idle tenant handle.
+        let _lease = self.tenant_l0.lease();
         let l0 = match self.tenant_l0.get_or_open(&spec.isolation_claims) {
             Ok(l0) => l0,
             Err(error) => {
@@ -823,7 +823,7 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             run_gateway,
             self.skills.clone(),
             self.blackboard.clone(),
-            l0,
+            Arc::clone(&l0),
             self.memory_manager.clone(),
             self.templates.clone(),
             self.scheduler.clone(),
@@ -883,32 +883,38 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
         let cancellation = spec.cancellation.clone();
         // Set only when the caller's token (not our own timeout) stopped the run.
         let mut cancelled_by_caller = false;
+        // `biased` is intentional. Branches are polled in source order, so a
+        // caller cancellation that is ready in the same turn as a result (or
+        // the timeout) wins. The run is reported as cancelled rather than
+        // completed when those two arrive together.
         let execution = if self.settings.agents.timeout_seconds > 0 {
             let timeout = std::time::Duration::from_secs(self.settings.agents.timeout_seconds);
             tokio::select! {
-                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
+                biased;
+                _ = cancellation.cancelled() => {
+                    cancelled_by_caller = true;
+                    Err(crate::CoreError::Internal {
+                        message: "task execution cancelled".to_string(),
+                    })
+                }
                 _ = tokio::time::sleep(timeout) => {
                     cancellation.cancel();
                     Err(crate::CoreError::Internal {
                         message: format!("task execution timed out after {} seconds", timeout.as_secs()),
                     })
                 }
-                _ = cancellation.cancelled() => {
-                    cancelled_by_caller = true;
-                    Err(crate::CoreError::Internal {
-                        message: "task execution cancelled".to_string(),
-                    })
-                }
+                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
             }
         } else {
             tokio::select! {
-                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
+                biased;
                 _ = cancellation.cancelled() => {
                     cancelled_by_caller = true;
                     Err(crate::CoreError::Internal {
                         message: "task execution cancelled".to_string(),
                     })
                 }
+                result = sa.process_task(&spec.prompt, &spec.task_iri) => result,
             }
         };
 
@@ -981,10 +987,27 @@ impl crate::api::http::TaskExecutor for HttpTaskExecutor {
             }
         };
 
-        // Release this run's clone of the tenant handle, then close tenant
-        // handles no other run is still using.
+        // process_task is dropped on timeout or cancellation, so its completion
+        // hook never runs. Settle only this task's subtree here on every exit,
+        // including success (a second subtree flush is empty). Other runs' nodes
+        // stay in the shared blackboard.
+        if let Err(error) = self.scheduler.on_run_end(&spec.task_iri, l0.as_ref()) {
+            let count = crate::memory::l0_store::note_l0_write_rejected("run_end");
+            tracing::warn!(error = %error, count, "L0 run-end flush rejected");
+            self.event_bus
+                .emit(
+                    &spec.task_iri,
+                    "L0_WRITE_REJECTED",
+                    "L0",
+                    &serde_json::json!({"kind": "run_end", "count": count}).to_string(),
+                )
+                .await;
+        }
+
+        // Drop the supervisor (and its L0 clone) before the lease releases
+        // idle handles.
         drop(sa);
-        self.tenant_l0.release_idle();
+        drop(l0);
         outcome
     }
 }
@@ -1074,6 +1097,55 @@ trait RequestSettings {
 }
 
 impl AgentOSService {
+    /// Load `task_iri` and require its persisted tenant and project to match
+    /// `claims`. An empty id, a missing task, and an out-of-scope task all
+    /// return the same not-found status.
+    async fn require_task_scope(
+        &self,
+        claims: &crate::isolation::IsolationClaims,
+        task_iri: &str,
+    ) -> Result<(), Status> {
+        self.require_scoped_node(claims, task_iri, true).await
+    }
+
+    async fn require_resource_scope(
+        &self,
+        claims: &crate::isolation::IsolationClaims,
+        iri: &str,
+    ) -> Result<(), Status> {
+        self.require_scoped_node(claims, iri, false).await
+    }
+
+    async fn require_scoped_node(
+        &self,
+        claims: &crate::isolation::IsolationClaims,
+        iri: &str,
+        task_only: bool,
+    ) -> Result<(), Status> {
+        if iri.is_empty() {
+            return Err(crate::api::grpc::auth::not_found());
+        }
+        match self.blackboard.read_node(iri) {
+            Ok(Some(node)) => {
+                let in_scope = if task_only {
+                    crate::api::http::core_ops::task_is_in_scope(&node.json_ld, claims)
+                } else {
+                    crate::api::grpc::auth::resource_in_scope(&node.json_ld, claims)
+                };
+                if in_scope {
+                    Ok(())
+                } else {
+                    Err(crate::api::grpc::auth::not_found())
+                }
+            }
+            Ok(None) => Err(crate::api::grpc::auth::not_found()),
+            Err(error) => {
+                tracing::warn!(%iri, "failed to read resource scope: {error}");
+                Err(Status::internal("failed to verify task scope"))
+            }
+        }
+    }
+
     pub async fn send_supplementary_input(&self, task_iri: &str, content: &str) {
         tracing::info!(task_iri = %task_iri, "Received user supplementary input");
         self.event_bus
@@ -1182,16 +1254,14 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         &self,
         request: Request<ExecuteStageRequest>,
     ) -> Result<Response<ExecuteStageResponse>, Status> {
+        let claims = crate::api::grpc::auth::claims_from_request(&request)?;
         let req = request.into_inner();
+        self.require_task_scope(&claims, &req.task_iri).await?;
         let settings = self.apply_request_settings(&req);
 
         let mut sa = self.create_sa(&settings);
 
-        let task_iri = if req.task_iri.is_empty() {
-            format!("iri://stage/{}", req.stage_id)
-        } else {
-            req.task_iri
-        };
+        let task_iri = req.task_iri;
 
         let result = sa
             .process_task(&req.prompt, &task_iri)
@@ -1217,18 +1287,16 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         &self,
         request: Request<ChatStreamRequest>,
     ) -> Result<Response<Self::ChatStreamStream>, Status> {
+        let claims = crate::api::grpc::auth::claims_from_request(&request)?;
         let req = request.into_inner();
+        self.require_task_scope(&claims, &req.task_iri).await?;
         let settings = self.apply_request_settings(&req);
 
         let (tx, rx) = mpsc::channel::<Result<ChatStreamChunk, Status>>(64);
 
         let mut sa = self.create_sa(&settings);
 
-        let task_iri = if req.task_iri.is_empty() {
-            format!("iri://chat/{}", uuid::Uuid::new_v4().hyphenated())
-        } else {
-            req.task_iri.clone()
-        };
+        let task_iri = req.task_iri.clone();
 
         let _ = tx
             .send(Ok(ChatStreamChunk {
@@ -1288,17 +1356,16 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         &self,
         request: Request<ExecuteTaskStreamRequest>,
     ) -> Result<Response<Self::ExecuteTaskStreamStream>, Status> {
+        let claims = crate::api::grpc::auth::claims_from_request(&request)?;
         let req = request.into_inner();
+        // Scope is checked before any subscription or execution, so an
+        // out-of-scope caller never observes that task's events or request ids.
+        self.require_task_scope(&claims, &req.task_iri).await?;
         let settings = self.apply_request_settings(&req);
 
         let (tx, rx) = mpsc::channel::<Result<seapp::ExecutionEvent, Status>>(256);
 
-        let task_iri = if req.task_iri.is_empty() {
-            let seq = TASK_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            format!("iri://stream/{}", seq)
-        } else {
-            req.task_iri.clone()
-        };
+        let task_iri = req.task_iri.clone();
 
         let include_thought = req.include_thought;
         let include_tool_calls = req.include_tool_calls;
@@ -1311,6 +1378,9 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         let event_bus = self.event_bus.clone();
         let states = self.execution_states.clone();
         let task_iri_clone = task_iri.clone();
+        let subscription = crate::core::event_bus::Subscription::new(format!("grpc-{task_iri}"))
+            .with_scope(task_iri.clone())
+            .with_tenant_project(claims.tenant_id(), claims.project_id());
         let mut event_rx = event_bus.subscribe();
 
         let tx_clone = tx.clone();
@@ -1321,10 +1391,15 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     result = event_rx.recv() => match result {
-                    Ok(event) => {
-                        if event.task_iri != task_iri_clone {
+                    Ok(mut event) => {
+                        if !subscription.matches(&event)
+                            || !crate::api::grpc::auth::forward_execution_event(&event)
+                        {
                             continue;
                         }
+                        event.payload = crate::api::grpc::auth::redact_request_ids(&event.payload);
+                        event.payload_json_ld =
+                            crate::api::grpc::auth::redact_request_ids(&event.payload_json_ld);
 
                         if let Some((core_event, proto_event)) = convert_event_bus_to_grpc(&event) {
                             let mut states = states_clone.write().await;
@@ -1401,8 +1476,10 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         &self,
         request: Request<GetExecutionDetailsRequest>,
     ) -> Result<Response<ExecutionDetails>, Status> {
+        let claims = crate::api::grpc::auth::claims_from_request(&request)?;
         let req = request.into_inner();
         let task_iri = req.task_iri;
+        self.require_task_scope(&claims, &task_iri).await?;
 
         let states = self.execution_states.read().await;
         let state = states.get(&task_iri).cloned().unwrap_or_default();
@@ -1435,8 +1512,10 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         &self,
         request: Request<GetRealtimeStatusRequest>,
     ) -> Result<Response<RealtimeStatus>, Status> {
+        let claims = crate::api::grpc::auth::claims_from_request(&request)?;
         let req = request.into_inner();
         let task_iri = req.task_iri;
+        self.require_task_scope(&claims, &task_iri).await?;
 
         let states = self.execution_states.read().await;
         let state = states.get(&task_iri).cloned().unwrap_or_default();
@@ -1482,8 +1561,12 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
 
     async fn validate_contract(
         &self,
-        _request: Request<ValidateContractRequest>,
+        request: Request<ValidateContractRequest>,
     ) -> Result<Response<ValidateContractResponse>, Status> {
+        let claims = crate::api::grpc::auth::claims_from_request(&request)?;
+        let req = request.into_inner();
+        self.require_resource_scope(&claims, &req.output_iri)
+            .await?;
         Ok(Response::new(ValidateContractResponse {
             valid: true,
             violations: vec![],
@@ -1492,8 +1575,11 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
 
     async fn flatten_to_frontend(
         &self,
-        _request: Request<FlattenRequest>,
+        request: Request<FlattenRequest>,
     ) -> Result<Response<FlattenResponse>, Status> {
+        let claims = crate::api::grpc::auth::claims_from_request(&request)?;
+        let req = request.into_inner();
+        self.require_resource_scope(&claims, &req.iri).await?;
         Ok(Response::new(FlattenResponse {
             frontend_json: "{}".to_string(),
         }))
@@ -1501,12 +1587,14 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
 
     async fn submit_human_approval(
         &self,
-        _request: Request<SubmitApprovalRequest>,
+        request: Request<SubmitApprovalRequest>,
     ) -> Result<Response<SubmitApprovalResponse>, Status> {
-        Ok(Response::new(SubmitApprovalResponse {
-            success: true,
-            message: "ok".to_string(),
-        }))
+        let _claims = crate::api::grpc::auth::claims_from_request(&request)?;
+        // A request id is not a tenant scope. Do not look it up, do not emit
+        // an approval, and do not echo it. Missing and out-of-scope are the
+        // same not-found.
+        let _req = request.into_inner();
+        Err(crate::api::grpc::auth::not_found())
     }
 }
 
@@ -1776,9 +1864,17 @@ fn clean_content(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "executor_l0_test_support.rs"]
+mod executor_l0_test_support;
+
+#[cfg(test)]
 #[path = "executor_l0_completion_tests.rs"]
 mod executor_l0_completion_tests;
 
 #[cfg(test)]
 #[path = "executor_l0_concurrency_tests.rs"]
 mod executor_l0_concurrency_tests;
+
+#[cfg(test)]
+#[path = "auth_tests.rs"]
+mod auth_tests;

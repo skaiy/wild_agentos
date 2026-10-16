@@ -1491,3 +1491,194 @@ async fn isolation_contract_graphify_needs_verified_claims() {
     let names = runner.tool_executor.read().micro_tool_names_for(&owner);
     assert_eq!(names, vec!["read_full_result_call_g".to_string()]);
 }
+
+#[tokio::test]
+async fn isolation_contract_graphify_triples_leave_with_the_run() {
+    use crate::knowledge_graph::store::KnowledgeGraphStore;
+    use crate::knowledge_graph::types::{RdfQuad, RdfValue};
+    use crate::tools::result_router::graphify::GENERATED_BY_RUN;
+    use crate::tools::tool_executor::MicroToolOwner;
+
+    let store = Arc::new(oxigraph::store::Store::new().unwrap());
+    let runner = create_test_runner().with_unified_graph_store(store.clone());
+    let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor").unwrap();
+    let kg = KnowledgeGraphStore::with_shared_store(store).unwrap();
+    kg.write_quads_for_claims(
+        &claims,
+        &[RdfQuad {
+            subject: "iri://entity/foreign-kept".to_string(),
+            predicate: "https://agentos.ontology/prov/kept".to_string(),
+            object: RdfValue::Literal("keep-me".to_string()),
+            graph: None,
+        }],
+    )
+    .unwrap();
+
+    let settings = crate::config::settings::ToolResultRouterSettings::default();
+    let structured = |prefix: &str| {
+        let mut rows = Vec::new();
+        let mut i = 0;
+        while serde_json::to_string(&rows).unwrap().len() <= settings.threshold_large + 100 {
+            rows.push(json!({
+                "id": format!("{prefix}-{i}"),
+                "type": "person",
+                "name": format!("name {prefix} {i}")
+            }));
+            i += 1;
+        }
+        serde_json::to_string(&rows).unwrap()
+    };
+
+    let guard_a = runner.begin_tool_restriction_run("iri://task/graphify-a");
+    let run_a = guard_a.run_id().to_string();
+    let owner_a = MicroToolOwner::new(Some(&claims), &run_a, "agent-a");
+    runner
+        .route_tool_result(
+            &structured("person-a"),
+            "db_query",
+            "call-a",
+            &owner_a,
+            Some(&claims),
+        )
+        .await;
+
+    let guard_b = runner.begin_tool_restriction_run("iri://task/graphify-b");
+    let run_b = guard_b.run_id().to_string();
+    let owner_b = MicroToolOwner::new(Some(&claims), &run_b, "agent-b");
+    runner
+        .route_tool_result(
+            &structured("person-b"),
+            "db_query",
+            "call-b",
+            &owner_b,
+            Some(&claims),
+        )
+        .await;
+
+    let markers = format!("SELECT ?run WHERE {{ ?s <{GENERATED_BY_RUN}> ?run }}");
+    let before = kg.query_sparql_for_claims(&claims, &markers).unwrap();
+    let before_text = serde_json::to_string(&before).unwrap();
+    assert!(before_text.contains(&run_a), "{before_text}");
+    assert!(before_text.contains(&run_b), "{before_text}");
+
+    drop(guard_a);
+    let after_a = kg.query_sparql_for_claims(&claims, &markers).unwrap();
+    let after_a_text = serde_json::to_string(&after_a).unwrap();
+    assert!(!after_a_text.contains(&run_a), "{after_a_text}");
+    assert!(after_a_text.contains(&run_b), "{after_a_text}");
+
+    let ask = |iri: &str| {
+        kg.query_sparql_for_claims(&claims, &format!("ASK {{ <{iri}> ?p ?o }}"))
+            .unwrap()
+    };
+    assert_eq!(
+        ask("iri://entity/person-a-0"),
+        vec![json!({"result": false})]
+    );
+    assert_eq!(
+        ask("iri://entity/person-b-0"),
+        vec![json!({"result": true})]
+    );
+    assert_eq!(
+        ask("iri://entity/foreign-kept"),
+        vec![json!({"result": true})]
+    );
+
+    drop(guard_b);
+    let after_b = kg.query_sparql_for_claims(&claims, &markers).unwrap();
+    assert!(after_b.is_empty(), "{after_b:?}");
+    assert_eq!(
+        ask("iri://entity/foreign-kept"),
+        vec![json!({"result": true})]
+    );
+}
+
+/// Two runs in one project can graphify the same triple. Ending the first
+/// must not delete that triple while the second run still recorded it.
+#[tokio::test]
+async fn isolation_contract_graphify_shared_triple_stays_until_every_recording_run_ends() {
+    use crate::knowledge_graph::store::KnowledgeGraphStore;
+    use crate::knowledge_graph::types::{RdfQuad, RdfValue};
+    use crate::tools::result_router::graphify::GENERATED_BY_RUN;
+    use crate::tools::tool_executor::MicroToolOwner;
+
+    let store = Arc::new(oxigraph::store::Store::new().unwrap());
+    let runner = create_test_runner().with_unified_graph_store(store.clone());
+    let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor").unwrap();
+    let kg = KnowledgeGraphStore::with_shared_store(store).unwrap();
+    kg.write_quads_for_claims(
+        &claims,
+        &[RdfQuad {
+            subject: "iri://entity/foreign-kept".to_string(),
+            predicate: "https://agentos.ontology/prov/kept".to_string(),
+            object: RdfValue::Literal("keep-me".to_string()),
+            graph: None,
+        }],
+    )
+    .unwrap();
+
+    let settings = crate::config::settings::ToolResultRouterSettings::default();
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while serde_json::to_string(&rows).unwrap().len() <= settings.threshold_large + 100 {
+        rows.push(json!({
+            "id": format!("person-same-{i}"),
+            "type": "person",
+            "name": format!("name person-same {i}")
+        }));
+        i += 1;
+    }
+    let structured = serde_json::to_string(&rows).unwrap();
+
+    let guard_a = runner.begin_tool_restriction_run("iri://task/graphify-same-a");
+    let run_a = guard_a.run_id().to_string();
+    let owner_a = MicroToolOwner::new(Some(&claims), &run_a, "agent-a");
+    runner
+        .route_tool_result(
+            &structured,
+            "db_query",
+            "call-same-a",
+            &owner_a,
+            Some(&claims),
+        )
+        .await;
+
+    let guard_b = runner.begin_tool_restriction_run("iri://task/graphify-same-b");
+    let run_b = guard_b.run_id().to_string();
+    let owner_b = MicroToolOwner::new(Some(&claims), &run_b, "agent-b");
+    runner
+        .route_tool_result(
+            &structured,
+            "db_query",
+            "call-same-b",
+            &owner_b,
+            Some(&claims),
+        )
+        .await;
+
+    let markers = format!("SELECT ?run WHERE {{ ?s <{GENERATED_BY_RUN}> ?run }}");
+    drop(guard_a);
+    let after_a = kg.query_sparql_for_claims(&claims, &markers).unwrap();
+    let after_a_text = serde_json::to_string(&after_a).unwrap();
+    assert!(!after_a_text.contains(&run_a), "{after_a_text}");
+    assert!(after_a_text.contains(&run_b), "{after_a_text}");
+    let ask = |iri: &str| {
+        kg.query_sparql_for_claims(&claims, &format!("ASK {{ <{iri}> ?p ?o }}"))
+            .unwrap()
+    };
+    assert_eq!(
+        ask("iri://entity/person-same-0"),
+        vec![json!({"result": true})],
+        "ending run A deleted a triple run B still recorded"
+    );
+
+    drop(guard_b);
+    assert_eq!(
+        ask("iri://entity/person-same-0"),
+        vec![json!({"result": false})]
+    );
+    assert_eq!(
+        ask("iri://entity/foreign-kept"),
+        vec![json!({"result": true})]
+    );
+}

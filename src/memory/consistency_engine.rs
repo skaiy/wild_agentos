@@ -53,14 +53,35 @@ impl ConsistencyEngine {
         task_iri: &str,
         tags: &[String],
     ) -> Result<(), CoreError> {
+        self.on_l2_write_for(node_iri, task_iri, tags, None).await
+    }
+
+    /// `tenant_l0` is the run's claims-verified handle. WriteThrough persists
+    /// only `node_iri`. It never flushes the process-wide dirty set, and it
+    /// never writes through the engine's startup store.
+    #[instrument(skip(self, tags, tenant_l0))]
+    pub async fn on_l2_write_for(
+        &self,
+        node_iri: &str,
+        task_iri: &str,
+        tags: &[String],
+        tenant_l0: Option<&L0Store>,
+    ) -> Result<(), CoreError> {
         let strategy = self.determine_write_strategy(tags);
 
         self.blackboard.mark_dirty(node_iri);
         debug!(node_iri = %node_iri, strategy = ?strategy, "L2 write: marking dirty node");
 
         if strategy == WriteStrategy::WriteThrough {
-            let flushed = self.blackboard.flush_dirty_nodes(&self.l0_store)?;
-            debug!(node_iri = %node_iri, flushed = flushed, "WriteThrough: dirty node flushed to L0");
+            let Some(tenant_l0) = tenant_l0 else {
+                return Err(CoreError::PermissionDenied {
+                    agent: "l0_store".to_string(),
+                    resource: "l0".to_string(),
+                    action: "write L0 data without verified claims".to_string(),
+                });
+            };
+            let flushed = self.blackboard.flush_node(node_iri, tenant_l0)?;
+            debug!(node_iri = %node_iri, flushed = flushed, "WriteThrough: written node flushed to tenant L0");
         }
 
         self.memory_bus.publish_invalidate(node_iri, task_iri).await;
@@ -160,14 +181,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_l2_write_write_through_for_critical() {
-        let (consistency, blackboard, _l0, _bus) = setup();
+        let (consistency, blackboard, l0, _bus) = setup();
         let config = CoreConfig::default();
         blackboard
             .write_node("iri://node1", r#"{"@id":"iri://node1"}"#, &config)
             .unwrap();
 
         consistency
-            .on_l2_write("iri://node1", "iri://task", &["emphasis".to_string()])
+            .on_l2_write_for(
+                "iri://node1",
+                "iri://task",
+                &["emphasis".to_string()],
+                Some(l0.as_ref()),
+            )
             .await
             .unwrap();
 
@@ -175,6 +201,53 @@ mod tests {
         // After WriteThrough flush to L0, state resets to Shared (clean, in-sync)
         assert_eq!(node.mesi_state, MesiState::Shared);
         assert!(!node.dirty);
+        assert!(l0.retrieve("iri://node1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn write_through_flushes_only_the_written_node_into_the_tenant_handle() {
+        let (consistency, blackboard, l0, _bus) = setup();
+        let config = CoreConfig::default();
+        for iri in ["iri://node1", "iri://other"] {
+            blackboard
+                .write_node(iri, &format!(r#"{{"@id":"{iri}"}}"#), &config)
+                .unwrap();
+            blackboard
+                .write_node(iri, &format!(r#"{{"@id":"{iri}","v":2}}"#), &config)
+                .unwrap();
+        }
+        consistency
+            .on_l2_write_for(
+                "iri://node1",
+                "iri://task",
+                &["emphasis".to_string()],
+                Some(l0.as_ref()),
+            )
+            .await
+            .unwrap();
+        assert!(l0.retrieve("iri://node1").unwrap().is_some());
+        assert!(
+            l0.retrieve("iri://other").unwrap().is_none(),
+            "a sibling dirty node must not be flushed with the written node"
+        );
+        assert!(blackboard.read_node("iri://other").unwrap().unwrap().dirty);
+    }
+
+    #[tokio::test]
+    async fn write_through_without_a_tenant_handle_fails_closed() {
+        let (consistency, blackboard, l0, _bus) = setup();
+        let config = CoreConfig::default();
+        blackboard
+            .write_node("iri://node1", r#"{"@id":"iri://node1"}"#, &config)
+            .unwrap();
+        let error = consistency
+            .on_l2_write("iri://node1", "iri://task", &["emphasis".to_string()])
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("without verified claims"), "{text}");
+        assert!(!text.contains('/'), "{text}");
+        assert!(l0.retrieve("iri://node1").unwrap().is_none());
     }
 
     #[tokio::test]

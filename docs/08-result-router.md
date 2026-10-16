@@ -184,13 +184,26 @@ owned, not global:
 - **Graphify.** Only with verified claims, into the graph minted from those
   claims (`graphify_json_for_claims`). Without claims there is no graphify; the
   result is truncated and gets a `read_full_result_{call_id}` reader instead.
+  Each written quad is recorded for that run, including a
+  `prov/generatedByRun` marker. When the run ends, quads that only this run
+  recorded are deleted from the claims graph. A triple with the same subject,
+  predicate, and object that another live run in the same project also recorded
+  stays until that run ends too. Triples written by another source stay. The
+  record is in memory, so a process crash leaves the triples until the next
+  successful run does not see them as its own.
 - **Lifetime.** Full results are kept in memory only, not copied to L0. When the
   run ends, its readers and results are removed. A TTL (default 1 hour,
-  `AGENTOS_MICRO_TOOL_TTL_SECS`) and a total cap (1024 readers and 1024 results,
-  oldest evicted first) bound memory regardless of run count.
+  `AGENTOS_MICRO_TOOL_TTL_SECS`), a per-tenant quota (default 256 readers and
+  256 results, `AGENTOS_MICRO_TOOL_TENANT_QUOTA`, hard cap 1024), and a total
+  cap (1024 readers and 1024 results) bound memory. Over the tenant quota, only
+  that tenant's oldest entries are evicted. The total cap is the fallback and
+  may evict any tenant's oldest entry.
 - Older builds wrote full results to L0 under `iri://tool-result/{call_id}`.
-  Nothing reads those entries any more; they can be left to age out or removed
-  by operators.
+  Reads refuse any tool-result IRI that is not the owner key
+  `iri://tool-result/{tenant}/{project}/{run}/{agent}/{call_id}`. A writable
+  open deletes those unscoped entries once and logs the count only. The owner
+  cannot be inferred, so the entry is removed rather than reassigned. A
+  read-only legacy database is not rewritten; its reads still refuse the key.
 
 ## UTF-8 Safe Handling
 

@@ -27,6 +27,12 @@ pub(crate) const DEFAULT_MICRO_TOOL_TTL: Duration = Duration::from_secs(60 * 60)
 pub(crate) const MICRO_TOOL_TTL_ENV: &str = "AGENTOS_MICRO_TOOL_TTL_SECS";
 /// Upper bound for readers and for stored results, each, across all owners.
 pub(crate) const MAX_MICRO_TOOL_ENTRIES: usize = 1024;
+/// Default per-tenant cap for readers and for stored results, each.
+pub(crate) const DEFAULT_MICRO_TOOL_TENANT_QUOTA: usize = 256;
+/// Hard cap for [`MICRO_TOOL_TENANT_QUOTA_ENV`]. Values above this clamp here.
+pub(crate) const MAX_MICRO_TOOL_TENANT_QUOTA: usize = 1024;
+/// Override for the per-tenant quota. `0` and non-numbers keep the default.
+pub(crate) const MICRO_TOOL_TENANT_QUOTA_ENV: &str = "AGENTOS_MICRO_TOOL_TENANT_QUOTA";
 
 /// Who a generated reader and its stored result belong to.
 ///
@@ -115,6 +121,8 @@ pub(crate) struct MicroToolStore {
     next_seq: u64,
     /// Test-only clock advance; always zero outside tests.
     clock_skew: Duration,
+    /// Test-only quota. `None` reads [`MICRO_TOOL_TENANT_QUOTA_ENV`].
+    tenant_quota_override: Option<usize>,
 }
 
 impl MicroToolStore {
@@ -127,12 +135,27 @@ impl MicroToolStore {
         self.next_seq
     }
 
+    fn tenant_quota(&self) -> usize {
+        let configured = self.tenant_quota_override.or_else(|| {
+            std::env::var(MICRO_TOOL_TENANT_QUOTA_ENV)
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|quota| *quota > 0)
+        });
+        configured
+            .map(|quota| quota.clamp(1, MAX_MICRO_TOOL_TENANT_QUOTA))
+            .unwrap_or(DEFAULT_MICRO_TOOL_TENANT_QUOTA)
+    }
+
     fn prune(&mut self, now: Instant) {
         let ttl = ttl();
         self.readers
             .retain(|_, entry| now.duration_since(entry.created) < ttl);
         self.data
             .retain(|_, entry| now.duration_since(entry.created) < ttl);
+        let quota = self.tenant_quota();
+        evict_readers_over_tenant_quota(&mut self.readers, quota);
+        evict_data_over_tenant_quota(&mut self.data, quota);
         while self.readers.len() > MAX_MICRO_TOOL_ENTRIES {
             let Some(oldest) = self
                 .readers
@@ -248,6 +271,65 @@ impl MicroToolStore {
     pub(crate) fn advance_clock_for_test(&mut self, by: Duration) {
         self.clock_skew += by;
     }
+
+    /// Pin the per-tenant quota so a test does not depend on process env.
+    #[cfg(test)]
+    pub(crate) fn set_tenant_quota_for_test(&mut self, quota: usize) {
+        self.tenant_quota_override = Some(quota);
+    }
+}
+
+fn evict_readers_over_tenant_quota(
+    readers: &mut HashMap<(MicroToolOwner, String), ReaderEntry>,
+    quota: usize,
+) {
+    loop {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for ((owner, _), _) in readers.iter() {
+            *counts.entry(owner.tenant_id.clone()).or_default() += 1;
+        }
+        let Some(tenant) = counts
+            .into_iter()
+            .find(|(_, count)| *count > quota)
+            .map(|(tenant, _)| tenant)
+        else {
+            break;
+        };
+        let oldest = readers
+            .iter()
+            .filter(|((owner, _), _)| owner.tenant_id == tenant)
+            .min_by_key(|(_, entry)| entry.seq)
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        readers.remove(&oldest);
+    }
+}
+
+fn evict_data_over_tenant_quota(data: &mut HashMap<String, DataEntry>, quota: usize) {
+    loop {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for entry in data.values() {
+            *counts.entry(entry.owner.tenant_id.clone()).or_default() += 1;
+        }
+        let Some(tenant) = counts
+            .into_iter()
+            .find(|(_, count)| *count > quota)
+            .map(|(tenant, _)| tenant)
+        else {
+            break;
+        };
+        let oldest = data
+            .iter()
+            .filter(|(_, entry)| entry.owner.tenant_id == tenant)
+            .min_by_key(|(_, entry)| entry.seq)
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        data.remove(&oldest);
+    }
 }
 
 /// Shared handle to the executor's micro-tool store, used by the run guard
@@ -264,6 +346,12 @@ impl MicroToolStoreHandle {
     /// `(readers, stored results)` across all owners.
     pub fn counts(&self) -> (usize, usize) {
         self.0.read().counts()
+    }
+
+    /// Pin the per-tenant quota so a test does not depend on process env.
+    #[cfg(test)]
+    pub fn set_tenant_quota_for_test(&self, quota: usize) {
+        self.0.write().set_tenant_quota_for_test(quota);
     }
 }
 
