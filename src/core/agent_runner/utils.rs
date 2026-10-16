@@ -739,6 +739,17 @@ impl super::AgentRunner {
             }
         }
 
+        if let Some(system_prompt) = self
+            .system_prompt_override
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        {
+            prompt_builder.set_region(
+                SystemPromptRegion::DefinitionInstructions,
+                system_prompt.to_string(),
+            );
+        }
+
         let system_content = prompt_builder.build();
 
         let summary_chain = session.get_summary_chain();

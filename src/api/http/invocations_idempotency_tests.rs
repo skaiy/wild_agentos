@@ -596,6 +596,7 @@ fn registered(fingerprint: &str) -> NewInvocation {
             prompt: Some("p".into()),
             ..InvocationRequest::default()
         },
+        agent_definition: None,
         task_iri: None,
         idempotency: Some(IdempotencyRegistration {
             key: KEY.into(),

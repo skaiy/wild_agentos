@@ -128,6 +128,17 @@ impl SupervisorAgent {
         self
     }
 
+    /// Applies definition-owned instructions to the system message for this
+    /// supervisor instance only.
+    pub fn with_system_prompt(mut self, system_prompt: String) -> Self {
+        let system_prompt = format!("```agent-definition\n{system_prompt}\n```");
+        let runner = (*self.runner)
+            .clone()
+            .with_system_prompt_override(system_prompt);
+        self.runner = Arc::new(runner);
+        self
+    }
+
     pub fn with_memory(
         mut self,
         blackboard: Option<Arc<Blackboard>>,
