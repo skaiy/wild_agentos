@@ -662,8 +662,9 @@ async fn create_validation_rejects_without_persisting() {
         }
         assert_eq!(stored_count(&h).await, 0, "{name} persisted");
     }
-    assert_eq!(agent_not_found_bodies.len(), 2);
+    assert_eq!(agent_not_found_bodies.len(), 3);
     assert_eq!(agent_not_found_bodies[0], agent_not_found_bodies[1]);
+    assert_eq!(agent_not_found_bodies[1], agent_not_found_bodies[2]);
 
     // A malformed Idempotency-Key is rejected before anything is stored
     // (full coverage in invocations_idempotency_tests.rs, #315).
