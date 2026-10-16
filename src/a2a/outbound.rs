@@ -191,12 +191,13 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_request_and_result_use_a2a_http_json() {
-        let received = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        type Received = Arc<Mutex<Vec<(HeaderMap, Value)>>>;
+        let received: Received = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route(
                 "/message:send",
                 post(
-                    |State(received): State<Arc<Mutex<Vec<(HeaderMap, Value)>>>>,
+                    |State(received): State<Received>,
                      headers: HeaderMap,
                      Json(body): Json<Value>| async move {
                         received.lock().await.push((headers, body));

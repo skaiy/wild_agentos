@@ -155,7 +155,7 @@ fn golden_ontology_ke_extract_canonicalize_and_gate_multi_metric() {
             "golden deterministic gate status changed for {}",
             case.id
         );
-        assert_eq!(report.production_write, false);
+        assert!(!report.production_write);
         if !kg
             .query_sparql_for_claims(&claims, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
             .expect("production graph query")

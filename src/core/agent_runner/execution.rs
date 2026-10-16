@@ -188,15 +188,23 @@ impl super::AgentRunner {
 
         let result = self.exec(agent, ctx.clone(), &mut session).await;
 
+        let l0 = Arc::clone(&self.l0_store);
+        let has_claims = ctx.isolation_claims.is_some();
+        let mut rejected_kinds = Vec::new();
         {
             let mut mm = self.memory_manager.lock().await;
+            let target = if has_claims { Some(l0.as_ref()) } else { None };
             if !result
                 .as_ref()
                 .map(|r| r.tracked_actions.is_empty())
                 .unwrap_or(true)
             {
                 if let Ok(ref r) = result {
-                    let _ = mm.archive_session_actions(&r.task_iri, &r.tracked_actions, &r.summary);
+                    if let Err(error) =
+                        mm.archive_session_actions(&r.task_iri, &r.tracked_actions, &r.summary)
+                    {
+                        warn!(error = %error, "L2 session-action archive rejected");
+                    }
                     if !r.tracked_actions.is_empty() {
                         let success_rate = r
                             .tracked_actions
@@ -206,16 +214,26 @@ impl super::AgentRunner {
                             })
                             .count() as f32
                             / r.tracked_actions.len().max(1) as f32;
-                        let _ = mm.archive_experience(
+                        if let Err(error) = mm.archive_experience_in(
                             &r.task_iri,
                             &agent.role.to_string(),
                             &r.summary,
                             success_rate,
-                        );
+                            target,
+                        ) {
+                            warn!(error = %error, "L0 experience archive rejected");
+                            rejected_kinds.push("experience");
+                        }
                     }
                 }
             }
-            let _ = mm.finalize_session(session, &ctx.task_iri);
+            if let Err(error) = mm.finalize_session_in(session, &ctx.task_iri, target) {
+                warn!(error = %error, "L0 session archive rejected");
+                rejected_kinds.push("archive");
+            }
+        }
+        for kind in rejected_kinds {
+            self.report_l0_write_rejected(kind, &ctx.task_iri).await;
         }
 
         // TaskEnd hook
@@ -669,6 +687,7 @@ Output the summary report directly, not in JSON format."#,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
                 cached_prompt_tokens: u.cached_prompt_tokens,
+                cost_usd: u.cost_usd,
             });
 
         Ok(crate::gateway::unified_gateway::ChatCompletionResponse {
@@ -942,18 +961,22 @@ Output the summary report directly, not in JSON format."#,
 
         let restriction_guard = self.begin_tool_restriction_run(&ctx.task_iri);
         let run_id = restriction_guard.run_id().to_string();
+        // #311: generated result readers belong to this run and agent only.
+        let micro_owner = crate::tools::tool_executor::MicroToolOwner::new(
+            ctx.isolation_claims.as_ref(),
+            &run_id,
+            &agent.agent_id,
+        );
         let mut activated_tools = self.tool_executor.read().activated_tools();
         if let Some(allowed) = self.run_tool_restriction(&run_id) {
             activated_tools.restrict_tools(&agent.agent_id, allowed);
         }
-        let tools = self
-            .tool_executor
-            .read()
-            .tool_definitions_for_turn_with_policy(
-                &agent.role.to_string(),
-                &agent.agent_id,
-                &activated_tools,
-            );
+        let tools = self.tool_executor.read().tool_definitions_for_run(
+            &agent.role.to_string(),
+            &agent.agent_id,
+            &activated_tools,
+            Some(&micro_owner),
+        );
 
         info!(
             "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}",
@@ -975,7 +998,8 @@ Output the summary report directly, not in JSON format."#,
         let mut tool_recovery_injected: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut action_tracker =
-            crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string());
+            crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string())
+                .with_usage_meter(self.gateway.usage_meter());
         let checkpoint_manager =
             crate::core::checkpoint::CheckpointManager::with_persistence(self.l0_store.clone());
 
@@ -1448,14 +1472,12 @@ Output the summary report directly, not in JSON format."#,
             if let Some(allowed) = self.run_tool_restriction(&run_id) {
                 activated_tools.restrict_tools(&agent.agent_id, allowed);
             }
-            let current_tools = self
-                .tool_executor
-                .read()
-                .tool_definitions_for_turn_with_policy(
-                    &agent.role.to_string(),
-                    &agent.agent_id,
-                    &activated_tools,
-                );
+            let current_tools = self.tool_executor.read().tool_definitions_for_run(
+                &agent.role.to_string(),
+                &agent.agent_id,
+                &activated_tools,
+                Some(&micro_owner),
+            );
             let advertised_tools: Vec<String> = current_tools
                 .iter()
                 .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
@@ -1626,19 +1648,22 @@ Output the summary report directly, not in JSON format."#,
                     &ctx.task_iri,
                     &agent.agent_id,
                     dedup_threshold,
+                    ctx.isolation_claims.as_ref(),
                 )
                 .await;
             }
 
             // Archive to L0: save full response + thought content
-            let l0_iri = sess
-                .archive_full_to_l0(
-                    &self.l0_store,
+            let l0_iri = self
+                .archive_turn_to_tenant_l0(
+                    sess,
                     &agent.role.to_string(),
                     &parsed.thought.clone().unwrap_or_default(),
                     &parsed.content,
+                    &ctx.task_iri,
+                    ctx.isolation_claims.as_ref(),
                 )
-                .ok();
+                .await;
             debug!(
                 "[L0] archived: {:?}, has_reasoning={}, is_valid_json={}",
                 l0_iri, parsed.has_native_reasoning, parsed.is_valid_json
@@ -1764,6 +1789,9 @@ Output the summary report directly, not in JSON format."#,
                     .map(|c| c.function.name.as_str()),
             );
             if !disallowed_tools.is_empty() {
+                for _ in &disallowed_tools {
+                    action_tracker.note_unregistered_attempt();
+                }
                 errs.push(
                     self.report_pa_disallowed_tools(agent, &ctx.task_iri, &disallowed_tools)
                         .await,
@@ -1863,6 +1891,7 @@ Output the summary report directly, not in JSON format."#,
                                     &ctx.task_iri,
                                     &agent.agent_id,
                                     dedup_threshold,
+                                    ctx.isolation_claims.as_ref(),
                                 )
                                 .await;
                             }
@@ -2125,6 +2154,7 @@ Output the summary report directly, not in JSON format."#,
                                     &advertised_tools,
                                     ctx.isolation_claims.clone(),
                                     activated_tools.policy(),
+                                    Some(&micro_owner),
                                 )
                                 .await
                             {
@@ -2152,16 +2182,29 @@ Output the summary report directly, not in JSON format."#,
                                     }
                                 }
                             }
-                            action_tracker.record(
+                            let registered = executor.is_registered_tool(name)
+                                || executor.has_micro_reader(&micro_owner, name);
+                            action_tracker.record_classified(
                                 name,
                                 &args_clone,
                                 &result,
                                 started_at.elapsed().as_secs_f64(),
+                                crate::core::tracked_action::ToolUsageClass {
+                                    registered,
+                                    policy_denied: policy_denied_by.is_some(),
+                                },
                             );
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
-                            let mut result_str =
-                                self.route_tool_result(&raw_result_str, name, &c.id).await;
+                            let mut result_str = self
+                                .route_tool_result(
+                                    &raw_result_str,
+                                    name,
+                                    &c.id,
+                                    &micro_owner,
+                                    ctx.isolation_claims.as_ref(),
+                                )
+                                .await;
 
                             debug!(
                                 "  [tool] {} result: {} bytes (raw: {} bytes)",
@@ -2204,11 +2247,15 @@ Output the summary report directly, not in JSON format."#,
                                     compressor.compress_tool_messages(&mut messages);
                                 }
                             }
-                            self.compress_tool_results_with_microtools(&mut messages);
+                            self.compress_tool_results_with_microtools(&mut messages, &micro_owner);
 
                             // Cross-turn aging: compress old tool results by staleness
                             if let Some(ref aging) = self.tool_result_aging {
-                                aging.age_tool_results(&mut messages, &self.tool_executor);
+                                aging.age_tool_results(
+                                    &mut messages,
+                                    &self.tool_executor,
+                                    Some(&micro_owner),
+                                );
                             }
 
                             if let Some(err) = result.get("error") {

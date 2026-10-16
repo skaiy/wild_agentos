@@ -35,6 +35,20 @@ issuer/audience 不匹配都会 fail closed。JWKS URL 必须是有效的 HTTPS 
 传入 `IsolationClaims::from_verified`；`.`、`..`、路径分隔符（如 `a/b`）等不安全
 值会 fail closed，`verify_jwt` 不产生 identity。
 
+gRPC 使用同一套校验。每个方法都要求 metadata `authorization: Bearer <jwt>`；
+不接受 `X-Identity`。拦截器与每个方法都会拒绝缺失或无效的 token。方法在读取
+任务、订阅其事件或开始执行之前，任务上持久化的租户和项目必须与已验证 claims
+一致。空 id、不存在的任务，以及作用域之外的任务，都返回 gRPC `NOT_FOUND`，
+消息为 `not found`。该状态不包含 `request_id`。审批结果仅在事件的任务与正在
+等待的任务一致时生效。
+
+Bearer 在 RPC 被接受时校验，包括打开流的那一刻。流存续期间不会再次校验。
+`ExecuteTaskStream` 或 `ChatStream` 已经打开后，令牌过期不会关闭该流。
+
+`api.grpc_addr` 默认为 `127.0.0.1:50051`。`AGENT_OS_API_GRPC_ADDR` 可覆盖它。
+监听其他网卡必须显式配置；随仓库提供的 `config.yaml` 使用 loopback 默认值。
+无法解析为套接字地址的值会导致进程启动失败。
+
 ## 平台级配置不属于任何租户
 
 `PUT /api/v1/config`（gateway、embedding、models、admin policies）和
@@ -264,8 +278,11 @@ legacy unscoped Agent 不再隐式共享。新 user Agent 创建时写入 verifi
 直接返回。Public API-key chat 没有 tenant/project claims，完全不做 tenant RAG。
 
 `L0Store::open_for_claims` 只在给定 L0 root 下创建和写入 `l0_path()` mint 的 tenant
-目录（`/data/l0/{tenant}`）。生产 HTTP task execution 有 JWT-verified claims 时调用
-`open_for_claims`，PDCA persistence 使用该 tenant directory。无 claims 时保留由
+目录（`/data/l0/{tenant}`）。生产 HTTP task execution 有 JWT-verified claims 时从进程级
+`TenantL0Registry` 取得该 tenant directory 的句柄，PDCA persistence 使用该 tenant
+directory。redb 对 `l0.redb` 加独占锁，因此同一 tenant 的所有并发 run（不论属于哪个
+project）共用同一个已打开句柄，而不是各自再打开文件；没有 run 再使用时由 registry 关闭
+句柄。该锁是进程级的：两个 Core 进程不得共用同一个 L0 root。无 claims 时保留由
 `L0Store::new` read-only 打开的 startup L0 store；写历史共享数据库会 fail closed。
 `./data/l0_store/l0.redb` 尚未迁移。
 
@@ -273,6 +290,36 @@ legacy unscoped Agent 不再隐式共享。新 user Agent 创建时写入 verifi
 read-only legacy 视图，不在该路径创建任何文件；无 claims 的写入仍 fail closed，tenant
 写入仍只经 `open_for_claims`。已存在但无法打开的 `l0.redb`（零字节或损坏）会让启动失败，
 错误信息给出文件路径和处理办法；该文件不会被覆盖。
+
+任务完成时，其 L2 脏节点刷入该 run 自己的 claims-verified tenant L0 句柄，不会刷入只读的
+startup store。只刷完成任务自身子树的节点；其他 run（可能属于其他 tenant）的脏节点留在
+L2。没有可写 tenant 句柄的 run 仍 fail closed，而不是静默丢弃写入。权限错误只说明动作和资源
+`l0`，不包含文件系统路径，也不包含 tenant id。会话归档、经验归档、emphasis 和审批记录使用
+同一个 tenant 句柄。没有已验证 claims 的写入返回该权限错误；runner 记录日志，并发出
+`L0_WRITE_REJECTED`，载荷只有种类和次数，不含路径或错误原文。该次数是进程级的：进程内
+每一次被拒绝的 L0 写入都累加到同一个计数器。
+
+L0 隔离粒度是 tenant。同一 tenant 的各个 project 共用一个目录和一个已打开句柄。tenant id
+含有 ASCII 大写字母时，在生成该目录时被拒绝，因此仅大小写不同的两个 id 不会落到同一目录。
+拒绝使用同一条通用权限错误。`open_for_claims` 是 crate 私有的。生产打开都经过
+`TenantL0Registry`。
+
+registry 的 map 锁只负责插入或查找 slot。创建目录和打开数据库发生在释放该锁之后，并且只有
+该路径在等待，因此一个 tenant 的打开或修复不会阻塞另一个 tenant。每个数据库缓存为 64 MiB。
+registry 最多保留 32 个已打开的 tenant 句柄（先关闭空闲句柄；再打开则失败，错误是句柄上限，
+不含路径）。run 持有一个 lease：run 返回、panic 或提前返回时都会释放空闲句柄。
+
+节点第一次写入时 `dirty=false`。flush 只写脏节点，因此该节点不会被持久化。随后
+`release_subtree` 会把它从 L2 清掉，包括这个干净节点。之后的更新把 `dirty` 设为 `true`，
+下一次对该节点的 flush 才会持久化这次更新。write-through 一致性只把刚刚写入的那个节点刷入
+调用方给出的 tenant 句柄，不会把进程里所有脏节点一起刷出去。
+
+run 结束时只刷写并释放该任务自己的子树。共享黑板不会按 IRI 前缀清扫。生产环境的任务 IRI
+是 `iri://task_<uuid>`，因此删除所有不以 `iri://task/` 开头的 IRI 会清掉其他正在运行的 run
+的脏节点。session 和 memory 节点留在 L2，除非它们登记在结束的那个任务上。它们不会写入这个
+tenant 的 L0。如果某个 run 需要清理游离节点，它只删除自己登记过的 IRI。失败、超时或取消的
+run 仍会把自己的脏任务子树刷入自己的 tenant L0，然后释放该子树；即使 flush 失败也会释放，
+以免 L2 留下这棵子树。共享的 startup store 保持只读。
 
 Coding 制品的上传、列出与下载同样要求 JWT-verified claims。制品字节使用 mint 的
 `{tenant}/artifacts/` blob 前缀；用于重放的元数据写入 mint 的 claims graph。每个

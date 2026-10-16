@@ -7,6 +7,10 @@
 //! and `INCONCLUSIVE` (extractor rejects before auth) are temporary, disjoint
 //! lists that may only shrink; an entry whose status changes fails the sweep.
 
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#![allow(clippy::await_holding_lock)]
+
 use std::time::Duration;
 
 use axum::{
@@ -53,19 +57,9 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
         "issue: TBD-P2-ontology-types",
     ),
     ("GET", "/metrics", "issue: #324"),
-    // Prompt routes are tracked by #302 and deliberately untouched here.
+    // Prompt reads stay open for now; #302 gated the prompt writes only.
     ("GET", "/api/v1/prompts", "issue: #302"),
     ("GET", "/api/v1/prompts/resolve", "issue: #302"),
-    (
-        "DELETE",
-        "/api/v1/prompts/:id",
-        "issue: #302 (403, not 401)",
-    ),
-    (
-        "POST",
-        "/api/v1/prompts/:id/activate",
-        "issue: #302 (403, not 401)",
-    ),
 ];
 
 /// TEMPORARY: routes whose anonymous probe is rejected by a request extractor
@@ -77,13 +71,11 @@ const INCONCLUSIVE: &[(&str, &str)] = &[
     ("DELETE", "/api/v1/mcp/skill-exposures"),
     ("DELETE", "/api/v1/skills"),
     ("GET", "/api/v1/blackboard/nodes"),
-    ("GET", "/api/v1/ontology/constrained-extractions/:id"),
     ("POST", "/api/v1/agents"),
     ("POST", "/api/v1/agents/:id/chat"),
     ("POST", "/api/v1/api-clients"),
     ("POST", "/api/v1/artifacts"),
     ("POST", "/api/v1/batch/agents/:name/control"),
-    ("POST", "/api/v1/embedding/activate"),
     ("POST", "/api/v1/events"),
     ("POST", "/api/v1/images/upload"),
     ("POST", "/api/v1/kb/bases"),
@@ -157,7 +149,12 @@ fn classify(status: &str) -> ProbeClass {
 
 /// Query strings that let a probe get past a required `Query` extractor, so the
 /// sweep observes the handler instead of a 400.
-const PROBE_QUERIES: &[(&str, &str)] = &[("/api/v1/skills/manifest", "iri=skill://sweep/probe")];
+const PROBE_QUERIES: &[(&str, &str)] = &[
+    ("/api/v1/skills/manifest", "iri=skill://sweep/probe"),
+    // Duplicate unknown `kind` must be 401 for an anonymous caller. A query
+    // parser that runs first answers 400 and this route leaves the protected set.
+    ("/api/v1/ontology/health", "kind=a&kind=b"),
+];
 
 /// Minimal valid bodies so a probe gets past the JSON extractor and reaches
 /// the handler's auth check (otherwise the route would be inconclusive).
@@ -182,6 +179,7 @@ const MUST_BE_PROTECTED: &[(&str, &str)] = &[
     ("GET", "/v1/invocations/:id"),
     ("POST", "/v1/invocations/:id/cancel"),
     ("GET", "/v1/invocations/:id/events"),
+    ("GET", "/api/v1/ontology/health"),
 ];
 
 const ROUTER_SOURCE: &str = include_str!("mod.rs");
@@ -238,7 +236,7 @@ fn router_source_violations(source: &str) -> Vec<String> {
     if chain.contains("_service(") {
         violations.push("build_router uses a *_service(...) call".to_string());
     }
-    if after.trim_start().chars().next() != Some('}') {
+    if !after.trim_start().starts_with('}') {
         violations.push(".with_state(state) is not the last call in build_router".to_string());
     }
     violations

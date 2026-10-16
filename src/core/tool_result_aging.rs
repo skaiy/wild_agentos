@@ -38,6 +38,7 @@ impl ToolResultAging {
         &self,
         messages: &mut [ChatMessage],
         tool_executor: &RwLock<crate::tools::tool_executor::ToolExecutor>,
+        micro_owner: Option<&crate::tools::tool_executor::MicroToolOwner>,
     ) -> (usize, usize) {
         // Collect all tool message indices (skip non-tool messages like system/perception)
         let tool_indices: Vec<usize> = messages
@@ -82,10 +83,12 @@ impl ToolResultAging {
             if rev_position < microtool_end {
                 // Second-oldest batch: try micro-tool reference compression
                 let micro_tool_name = format!("read_full_result_{}", call_id);
-                let has_micro_tool = tool_executor
-                    .read()
-                    .try_get_handler(&micro_tool_name)
-                    .is_some();
+                // #311: only the run's own reader counts.
+                let has_micro_tool = micro_owner.is_some_and(|owner| {
+                    tool_executor
+                        .read()
+                        .has_micro_reader(owner, &micro_tool_name)
+                });
 
                 if has_micro_tool {
                     let iri = format!("iri://tool-result/{}", call_id);
@@ -168,7 +171,7 @@ mod tests {
             msgs.push(make_tool_msg(&"x".repeat(500), &format!("call_{}", i)));
         }
 
-        let (aged, _) = aging.age_tool_results(&mut msgs, &executor);
+        let (aged, _) = aging.age_tool_results(&mut msgs, &executor, None);
 
         // keep_full=3: keep newest 3 (call_4/3/2), oldest 2 are compressed (call_0/1)
         // call_0/1 rev_position 4/3 < microtool_end(6) → [Old result] prefix
@@ -216,7 +219,7 @@ mod tests {
             msgs.push(make_tool_msg(&"y".repeat(200), &format!("call_{}", i)));
         }
 
-        let (aged, _) = aging.age_tool_results(&mut msgs, &executor);
+        let (aged, _) = aging.age_tool_results(&mut msgs, &executor, None);
 
         // total=4, keep_full=1, microtool_end=3
         // rev_positions: call_0=3, call_1=2, call_2=1, call_3=0
@@ -265,7 +268,7 @@ mod tests {
             msgs.push(make_tool_msg("small", &format!("call_{}", i)));
         }
 
-        let (aged, _) = aging.age_tool_results(&mut msgs, &executor);
+        let (aged, _) = aging.age_tool_results(&mut msgs, &executor, None);
         assert_eq!(aged, 0, "small results should not be aged");
     }
 
@@ -279,7 +282,7 @@ mod tests {
             msgs.push(make_tool_msg(&"x".repeat(500), &format!("call_{}", i)));
         }
 
-        let (_, freed) = aging.age_tool_results(&mut msgs, &executor);
+        let (_, freed) = aging.age_tool_results(&mut msgs, &executor, None);
         assert!(freed > 0, "should free bytes from aging");
     }
 }

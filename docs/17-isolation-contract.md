@@ -45,6 +45,25 @@ mints the `default` project. A non-empty value is passed to
 separators (for example `a/b`) fail closed there before graph, vector, L0, or
 blob names are minted. In that case `verify_jwt` produces no identity.
 
+gRPC uses that same verification. Every method requires
+`authorization: Bearer <jwt>` metadata; `X-Identity` is not accepted. The
+interceptor and each method both reject a missing or invalid token. Before a
+method reads a task, subscribes to its events, or starts execution, the task's
+persisted tenant and project must match the verified claims. An empty id, a
+missing task, and a task outside that scope all return gRPC `NOT_FOUND` with
+the message `not found`. The status does not include a `request_id`. Approval
+results apply only when the event's task matches the waiting task.
+
+The bearer is checked when the RPC is accepted, including the moment a stream
+opens. It is not checked again for the life of that stream. A token that
+expires while `ExecuteTaskStream` or `ChatStream` is open does not close the
+stream.
+
+`api.grpc_addr` defaults to `127.0.0.1:50051`. `AGENT_OS_API_GRPC_ADDR` overrides
+it. Listening on another interface is explicit configuration; the shipped
+`config.yaml` uses the loopback default. A value that is not a socket address
+fails process startup.
+
 This is deliberately not a Keycloak integration, a 17-state Temporal workflow,
 or a StageExecutor feature.
 
@@ -396,8 +415,13 @@ falls back to a tenant graph or vector namespace.
 
 `L0Store::open_for_claims` creates and writes only the tenant directory minted
 from `l0_path()` under its supplied L0 root (the `/data/l0/{tenant}` contract).
-Production HTTP task execution opens `open_for_claims` when JWT-verified claims
-are present, so PDCA persistence uses that tenant directory. Without claims it
+Production HTTP task execution gets that tenant directory's handle from a
+process-wide `TenantL0Registry` when JWT-verified claims are present, so PDCA
+persistence uses that tenant directory. redb locks `l0.redb` exclusively, so
+all concurrent runs of one tenant, in any of its projects, share one open
+handle instead of each opening the file; the registry closes the handle once
+no run uses it. The lock is per process: two Core processes must not share one
+L0 root. Without claims it
 keeps the startup L0 store, which `L0Store::new` opened read-only; writes through
 that historical shared database fail closed. The historical
 `./data/l0_store/l0.redb` database has not been migrated.
@@ -408,6 +432,51 @@ file at that path; unclaimed writes still fail closed and tenant writes still
 go through `open_for_claims`. An existing `l0.redb` that cannot be opened
 (zero bytes or corrupt) stops startup with an error that names the file and how
 to recover; the file is never overwritten.
+
+When a task completes, its dirty L2 nodes are flushed into the run's own
+claims-verified tenant L0 handle, never into the read-only startup store. Only
+the completing task's subtree is flushed; dirty nodes of other runs, which may
+belong to other tenants, stay in L2. A run without a writable tenant handle
+still fails closed instead of dropping the write. The permission error names
+the action and the resource `l0`. It does not include a filesystem path or a
+tenant id. Session archive, experience archive, emphasis, and approval records
+use that same tenant handle. A write with no verified claims returns that
+permission error; the runner logs it and emits `L0_WRITE_REJECTED` with a kind
+and a count. The count is process-wide: every rejected L0 write in the process
+increments the same counter. The event does not include a path or the error text.
+
+L0 isolation is per tenant. Projects of one tenant share one directory and one
+open handle. Tenant ids that contain an ASCII uppercase letter are rejected
+when that directory is minted, so two ids that differ only by case cannot land
+on the same directory. The rejection is the same generic permission error.
+`open_for_claims` is crate-private. Production opens go through
+`TenantL0Registry`.
+
+The registry map lock only inserts or looks up a slot. Creating the directory
+and opening the database happen after that lock is released, and only that
+path waits, so one tenant's open or repair does not block another tenant.
+Each database cache is 64 MiB. The registry keeps at most 32 open tenant
+handles (idle handles are closed first; a further open fails with a handle
+limit and no path). A run holds a lease: when the run returns, panics, or
+returns early, idle handles are released.
+
+A node written once has `dirty=false`. Flush writes only dirty nodes, so that
+node is not persisted. `release_subtree` then removes it from L2, including
+the clean node. A later update sets `dirty=true`, and the next flush of that
+node persists the update. Write-through consistency flushes only the node that
+was just written, into the caller-supplied tenant handle. It does not flush
+every dirty node in the process.
+
+A run ends by flushing and releasing only that task's own subtree. The shared
+blackboard is not prefix-filtered. Production task IRIs are `iri://task_<uuid>`,
+so deleting every IRI that does not start with `iri://task/` would remove other
+in-flight runs' dirty nodes. Session and memory nodes stay in L2 unless they
+were recorded on the finishing task. They are not written into this tenant's
+L0. If a run must drop orphans, it deletes only the IRIs it recorded. A run
+that fails, times out, or is cancelled still flushes its own dirty task subtree
+into its tenant L0 and then releases that subtree, including when the flush
+itself fails, so L2 does not keep that subtree. The shared startup store stays
+read-only.
 
 ## Graph interface
 

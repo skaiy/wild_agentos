@@ -182,6 +182,8 @@ batch_agents:
     # ... 其他字段与上面结构相同，值不同
 ```
 
+When `batch_agents.event_tenant_id` and `batch_agents.event_project_id` are both set, every batch event payload carries those two fields. The batch event stream then delivers the event only to subscribers in that tenant and project. When either field is unset, the event has no scope and only a platform admin receives it.
+
 ---
 
 ## 3. Unified Execution Flow

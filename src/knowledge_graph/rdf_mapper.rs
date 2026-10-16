@@ -521,9 +521,9 @@ mod tests {
     #[test]
     fn test_json_value_to_rdf_float() {
         assert_eq!(
-            RdfMapper::json_value_to_rdf(&serde_json::json!(3.14)),
+            RdfMapper::json_value_to_rdf(&serde_json::json!(2.75)),
             Some(RdfValue::TypedLiteral(
-                "3.14".to_string(),
+                "2.75".to_string(),
                 "http://www.w3.org/2001/XMLSchema#decimal".to_string()
             ))
         );

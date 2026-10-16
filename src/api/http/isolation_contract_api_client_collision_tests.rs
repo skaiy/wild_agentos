@@ -2,6 +2,10 @@
 //! (legacy or imported `api_clients.json`): no first-match attribution in
 //! auth, and no ambiguous legacy audit records.
 
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#![allow(clippy::await_holding_lock)]
+
 use std::path::Path;
 
 use axum::{

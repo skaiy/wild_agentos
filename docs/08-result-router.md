@@ -160,6 +160,51 @@ sequenceDiagram
     end
 ```
 
+### Micro-tool scope and lifetime (#311)
+
+The `ToolExecutor` is shared by every run, agent and tenant in the process, so
+generated readers (`read_full_result_{call_id}`, `query_{type}`,
+`get_entity_details`, `expand_relation`) and the full results they serve are
+owned, not global:
+
+- **Owner.** Each stored result and each reader belongs to a
+  `MicroToolOwner { tenant_id, project_id, run_id, agent_id }`. Tenant and
+  project come from the run's verified isolation claims (empty when the run has
+  none); `run_id` comes from the run guard; `agent_id` is the running agent.
+  None of these come from model output.
+- **Storage key.** `iri://tool-result/{tenant}/{project}/{run_id}/{agent_id}/{call_id}`,
+  every segment percent-escaped. The model still sees the short reference
+  `iri://tool-result/{call_id}`; provider-supplied call ids may repeat across
+  runs and tenants without colliding.
+- **Visibility.** Readers are not added to the shared tool table. A run's turn
+  schema lists only its own readers (newest 5), and a reader resolves only
+  inside a guarded call made by the same owner. Any other caller, including the
+  same run with a different agent, gets exactly the response for a tool that
+  never existed.
+- **Graphify.** Only with verified claims, into the graph minted from those
+  claims (`graphify_json_for_claims`). Without claims there is no graphify; the
+  result is truncated and gets a `read_full_result_{call_id}` reader instead.
+  Each written quad is recorded for that run, including a
+  `prov/generatedByRun` marker. When the run ends, quads that only this run
+  recorded are deleted from the claims graph. A triple with the same subject,
+  predicate, and object that another live run in the same project also recorded
+  stays until that run ends too. Triples written by another source stay. The
+  record is in memory, so a process crash leaves the triples until the next
+  successful run does not see them as its own.
+- **Lifetime.** Full results are kept in memory only, not copied to L0. When the
+  run ends, its readers and results are removed. A TTL (default 1 hour,
+  `AGENTOS_MICRO_TOOL_TTL_SECS`), a per-tenant quota (default 256 readers and
+  256 results, `AGENTOS_MICRO_TOOL_TENANT_QUOTA`, hard cap 1024), and a total
+  cap (1024 readers and 1024 results) bound memory. Over the tenant quota, only
+  that tenant's oldest entries are evicted. The total cap is the fallback and
+  may evict any tenant's oldest entry.
+- Older builds wrote full results to L0 under `iri://tool-result/{call_id}`.
+  Reads refuse any tool-result IRI that is not the owner key
+  `iri://tool-result/{tenant}/{project}/{run}/{agent}/{call_id}`. A writable
+  open deletes those unscoped entries once and logs the count only. The owner
+  cannot be inferred, so the entry is removed rather than reassigned. A
+  read-only legacy database is not rewritten; its reads still refuse the key.
+
 ## UTF-8 Safe Handling
 
 All truncation operations ensure that slices end on a character boundary:

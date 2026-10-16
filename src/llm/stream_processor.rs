@@ -204,6 +204,22 @@ pub struct MessageStream {
     processor: StreamingProcessor,
     #[allow(dead_code)]
     buffer: Vec<u8>,
+    /// Per-run usage meter this call reports into, once, when the stream
+    /// ends (or is dropped early).
+    meter: Option<StreamMeter>,
+}
+
+struct StreamMeter {
+    meter: std::sync::Arc<crate::gateway::usage_meter::RunUsageMeter>,
+    requested_model: String,
+}
+
+impl Drop for MessageStream {
+    fn drop(&mut self) {
+        // A stream abandoned before its end still counts as a call; without a
+        // usage block it is recorded as a call without usage (fail closed).
+        self.finish_metering();
+    }
 }
 
 impl MessageStream {
@@ -212,7 +228,45 @@ impl MessageStream {
             response,
             processor: StreamingProcessor::new(),
             buffer: Vec::new(),
+            meter: None,
         }
+    }
+
+    /// Report this call's upstream usage into `meter` when the stream ends.
+    /// A stream that ends without a usage block is recorded as a call without
+    /// usage.
+    pub fn with_usage_meter(
+        mut self,
+        meter: std::sync::Arc<crate::gateway::usage_meter::RunUsageMeter>,
+        requested_model: &str,
+    ) -> Self {
+        self.meter = Some(StreamMeter {
+            meter,
+            requested_model: requested_model.to_string(),
+        });
+        self
+    }
+
+    fn finish_metering(&mut self) {
+        let Some(stream_meter) = self.meter.take() else {
+            return;
+        };
+        let acc = self.processor.get_accumulator();
+        let usage = acc
+            .usage
+            .as_ref()
+            .map(|u| crate::gateway::usage_meter::CallUsage {
+                model: acc
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| stream_meter.requested_model.clone()),
+                input_tokens: u64::from(u.prompt_tokens),
+                output_tokens: u64::from(u.completion_tokens),
+                reported_cost_usd: u.cost_usd,
+            });
+        stream_meter
+            .meter
+            .record(&stream_meter.requested_model, usage);
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, SseError> {
@@ -227,6 +281,7 @@ impl MessageStream {
                 if let Some(event) = self.processor.pending.pop_front() {
                     return Ok(Some(event));
                 }
+                self.finish_metering();
                 return Ok(None);
             }
 
@@ -245,6 +300,7 @@ impl MessageStream {
                     let remaining = self.processor.finish()?;
                     self.processor.pending.extend(remaining);
                     if self.processor.pending.is_empty() {
+                        self.finish_metering();
                         return Ok(None);
                     }
                 }
@@ -256,6 +312,7 @@ impl MessageStream {
         while let Some(event) = self.next_event().await? {
             debug!("Collected stream event: {:?}", event);
         }
+        self.finish_metering();
         Ok(std::mem::take(&mut self.processor).into_response())
     }
 
@@ -269,6 +326,7 @@ impl MessageStream {
         while let Some(event) = self.next_event().await? {
             callback(&event);
         }
+        self.finish_metering();
         Ok(std::mem::take(&mut self.processor).into_response())
     }
 

@@ -131,6 +131,9 @@ pub(crate) async fn guard_stats_handler(identity: UserIdentity) -> Response {
 }
 
 #[cfg(test)]
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use std::sync::Mutex;
 

@@ -1,5 +1,9 @@
 //! Route-level isolation contract for reading configuration.
 
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#![allow(clippy::await_holding_lock)]
+
 use axum::{
     body::{to_bytes, Body, Bytes},
     http::{Method, Request, StatusCode},

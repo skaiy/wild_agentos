@@ -9,7 +9,48 @@ use super::actions::get_action_handler;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+/// A `HUMAN_APPROVAL_RESULT` counts only when `event_type`, `task_iri`, and
+/// `request_id` all match. A payload that names another task is ignored.
+pub(crate) fn matching_approval_result(
+    event: &crate::core::event_bus::Event,
+    task_iri: &str,
+    request_id: &str,
+) -> Option<serde_json::Value> {
+    if event.event_type != "HUMAN_APPROVAL_RESULT" || event.task_iri != task_iri {
+        return None;
+    }
+    let result = serde_json::from_str::<serde_json::Value>(&event.payload).ok()?;
+    if result
+        .get("task_iri")
+        .and_then(|value| value.as_str())
+        .is_some_and(|payload_task| payload_task != task_iri)
+    {
+        return None;
+    }
+    if result.get("request_id").and_then(|value| value.as_str()) != Some(request_id) {
+        return None;
+    }
+    Some(result)
+}
+
 impl SupervisorAgent {
+    /// Persist an approval record into this run's tenant L0. Without verified
+    /// claims the write fails closed; the error is counted and not swallowed.
+    async fn store_approval_in_tenant_l0(&self, iri: &str, payload: &str, task_iri: &str) {
+        if self.isolation_claims.is_none() {
+            self.runner
+                .report_l0_write_rejected("approval", task_iri)
+                .await;
+            return;
+        }
+        if let Err(error) = self.runner.l0_store.store(iri, payload) {
+            warn!(error = %error, "L0 approval write rejected");
+            self.runner
+                .report_l0_write_rejected("approval", task_iri)
+                .await;
+        }
+    }
+
     pub(super) async fn execute_intervention(
         &mut self,
         plan: crate::perception::proactive_engine::InterventionPlan,
@@ -220,6 +261,10 @@ Notes:
             _ => return Ok(true),
         };
 
+        // Subscribe before publishing so an approval that arrives with the
+        // request is not dropped, and so a result for another task cannot
+        // match on request_id alone.
+        let mut receiver = self.event_bus.subscribe();
         self.event_bus
             .emit_with_priority(
                 task_iri,
@@ -233,7 +278,8 @@ Notes:
         info!(request_id = %request_id, "Waiting for human confirmation");
 
         let iri = format!("iri://approval/{}", request_id);
-        let _ = self.runner.l0_store.store(&iri, &details.to_string());
+        self.store_approval_in_tenant_l0(&iri, &details.to_string(), task_iri)
+            .await;
 
         // Non-blocking wait: register pending approval request
         // External systems return confirmation via EventBus HUMAN_APPROVAL_RESULT event
@@ -244,25 +290,20 @@ Notes:
             .insert(request_id.clone(), false);
 
         // Wait briefly for any instant approval result
-        let mut receiver = self.event_bus.subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok(event) = receiver.try_recv() {
-                if event.event_type == "HUMAN_APPROVAL_RESULT" {
-                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                        if result.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
-                            let approved = result
-                                .get("approved")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            self.pending_approvals
-                                .lock()
-                                .await
-                                .insert(request_id, approved);
-                            return Ok(approved);
-                        }
-                    }
+            while let Ok(event) = receiver.try_recv() {
+                if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
+                    let approved = result
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    self.pending_approvals
+                        .lock()
+                        .await
+                        .insert(request_id, approved);
+                    return Ok(approved);
                 }
             }
         }
@@ -288,6 +329,7 @@ Notes:
             "status": "pending",
         });
 
+        let mut receiver = self.event_bus.subscribe();
         self.event_bus
             .emit_with_priority(
                 task_iri,
@@ -301,7 +343,8 @@ Notes:
         info!(request_id = %request_id, node_id = %node_id, "HumanApprovalNode: waiting for human confirmation");
 
         let iri = format!("iri://approval/{}", request_id);
-        let _ = self.runner.l0_store.store(&iri, &details.to_string());
+        self.store_approval_in_tenant_l0(&iri, &details.to_string(), task_iri)
+            .await;
 
         self.pending_approvals
             .lock()
@@ -309,33 +352,28 @@ Notes:
             .insert(request_id.clone(), false);
 
         // Wait briefly for any instant approval result
-        let mut receiver = self.event_bus.subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Ok(event) = receiver.try_recv() {
-                if event.event_type == "HUMAN_APPROVAL_RESULT" {
-                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                        if result.get("request_id").and_then(|v| v.as_str()) == Some(&request_id) {
-                            let approved = result
-                                .get("approved")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            let comment = result
-                                .get("comment")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            self.pending_approvals
-                                .lock()
-                                .await
-                                .insert(request_id, approved);
-                            return Ok(HumanApprovalNodeResult {
-                                node_id: node_id.to_string(),
-                                approved,
-                                comment,
-                            });
-                        }
-                    }
+            while let Ok(event) = receiver.try_recv() {
+                if let Some(result) = matching_approval_result(&event, task_iri, &request_id) {
+                    let approved = result
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let comment = result
+                        .get("comment")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    self.pending_approvals
+                        .lock()
+                        .await
+                        .insert(request_id, approved);
+                    return Ok(HumanApprovalNodeResult {
+                        node_id: node_id.to_string(),
+                        approved,
+                        comment,
+                    });
                 }
             }
         }
@@ -742,5 +780,61 @@ Notes:
                 &serde_json::to_string(&event).unwrap_or_default(),
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matching_approval_result;
+    use crate::core::event_bus::{Event, EventPriority};
+    use chrono::Utc;
+
+    fn approval_event(task_iri: &str, payload_task: &str, request_id: &str) -> Event {
+        Event {
+            event_id: "evt".to_string(),
+            task_iri: task_iri.to_string(),
+            event_type: "HUMAN_APPROVAL_RESULT".to_string(),
+            source_agent_iri: "external:http:tester".to_string(),
+            payload: serde_json::json!({
+                "request_id": request_id,
+                "task_iri": payload_task,
+                "approved": true,
+            })
+            .to_string(),
+            payload_json_ld: "{}".to_string(),
+            timestamp: Utc::now(),
+            sequence: 1,
+            type_mask: 0,
+            priority: EventPriority::High,
+        }
+    }
+
+    #[test]
+    fn isolation_contract_approval_result_for_other_task_is_ignored() {
+        let request_id = "approval_same_request";
+        let own = approval_event("iri://task/a", "iri://task/a", request_id);
+        assert!(matching_approval_result(&own, "iri://task/a", request_id).is_some());
+
+        let other_event = approval_event("iri://task/b", "iri://task/b", request_id);
+        assert!(matching_approval_result(&other_event, "iri://task/a", request_id).is_none());
+
+        let other_payload = approval_event("iri://task/a", "iri://task/b", request_id);
+        assert!(matching_approval_result(&other_payload, "iri://task/a", request_id).is_none());
+    }
+
+    #[test]
+    fn isolation_contract_approval_result_for_other_task_without_payload_task_iri_is_ignored() {
+        let request_id = "approval_same_request";
+        let mut other = approval_event("iri://task/b", "iri://task/b", request_id);
+        other.payload = serde_json::json!({
+            "request_id": request_id,
+            "approved": true,
+        })
+        .to_string();
+        assert!(
+            !other.payload.contains("task_iri"),
+            "this case is the approval whose payload names no task"
+        );
+        assert!(matching_approval_result(&other, "iri://task/a", request_id).is_none());
     }
 }

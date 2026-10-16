@@ -338,6 +338,25 @@ impl MemoryManager {
         summary: &str,
         success_rate: f32,
     ) -> Result<(), CoreError> {
+        self.archive_experience_in(task_iri, agent_role, summary, success_rate, Some(&self.l0))
+    }
+
+    /// Archive an experience into `tenant_l0`. `None` fails closed: there is
+    /// no claims-verified handle, and the shared startup store is not a
+    /// fallback.
+    pub fn archive_experience_in(
+        &self,
+        task_iri: &str,
+        agent_role: &str,
+        summary: &str,
+        success_rate: f32,
+        tenant_l0: Option<&L0Store>,
+    ) -> Result<(), CoreError> {
+        let l0 = tenant_l0.ok_or_else(|| CoreError::PermissionDenied {
+            agent: "l0_store".to_string(),
+            resource: "l0".to_string(),
+            action: "write L0 data without verified claims".to_string(),
+        })?;
         let exp = serde_json::json!({
             "experience_id": format!("exp_{}", uuid::Uuid::new_v4().hyphenated()),
             "scenario": summary,
@@ -349,11 +368,15 @@ impl MemoryManager {
         })
         .to_string();
         let iri = format!("iri://experience/{}", uuid::Uuid::new_v4().hyphenated());
-        self.l0.store(&iri, &exp)
+        l0.store(&iri, &exp)
     }
 
     /// Archive summary to L0 permanent storage
     pub fn archive_to_l0(&self, summary: &SessionSummary) -> Result<(), CoreError> {
+        self.archive_to_l0_in(summary, &self.l0)
+    }
+
+    fn archive_to_l0_in(&self, summary: &SessionSummary, l0: &L0Store) -> Result<(), CoreError> {
         let iri = format!("iri://archive/session/{}", summary.session_id);
         let content = serde_json::json!({
             "session_id": summary.session_id,
@@ -367,7 +390,7 @@ impl MemoryManager {
         })
         .to_string();
 
-        self.l0.store(&iri, &content)
+        l0.store(&iri, &content)
     }
 
     // ========== L3 Projection ==========
@@ -512,11 +535,28 @@ impl MemoryManager {
         session: L1Session,
         task_iri: &str,
     ) -> Result<(), CoreError> {
+        let l0 = Arc::clone(&self.l0);
+        self.finalize_session_in(session, task_iri, Some(l0.as_ref()))
+    }
+
+    /// Finalize a session into `tenant_l0`. `None` fails closed without
+    /// writing the shared startup store.
+    pub fn finalize_session_in(
+        &mut self,
+        session: L1Session,
+        task_iri: &str,
+        tenant_l0: Option<&L0Store>,
+    ) -> Result<(), CoreError> {
+        let l0 = tenant_l0.ok_or_else(|| CoreError::PermissionDenied {
+            agent: "l0_store".to_string(),
+            resource: "l0".to_string(),
+            action: "write L0 data without verified claims".to_string(),
+        })?;
         let session_id = session.session_id().to_string();
         self.track_session(session);
         let summary = self.close_session(&session_id)?;
         self.archive_to_l2(task_iri, &summary)?;
-        self.archive_to_l0(&summary)?;
+        self.archive_to_l0_in(&summary, l0)?;
         info!(
             session_id = %session_id,
             task_iri = %task_iri,
@@ -660,5 +700,38 @@ mod tests {
         assert_eq!(s.user_id(), None);
         mm.track_session(s);
         assert_eq!(mm.tenant_session_count("tenant_a"), 0);
+    }
+
+    #[test]
+    fn archive_without_claims_fails_closed_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let mut mm = build_manager();
+        let before = mm.l0.count().unwrap();
+        let session = mm.create_session("agent", "DA", "iri://task/none");
+        let error = mm
+            .finalize_session_in(session, "iri://task/none", None)
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("without verified claims"), "{text}");
+        assert!(!text.contains('/'), "{text}");
+        assert_eq!(mm.l0.count().unwrap(), before);
+
+        let error = mm
+            .archive_experience_in("iri://task/none", "DA", "summary", 1.0, None)
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("without verified claims"), "{text}");
+        assert!(!text.contains('/'), "{text}");
+        assert_eq!(mm.l0.count().unwrap(), before);
+
+        let tenant = L0Store::new(dir.path().join("tenant").to_str().unwrap()).unwrap();
+        mm.archive_experience_in("iri://task/own", "DA", "summary", 1.0, Some(&tenant))
+            .unwrap();
+        assert!(tenant.count().unwrap() >= 1);
+        assert_eq!(
+            mm.l0.count().unwrap(),
+            before,
+            "the shared startup store must stay unchanged"
+        );
     }
 }

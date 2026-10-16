@@ -50,7 +50,9 @@ async-trait = { workspace = true }
 
 # LLM 通信
 async-openai = "0.20"
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+# rustls only: default features minus `default-tls` (native-tls/OpenSSL), so the
+# runtime image needs no libssl. Keep the other defaults explicit.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }
 ipnet = "2.12.2"
 
 # 图数据库

@@ -364,7 +364,7 @@ impl OutboundMcpResolver for SystemOutboundMcpResolver {
     }
 }
 
-fn blocked_outbound_ip(ip: IpAddr) -> bool {
+pub(super) fn blocked_outbound_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, c, _] = ip.octets();
@@ -414,7 +414,7 @@ fn embedded_outbound_ipv4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> 
 // allowed CIDR: link-local (which includes cloud instance metadata such as
 // 169.254.169.254), well-known metadata addresses outside link-local,
 // unspecified, multicast, and broadcast.
-fn never_permitted_outbound_ip(ip: IpAddr) -> bool {
+pub(super) fn never_permitted_outbound_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, _, _] = ip.octets();
@@ -1273,6 +1273,9 @@ async fn invoke_mcp_server(
 }
 
 #[cfg(test)]
+// Test-only lock held for the whole test by design (serializes process-global env/state);
+// code under test never takes it, so holding it across `.await` cannot deadlock.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::isolation::IsolationClaims;

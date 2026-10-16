@@ -149,9 +149,10 @@ mod tests {
     }
 
     fn disabled_settings() -> ToolResultRouterSettings {
-        let mut s = ToolResultRouterSettings::default();
-        s.enabled = false;
-        s
+        ToolResultRouterSettings {
+            enabled: false,
+            ..Default::default()
+        }
     }
 
     #[test]

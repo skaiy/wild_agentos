@@ -11,6 +11,35 @@ use crate::CoreError;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+/// Keep tool calls from earlier steps on the `TaskResult` the executor sees.
+/// A later step replaces `last_result`; without this, its empty tracker would
+/// drop built-in calls the invocation usage is supposed to record.
+fn carry_tracked_actions(result: &mut TaskResult, prior: &mut Option<TaskResult>) {
+    let Some(prior) = prior.as_mut() else {
+        return;
+    };
+    if prior.tracked_actions.is_empty() {
+        return;
+    }
+    let mut actions = std::mem::take(&mut prior.tracked_actions);
+    actions.append(&mut result.tracked_actions);
+    result.tracked_actions = actions;
+}
+
+fn collect_tracked_actions(
+    prior: &Option<TaskResult>,
+    results: &[TaskResult],
+) -> Vec<crate::core::tracked_action::TrackedAction> {
+    let mut actions = prior
+        .as_ref()
+        .map(|result| result.tracked_actions.clone())
+        .unwrap_or_default();
+    for result in results {
+        actions.extend(result.tracked_actions.iter().cloned());
+    }
+    actions
+}
+
 impl SupervisorAgent {
     fn create_agent(&self, role: AgentRole, cycle_id: &str) -> AgentInstance {
         let agent_id = format!(
@@ -286,8 +315,8 @@ impl SupervisorAgent {
         }
 
         let mut results = Vec::new();
-        for h in handles {
-            match h.await {
+        for joined in join_all_aborting_on_drop(handles).await {
+            match joined {
                 Ok(Ok(res)) => results.push(res),
                 Ok(Err(e)) => warn!("Parallel agent failed: {}", e),
                 Err(e) => warn!("Parallel agent panicked: {}", e),
@@ -587,7 +616,7 @@ impl SupervisorAgent {
                         },
                     );
 
-                    let ha_result = TaskResult {
+                    let mut ha_result = TaskResult {
                         task_iri: task_iri.to_string(),
                         status: status.to_string(),
                         verdict: None,
@@ -603,6 +632,7 @@ impl SupervisorAgent {
                         archive_iri: None,
                     };
                     prev_summary = Some(format!("## Human Approval Result\n{}", summary));
+                    carry_tracked_actions(&mut ha_result, &mut last_result);
                     last_result = Some(ha_result);
 
                     // Branch jump handling (rejected → skip to reject target)
@@ -741,6 +771,7 @@ impl SupervisorAgent {
                     let failed = results.iter().find(|r| r.status == "failed");
                     if let Some(f) = failed {
                         warn!(role = ?step.role, step_id = %step.step_id, "Parallel agent failed");
+                        let tracked_actions = collect_tracked_actions(&last_result, &results);
                         return Ok(TaskResult {
                             task_iri: task_iri.to_string(),
                             status: "partial_failure".to_string(),
@@ -753,7 +784,7 @@ impl SupervisorAgent {
                             turn_count: results.iter().map(|r| r.turn_count).sum(),
                             tool_call_count: results.iter().map(|r| r.tool_call_count).sum(),
                             five_w2h_updates: None,
-                            tracked_actions: Vec::new(),
+                            tracked_actions,
                             archive_iri: None,
                         });
                     }
@@ -771,7 +802,13 @@ impl SupervisorAgent {
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     prev_summary = Some(combined_summary);
-                    last_result = results.into_iter().last();
+                    let tracked_actions = collect_tracked_actions(&last_result, &results);
+                    if let Some(mut result) = results.into_iter().last() {
+                        result.tracked_actions = tracked_actions;
+                        last_result = Some(result);
+                    } else if let Some(prior) = last_result.as_mut() {
+                        prior.tracked_actions = tracked_actions;
+                    }
                     continue;
                 }
 
@@ -925,7 +962,7 @@ impl SupervisorAgent {
                                 turn_count: 0,
                                 tool_call_count: 0,
                                 five_w2h_updates: None,
-                                tracked_actions: vec![],
+                                tracked_actions: collect_tracked_actions(&last_result, &[]),
                                 archive_iri: None,
                             });
                         }
@@ -1030,7 +1067,7 @@ impl SupervisorAgent {
     #[allow(clippy::too_many_arguments)]
     async fn handle_step_result(
         &self,
-        result: TaskResult,
+        mut result: TaskResult,
         step: PlanStep,
         _node_idx: NodeIndex,
         i: usize,
@@ -1062,6 +1099,8 @@ impl SupervisorAgent {
                 .first()
                 .map(|e| format!("\n\n**Error details**: {}", e))
                 .unwrap_or_default();
+            let tracked_actions =
+                collect_tracked_actions(last_result, std::slice::from_ref(&result));
             return Ok(Some(TaskResult {
                 task_iri: task_iri.to_string(),
                 status: "failed".to_string(),
@@ -1077,7 +1116,7 @@ impl SupervisorAgent {
                 turn_count: result.turn_count,
                 tool_call_count: result.tool_call_count,
                 five_w2h_updates: None,
-                tracked_actions: Vec::new(),
+                tracked_actions,
                 archive_iri: None,
             }));
         }
@@ -1241,6 +1280,7 @@ impl SupervisorAgent {
             });
         }
 
+        carry_tracked_actions(&mut result, last_result);
         *last_result = Some(result);
 
         // Track Do agent output separately
@@ -1718,6 +1758,32 @@ Output only JSON."#,
     }
 }
 
+/// Awaits every task in order. If the returned future is dropped first (run
+/// timeout or cancellation), the tasks still running are aborted: otherwise
+/// parallel agents keep calling the LLM after the run ended and its usage was
+/// reported (#337). Aborting a finished task is a no-op.
+async fn join_all_aborting_on_drop<T>(
+    handles: Vec<tokio::task::JoinHandle<T>>,
+) -> Vec<Result<T, tokio::task::JoinError>> {
+    let _abort_on_drop = AbortOnDrop(handles.iter().map(|h| h.abort_handle()).collect());
+    let mut joined = Vec::with_capacity(handles.len());
+    for handle in handles {
+        joined.push(handle.await);
+    }
+    joined
+}
+
+/// Aborts the wrapped tasks when dropped.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod plan_policy_tests {
     use super::*;
@@ -1828,5 +1894,125 @@ mod plan_policy_tests {
             assert!(completed.is_empty());
             assert!(da_output.is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod tracked_action_carry_tests {
+    use super::{carry_tracked_actions, collect_tracked_actions};
+    use crate::core::agent_runner::TaskResult;
+    use crate::core::tracked_action::{ActionStatus, TrackedAction};
+
+    fn action(name: &str) -> TrackedAction {
+        TrackedAction {
+            action_id: name.into(),
+            tool_name: name.into(),
+            agent_role: "do".into(),
+            duration_secs: 0.0,
+            status: ActionStatus::Success,
+            files_created: vec![],
+            files_modified: vec![],
+            files_read: vec![],
+            error: Some("secret result".into()),
+            tool_args: [("query".into(), serde_json::json!("never persist this"))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn result(name: &str) -> TaskResult {
+        TaskResult {
+            task_iri: "iri://task/t".into(),
+            status: "success".into(),
+            verdict: None,
+            summary: String::new(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: vec![action(name)],
+            archive_iri: None,
+        }
+    }
+
+    #[test]
+    fn later_step_keeps_earlier_tool_calls() {
+        let mut prior = Some(result("web_search"));
+        let mut current = result("file_read");
+        carry_tracked_actions(&mut current, &mut prior);
+        let names: Vec<_> = current
+            .tracked_actions
+            .iter()
+            .map(|action| action.tool_name.as_str())
+            .collect();
+        assert_eq!(names, ["web_search", "file_read"]);
+    }
+
+    #[test]
+    fn parallel_results_keep_every_tool_call() {
+        let prior = Some(result("file_read"));
+        let results = vec![result("web_search"), result("web_fetch")];
+        let actions = collect_tracked_actions(&prior, &results);
+        let names: Vec<_> = actions
+            .iter()
+            .map(|action| action.tool_name.as_str())
+            .collect();
+        assert_eq!(names, ["file_read", "web_search", "web_fetch"]);
+    }
+}
+
+#[cfg(test)]
+mod abort_on_drop_tests {
+    use super::join_all_aborting_on_drop;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// N2 (#337): when the run times out or is cancelled, the future waiting
+    /// on the parallel agents is dropped, and the agents still running stop
+    /// instead of calling the LLM unmetered after the run ended.
+    #[tokio::test]
+    async fn dropping_the_wait_aborts_the_running_parallel_agents() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let handles = (0..3)
+            .map(|i| {
+                let finished = finished.clone();
+                tokio::spawn(async move {
+                    // The first agent finishes; the others are still running
+                    // when the wait is dropped.
+                    let ms = if i == 0 { 1 } else { 300 };
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect::<Vec<_>>();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(100),
+            join_all_aborting_on_drop(handles),
+        )
+        .await;
+        assert!(waited.is_err(), "the wait must have timed out");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "agents still running when the wait was dropped must be aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_to_the_end_returns_every_result_in_order() {
+        let handles = (0..3u32)
+            .map(|i| tokio::spawn(async move { i * 10 }))
+            .collect::<Vec<_>>();
+        let joined: Vec<u32> = join_all_aborting_on_drop(handles)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(joined, vec![0, 10, 20]);
     }
 }

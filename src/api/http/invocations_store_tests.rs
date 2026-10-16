@@ -1237,6 +1237,7 @@ async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
         input_tokens: Some(1200),
         output_tokens: Some(345),
         cost: Some(2_500_000),
+        cost_source: Some(CostSource::Gateway),
         tool_calls: Some(vec![InvocationToolCallUsage {
             name: "search".into(),
             transport: Some("mcp".into()),
@@ -1276,6 +1277,179 @@ async fn invocations_lifecycle_result_usage_round_trips_with_optional_fields() {
     assert_eq!(sparse, json!({"cost": 7}));
     let no_usage = serde_json::to_value(InvocationResult::default()).unwrap();
     assert!(no_usage.get("usage").is_none());
+}
+
+#[tokio::test]
+async fn invocation_usage_rejects_unknown_members_and_invalid_transport_at_write_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let claims = alice();
+    let running = invocation_in(&store, &claims, InvocationState::Running).await;
+    let before = store.get_for_claims(&claims, &running.id).await.unwrap();
+    let invalid = InvocationUsage {
+        model: Some("model".into()),
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+        cost: Some(1),
+        tool_calls: Some(vec![InvocationToolCallUsage {
+            name: "tool".into(),
+            transport: Some("smtp".into()),
+        }]),
+        ..InvocationUsage::default()
+    };
+    assert_eq!(
+        store
+            .transition_for_claims(
+                &claims,
+                &running.id,
+                None,
+                InvocationState::Succeeded,
+                TransitionPatch {
+                    result: Some(InvocationResult {
+                        summary: "nope".into(),
+                        artifacts: vec![],
+                        usage: Some(invalid),
+                    }),
+                    ..TransitionPatch::default()
+                },
+            )
+            .await,
+        Err(InvocationStoreError::InvalidUsage(
+            "tool_calls[].transport must be mcp, http, a2a, local, or unknown"
+        ))
+    );
+    assert_eq!(
+        store.get_for_claims(&claims, &running.id).await.unwrap(),
+        before
+    );
+
+    let malformed = serde_json::json!({
+        "model": "model",
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cost": 1,
+        "extra": true
+    });
+    assert!(serde_json::from_value::<InvocationUsage>(malformed).is_err());
+
+    let legacy = serde_json::json!({
+        "tool_calls": [{ "name": "t", "transport": "grpc" }]
+    });
+    let parsed: InvocationUsage = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        parsed.tool_calls.unwrap()[0].transport.as_deref(),
+        Some("unknown")
+    );
+}
+
+/// A pre-upgrade row whose transport is outside the closed set must still
+/// open. The value is read as `unknown`; writes of that value stay rejected.
+#[tokio::test]
+async fn poc424_legacy_row_with_non_closed_transport_blocks_store_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let claims = alice();
+    let id = {
+        let store = open_store(&dir);
+        let running = invocation_in(&store, &claims, InvocationState::Running).await;
+        store
+            .transition_for_claims(
+                &claims,
+                &running.id,
+                None,
+                InvocationState::Succeeded,
+                TransitionPatch {
+                    result: Some(InvocationResult {
+                        summary: "ok".into(),
+                        artifacts: vec![],
+                        usage: Some(InvocationUsage {
+                            model: Some("m".into()),
+                            input_tokens: Some(1),
+                            output_tokens: Some(1),
+                            cost: Some(1),
+                            cost_source: Some(CostSource::Gateway),
+                            tool_calls: Some(vec![InvocationToolCallUsage {
+                                name: "t".into(),
+                                transport: Some("http".into()),
+                            }]),
+                            ..InvocationUsage::default()
+                        }),
+                    }),
+                    ..TransitionPatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        running.id
+    };
+    let path = dir.path().join("invocations.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("\"transport\":\"http\""), "{raw}");
+    std::fs::write(
+        &path,
+        raw.replace("\"transport\":\"http\"", "\"transport\":\"grpc\""),
+    )
+    .unwrap();
+    let (reopened, _) = InvocationStore::open(&path).expect("legacy row must not block open");
+    let loaded = reopened.get_for_claims(&claims, &id).await.unwrap();
+    let transport = loaded
+        .result
+        .unwrap()
+        .usage
+        .unwrap()
+        .tool_calls
+        .unwrap()
+        .pop()
+        .unwrap()
+        .transport;
+    assert_eq!(transport.as_deref(), Some("unknown"));
+}
+
+#[test]
+fn builtin_tool_calls_record_name_and_transport_only() {
+    assert!(record_builtin_tool_calls(None, ["", "  "]).is_none());
+    let usage = record_builtin_tool_calls(
+        Some(InvocationUsage {
+            model: Some("model".into()),
+            ..InvocationUsage::default()
+        }),
+        [
+            "web_search",
+            "web_fetch",
+            "http_request",
+            "knowledge_import_url",
+            "knowledge_extract",
+            "create_skill",
+            "convert_skill",
+            "bash",
+            "file_read",
+        ],
+    )
+    .unwrap();
+    let calls = usage.tool_calls.expect("tool calls");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.transport.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("web_search", Some("http")),
+            ("web_fetch", Some("http")),
+            ("http_request", Some("http")),
+            ("knowledge_import_url", Some("http")),
+            ("knowledge_extract", Some("http")),
+            ("create_skill", Some("http")),
+            ("convert_skill", Some("http")),
+            ("bash", Some("http")),
+            ("file_read", Some("local")),
+        ]
+    );
+    let persisted = serde_json::to_value(&calls).unwrap();
+    for call in persisted.as_array().unwrap() {
+        let object = call.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        assert!(object.contains_key("name"));
+        assert!(object.contains_key("transport"));
+    }
 }
 
 /// Fills the store with terminal (`succeeded`) records, all inside the
@@ -1367,4 +1541,109 @@ async fn invocations_lifecycle_store_full_sweep_frees_space_then_create_succeeds
             .unwrap_err(),
         InvocationStoreError::StoreFull
     );
+}
+
+// ── #337: usage built from what the run's LLM calls reported ─────────────
+
+fn run_snapshot(
+    calls: &[(&str, u64, u64, Option<f64>)],
+    without_usage: u64,
+) -> crate::gateway::usage_meter::RunUsageSnapshot {
+    let meter = crate::gateway::usage_meter::RunUsageMeter::new();
+    for (model, input, output, cost) in calls {
+        meter.record(
+            model,
+            Some(crate::gateway::usage_meter::CallUsage {
+                model: (*model).into(),
+                input_tokens: *input,
+                output_tokens: *output,
+                reported_cost_usd: *cost,
+            }),
+        );
+    }
+    for _ in 0..without_usage {
+        meter.record("m", None);
+    }
+    meter.snapshot()
+}
+
+fn price_table(entries: &[(&str, f64, f64)]) -> crate::config::settings::PricingSettings {
+    let mut pricing = crate::config::settings::PricingSettings::default();
+    for (model, input, output) in entries {
+        pricing.models.insert(
+            (*model).into(),
+            crate::config::settings::ModelPrice {
+                input_usd_per_million_tokens: *input,
+                output_usd_per_million_tokens: *output,
+            },
+        );
+    }
+    pricing
+}
+
+#[test]
+fn usage_from_run_prefers_gateway_cost() {
+    let run = run_snapshot(
+        &[("m", 100, 10, Some(0.0005)), ("m", 50, 5, Some(0.00025))],
+        0,
+    );
+    let usage = usage_from_run(&run, &price_table(&[("m", 1.0, 1.0)])).unwrap();
+    assert_eq!(usage.model.as_deref(), Some("m"));
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (Some(150), Some(15))
+    );
+    assert_eq!(usage.cost, Some(750));
+    assert_eq!(usage.cost_source, Some(CostSource::Gateway));
+}
+
+#[test]
+fn usage_from_run_uses_price_table_when_any_call_lacks_gateway_cost() {
+    let run = run_snapshot(&[("m", 100, 10, Some(0.0005)), ("n", 3, 1, None)], 0);
+    let pricing = price_table(&[("m", 2.0, 8.0), ("n", 0.5, 0.5)]);
+    let usage = usage_from_run(&run, &pricing).unwrap();
+    // m: 100*2 + 10*8 = 280; n: ceil(3*0.5 + 1*0.5) = 2.
+    assert_eq!(usage.cost, Some(282));
+    assert_eq!(usage.cost_source, Some(CostSource::ConfigPriceTable));
+}
+
+#[test]
+fn usage_from_run_never_fills_in_a_cost() {
+    let run = run_snapshot(&[("m", 100, 10, None)], 0);
+    for pricing in [
+        price_table(&[]),
+        price_table(&[("other", 1.0, 1.0)]),
+        // Exact names only: no case folding.
+        price_table(&[("M", 1.0, 1.0)]),
+        price_table(&[("m", -1.0, 1.0)]),
+        price_table(&[("m", f64::NAN, 1.0)]),
+    ] {
+        let usage = usage_from_run(&run, &pricing).unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cost, None);
+        assert_eq!(usage.cost_source, None);
+    }
+}
+
+#[test]
+fn usage_from_run_leaves_out_tokens_when_a_call_reported_none() {
+    let run = run_snapshot(&[("m", 100, 10, Some(0.1))], 1);
+    let usage = usage_from_run(&run, &price_table(&[("m", 1.0, 1.0)])).unwrap();
+    assert_eq!(usage.input_tokens, None);
+    assert_eq!(usage.output_tokens, None);
+    assert_eq!(usage.cost, None);
+    assert!(usage_from_run(&run_snapshot(&[], 0), &price_table(&[])).is_none());
+}
+
+#[test]
+fn cost_source_serializes_as_closed_snake_case_set() {
+    assert_eq!(
+        serde_json::to_value(CostSource::Gateway).unwrap(),
+        json!("gateway")
+    );
+    assert_eq!(
+        serde_json::to_value(CostSource::ConfigPriceTable).unwrap(),
+        json!("config_price_table")
+    );
+    assert!(serde_json::from_value::<CostSource>(json!("estimate")).is_err());
 }

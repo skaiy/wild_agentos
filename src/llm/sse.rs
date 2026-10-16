@@ -5,6 +5,10 @@ use crate::llm::stream_types::{
     MessageDeltaEvent, MessageStartEvent, StreamEvent, Usage,
 };
 
+/// Incomplete SSE data is capped so an upstream that never sends a frame
+/// separator cannot grow the buffer without bound (#396).
+pub(crate) const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+
 #[derive(Debug, Default)]
 pub struct SseParser {
     buffer: Vec<u8>,
@@ -16,13 +20,29 @@ impl SseParser {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, SseError> {
+        // A chunk of complete frames may be larger than the cap; the cap
+        // applies to the incomplete tail left after those frames are taken.
+        // Only the newly appended suffix is normalized, plus a trailing CR
+        // that the previous push left in place (#396, #427 N9).
+        let mut start = self.buffer.len();
+        if start > 0 && self.buffer[start - 1] == b'\r' {
+            start -= 1;
+        }
         self.buffer.extend_from_slice(chunk);
+        normalize_crlf_from(&mut self.buffer, start);
         let mut events = Vec::new();
 
         while let Some(frame) = self.next_frame() {
             if let Some(event) = parse_frame(&frame)? {
                 events.push(event);
             }
+        }
+
+        if self.buffer.len() > MAX_SSE_BUFFER_BYTES {
+            self.buffer.clear();
+            return Err(SseError(format!(
+                "SSE buffer exceeded {MAX_SSE_BUFFER_BYTES} bytes"
+            )));
         }
 
         Ok(events)
@@ -41,26 +61,62 @@ impl SseParser {
     }
 
     fn next_frame(&mut self) -> Option<String> {
-        let separator = self
+        let position = self
             .buffer
             .windows(2)
-            .position(|window| window == b"\n\n")
-            .map(|position| (position, 2))
-            .or_else(|| {
-                self.buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|position| (position, 4))
-            })?;
-
-        let (position, separator_len) = separator;
-        let frame = self
-            .buffer
-            .drain(..position + separator_len)
-            .collect::<Vec<_>>();
-        let frame_len = frame.len().saturating_sub(separator_len);
+            .position(|window| window == b"\n\n")?;
+        let frame: Vec<u8> = self.buffer.drain(..position + 2).collect();
+        let frame_len = frame.len() - 2;
         Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
     }
+}
+
+/// Turn CRLF into LF so a stream that mixes the two separators splits on `\n\n`.
+/// A trailing CR is left in place: it may be the first byte of a CRLF that the
+/// next chunk completes.
+fn normalize_crlf_from(buffer: &mut Vec<u8>, start: usize) {
+    let limit = if buffer.last() == Some(&b'\r') {
+        buffer.len().saturating_sub(1)
+    } else {
+        buffer.len()
+    };
+    if start >= limit {
+        return;
+    }
+    let mut read = start;
+    let mut write = start;
+    while read < limit {
+        if buffer[read] == b'\r' && read + 1 < limit && buffer[read + 1] == b'\n' {
+            buffer[write] = b'\n';
+            write += 1;
+            read += 2;
+            continue;
+        }
+        if write != read {
+            buffer[write] = buffer[read];
+        }
+        write += 1;
+        read += 1;
+    }
+    if write != limit {
+        let tail = buffer.len() - limit;
+        buffer.copy_within(limit.., write);
+        buffer.truncate(write + tail);
+    }
+}
+
+/// Byte-safe prefix for debug logs. Slicing at a fixed byte index panics when
+/// that index is inside a non-ASCII character (#396).
+fn sse_payload_preview(payload: &str) -> &str {
+    const MAX_BYTES: usize = 200;
+    if payload.len() <= MAX_BYTES {
+        return payload;
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !payload.is_char_boundary(end) {
+        end -= 1;
+    }
+    &payload[..end]
 }
 
 #[derive(Debug, Clone)]
@@ -112,10 +168,11 @@ pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, SseError> {
     let json: Value = match serde_json::from_str(&payload) {
         Ok(v) => v,
         Err(e) => {
+            let preview = sse_payload_preview(&payload);
             tracing::debug!(
-                "Failed to parse SSE payload as JSON: {} - payload: {}",
-                e,
-                &payload[..payload.len().min(200)]
+                error = %e,
+                payload_preview = %preview,
+                "Failed to parse SSE payload as JSON"
             );
             return Ok(None);
         }
@@ -141,6 +198,14 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
 
     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
         if choices.is_empty() {
+            // `stream_options.include_usage` delivers usage on a trailing
+            // chunk with an empty `choices` array.
+            if let Some(usage) = json.get("usage").and_then(chat_chunk_usage) {
+                return Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
+                    finish_reason: None,
+                    usage: Some(usage),
+                })));
+            }
             return Ok(None);
         }
 
@@ -204,36 +269,20 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
 
         if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
             if !finish_reason.is_empty() {
+                // Some upstreams put the usage block on the finish chunk
+                // itself rather than on a separate trailing chunk.
                 return Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
                     finish_reason: Some(finish_reason.to_string()),
-                    usage: None,
+                    usage: json.get("usage").and_then(chat_chunk_usage),
                 })));
             }
         }
     }
 
-    if let Some(usage) = json.get("usage") {
-        let prompt_tokens = usage
-            .get("prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let completion_tokens = usage
-            .get("completion_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let total_tokens = usage
-            .get("total_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-
+    if let Some(usage) = json.get("usage").and_then(chat_chunk_usage) {
         return Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
             finish_reason: None,
-            usage: Some(Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                cached_prompt_tokens: cached_prompt_tokens(usage),
-            }),
+            usage: Some(usage),
         })));
     }
 
@@ -391,13 +440,9 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
                 "incomplete" => "length".to_string(),
                 _ => "error".to_string(),
             };
-            let usage = response.and_then(|r| r.get("usage")).map(|u| Usage {
-                prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-                    as u32,
-                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                cached_prompt_tokens: cached_prompt_tokens(u),
-            });
+            let usage = response
+                .and_then(|r| r.get("usage"))
+                .and_then(responses_usage);
             Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
                 finish_reason: Some(finish_reason),
                 usage,
@@ -405,6 +450,67 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
         }
         _ => Ok(None),
     }
+}
+
+/// Usage block of a chat-completions stream chunk.
+/// Usage from a chat-completions chunk. `None` for `"usage": null` (sent on
+/// every chunk by upstreams honouring `include_usage`) or a block without
+/// token counts, so it is never mistaken for a reported zero.
+fn chat_chunk_usage(usage: &serde_json::Value) -> Option<Usage> {
+    let (prompt_tokens, completion_tokens, total_tokens) =
+        reported_token_counts(usage, "prompt_tokens", "completion_tokens")?;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cached_prompt_tokens: cached_prompt_tokens(usage),
+        cost_usd: reported_cost_usd(usage),
+    })
+}
+
+/// Usage from a Responses API `usage` block (`input_tokens` /
+/// `output_tokens`), under the same rules as [`chat_chunk_usage`].
+fn responses_usage(usage: &serde_json::Value) -> Option<Usage> {
+    let (prompt_tokens, completion_tokens, total_tokens) =
+        reported_token_counts(usage, "input_tokens", "output_tokens")?;
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cached_prompt_tokens: cached_prompt_tokens(usage),
+        cost_usd: reported_cost_usd(usage),
+    })
+}
+
+/// `(input, output, total)` token counts an upstream reported, or `None`
+/// unless both `input_key` and `output_key` are present as non-negative
+/// integers that fit in `u32`. `null`, a missing count or an out-of-range
+/// value is "no usage reported", never zero and never truncated (#337).
+pub(crate) fn reported_token_counts(
+    usage: &serde_json::Value,
+    input_key: &str,
+    output_key: &str,
+) -> Option<(u32, u32, u32)> {
+    let tokens = |key: &str| {
+        usage
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let input = tokens(input_key)?;
+    let output = tokens(output_key)?;
+    let total = match usage.get("total_tokens") {
+        None | Some(serde_json::Value::Null) => input.checked_add(output)?,
+        Some(_) => tokens("total_tokens")?,
+    };
+    Some((input, output, total))
+}
+
+fn reported_cost_usd(usage: &serde_json::Value) -> Option<f64> {
+    usage
+        .get("cost")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 fn cached_prompt_tokens(usage: &serde_json::Value) -> Option<u32> {
@@ -797,5 +903,175 @@ mod tests {
                 ..
             })) if r == "error"
         ));
+    }
+
+    fn usage_of(event: Option<StreamEvent>) -> Option<Usage> {
+        match event {
+            Some(StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. })) => usage,
+            _ => None,
+        }
+    }
+
+    /// #337: `stream_options.include_usage` sends usage on a trailing chunk
+    /// whose `choices` is empty; it must not be dropped.
+    #[test]
+    fn include_usage_trailing_chunk_with_empty_choices_yields_usage() {
+        let frame = "data: {\"id\":\"s\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15,\"cost\":0.00042}}\n\n";
+        let usage = usage_of(parse_frame(frame).unwrap()).expect("usage");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (12, 3));
+        assert_eq!(usage.cost_usd, Some(0.00042));
+    }
+
+    #[test]
+    fn usage_on_the_finish_chunk_is_kept() {
+        let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n";
+        let usage = usage_of(parse_frame(frame).unwrap()).expect("usage");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (5, 2, 7)
+        );
+        assert_eq!(usage.cost_usd, None);
+    }
+
+    /// `"usage": null` (sent on every chunk before the trailing one) is not a
+    /// reported zero.
+    #[test]
+    fn null_or_tokenless_usage_is_not_a_zero_usage() {
+        for frame in [
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"cost\":1.0}}\n\n",
+        ] {
+            assert_eq!(usage_of(parse_frame(frame).unwrap()), None, "{frame}");
+        }
+    }
+
+    /// N1: a Responses API `usage` of `null`, without both token counts, or
+    /// with a count above `u32` is "no usage", not 0/0 or a truncated value.
+    #[test]
+    fn responses_usage_null_partial_or_out_of_range_is_no_usage() {
+        for usage in [
+            "null",
+            "{\"cost\":0.0}",
+            "{\"input_tokens\":4}",
+            "{\"input_tokens\":4294967301,\"output_tokens\":2}",
+            "{\"input_tokens\":-1,\"output_tokens\":2}",
+        ] {
+            let frame = format!("data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[],\"usage\":{usage}}}}}\n\n");
+            assert_eq!(usage_of(parse_frame(&frame).unwrap()), None, "{usage}");
+        }
+        let frame = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"cost\":0.5}}}\n\n";
+        let usage = usage_of(parse_frame(frame).unwrap()).expect("usage");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (4, 2, 6)
+        );
+        assert_eq!(usage.cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn chat_usage_above_u32_is_no_usage() {
+        let frame = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1099511627776,\"completion_tokens\":1}}\n\n";
+        assert_eq!(usage_of(parse_frame(frame).unwrap()), None);
+    }
+
+    fn text_of(event: &StreamEvent) -> Option<&str> {
+        match event {
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::TextDelta { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// #396: a stream that mixes LF and CRLF frame separators must yield both
+    /// frames. Before the fix the two frames were merged and dropped.
+    #[test]
+    fn mixed_lf_and_crlf_separators_yield_both_frames() {
+        let mut parser = SseParser::new();
+        let stream = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\r\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"B\"}}]}\r\n\r\n",
+        );
+        let events = parser.push(stream.as_bytes()).unwrap();
+        assert_eq!(events.len(), 2, "mixed separators merged the frames");
+        assert_eq!(text_of(&events[0]), Some("A"));
+        assert_eq!(text_of(&events[1]), Some("B"));
+    }
+
+    /// The separator itself may be split across chunks (`\n\r` then `\n`).
+    #[test]
+    fn mixed_separator_split_across_chunks_is_not_merged() {
+        let mut parser = SseParser::new();
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\r";
+        assert!(parser.push(first).unwrap().is_empty());
+        let second = b"\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"B\"}}]}\n\n";
+        let events = parser.push(second).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(text_of(&events[0]), Some("A"));
+        assert_eq!(text_of(&events[1]), Some("B"));
+    }
+
+    /// #396: no frame separator must not grow the buffer without bound.
+    #[test]
+    fn sse_buffer_over_the_cap_fails_the_stream() {
+        let mut parser = SseParser::new();
+        let chunk = vec![b'x'; MAX_SSE_BUFFER_BYTES + 1];
+        let error = parser.push(&chunk).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded"),
+            "uncapped buffer accepted {MAX_SSE_BUFFER_BYTES} + 1 bytes: {error}"
+        );
+        assert!(
+            parser.buffer.is_empty(),
+            "a failed push must drop the buffer"
+        );
+    }
+
+    /// A chunk made entirely of complete frames may exceed the cap. The cap
+    /// applies to the incomplete tail, which is empty here.
+    #[test]
+    fn complete_frames_larger_than_the_cap_are_kept() {
+        let mut parser = SseParser::new();
+        let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\n";
+        let chunk = frame.repeat((MAX_SSE_BUFFER_BYTES / frame.len()) + 2);
+        assert!(chunk.len() > MAX_SSE_BUFFER_BYTES);
+        let events = parser
+            .push(chunk.as_bytes())
+            .expect("complete frames must not trip the incomplete-buffer cap");
+        assert!(events.len() > 1, "frames: {}", events.len());
+        assert!(parser.buffer.is_empty());
+    }
+
+    /// #396: the debug preview used to slice at byte 200 and panic when that
+    /// index sat inside a multibyte character.
+    #[test]
+    fn invalid_json_preview_does_not_panic_on_char_boundary() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut payload = "x".repeat(199);
+            payload.push('你');
+            assert!(
+                !payload.is_char_boundary(200),
+                "fixture must straddle byte 200"
+            );
+            payload.push_str(" not-json");
+            let frame = format!("data: {payload}\n\n");
+            let parsed = parse_frame(&frame).expect("preview must not panic");
+            assert!(parsed.is_none());
+        });
     }
 }
