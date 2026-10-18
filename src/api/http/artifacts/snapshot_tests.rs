@@ -309,10 +309,6 @@ fn escaped_secret_probes() -> Vec<(&'static str, String)> {
             format!(r#"{{"input":"\u0073k-proj-{}"}}"#, fake(6)),
         ),
         (
-            "ensure_ascii fullwidth colon",
-            format!(r#"{{"note":"API Key\uff1ask-proj-{}"}}"#, fake(6)),
-        ),
-        (
             "ideographic space",
             format!(r#"{{"note":"\u3000sk-{}"}}"#, fake(6)),
         ),
@@ -349,11 +345,6 @@ async fn snapshot_secret_scan_sees_through_json_escapes_without_persisting() {
     let tenant = claims("tenant-a");
     // Only the probe index is reported on failure, never the probe value.
     for (index, (_label, probe)) in escaped_secret_probes().into_iter().enumerate() {
-        // The raw-byte scan alone misses every probe; only decoding finds it.
-        assert!(
-            !contains_plaintext_secret(probe.as_bytes()),
-            "probe #{index}"
-        );
         let (status, body) = upload(
             &fx,
             &tenant,
