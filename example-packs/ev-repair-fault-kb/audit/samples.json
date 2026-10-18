@@ -1,0 +1,26 @@
+{
+  "schema": "agentos.dev/knowledge-pack-audit/v1",
+  "fictional_data_only": true,
+  "samples": [
+    {
+      "id": "audit-ev-pack-001",
+      "tenant_id": "tenant-ficto-demo",
+      "project_id": "project-ev-pack-showcase",
+      "actor_id": "actor-pack-gate-ci",
+      "action": "knowledge_pack.gate_passed",
+      "resource": "ev-repair-fault-kb",
+      "isolation_verified": true,
+      "detail": "Pack gate validated SHACL, ontology anchors, and golden fixtures."
+    },
+    {
+      "id": "audit-ev-pack-002",
+      "tenant_id": "tenant-ficto-demo",
+      "project_id": "project-ev-pack-showcase",
+      "actor_id": "actor-runtime-readonly",
+      "action": "runtime_asset.bound",
+      "resource": "ev-repair",
+      "isolation_verified": true,
+      "detail": "Agent bound optional ev-repair runtime asset; retrieval stayed claims-scoped."
+    }
+  ]
+}

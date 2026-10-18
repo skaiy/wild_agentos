@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod canonicalizer;
 pub mod code_ast;
+pub mod example_pack_gate;
 pub mod extractor;
 pub mod ontology;
 pub mod ontology_draft;

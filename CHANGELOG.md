@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- Added the fictional `ev-repair-fault-kb` filesystem example pack (ontology
+  anchors, SHACL, Skill, golden I/O, audit samples) with a `knowledge-pack-gate`
+  CI job. (#417)
 - Removed gRPC `SubmitHumanApproval`. Human approval is submitted over HTTP (`POST /api/v1/events`). (#443)
 
 ## [0.7.0] — 2026-09-13

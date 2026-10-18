@@ -1,0 +1,17 @@
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ev: <https://agentos.ontology/ev/> .
+@prefix evp: <https://agentos.ontology/ev/prop/> .
+
+<https://agentos.ontology/ev/FaultCode/FICT-P0A80> a ev:FaultCode ;
+  evp:code "FICT-P0A80" ;
+  rdfs:label "Fictional DC-link communication loss" .
+
+<https://agentos.ontology/ev/FaultCode/FICT-U0100> a ev:FaultCode ;
+  evp:code "FICT-U0100" ;
+  rdfs:label "Fictional gateway sleep timeout" .
+
+<https://agentos.ontology/ev/Brand/FictoMotors> a ev:Brand ;
+  rdfs:label "FictoMotors (fictional OEM)" .
+
+<https://agentos.ontology/ev/Brand/Voltaria> a ev:Brand ;
+  rdfs:label "Voltaria (fictional OEM)" .
