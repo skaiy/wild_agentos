@@ -36,15 +36,26 @@ Locally:
 cargo test --lib knowledge_pack_gate_ --verbose
 ```
 
-The gate verifies manifest fields, frozen SHA-256 digests, ontology anchors against
-`ev_repair_ontology()`, SHACL conformance of fictional sample data, embedded Skill
-package manifests, audit sample schema, and equality with the frozen golden output.
+The gate verifies manifest fields (including `spec.named_graph` /
+`spec.vector_namespace` aligned with the seeded `ev-repair-fault-kb` pack),
+pack-relative path containment (no `..`), frozen SHA-256 digests, ontology
+anchors against `ev_repair_ontology()`, SHACL conformance of fictional sample
+data, embedded Skill package manifests, audit sample schema, and equality with
+the frozen golden output.
+
+SHACL in this showcase targets **only** `ev:FaultCode` instances
+(`shacl/fault-code-shapes.ttl`); other triples in `rdf/fictional-sample.ttl`
+(e.g. fictional `ev:Brand`) are not shape-validated at pack gate time.
+
+When golden input sets `validate_shacl: false`, the gate report uses
+`shacl_conforms: "skipped"` instead of implying conformance.
 
 ## Optional load for demos
 
-`./scripts/load-ev-repair-example-pack.sh` currently runs the same validation gate.
-Wiring this pack into the one-command 10-minute governed-ontology demo (#416) is a
-follow-up once that script orchestrates import → gate → agent bind.
+`./scripts/load-ev-repair-example-pack.sh` is a **stub**: it prints a notice and
+runs the same filesystem gate as CI. It does **not** import into a live KB or
+bind agents. Wiring import → gate → bind for the one-command demo (#416) is a
+follow-up.
 
 ## Agent binding
 
