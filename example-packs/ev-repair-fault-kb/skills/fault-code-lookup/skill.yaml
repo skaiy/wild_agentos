@@ -1,0 +1,17 @@
+apiVersion: agentos.dev/v1
+kind: Skill
+metadata:
+  iri: skill://example/ev-repair/fault-code-lookup
+  name: fictional-fault-code-lookup
+  version: 1.0.0
+spec:
+  description: Retrieve fictional fault code meaning and driveability from the showcase graph.
+package:
+  schema: agentos.dev/skill-package/v1
+  side_effect_level: read
+  visibility: tenant
+  entrypoint: SKILL.md
+  golden_input: tests/golden-input.json
+  golden_output: tests/golden-output.json
+  golden_input_sha256: 8036b314b36eff221193888f0a7f3129aa9dd438f9cf7de653a7954d8bfbf108
+  golden_output_sha256: 09b1b04e595b62f2777d182cddb43415c075a9b422a870e3715ac23a00177e56

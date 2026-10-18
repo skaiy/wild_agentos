@@ -1,0 +1,10 @@
+{
+  "gate": "pass",
+  "pack_id": "ev-repair-fault-kb",
+  "domain": "ev-repair",
+  "shacl_conforms": true,
+  "ontology_anchors_ok": true,
+  "skill_package_count": 1,
+  "audit_sample_count": 2,
+  "fictional_data_only": true
+}

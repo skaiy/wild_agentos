@@ -1,0 +1,22 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ev: <https://agentos.ontology/ev/> .
+@prefix evp: <https://agentos.ontology/ev/prop/> .
+
+ev:FaultCodeShape a sh:NodeShape ;
+  sh:targetClass ev:FaultCode ;
+  sh:property [
+    sh:path evp:code ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+    sh:message "Fictional fault codes must declare evp:code" ;
+  ] ;
+  sh:property [
+    sh:path rdfs:label ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+    sh:message "Fictional fault codes must declare rdfs:label" ;
+  ] .

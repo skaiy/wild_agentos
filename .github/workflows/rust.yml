@@ -71,6 +71,20 @@ jobs:
     - name: Run tests
       run: cargo test --workspace --verbose
 
+  knowledge-pack-gate:
+    name: EV-repair knowledge example pack gate
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Install protoc
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+    - name: Cache Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Verify EV-repair example pack
+      run: ./scripts/check_ev_repair_example_pack.sh
+
   skill-package-gate:
     name: Skill package gate fixtures
     runs-on: ubuntu-latest

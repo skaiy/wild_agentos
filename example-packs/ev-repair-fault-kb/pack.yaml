@@ -1,0 +1,26 @@
+apiVersion: agentos.dev/v1
+kind: KnowledgePack
+metadata:
+  id: ev-repair-fault-kb
+  name: EV repair fault knowledge (fictional showcase)
+  version: 1.1.0
+spec:
+  description: >
+    Fictional new-energy vehicle fault diagnosis pack with ontology anchors,
+    SHACL shapes, a distributable Skill, golden gate fixtures, and audit samples.
+  domain: ev-repair
+  fictional_data_only: true
+  named_graph: graph:pack/ev-repair
+  vector_namespace: vec:pack/ev-repair
+  runtime_asset_id: ev-repair
+package:
+  schema: agentos.dev/knowledge-pack/v1
+  ontology_anchors: ontology/anchors.json
+  shacl_shapes: shacl/fault-code-shapes.ttl
+  sample_data: rdf/fictional-sample.ttl
+  skills_dir: skills
+  audit_samples: audit/samples.json
+  golden_input: tests/golden-input.json
+  golden_output: tests/golden-output.json
+  golden_input_sha256: 6fb1c9e7db3ba3dbabea8d60e86196b33b77777fe2952b5d15b4694a7c16a5b6
+  golden_output_sha256: ed9b45950f4339d3dd90470d3a4f3318a1faa163f83a8df9104d15e02bbd684c
