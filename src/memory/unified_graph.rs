@@ -220,6 +220,10 @@ impl UnifiedGraphStore {
                     format!("\"{}\"^^<{}>", value, datatype.as_str())
                 }
             }
+            Term::Triple(triple) => format!(
+                "<< {} {} {} >>",
+                triple.subject, triple.predicate, triple.object
+            ),
         }
     }
 
@@ -484,6 +488,13 @@ impl UnifiedGraphStore {
                             Term::BlankNode(node) => {
                                 SparqlValue::BlankNode(node.as_str().to_string())
                             }
+                            Term::Triple(triple) => SparqlValue::Literal(
+                                format!(
+                                    "<< {} {} {} >>",
+                                    triple.subject, triple.predicate, triple.object
+                                ),
+                                None,
+                            ),
                         };
                         row.insert(var.as_str().to_string(), sparql_value);
                     }

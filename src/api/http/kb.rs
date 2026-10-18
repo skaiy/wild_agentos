@@ -2276,6 +2276,17 @@ pub(crate) async fn materialize_rml_knowledge_base_handler(
             graph: None,
         });
     }
+    let fact_terms = match crate::knowledge_graph::provenance::triple_terms_from_rdf_quads(
+        &quads[..triples_written],
+    ) {
+        Ok(terms) => terms,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+        }
+    };
     let kg = match KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
         Ok(kg) => kg,
         Err(error) => {
@@ -2287,6 +2298,18 @@ pub(crate) async fn materialize_rml_knowledge_base_handler(
     };
     match kg.write_quads_for_claims(claims, &quads) {
         Ok(()) => {
+            if let Err(error) = kg.record_rml_materialization_provenance(
+                claims,
+                &run_iri,
+                &mapping_checksum,
+                fact_terms,
+                crate::knowledge_graph::provenance::ProvenanceOutcome::Succeeded,
+            ) {
+                crate::knowledge_graph::provenance::log_provenance_write_failure(
+                    "rml_materialization",
+                    &error,
+                );
+            }
             let _ = state.kg_store.flush();
             (
                 StatusCode::OK,

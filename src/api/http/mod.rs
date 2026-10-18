@@ -100,6 +100,7 @@ use ontology::{
     delete_object_type_handler, domain_guardrails_handler, invoke_action_handler,
     list_action_approvals_handler, list_extraction_reviews_handler, list_type_drafts_handler,
     materialize_constrained_extraction_handler, ontology_health_handler,
+    ontology_provenance_activity_handler, ontology_provenance_by_subject_handler,
     ontology_readiness_report_handler, ontology_types_handler, promote_type_draft_handler,
     quality_gate_handler, reject_action_approval_handler, resolve_extraction_review_handler,
     update_action_type_handler, update_domain_guardrails_handler, update_function_def_handler,
@@ -608,6 +609,14 @@ pub fn build_router(
         .route(
             "/api/v1/ontology/constrained-extractions/:id/materialize",
             post(materialize_constrained_extraction_handler),
+        )
+        .route(
+            "/api/v1/ontology/provenance",
+            get(ontology_provenance_by_subject_handler),
+        )
+        .route(
+            "/api/v1/ontology/provenance/activities/:id",
+            get(ontology_provenance_activity_handler),
         )
         .route(
             "/api/v1/ontology/extraction-reviews",
