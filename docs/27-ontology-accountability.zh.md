@@ -17,8 +17,19 @@
   （文档 → 页 → chunk）使用
   `https://wildagentos.org/ontology/prov/` 下稳定 IRI。
 - **只读 API**（JWT + claims）：`GET /api/v1/ontology/provenance?subject=<IRI>`
-  与 `GET /api/v1/ontology/provenance/activities/{id}`。跨租户或未知
-  activity id 返回字节一致的 `404` 响应体。
+  与 `GET /api/v1/ontology/provenance/activities/{id}`。
+- **HTTP 响应约定**（避免把格式错误当成信息泄露）：
+  - **未授权（`401`）**：两条路由均无已验证 JWT / isolation claims。
+  - **按 subject 查询（`200`）**：固定返回 `{ "subject", "links" }`；`links`
+    为空表示本 tenant/project 无溯源（含跨租户），与域内查无结果时响应体逐字节一致。
+  - **按 activity id 查询（`404`）**：未知、跨租户、路径段非法（解码后仍含 `%`）
+    或字符集不允许 — 共用同一 JSON 体
+    `{"error":"provenance activity not found"}`。路径格式错误在 **claims 检查之前**
+    即返回该 `404`（未认证亦然，不是 `401`）。
+- **RML 溯源**：worker 跑通后若 claims 作用域内的生产写入失败，会记录
+  `activityOutcome=failed` 的 `prov:Activity`；更早的 worker/解析失败不 mint activity。
+- **读路径扫描**：溯源读路径经共享 helper 只处理 mint 的伴生图；在 Oxigraph
+  提供按图迭代前，底层仍可能全库遍历。
 - **Oxigraph**：工作区依赖开启 `rdf-12` feature 以支持 triple term。
 
 ## 决策节点（规划中）

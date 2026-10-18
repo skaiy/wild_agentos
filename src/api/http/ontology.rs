@@ -3433,12 +3433,16 @@ mod ontology_crud_tests {
     }
 
     fn test_jwt(tenant: &str) -> String {
+        test_jwt_for_project(tenant, "repair")
+    }
+
+    fn test_jwt_for_project(tenant: &str, project: &str) -> String {
         encode(
             &Header::default(),
             &super::super::iam::JwtClaims {
                 sub: "ontology-tester".to_string(),
                 tenant_id: tenant.to_string(),
-                project_id: Some("repair".to_string()),
+                project_id: Some(project.to_string()),
                 roles: vec![],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
@@ -5292,7 +5296,8 @@ mod ontology_crud_tests {
                 get(ontology_provenance_activity_handler),
             )
             .with_state(state);
-        let response = app
+        let subject = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/v1/ontology/provenance?subject=%3Chttp://example.org/x%3E")
@@ -5301,7 +5306,151 @@ mod ontology_crud_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(subject.status(), StatusCode::UNAUTHORIZED);
+        let activities = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/provenance/activities/action-audit%2Fdemo")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(activities.status(), StatusCode::UNAUTHORIZED);
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_provenance_malformed_activity_path_is_404_before_auth() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("agentos_prov_fmt_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/provenance/activities/:id",
+                get(ontology_provenance_activity_handler),
+            )
+            .with_state(state);
+        let malformed = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/provenance/activities/action-audit%2Fevil%25x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            malformed.status(),
+            StatusCode::NOT_FOUND,
+            "residual percent-encoding is treated as not found before JWT claims are checked"
+        );
+        std::env::remove_var("AGENTOS_DATA_DIR");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn isolation_contract_provenance_subject_is_invisible_cross_tenant() {
+        use crate::knowledge_graph::provenance::{triple_terms_from_rdf_quads, ProvenanceOutcome};
+        use crate::knowledge_graph::types::{RdfQuad, RdfValue};
+
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("agentos_prov_subject_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("AGENTOS_DATA_DIR", &tmp);
+        let state = make_state(&tmp);
+        let claims_a = IsolationClaims::from_verified("tenant-a", "repair", "actor-a").unwrap();
+        let kg = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).unwrap();
+        let subject = "https://example.test/asset/A-100";
+        let terms = triple_terms_from_rdf_quads(&[RdfQuad {
+            subject: subject.to_string(),
+            predicate: "https://example.test/ontology/name".into(),
+            object: RdfValue::Literal("Inverter".into()),
+            graph: None,
+        }])
+        .unwrap();
+        kg.record_rml_materialization_provenance(
+            &claims_a,
+            "https://agentos.ontology/rml-materialization/tenant-a-run",
+            "checksum-a",
+            terms,
+            ProvenanceOutcome::Succeeded,
+        )
+        .unwrap();
+        let app = Router::new()
+            .route(
+                "/api/v1/ontology/provenance",
+                get(ontology_provenance_by_subject_handler),
+            )
+            .with_state(state);
+        let subject_query = "https%3A%2F%2Fexample.test%2Fasset%2FA-100";
+        let tenant_a_hit = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/v1/ontology/provenance?subject={subject_query}"
+                    ))
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tenant_a_hit.status(), StatusCode::OK);
+        let hit_body = axum::body::to_bytes(tenant_a_hit.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !hit_body.is_empty() && hit_body.windows(6).any(|w| w == b"links\""),
+            "tenant-a must see provenance links for the subject"
+        );
+        let tenant_b = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/v1/ontology/provenance?subject={subject_query}"
+                    ))
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-b")))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tenant_a_other_project = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/v1/ontology/provenance?subject={subject_query}"
+                    ))
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", test_jwt_for_project("tenant-a", "p2")),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tenant_b.status(), StatusCode::OK);
+        assert_eq!(tenant_a_other_project.status(), StatusCode::OK);
+        let body_b = axum::body::to_bytes(tenant_b.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_other_project =
+            axum::body::to_bytes(tenant_a_other_project.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        assert_eq!(
+            body_b,
+            body_other_project,
+            "cross-tenant subject lookup must be byte-identical to an in-scope miss for the same subject"
+        );
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
