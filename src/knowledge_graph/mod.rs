@@ -5,6 +5,7 @@ pub mod extractor;
 pub mod ontology;
 pub mod ontology_draft;
 pub mod ontology_health;
+pub mod provenance;
 pub mod ontology_layer;
 pub mod ontology_store;
 pub mod quality_gate;

@@ -248,7 +248,11 @@ the WAO kernel.
 ## Graph Engineering lens (governance graph ≠ data graph)
 
 Oxigraph RDF is the **data graph**: it stores claims, entities, relations,
-provenance, and validation evidence. Graph Engineering adds a distinct
+provenance, and validation evidence. Server-minted PROV-O for materialized facts
+lives in the companion graph `graph://{tenant}/{project}/prov` (subgraph-style
+activities with RDF 1.2 triple terms); see
+[27-ontology-accountability.md](27-ontology-accountability.md). Graph
+Engineering adds a distinct
 **governance graph**: the explicit topology of loops that make, check, approve,
 audit, and arbitrate decisions about that data. It is not another graph-store
 replacement.

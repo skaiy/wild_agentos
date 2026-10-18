@@ -196,7 +196,10 @@ LlamaIndex PropertyGraph extractor 也可作为 Apache-2.0 ecosystem 中的 patt
 ## Graph Engineering 视角（治理图 ≠ 数据图）
 
 Oxigraph RDF 是**数据图**：它存储 claims、实体、关系、provenance 和验证证据。
-Graph Engineering 增加的是不同的**治理图**：让生成、检查、审批、审计和仲裁数据决策的
+物化事实的服务端 PROV-O 写入伴生图 `graph://{tenant}/{project}/prov`（子图式
+Activity + RDF 1.2 triple term）；见
+[27-ontology-accountability.zh.md](27-ontology-accountability.zh.md)。Graph
+Engineering 增加的是不同的**治理图**：让生成、检查、审批、审计和仲裁数据决策的
 各个 loop 的显式拓扑。它不是另一种用于替换的 graph store。
 
 公开的 [Graph Engineering 表述](https://agentfactory.panaversity.org/docs/graph-engineering-crash-course)
