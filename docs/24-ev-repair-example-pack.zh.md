@@ -15,7 +15,7 @@
 | `shacl/fault-code-shapes.ttl` | 虚构 `FaultCode` 的 SHACL 形状 |
 | `rdf/fictional-sample.ttl` | 门控校验用的示例 RDF |
 | `skills/fault-code-lookup/` | 带独立 golden 的租户 Skill 包 |
-| `audit/samples.json` | 虚构隔离审计样例（`isolation_verified: true`） |
+| `audit/samples.json` | 虚构审计样例；仅 `knowledge_pack.gate_passed` 可设 `isolation_verified: true` |
 | `tests/golden-input.json` / `golden-output.json` | 包级门控冻结契约 |
 
 内核内置种子（`ev-repair-fault-kb` / `ev-repair` 别名）仍是运行时绑定入口；本目录是
@@ -36,7 +36,7 @@ cargo test --lib knowledge_pack_gate_ --verbose
 ```
 
 门控会校验清单字段（含与种子包一致的 `spec.named_graph` /
-`spec.vector_namespace`）、包内相对路径不得含 `..`、SHA-256 冻结摘要、本体锚点与
+`spec.vector_namespace`）、包内相对路径不得含 `..`（已存在路径会做 symlink 逃逸检查）、SHA-256 冻结摘要、本体锚点与
 `ev_repair_ontology()` 一致、虚构样本 SHACL、内嵌 Skill 包清单、审计样例结构，以及与
 冻结 golden 输出一致。
 

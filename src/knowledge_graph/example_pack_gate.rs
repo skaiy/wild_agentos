@@ -2,6 +2,10 @@
 //!
 //! Showcase packs live under `example-packs/` and are validated in CI without
 //! executing pack scripts or touching production tenant graphs.
+//!
+//! Path containment rejects `..` and absolute manifest paths. When the resolved
+//! path already exists, a best-effort `canonicalize` check rejects symlink escapes;
+//! non-existent targets rely on lexical rules only (documented limitation).
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -177,7 +181,39 @@ pub fn resolve_contained_pack_path(pack_dir: &Path, rel: &str) -> Result<PathBuf
             Component::CurDir | Component::Normal(_) => {}
         }
     }
-    Ok(pack_dir.join(rel_path))
+    let joined = pack_dir.join(rel_path);
+    if joined.exists() {
+        if let Ok(root) = pack_dir.canonicalize() {
+            if let Ok(canonical) = joined.canonicalize() {
+                if !canonical.starts_with(&root) {
+                    return Err(
+                        "pack-relative path escapes its root via symlink or hard link".into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(joined)
+}
+
+fn audit_sample_isolation_claim_ok(sample: &AuditSample) -> Result<(), String> {
+    const GATE_VERIFIED_ACTIONS: &[&str] = &["knowledge_pack.gate_passed"];
+    if GATE_VERIFIED_ACTIONS.contains(&sample.action.as_str()) {
+        if !sample.isolation_verified {
+            return Err(format!(
+                "audit sample {} action {} must declare isolation_verified=true (checked by pack gate)",
+                sample.id,
+                sample.action
+            ));
+        }
+    } else if sample.isolation_verified {
+        return Err(format!(
+            "audit sample {} must not claim isolation_verified=true; pack gate does not verify action {}",
+            sample.id,
+            sample.action
+        ));
+    }
+    Ok(())
 }
 
 /// Run the full admission gate for a knowledge example pack directory.
@@ -290,7 +326,8 @@ fn verify_isolation_namespace_targets(manifest: &KnowledgePackManifest) -> Resul
         return Err("isolation namespace fields must not contain '..'".into());
     }
     for forbidden in ["graph://", "vector://"] {
-        if manifest.named_graph.contains(forbidden) || manifest.vector_namespace.contains(forbidden) {
+        if manifest.named_graph.contains(forbidden) || manifest.vector_namespace.contains(forbidden)
+        {
             return Err(format!(
                 "showcase pack namespaces must use fictional pack-scoped ids, not client {forbidden} URIs"
             ));
@@ -299,15 +336,13 @@ fn verify_isolation_namespace_targets(manifest: &KnowledgePackManifest) -> Resul
     if manifest.named_graph != seed.named_graph {
         return Err(format!(
             "spec.named_graph must match seeded pack graph (expected {}, got {})",
-            seed.named_graph,
-            manifest.named_graph
+            seed.named_graph, manifest.named_graph
         ));
     }
     if manifest.vector_namespace != seed.vector_namespace {
         return Err(format!(
             "spec.vector_namespace must match seeded pack namespace (expected {}, got {})",
-            seed.vector_namespace,
-            manifest.vector_namespace
+            seed.vector_namespace, manifest.vector_namespace
         ));
     }
     Ok(())
@@ -392,8 +427,8 @@ fn verify_shacl_sample(pack_dir: &Path, manifest: &KnowledgePackManifest) -> Res
     let data_path = resolve_contained_pack_path(pack_dir, &manifest.sample_data)?;
     let shapes = std::fs::read_to_string(&shapes_path)
         .map_err(|e| format!("SHACL shapes unreadable: {e}"))?;
-    let data = std::fs::read_to_string(&data_path)
-        .map_err(|e| format!("sample data unreadable: {e}"))?;
+    let data =
+        std::fs::read_to_string(&data_path).map_err(|e| format!("sample data unreadable: {e}"))?;
     let store = crate::ontology::new_shared_store()
         .map_err(|e| format!("failed to create ontology store: {e}"))?;
     store
@@ -457,10 +492,11 @@ fn verify_skill_packages(
                 digest.ok_or_else(|| format!("{label} must declare a SHA-256 digest"))?;
             verify_frozen_fixture(&fixture_path, expected, label)?;
         }
-        if !path.join(&skill_manifest.entrypoint).is_file() {
+        let entrypoint_path = resolve_contained_pack_path(&path, &skill_manifest.entrypoint)?;
+        if !entrypoint_path.is_file() {
             return Err(format!(
                 "skill package entrypoint missing: {}",
-                path.join(&skill_manifest.entrypoint).display()
+                entrypoint_path.display()
             ));
         }
         count += 1;
@@ -493,12 +529,7 @@ fn verify_audit_samples(
         {
             return Err("audit sample identity fields cannot be empty".into());
         }
-        if !sample.isolation_verified {
-            return Err(format!(
-                "audit sample {} must keep isolation_verified=true",
-                sample.id
-            ));
-        }
+        audit_sample_isolation_claim_ok(sample)?;
         if sample.tenant_id == "default" {
             return Err("audit samples must not use production default tenant id".into());
         }
@@ -644,6 +675,9 @@ ev:Shape a sh:NodeShape ; sh:targetClass ev:FaultCode ; sh:property [
         let ski_sha = hex::encode(Sha256::digest(ski));
         let sko_sha = hex::encode(Sha256::digest(sko));
         std::fs::write(skill_dir.join("SKILL.md"), b"# fake").unwrap();
+        let skill_entrypoint = overrides
+            .skill_entrypoint
+            .unwrap_or_else(|| "SKILL.md".into());
         std::fs::write(
             skill_dir.join("skill.yaml"),
             format!(
@@ -651,7 +685,7 @@ ev:Shape a sh:NodeShape ; sh:targetClass ev:FaultCode ; sh:property [
   schema: agentos.dev/skill-package/v1
   side_effect_level: read
   visibility: tenant
-  entrypoint: SKILL.md
+  entrypoint: {skill_entrypoint}
   golden_input: tests/golden-input.json
   golden_output: tests/golden-output.json
   golden_input_sha256: {ski_sha}
@@ -711,6 +745,7 @@ package:
         named_graph: Option<String>,
         vector_namespace: Option<String>,
         ontology_anchors_path: Option<String>,
+        skill_entrypoint: Option<String>,
     }
 
     impl Default for ShowcasePackOverrides {
@@ -726,6 +761,7 @@ package:
                 named_graph: None,
                 vector_namespace: None,
                 ontology_anchors_path: None,
+                skill_entrypoint: None,
             }
         }
     }
@@ -970,5 +1006,81 @@ package:
         .unwrap();
         let err = run_knowledge_pack_gate(&root).unwrap_err();
         assert!(err.contains("skill packages"), "got: {err}");
+    }
+
+    #[test]
+    fn knowledge_pack_gate_rejects_absolute_package_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("abs-path");
+        write_minimal_showcase_pack(
+            &root,
+            ShowcasePackOverrides {
+                ontology_anchors_path: Some("/ontology/anchors.json".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = run_knowledge_pack_gate(&root).unwrap_err();
+        assert!(
+            err.contains("absolute"),
+            "expected absolute path rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn knowledge_pack_gate_rejects_dirty_vector_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("bad-vector");
+        write_minimal_showcase_pack(
+            &root,
+            ShowcasePackOverrides {
+                vector_namespace: Some("vec:pack/not-seeded".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = run_knowledge_pack_gate(&root).unwrap_err();
+        assert!(
+            err.contains("vector_namespace"),
+            "expected vector namespace gate failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn knowledge_pack_gate_rejects_skill_entrypoint_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("entry-escape");
+        write_minimal_showcase_pack(
+            &root,
+            ShowcasePackOverrides {
+                skill_entrypoint: Some("../../../SKILL.md".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = run_knowledge_pack_gate(&root).unwrap_err();
+        assert!(
+            err.contains("..") || err.contains("entrypoint"),
+            "expected entrypoint containment failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn knowledge_pack_gate_rejects_audit_sample_false_isolation_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("bad-audit-claim");
+        write_minimal_showcase_pack(
+            &root,
+            ShowcasePackOverrides {
+                audit_json: Some(
+                    br#"{"schema":"agentos.dev/knowledge-pack-audit/v1","fictional_data_only":true,"samples":[{"id":"x","tenant_id":"t","project_id":"p","actor_id":"a","action":"runtime_asset.bound","resource":"ev-repair","isolation_verified":true}]}"#
+                        .to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = run_knowledge_pack_gate(&root).unwrap_err();
+        assert!(err.contains("isolation_verified"), "got: {err}");
     }
 }

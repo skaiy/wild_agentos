@@ -16,7 +16,7 @@ All entities, brands, and fault codes are **fictional** and safe for CI.
 | `shacl/fault-code-shapes.ttl` | SHACL shapes for fictional `FaultCode` instances |
 | `rdf/fictional-sample.ttl` | Sample RDF triples validated by the gate |
 | `skills/fault-code-lookup/` | Tenant Skill package with its own golden fixtures |
-| `audit/samples.json` | Fictional isolation audit exemplars (`isolation_verified: true`) |
+| `audit/samples.json` | Fictional audit exemplars; only `knowledge_pack.gate_passed` samples may set `isolation_verified: true` |
 | `tests/golden-input.json` / `golden-output.json` | Frozen pack-level gate contract |
 
 The built-in kernel seed (`ev-repair-fault-kb` / `ev-repair` alias) remains the
@@ -38,7 +38,7 @@ cargo test --lib knowledge_pack_gate_ --verbose
 
 The gate verifies manifest fields (including `spec.named_graph` /
 `spec.vector_namespace` aligned with the seeded `ev-repair-fault-kb` pack),
-pack-relative path containment (no `..`), frozen SHA-256 digests, ontology
+pack-relative path containment (no `..`; best-effort symlink check when paths exist), frozen SHA-256 digests, ontology
 anchors against `ev_repair_ontology()`, SHACL conformance of fictional sample
 data, embedded Skill package manifests, audit sample schema, and equality with
 the frozen golden output.
