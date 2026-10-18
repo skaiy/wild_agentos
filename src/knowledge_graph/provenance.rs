@@ -227,7 +227,7 @@ impl KnowledgeGraphStore {
         let now = Utc::now().to_rfc3339();
         let local_id = format!(
             "rml/{}",
-            RdfMapper::sanitize_id(&run_iri.rsplit('/').next().unwrap_or("run"),)
+            RdfMapper::sanitize_id(run_iri.rsplit('/').next().unwrap_or("run"))
         );
         let activity = activity_iri(&local_id);
         let quads = self.build_activity_bundle(
@@ -400,6 +400,7 @@ impl KnowledgeGraphStore {
         terms
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_activity_bundle(
         &self,
         claims: &IsolationClaims,
