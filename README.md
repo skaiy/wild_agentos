@@ -176,6 +176,8 @@ production HS256 configuration.
 - [Ontology KE golden-freeze policy](docs/22-ontology-ke-golden-freeze-policy.md)
 - [Admin control-plane API matrix](docs/23-admin-control-plane-api-matrix.md) —
   current Admin-to-kernel API coverage and access boundaries
+- [EV-repair example knowledge pack](docs/24-ev-repair-example-pack.md) —
+  fictional showcase pack, SHACL, and pack-level CI gate
 - [Outbound A2A adapter](docs/19-a2a-outbound.md)
 - [Private-deployment benchmark](docs/19-private-deploy-benchmark.md)
 - [Design detail](docs/13-DESIGN_DETAIL.md)

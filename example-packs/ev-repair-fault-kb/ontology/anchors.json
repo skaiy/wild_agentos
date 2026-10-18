@@ -1,0 +1,26 @@
+{
+  "domain": "ev-repair",
+  "required_object_types": [
+    "Brand",
+    "VehicleModel",
+    "System",
+    "FaultCode",
+    "SeverityLevel",
+    "Cause",
+    "DiagnosticStep",
+    "HandlingMeasure",
+    "FAQ",
+    "DataSource"
+  ],
+  "required_link_types": [
+    "hasModel",
+    "hasSystem",
+    "affectsSystem",
+    "hasSeverity",
+    "hasCause",
+    "hasDiagnosticStep",
+    "recommends",
+    "relatedFaq",
+    "sourcedFrom"
+  ]
+}

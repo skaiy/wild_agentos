@@ -1,0 +1,8 @@
+{
+  "result": {
+    "code": "FICT-P0A80",
+    "label": "Fictional DC-link communication loss",
+    "can_drive": false,
+    "fictional": true
+  }
+}
