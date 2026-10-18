@@ -28,12 +28,12 @@ use crate::{
         },
         ontology_health,
         ontology_layer::ActionGuardrailConfig,
+        provenance::{self, ExtractionSourceRef, ProvenanceOutcome},
         quality_gate::{
             JudgeConfig, JudgeReport, JudgeVerdict, KgQualityGate, QualityGateReport,
             QualityGateRequest,
         },
         rdf_mapper::RdfMapper,
-        provenance::{ExtractionSourceRef, ProvenanceOutcome},
         store::{
             ClaimsGraphUpdate, KnowledgeGraphStore, MaterializationAnchor, PendingActionApproval,
             PendingExtractionReview, PendingTypeDraft,
@@ -901,7 +901,7 @@ pub(crate) async fn constrained_extraction_handler(
         )
             .into_response();
     }
-    let _ = kg.record_extraction_staging_provenance(
+    if let Err(error) = kg.record_extraction_staging_provenance(
         claims,
         &extraction_id,
         &ExtractionSourceRef {
@@ -910,7 +910,9 @@ pub(crate) async fn constrained_extraction_handler(
             extractor: request.extractor.clone(),
             model: request.model.clone(),
         },
-    );
+    ) {
+        provenance::log_provenance_write_failure("extraction_staging", &error);
+    }
     let _ = state.kg_store.flush();
     Json(json!({
         "status": "staged",
@@ -1269,7 +1271,7 @@ pub(crate) async fn ontology_provenance_by_subject_handler(
             "subject": query.subject.trim(),
             "links": hits,
         }))
-            .into_response(),
+        .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": error})),
@@ -1278,8 +1280,12 @@ pub(crate) async fn ontology_provenance_by_subject_handler(
     }
 }
 
-fn decode_provenance_activity_path(segment: &str) -> String {
-    segment.replace("%2F", "/").replace("%2f", "/")
+fn decode_provenance_activity_path(segment: &str) -> Option<String> {
+    let decoded = segment.replace("%2F", "/").replace("%2f", "/");
+    if decoded.contains('%') {
+        return None;
+    }
+    Some(decoded)
 }
 
 fn provenance_activity_not_found(_activity_id: &str) -> Response {
@@ -1298,17 +1304,17 @@ pub(crate) async fn ontology_provenance_activity_handler(
     identity: UserIdentity,
     Path(activity_id): Path<String>,
 ) -> impl IntoResponse {
-    let activity_id = decode_provenance_activity_path(&activity_id);
+    let activity_id = match decode_provenance_activity_path(&activity_id) {
+        Some(id) => id,
+        None => return provenance_activity_not_found(""),
+    };
     let Some(claims) = identity.isolation_claims() else {
         return unauthorized_isolation_claims().into_response();
     };
     if activity_id.trim().is_empty()
         || !activity_id
             .bytes()
-            .all(|byte| {
-                byte.is_ascii_alphanumeric()
-                    || matches!(byte, b'-' | b'_' | b'/' | b'%')
-            })
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'/'))
     {
         return provenance_activity_not_found(&activity_id);
     }
@@ -1392,12 +1398,14 @@ pub(crate) async fn materialize_constrained_extraction_handler(
         None
     };
     let Some(authority) = authority else {
-        let _ = kg.record_materialization_provenance(
+        if let Err(error) = kg.record_materialization_provenance(
             claims,
             &extraction_id,
             ProvenanceOutcome::Blocked,
             extraction_model_from_staging(&kg, claims, &extraction_id).as_deref(),
-        );
+        ) {
+            provenance::log_provenance_write_failure("materialization_blocked", &error);
+        }
         let _ = state.kg_store.flush();
         return (
             StatusCode::CONFLICT,
@@ -1412,12 +1420,14 @@ pub(crate) async fn materialize_constrained_extraction_handler(
     let anchor = match kg.materialize_staging_with_anchor_for_claims(claims, &extraction_id) {
         Ok(anchor) => anchor,
         Err(error) => {
-            let _ = kg.record_materialization_provenance(
+            if let Err(error) = kg.record_materialization_provenance(
                 claims,
                 &extraction_id,
                 ProvenanceOutcome::Failed,
                 extraction_model_from_staging(&kg, claims, &extraction_id).as_deref(),
-            );
+            ) {
+                provenance::log_provenance_write_failure("materialization_failed", &error);
+            }
             emit_materialization_audit(
                 &state,
                 claims,
@@ -1441,7 +1451,7 @@ pub(crate) async fn materialize_constrained_extraction_handler(
     } else {
         "materialize_failed"
     };
-    let _ = kg.record_materialization_provenance(
+    if let Err(error) = kg.record_materialization_provenance(
         claims,
         &extraction_id,
         if anchor.passed {
@@ -1450,7 +1460,14 @@ pub(crate) async fn materialize_constrained_extraction_handler(
             ProvenanceOutcome::Failed
         },
         extraction_model_from_staging(&kg, claims, &extraction_id).as_deref(),
-    );
+    ) {
+        let kind = if anchor.passed {
+            "materialization_succeeded"
+        } else {
+            "materialization_anchor_failed"
+        };
+        provenance::log_provenance_write_failure(kind, &error);
+    }
     emit_materialization_audit(
         &state,
         claims,
@@ -2440,14 +2457,11 @@ async fn emit_action_audit(
 ) {
     let timestamp = chrono::Utc::now().to_rfc3339();
     if let Ok(kg) = KnowledgeGraphStore::with_shared_store(state.kg_store.clone()) {
-        let _ = kg.record_action_audit_provenance(
-            claims,
-            action_id,
-            staging_id,
-            decision,
-            violations,
-            &timestamp,
-        );
+        if let Err(error) = kg.record_action_audit_provenance(
+            claims, action_id, staging_id, decision, violations, &timestamp,
+        ) {
+            provenance::log_provenance_write_failure("action_audit", &error);
+        }
     }
     let event = ActionAuditEvent {
         tenant_id: claims.tenant_id(),
@@ -5263,10 +5277,8 @@ mod ontology_crud_tests {
     #[tokio::test]
     async fn isolation_contract_provenance_requires_claims() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!(
-            "agentos_prov_claims_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("agentos_prov_claims_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         let state = make_state(&tmp);
@@ -5297,10 +5309,7 @@ mod ontology_crud_tests {
     #[tokio::test]
     async fn isolation_contract_provenance_is_invisible_cross_tenant() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!(
-            "agentos_prov_cross_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp = std::env::temp_dir().join(format!("agentos_prov_cross_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("AGENTOS_DATA_DIR", &tmp);
         let state = make_state(&tmp);
@@ -5323,33 +5332,31 @@ mod ontology_crud_tests {
             .with_state(state);
         let activity_id = "action-audit/demo-action/staging-1/2026-01-01T00-00-00Z";
         let encoded_id = activity_id.replace('/', "%2F");
-        let tenant_b = app.clone().oneshot(
-            axum::http::Request::builder()
-                .uri(format!(
-                    "/api/v1/ontology/provenance/activities/{}",
-                    encoded_id
-                ))
-                .header(
-                    "authorization",
-                    format!("Bearer {}", test_jwt("tenant-b")),
-                )
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        let missing = app.clone().oneshot(
-            axum::http::Request::builder()
-                .uri("/api/v1/ontology/provenance/activities/does-not-exist")
-                .header(
-                    "authorization",
-                    format!("Bearer {}", test_jwt("tenant-a")),
-                )
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let tenant_b = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/v1/ontology/provenance/activities/{}",
+                        encoded_id
+                    ))
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-b")))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let missing = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/provenance/activities/does-not-exist")
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(tenant_b.status(), StatusCode::NOT_FOUND);
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         let body_b = axum::body::to_bytes(tenant_b.into_body(), usize::MAX)
@@ -5359,12 +5366,30 @@ mod ontology_crud_tests {
             .await
             .unwrap();
         assert_eq!(body_b, body_missing);
+        let malformed = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/ontology/provenance/activities/action-audit%2Fevil%25x")
+                    .header("authorization", format!("Bearer {}", test_jwt("tenant-a")))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
+        let body_malformed = axum::body::to_bytes(malformed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body_malformed, body_missing);
         std::env::remove_var("AGENTOS_DATA_DIR");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]
     async fn isolation_contract_provenance_graph_is_server_minted() {
+        use crate::knowledge_graph::provenance::prov_graph_iri_for_claims;
+
         let claims_p = IsolationClaims::from_verified("tenant-a", "p", "actor-a").unwrap();
         let claims_p2 = IsolationClaims::from_verified("tenant-a", "p2", "actor-a").unwrap();
         let kg = KnowledgeGraphStore::new().unwrap();
@@ -5377,11 +5402,13 @@ mod ontology_crud_tests {
             "2026-01-02T00-00-00Z",
         )
         .unwrap();
-        assert!(
-            kg.get_provenance_activity(&claims_p, "action-audit/action/staging/2026-01-02T00-00-00Z")
-                .unwrap()
-                .is_some()
-        );
+        assert!(kg
+            .get_provenance_activity(
+                &claims_p,
+                "action-audit/action/staging/2026-01-02T00-00-00Z"
+            )
+            .unwrap()
+            .is_some());
         assert!(
             kg.get_provenance_activity(
                 &claims_p2,
@@ -5405,6 +5432,19 @@ mod ontology_crud_tests {
                 .unwrap()
                 .is_none(),
             "caller update_for_claims cannot write the prov companion graph"
+        );
+        let prov = prov_graph_iri_for_claims(&claims_p).unwrap();
+        let graph_err = kg
+            .update_for_claims(
+                &claims_p,
+                &ClaimsGraphUpdate::insert_data(format!(
+                    "GRAPH <{prov}> {{ <http://example.org/x> <http://example.org/y> \"z\" . }}"
+                )),
+            )
+            .unwrap_err();
+        assert!(
+            graph_err.contains("GRAPH"),
+            "caller update payload must not target prov via GRAPH"
         );
     }
 }

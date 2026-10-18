@@ -18,6 +18,15 @@ pub const PROV_NS: &str = "http://www.w3.org/ns/prov#";
 pub const WAO_PROV_VOCAB: &str = "https://wildagentos.org/ontology/prov#";
 const WAO_PROV_RESOURCE: &str = "https://wildagentos.org/ontology/prov/";
 
+/// Best-effort prov writes must not change the primary HTTP outcome; failures are logged only.
+pub(crate) fn log_provenance_write_failure(activity_kind: &'static str, error: &str) {
+    tracing::warn!(
+        provenance_activity_kind = activity_kind,
+        error = error,
+        "failed to record provenance activity in server-minted prov graph"
+    );
+}
+
 const EXTRACTION_STAGING_PROV_NS: &str = "https://agentos.ontology/extraction/";
 const RML_META_NS: &str = "https://agentos.ontology/meta/";
 
@@ -132,8 +141,8 @@ impl KnowledgeGraphStore {
             return Ok(());
         }
         let graph = prov_graph_iri_for_claims(claims)?;
-        let graph_name = NamedNode::new(graph.as_str())
-            .map_err(|e| format!("invalid prov graph IRI: {e}"))?;
+        let graph_name =
+            NamedNode::new(graph.as_str()).map_err(|e| format!("invalid prov graph IRI: {e}"))?;
         for quad in quads {
             let mut q = quad.clone();
             q.graph_name = GraphName::NamedNode(graph_name.clone());
@@ -218,9 +227,7 @@ impl KnowledgeGraphStore {
         let now = Utc::now().to_rfc3339();
         let local_id = format!(
             "rml/{}",
-            RdfMapper::sanitize_id(
-                &run_iri.rsplit('/').next().unwrap_or("run"),
-            )
+            RdfMapper::sanitize_id(&run_iri.rsplit('/').next().unwrap_or("run"),)
         );
         let activity = activity_iri(&local_id);
         let quads = self.build_activity_bundle(
@@ -272,10 +279,7 @@ impl KnowledgeGraphStore {
                 writer.literal(&wao("actionId"), action_id);
                 writer.literal(&wao("stagingId"), staging_id);
                 writer.literal(&wao("decision"), decision);
-                writer.literal(
-                    &wao("violationCount"),
-                    violations.len().to_string(),
-                );
+                writer.literal(&wao("violationCount"), violations.len().to_string());
             },
         )?;
         self.record_provenance_quads_for_claims(claims, &quads)
@@ -300,8 +304,8 @@ impl KnowledgeGraphStore {
         subject_iri: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
         let graph = prov_graph_iri_for_claims(claims)?;
-        let subject = NamedNodeRef::new(subject_iri)
-            .map_err(|e| format!("invalid subject IRI: {e}"))?;
+        let subject =
+            NamedNodeRef::new(subject_iri).map_err(|e| format!("invalid subject IRI: {e}"))?;
         let mut hits = Vec::new();
         for quad in self.store_arc().iter() {
             let quad = quad.map_err(|e| format!("read prov graph failed: {e}"))?;
@@ -334,8 +338,8 @@ impl KnowledgeGraphStore {
     ) -> Result<Option<serde_json::Value>, String> {
         let graph = prov_graph_iri_for_claims(claims)?;
         let activity = activity_iri(activity_local_id);
-        let activity_node = NamedNode::new(activity.as_str())
-            .map_err(|e| format!("invalid activity IRI: {e}"))?;
+        let activity_node =
+            NamedNode::new(activity.as_str()).map_err(|e| format!("invalid activity IRI: {e}"))?;
         let mut props = serde_json::Map::new();
         let mut contains = Vec::new();
         let mut found = false;
@@ -431,7 +435,13 @@ impl KnowledgeGraphStore {
         Ok(writer.finish())
     }
 
-    fn quad_exists_in_graph(&self, graph: &str, subject: &str, predicate: &str, object: &str) -> bool {
+    fn quad_exists_in_graph(
+        &self,
+        graph: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> bool {
         for quad in self.store_arc().iter().flatten() {
             if !graph_matches(&quad, graph) {
                 continue;
@@ -576,13 +586,13 @@ fn rdf_value_to_term(value: &RdfValue) -> Result<Term, String> {
         RdfValue::Literal(text) => {
             Term::Literal(oxigraph::model::Literal::new_simple_literal(text.clone()))
         }
-        RdfValue::TypedLiteral(text, datatype) => Term::Literal(
-            oxigraph::model::Literal::new_typed_literal(
+        RdfValue::TypedLiteral(text, datatype) => {
+            Term::Literal(oxigraph::model::Literal::new_typed_literal(
                 text.clone(),
                 NamedNode::new(datatype.as_str())
                     .map_err(|e| format!("invalid datatype IRI: {e}"))?,
-            ),
-        ),
+            ))
+        }
     })
 }
 
@@ -627,9 +637,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        let terms = store.collect_fact_triple_terms_in_graph(
-            &claims.graph_iri().unwrap(),
-        );
+        let terms = store.collect_fact_triple_terms_in_graph(&claims.graph_iri().unwrap());
         assert_eq!(terms.len(), 1);
         store
             .record_rml_materialization_provenance(

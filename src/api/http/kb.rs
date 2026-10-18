@@ -2298,13 +2298,18 @@ pub(crate) async fn materialize_rml_knowledge_base_handler(
     };
     match kg.write_quads_for_claims(claims, &quads) {
         Ok(()) => {
-            let _ = kg.record_rml_materialization_provenance(
+            if let Err(error) = kg.record_rml_materialization_provenance(
                 claims,
                 &run_iri,
                 &mapping_checksum,
                 fact_terms,
                 crate::knowledge_graph::provenance::ProvenanceOutcome::Succeeded,
-            );
+            ) {
+                crate::knowledge_graph::provenance::log_provenance_write_failure(
+                    "rml_materialization",
+                    &error,
+                );
+            }
             let _ = state.kg_store.flush();
             (
                 StatusCode::OK,
