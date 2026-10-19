@@ -31,6 +31,16 @@ pub(crate) fn log_provenance_write_failure(activity_kind: &'static str, error: &
 const EXTRACTION_STAGING_PROV_NS: &str = "https://agentos.ontology/extraction/";
 const RML_META_NS: &str = "https://agentos.ontology/meta/";
 
+/// Fail-closed cap on backing-store quads examined per prov read (full-store walk).
+pub(crate) const PROV_READ_MAX_STORE_QUADS_SCANNED: usize = 2_097_152;
+/// Fail-closed cap on companion-graph quads yielded per prov read.
+pub(crate) const PROV_READ_MAX_COMPANION_GRAPH_QUADS: usize = 65_536;
+
+const ERR_PROV_READ_STORE_SCAN_BUDGET: &str =
+    "provenance read path exceeded store scan budget (fail-closed)";
+const ERR_PROV_READ_GRAPH_QUAD_BUDGET: &str =
+    "provenance read path exceeded companion graph quad budget (fail-closed)";
+
 fn wao(pred: &str) -> String {
     format!("{WAO_PROV_VOCAB}{pred}")
 }
@@ -569,16 +579,46 @@ fn graph_matches(quad: &Quad, graph: &str) -> bool {
     }
 }
 
+struct ProvReadScanBudget {
+    store_quads_scanned: usize,
+    graph_quads_matched: usize,
+}
+
+impl ProvReadScanBudget {
+    fn record_store_quad(&mut self) -> Result<(), String> {
+        self.store_quads_scanned += 1;
+        if self.store_quads_scanned > PROV_READ_MAX_STORE_QUADS_SCANNED {
+            return Err(ERR_PROV_READ_STORE_SCAN_BUDGET.to_string());
+        }
+        Ok(())
+    }
+
+    fn record_companion_graph_quad(&mut self) -> Result<(), String> {
+        self.graph_quads_matched += 1;
+        if self.graph_quads_matched > PROV_READ_MAX_COMPANION_GRAPH_QUADS {
+            return Err(ERR_PROV_READ_GRAPH_QUAD_BUDGET.to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Yields only quads in one named graph. Still walks the backing store today; a
 /// follow-up can switch to graph-native iterators when Oxigraph exposes them.
+/// Scan cost is bounded; exceeding either budget fails closed with an error.
 fn for_each_quad_in_named_graph<F>(store: &Store, graph: &str, mut visit: F) -> Result<(), String>
 where
     F: FnMut(&Quad) -> Result<(), String>,
 {
     let graph_name = NamedNodeRef::new(graph).map_err(|e| format!("invalid graph IRI: {e}"))?;
+    let mut budget = ProvReadScanBudget {
+        store_quads_scanned: 0,
+        graph_quads_matched: 0,
+    };
     for quad in store.iter() {
         let quad = quad.map_err(|e| format!("read graph failed: {e}"))?;
+        budget.record_store_quad()?;
         if quad.graph_name.as_ref() == GraphNameRef::NamedNode(graph_name) {
+            budget.record_companion_graph_quad()?;
             visit(&quad)?;
         }
     }
@@ -781,6 +821,49 @@ mod tests {
         assert!(
             activity["contains"].as_array().unwrap().is_empty(),
             "failed materialization must not link fact triples via contains"
+        );
+    }
+
+    #[test]
+    fn prov_read_path_fail_closed_on_oversized_companion_graph() {
+        use std::time::{Duration, Instant};
+
+        let store = KnowledgeGraphStore::new().unwrap();
+        let claims = claims();
+        let over = PROV_READ_MAX_COMPANION_GRAPH_QUADS + 1;
+        let batch = 1024usize;
+        let seed_started = Instant::now();
+        for start in (0..over).step_by(batch) {
+            let end = (start + batch).min(over);
+            let quads: Vec<Quad> = (start..end)
+                .map(|i| Quad {
+                    subject: NamedNode::new(format!("urn:prov-bloat:{i}"))
+                        .expect("subject")
+                        .into(),
+                    predicate: NamedNode::new("urn:prov-bloat:p").expect("predicate"),
+                    object: Term::Literal(oxigraph::model::Literal::new_simple_literal("padding")),
+                    graph_name: GraphName::DefaultGraph,
+                })
+                .collect();
+            store
+                .record_provenance_quads_for_claims(&claims, &quads)
+                .expect("seed companion graph");
+        }
+        let seed_elapsed = seed_started.elapsed();
+
+        let read_started = Instant::now();
+        let err = store
+            .count_prov_activities_for_claims(&claims)
+            .expect_err("oversized companion graph must fail closed on read");
+        let read_elapsed = read_started.elapsed();
+
+        assert!(
+            err.contains("companion graph quad budget"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            read_elapsed < Duration::from_secs(60),
+            "read path must fail closed promptly (seed {seed_elapsed:?}, read {read_elapsed:?})"
         );
     }
 

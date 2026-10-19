@@ -37,7 +37,9 @@ for follow-on work.
   failures before that point do not mint an activity.
 - **Read-path scanning**: prov reads filter to the minted companion graph via a
   shared helper; the backing store may still be walked until graph-native
-  iterators land.
+  iterators land. Each read is fail-closed with explicit scan budgets
+  (`PROV_READ_MAX_STORE_QUADS_SCANNED`, `PROV_READ_MAX_COMPANION_GRAPH_QUADS` in
+  `knowledge_graph::provenance`).
 - **Oxigraph**: workspace dependency enables feature `rdf-12` for triple terms.
 
 ## Decision nodes (planned)
