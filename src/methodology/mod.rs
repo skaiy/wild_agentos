@@ -8,6 +8,7 @@ pub mod evolution;
 /// See design: PR-res/superpowers-skills-full-integration-design.md §0
 pub mod gate;
 pub mod integration;
+pub mod kg_seed;
 
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
