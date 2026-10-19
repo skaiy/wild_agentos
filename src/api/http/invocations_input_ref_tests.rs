@@ -436,7 +436,7 @@ impl ArtifactFixture {
         let metadata = ArtifactMetadata {
             id: id.clone(),
             kind: ArtifactKind::InputSnapshot,
-            task_iri: "iri://task/input-ref".to_string(),
+            task_iri: Some("iri://task/input-ref".to_string()),
             blob_key: artifact_key_for_tests(&id, ArtifactKind::InputSnapshot),
             content_type: "text/plain; charset=utf-8".to_string(),
             size_bytes: bytes.len(),
@@ -462,7 +462,7 @@ impl ArtifactFixture {
         let metadata = ArtifactMetadata {
             id: id.clone(),
             kind,
-            task_iri: "iri://task/input-ref".to_string(),
+            task_iri: Some("iri://task/input-ref".to_string()),
             blob_key: artifact_key_for_tests(&id, kind),
             content_type: "text/plain; charset=utf-8".to_string(),
             size_bytes: bytes.len(),
@@ -601,7 +601,7 @@ async fn artifact_resolver_enforces_size_and_canonical_key() {
     let forged = ArtifactMetadata {
         id: id.clone(),
         kind: ArtifactKind::InputSnapshot,
-        task_iri: "iri://task/x".to_string(),
+        task_iri: Some("iri://task/x".to_string()),
         blob_key: "kb/other/blob".to_string(),
         content_type: "text/plain".to_string(),
         size_bytes: 15,
@@ -659,7 +659,7 @@ async fn artifact_resolver_rejects_metadata_digest_and_blob_tamper_the_same_way(
     let metadata = ArtifactMetadata {
         id: id.clone(),
         kind: ArtifactKind::InputSnapshot,
-        task_iri: "iri://task/input-ref".to_string(),
+        task_iri: Some("iri://task/input-ref".to_string()),
         blob_key: artifact_key_for_tests(&id, ArtifactKind::InputSnapshot),
         content_type: "application/json".to_string(),
         size_bytes: bytes.len(),
