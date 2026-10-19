@@ -29,7 +29,9 @@
 - **RML 溯源**：worker 跑通后若 claims 作用域内的生产写入失败，会记录
   `activityOutcome=failed` 的 `prov:Activity`；更早的 worker/解析失败不 mint activity。
 - **读路径扫描**：溯源读路径经共享 helper 只处理 mint 的伴生图；在 Oxigraph
-  提供按图迭代前，底层仍可能全库遍历。
+  提供按图迭代前，底层仍可能全库遍历。每次读取有显式扫描预算，超限 fail-closed
+  （见 `knowledge_graph::provenance` 中 `PROV_READ_MAX_STORE_QUADS_SCANNED`、
+  `PROV_READ_MAX_COMPANION_GRAPH_QUADS`）。
 - **Oxigraph**：工作区依赖开启 `rdf-12` feature 以支持 triple term。
 
 ## 决策节点（规划中）
