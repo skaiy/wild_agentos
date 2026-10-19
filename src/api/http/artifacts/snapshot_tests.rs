@@ -313,6 +313,10 @@ fn escaped_secret_probes() -> Vec<(&'static str, String)> {
             format!(r#"{{"note":"\u3000sk-{}"}}"#, fake(6)),
         ),
         (
+            "fullwidth colon",
+            format!(r#"{{"note":"API Key\uFF1Ask-proj-{}"}}"#, fake(6)),
+        ),
+        (
             "backspace escape",
             format!(r#"{{"note":"\bsk-{}"}}"#, fake(6)),
         ),
