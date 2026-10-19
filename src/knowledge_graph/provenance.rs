@@ -7,6 +7,7 @@ use oxigraph::model::{
     GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNode, NamedOrBlankNodeRef, Quad,
     Term, Triple,
 };
+use oxigraph::store::Store;
 
 use crate::isolation::IsolationClaims;
 
@@ -230,6 +231,11 @@ impl KnowledgeGraphStore {
             RdfMapper::sanitize_id(run_iri.rsplit('/').next().unwrap_or("run"))
         );
         let activity = activity_iri(&local_id);
+        let fact_triple_terms = if outcome == ProvenanceOutcome::Succeeded {
+            fact_triple_terms
+        } else {
+            Vec::new()
+        };
         let quads = self.build_activity_bundle(
             claims,
             &activity,
@@ -306,14 +312,11 @@ impl KnowledgeGraphStore {
         let graph = prov_graph_iri_for_claims(claims)?;
         let subject =
             NamedNodeRef::new(subject_iri).map_err(|e| format!("invalid subject IRI: {e}"))?;
+        let contains = wao("contains");
         let mut hits = Vec::new();
-        for quad in self.store_arc().iter() {
-            let quad = quad.map_err(|e| format!("read prov graph failed: {e}"))?;
-            if !graph_matches(&quad, &graph) {
-                continue;
-            }
-            if quad.predicate.as_str() != wao("contains") {
-                continue;
+        for_each_quad_in_named_graph(self.store_arc(), &graph, |quad| {
+            if quad.predicate.as_str() != contains {
+                return Ok(());
             }
             if let Term::Triple(triple) = &quad.object {
                 if triple.subject.as_ref() == NamedOrBlankNodeRef::NamedNode(subject) {
@@ -327,7 +330,8 @@ impl KnowledgeGraphStore {
                     }));
                 }
             }
-        }
+            Ok(())
+        })?;
         Ok(hits)
     }
 
@@ -343,16 +347,13 @@ impl KnowledgeGraphStore {
         let mut props = serde_json::Map::new();
         let mut contains = Vec::new();
         let mut found = false;
-        for quad in self.store_arc().iter() {
-            let quad = quad.map_err(|e| format!("read prov graph failed: {e}"))?;
-            if !graph_matches(&quad, &graph) {
-                continue;
-            }
+        let contains_pred = wao("contains");
+        for_each_quad_in_named_graph(self.store_arc(), &graph, |quad| {
             if quad.subject.as_ref() != NamedOrBlankNodeRef::NamedNode(activity_node.as_ref()) {
-                continue;
+                return Ok(());
             }
             found = true;
-            if quad.predicate.as_str() == wao("contains") {
+            if quad.predicate.as_str() == contains_pred {
                 if let Term::Triple(triple) = &quad.object {
                     contains.push(serde_json::json!({
                         "subject": triple.subject.to_string(),
@@ -366,7 +367,8 @@ impl KnowledgeGraphStore {
                     serde_json::Value::String(quad.object.to_string()),
                 );
             }
-        }
+            Ok(())
+        })?;
         if !found {
             return Ok(None);
         }
@@ -398,6 +400,24 @@ impl KnowledgeGraphStore {
             terms.push(quad_to_triple_term(&quad));
         }
         terms
+    }
+
+    /// Counts `prov:Activity` nodes in the minted companion graph (test / contract aid).
+    pub fn count_prov_activities_for_claims(
+        &self,
+        claims: &IsolationClaims,
+    ) -> Result<usize, String> {
+        let graph = prov_graph_iri_for_claims(claims)?;
+        let prov_type = prov("type");
+        let activity_type = prov("Activity");
+        let mut count = 0usize;
+        for_each_quad_in_named_graph(self.store_arc(), &graph, |quad| {
+            if quad.predicate.as_str() == prov_type && quad.object.to_string() == activity_type {
+                count += 1;
+            }
+            Ok(())
+        })?;
+        Ok(count)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -443,18 +463,17 @@ impl KnowledgeGraphStore {
         predicate: &str,
         object: &str,
     ) -> bool {
-        for quad in self.store_arc().iter().flatten() {
-            if !graph_matches(&quad, graph) {
-                continue;
-            }
+        let mut found = false;
+        let _ = for_each_quad_in_named_graph(self.store_arc(), graph, |quad| {
             if quad.subject.to_string() == subject
                 && quad.predicate.as_str() == predicate
                 && quad.object.to_string() == object
             {
-                return true;
+                found = true;
             }
-        }
-        false
+            Ok(())
+        });
+        found
     }
 }
 
@@ -548,6 +567,22 @@ fn graph_matches(quad: &Quad, graph: &str) -> bool {
         GraphNameRef::NamedNode(name) => name.as_str() == graph,
         GraphNameRef::DefaultGraph | GraphNameRef::BlankNode(_) => false,
     }
+}
+
+/// Yields only quads in one named graph. Still walks the backing store today; a
+/// follow-up can switch to graph-native iterators when Oxigraph exposes them.
+fn for_each_quad_in_named_graph<F>(store: &Store, graph: &str, mut visit: F) -> Result<(), String>
+where
+    F: FnMut(&Quad) -> Result<(), String>,
+{
+    let graph_name = NamedNodeRef::new(graph).map_err(|e| format!("invalid graph IRI: {e}"))?;
+    for quad in store.iter() {
+        let quad = quad.map_err(|e| format!("read graph failed: {e}"))?;
+        if quad.graph_name.as_ref() == GraphNameRef::NamedNode(graph_name) {
+            visit(&quad)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_provenance_or_meta_triple(quad: &Quad) -> bool {
@@ -675,12 +710,112 @@ mod tests {
                 }],
             )
             .unwrap();
+        assert_eq!(
+            store.count_prov_activities_for_claims(&claims).unwrap(),
+            0,
+            "minted prov graph must stay empty until kernel provenance writers run"
+        );
+        assert!(
+            store
+                .query_provenance_for_subject(&claims, "http://example.org/x")
+                .unwrap()
+                .is_empty(),
+            "subject lookup must not fabricate links from production-only triples"
+        );
         assert!(
             store
                 .get_provenance_activity(&claims, "extraction/test")
                 .unwrap()
                 .is_none(),
             "write_quads_for_claims must not write the prov companion graph"
+        );
+    }
+
+    #[test]
+    fn rml_failed_outcome_records_symmetric_activity_metadata() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let claims = claims();
+        let subject = "https://example.test/asset/A-100";
+        store
+            .write_quads_for_claims(
+                &claims,
+                &[super::super::types::RdfQuad {
+                    subject: subject.into(),
+                    predicate: "https://example.test/ontology/name".into(),
+                    object: super::super::types::RdfValue::Literal("Inverter".into()),
+                    graph: None,
+                }],
+            )
+            .unwrap();
+        let terms = triple_terms_from_rdf_quads(&[super::super::types::RdfQuad {
+            subject: subject.into(),
+            predicate: "https://example.test/ontology/name".into(),
+            object: super::super::types::RdfValue::Literal("Inverter".into()),
+            graph: None,
+        }])
+        .unwrap();
+        store
+            .record_rml_materialization_provenance(
+                &claims,
+                "https://agentos.ontology/rml-materialization/failed-run",
+                "checksum-deadbeef",
+                terms,
+                ProvenanceOutcome::Failed,
+            )
+            .expect("record_rml_materialization_provenance");
+        let activity = store
+            .get_provenance_activity(&claims, "rml/failed-run")
+            .unwrap()
+            .expect("failed RML run must still mint an activity");
+        let props = activity["properties"]
+            .as_object()
+            .expect("activity properties");
+        let literal = |key: &str| {
+            props
+                .get(&format!("<{}>", wao(key)))
+                .and_then(|v| v.as_str())
+                .map(|value| value.trim_matches('"'))
+        };
+        assert_eq!(literal("activityOutcome"), Some("failed"));
+        assert_eq!(literal("activityKind"), Some("rml_materialization"));
+        assert!(
+            activity["contains"].as_array().unwrap().is_empty(),
+            "failed materialization must not link fact triples via contains"
+        );
+    }
+
+    #[test]
+    fn prov_read_path_ignores_quads_outside_minted_companion_graph() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let claims = claims();
+        let subject = "https://example.test/only-tenant-b";
+        let foreign_activity = activity_iri("rml/foreign");
+        let foreign_contains = wao("contains");
+        let triple = Term::Triple(Box::new(Triple::new(
+            NamedOrBlankNode::NamedNode(NamedNode::new(subject).expect("subject")),
+            NamedNode::new("https://example.test/p").expect("predicate"),
+            NamedNode::new("https://example.test/o").expect("object"),
+        )));
+        store
+            .record_provenance_quads_for_claims(
+                &IsolationClaims::from_verified("tenant-b", "project-b", "actor-b").unwrap(),
+                &[Quad {
+                    subject: NamedNode::new(foreign_activity.as_str())
+                        .expect("activity")
+                        .into(),
+                    predicate: NamedNode::new(foreign_contains).expect("contains"),
+                    object: triple,
+                    graph_name: GraphName::DefaultGraph,
+                }],
+            )
+            .unwrap();
+        assert_eq!(store.count_prov_activities_for_claims(&claims).unwrap(), 0);
+        assert!(
+            store
+                .query_provenance_for_subject(&claims, subject)
+                .unwrap()
+                .is_empty(),
+            "tenant-a read path must not surface tenant-b prov quads even though they share one store"
         );
     }
 }

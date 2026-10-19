@@ -21,8 +21,23 @@ for follow-on work.
   object. Source chain nodes (document → page → chunk) use stable IRIs under
   `https://wildagentos.org/ontology/prov/`.
 - **Read API** (JWT + claims): `GET /api/v1/ontology/provenance?subject=<IRI>`
-  and `GET /api/v1/ontology/provenance/activities/{id}`. Cross-tenant or unknown
-  activity ids return identical `404` bodies.
+  and `GET /api/v1/ontology/provenance/activities/{id}`.
+- **HTTP response semantics** (do not confuse with information leakage):
+  - **Unauthorized (`401`)**: no verified JWT / isolation claims on either route.
+  - **Subject lookup (`200`)**: always returns `{ "subject", "links" }`. An empty
+    `links` array means “no provenance in this tenant/project,” including
+    cross-tenant cases (byte-identical to an in-scope miss).
+  - **Activity lookup (`404`)**: unknown id, cross-tenant id, invalid path segment
+    (residual `%` after decoding), or disallowed characters — all share the same
+    JSON body `{"error":"provenance activity not found"}`. Malformed *path*
+    segments are rejected **before** claims are checked, so unauthenticated
+    callers also receive this `404` (not `401`).
+- **RML provenance**: a `prov:Activity` with `activityOutcome=failed` is recorded
+  when claims-scoped production writes fail after a worker run; worker/parse
+  failures before that point do not mint an activity.
+- **Read-path scanning**: prov reads filter to the minted companion graph via a
+  shared helper; the backing store may still be walked until graph-native
+  iterators land.
 - **Oxigraph**: workspace dependency enables feature `rdf-12` for triple terms.
 
 ## Decision nodes (planned)

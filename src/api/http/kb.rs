@@ -2326,10 +2326,25 @@ pub(crate) async fn materialize_rml_knowledge_base_handler(
                 })),
             )
         }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
-        ),
+        Err(error) => {
+            if let Err(prov_err) = kg.record_rml_materialization_provenance(
+                claims,
+                &run_iri,
+                &mapping_checksum,
+                fact_terms,
+                crate::knowledge_graph::provenance::ProvenanceOutcome::Failed,
+            ) {
+                crate::knowledge_graph::provenance::log_provenance_write_failure(
+                    "rml_materialization",
+                    &prov_err,
+                );
+            }
+            let _ = state.kg_store.flush();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+        }
     }
 }
 
