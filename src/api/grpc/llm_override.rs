@@ -10,6 +10,7 @@ pub(crate) const EXPLICIT_API_KEY_REQUIRED: &str = "explicit_api_key_required";
 
 /// Reject a caller-supplied `llm_base_url` that would send the server's
 /// configured gateway API key to a different endpoint.
+#[allow(clippy::result_large_err)]
 pub(crate) fn validate_grpc_llm_gateway_override(
     llm_base_url: &str,
     llm_api_key: &str,

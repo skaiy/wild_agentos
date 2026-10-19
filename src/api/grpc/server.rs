@@ -617,23 +617,7 @@ impl AgentOSService {
         }
     }
 
-    fn create_sa(&self, settings: &Settings) -> SupervisorAgent {
-        build_supervisor_agent(
-            self.gateway.clone(),
-            self.skills.clone(),
-            self.blackboard.clone(),
-            self.l0.clone(),
-            self.memory_manager.clone(),
-            self.templates.clone(),
-            self.scheduler.clone(),
-            self.prefetch.clone(),
-            self.unified_graph.clone(),
-            self.event_bus.clone(),
-            self.vector_store.clone(),
-            settings,
-        )
-    }
-
+    #[allow(clippy::result_large_err)]
     fn apply_request_settings(&self, req: &impl RequestSettings) -> Result<Settings, Status> {
         crate::api::grpc::llm_override::validate_grpc_llm_gateway_override(
             req.llm_base_url(),
@@ -646,6 +630,7 @@ impl AgentOSService {
         Ok(settings)
     }
 
+    #[allow(clippy::result_large_err)]
     fn require_grpc_execution_enabled(&self) -> Result<(), Status> {
         if !crate::api::http::invocations::InvocationsRuntime::execution_enabled_from_env() {
             return Err(Status::unavailable(
@@ -671,6 +656,7 @@ impl AgentOSService {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn prepare_grpc_supervisor(
         &self,
         claims: &IsolationClaims,
@@ -722,7 +708,7 @@ struct GrpcSupervisorRun {
 
 /// 从共享运行态组件装配一个 SupervisorAgent（PDCA 管线）。
 ///
-/// gRPC 的 `create_sa` 与 HTTP 的 `HttpTaskExecutor` 共用此函数，避免重复装配逻辑，
+/// gRPC 的 `prepare_grpc_supervisor` 与 HTTP 的 `HttpTaskExecutor` 共用此函数，避免重复装配逻辑，
 /// 并确保两条入口用的是**同一套**共享运行态（EventBus / Blackboard / 内存分层 / KG）。
 #[allow(clippy::too_many_arguments)]
 fn build_supervisor_agent(
