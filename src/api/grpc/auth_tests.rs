@@ -177,11 +177,13 @@ async fn isolation_contract_execute_task_stream_hides_other_task_and_tenant_even
     let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
     let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
     let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+    let previous_execution = std::env::var_os("AGENTOS_INVOCATION_EXECUTION_ENABLED");
     std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
     std::env::set_var(
         "AGENTOS_JWT_SECRET",
         "test-hs256-secret-at-least-32-bytes-long",
     );
+    std::env::set_var("AGENTOS_INVOCATION_EXECUTION_ENABLED", "true");
 
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
@@ -330,5 +332,9 @@ async fn isolation_contract_execute_task_stream_hides_other_task_and_tenant_even
     match previous_data_dir {
         Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
         None => std::env::remove_var("AGENTOS_DATA_DIR"),
+    }
+    match previous_execution {
+        Some(value) => std::env::set_var("AGENTOS_INVOCATION_EXECUTION_ENABLED", value),
+        None => std::env::remove_var("AGENTOS_INVOCATION_EXECUTION_ENABLED"),
     }
 }
