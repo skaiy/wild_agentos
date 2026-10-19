@@ -55,14 +55,12 @@ pub fn seed_builtin_methodologies_once(
 ) {
     SEED_ONCE.call_once(|| {
         let seeded = seed_builtin_methodologies(kg, methodologies);
-        if seeded == 0 {
-            if platform_methodology_seed_claims().is_none() {
-                debug!(
-                    "Built-in methodologies are served from the in-memory registry; \
-                     KG seed skipped (set {} and {} to mirror into the platform graph)",
-                    PLATFORM_ADMIN_TENANT_ENV, PLATFORM_METHODOLOGY_PROJECT_ENV,
-                );
-            }
+        if seeded == 0 && platform_methodology_seed_claims().is_none() {
+            debug!(
+                "Built-in methodologies are served from the in-memory registry; \
+                 KG seed skipped (set {} and {} to mirror into the platform graph)",
+                PLATFORM_ADMIN_TENANT_ENV, PLATFORM_METHODOLOGY_PROJECT_ENV,
+            );
         }
     });
 }
