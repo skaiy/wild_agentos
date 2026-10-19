@@ -836,17 +836,13 @@ mod tests {
         for start in (0..over).step_by(batch) {
             let end = (start + batch).min(over);
             let quads: Vec<Quad> = (start..end)
-                .map(|i| {
-                    Quad {
-                        subject: NamedNode::new(format!("urn:prov-bloat:{i}"))
-                            .expect("subject")
-                            .into(),
-                        predicate: NamedNode::new("urn:prov-bloat:p").expect("predicate"),
-                        object: Term::Literal(
-                            oxigraph::model::Literal::new_simple_literal("padding"),
-                        ),
-                        graph_name: GraphName::DefaultGraph,
-                    }
+                .map(|i| Quad {
+                    subject: NamedNode::new(format!("urn:prov-bloat:{i}"))
+                        .expect("subject")
+                        .into(),
+                    predicate: NamedNode::new("urn:prov-bloat:p").expect("predicate"),
+                    object: Term::Literal(oxigraph::model::Literal::new_simple_literal("padding")),
+                    graph_name: GraphName::DefaultGraph,
                 })
                 .collect();
             store
