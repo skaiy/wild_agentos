@@ -19,8 +19,8 @@
       "actor_id": "actor-runtime-readonly",
       "action": "runtime_asset.bound",
       "resource": "ev-repair",
-      "isolation_verified": true,
-      "detail": "Agent bound optional ev-repair runtime asset; retrieval stayed claims-scoped."
+      "isolation_verified": false,
+      "detail": "Agent bound optional ev-repair runtime asset; runtime retrieval uses claims-minted graph/vector targets (pack metadata is descriptive only). Pack gate does not execute runtime isolation checks."
     }
   ]
 }
