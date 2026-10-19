@@ -305,11 +305,8 @@ impl KnowledgeGraphStore {
         &self,
         claims: &IsolationClaims,
         activity_local_id: &str,
-    ) -> bool {
-        let graph = match prov_graph_iri_for_claims(claims) {
-            Ok(graph) => graph,
-            Err(_) => return false,
-        };
+    ) -> Result<bool, String> {
+        let graph = prov_graph_iri_for_claims(claims)?;
         let activity = activity_iri(activity_local_id);
         self.quad_exists_in_graph(&graph, &activity, &prov("type"), &prov("Activity"))
     }
@@ -324,24 +321,29 @@ impl KnowledgeGraphStore {
             NamedNodeRef::new(subject_iri).map_err(|e| format!("invalid subject IRI: {e}"))?;
         let contains = wao("contains");
         let mut hits = Vec::new();
-        for_each_quad_in_named_graph(self.store_arc(), &graph, |quad| {
-            if quad.predicate.as_str() != contains {
-                return Ok(());
-            }
-            if let Term::Triple(triple) = &quad.object {
-                if triple.subject.as_ref() == NamedOrBlankNodeRef::NamedNode(subject) {
-                    hits.push(serde_json::json!({
-                        "activity": quad.subject.to_string(),
-                        "triple": {
-                            "subject": triple.subject.to_string(),
-                            "predicate": triple.predicate.to_string(),
-                            "object": triple.object.to_string(),
-                        }
-                    }));
+        for_each_quad_in_named_graph(
+            self.store_arc(),
+            &graph,
+            ProvReadScanLimits::production(),
+            |quad| {
+                if quad.predicate.as_str() != contains {
+                    return Ok(());
                 }
-            }
-            Ok(())
-        })?;
+                if let Term::Triple(triple) = &quad.object {
+                    if triple.subject.as_ref() == NamedOrBlankNodeRef::NamedNode(subject) {
+                        hits.push(serde_json::json!({
+                            "activity": quad.subject.to_string(),
+                            "triple": {
+                                "subject": triple.subject.to_string(),
+                                "predicate": triple.predicate.to_string(),
+                                "object": triple.object.to_string(),
+                            }
+                        }));
+                    }
+                }
+                Ok(())
+            },
+        )?;
         Ok(hits)
     }
 
@@ -358,27 +360,32 @@ impl KnowledgeGraphStore {
         let mut contains = Vec::new();
         let mut found = false;
         let contains_pred = wao("contains");
-        for_each_quad_in_named_graph(self.store_arc(), &graph, |quad| {
-            if quad.subject.as_ref() != NamedOrBlankNodeRef::NamedNode(activity_node.as_ref()) {
-                return Ok(());
-            }
-            found = true;
-            if quad.predicate.as_str() == contains_pred {
-                if let Term::Triple(triple) = &quad.object {
-                    contains.push(serde_json::json!({
-                        "subject": triple.subject.to_string(),
-                        "predicate": triple.predicate.to_string(),
-                        "object": triple.object.to_string(),
-                    }));
+        for_each_quad_in_named_graph(
+            self.store_arc(),
+            &graph,
+            ProvReadScanLimits::production(),
+            |quad| {
+                if quad.subject.as_ref() != NamedOrBlankNodeRef::NamedNode(activity_node.as_ref()) {
+                    return Ok(());
                 }
-            } else {
-                props.insert(
-                    quad.predicate.to_string(),
-                    serde_json::Value::String(quad.object.to_string()),
-                );
-            }
-            Ok(())
-        })?;
+                found = true;
+                if quad.predicate.as_str() == contains_pred {
+                    if let Term::Triple(triple) = &quad.object {
+                        contains.push(serde_json::json!({
+                            "subject": triple.subject.to_string(),
+                            "predicate": triple.predicate.to_string(),
+                            "object": triple.object.to_string(),
+                        }));
+                    }
+                } else {
+                    props.insert(
+                        quad.predicate.to_string(),
+                        serde_json::Value::String(quad.object.to_string()),
+                    );
+                }
+                Ok(())
+            },
+        )?;
         if !found {
             return Ok(None);
         }
@@ -395,12 +402,16 @@ impl KnowledgeGraphStore {
         staging_id: &str,
     ) -> Result<Vec<Term>, String> {
         let graph = self.staging_graph_iri_for_claims(claims, staging_id)?;
-        Ok(self.collect_fact_triple_terms_in_graph(&graph))
+        self.collect_fact_triple_terms_in_graph(&graph)
     }
 
-    fn collect_fact_triple_terms_in_graph(&self, graph: &str) -> Vec<Term> {
+    /// Full-store walk on the provenance write path; bounded like read-path scans.
+    fn collect_fact_triple_terms_in_graph(&self, graph: &str) -> Result<Vec<Term>, String> {
         let mut terms = Vec::new();
-        for quad in self.store_arc().iter().flatten() {
+        let mut budget = ProvReadScanBudget::new(ProvReadScanLimits::production());
+        for quad in self.store_arc().iter() {
+            let quad = quad.map_err(|e| format!("read graph failed: {e}"))?;
+            budget.record_store_quad()?;
             if !graph_matches(&quad, graph) {
                 continue;
             }
@@ -409,7 +420,7 @@ impl KnowledgeGraphStore {
             }
             terms.push(quad_to_triple_term(&quad));
         }
-        terms
+        Ok(terms)
     }
 
     /// Counts `prov:Activity` nodes in the minted companion graph (test / contract aid).
@@ -421,12 +432,18 @@ impl KnowledgeGraphStore {
         let prov_type = prov("type");
         let activity_type = prov("Activity");
         let mut count = 0usize;
-        for_each_quad_in_named_graph(self.store_arc(), &graph, |quad| {
-            if quad.predicate.as_str() == prov_type && quad.object.to_string() == activity_type {
-                count += 1;
-            }
-            Ok(())
-        })?;
+        for_each_quad_in_named_graph(
+            self.store_arc(),
+            &graph,
+            ProvReadScanLimits::production(),
+            |quad| {
+                if quad.predicate.as_str() == prov_type && quad.object.to_string() == activity_type
+                {
+                    count += 1;
+                }
+                Ok(())
+            },
+        )?;
         Ok(count)
     }
 
@@ -472,18 +489,23 @@ impl KnowledgeGraphStore {
         subject: &str,
         predicate: &str,
         object: &str,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let mut found = false;
-        let _ = for_each_quad_in_named_graph(self.store_arc(), graph, |quad| {
-            if quad.subject.to_string() == subject
-                && quad.predicate.as_str() == predicate
-                && quad.object.to_string() == object
-            {
-                found = true;
-            }
-            Ok(())
-        });
-        found
+        for_each_quad_in_named_graph(
+            self.store_arc(),
+            graph,
+            ProvReadScanLimits::production(),
+            |quad| {
+                if quad.subject.to_string() == subject
+                    && quad.predicate.as_str() == predicate
+                    && quad.object.to_string() == object
+                {
+                    found = true;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(found)
     }
 }
 
@@ -579,15 +601,38 @@ fn graph_matches(quad: &Quad, graph: &str) -> bool {
     }
 }
 
+struct ProvReadScanLimits {
+    max_store_quads_scanned: usize,
+    max_companion_graph_quads: usize,
+}
+
+impl ProvReadScanLimits {
+    fn production() -> Self {
+        Self {
+            max_store_quads_scanned: PROV_READ_MAX_STORE_QUADS_SCANNED,
+            max_companion_graph_quads: PROV_READ_MAX_COMPANION_GRAPH_QUADS,
+        }
+    }
+}
+
 struct ProvReadScanBudget {
+    limits: ProvReadScanLimits,
     store_quads_scanned: usize,
     graph_quads_matched: usize,
 }
 
 impl ProvReadScanBudget {
+    fn new(limits: ProvReadScanLimits) -> Self {
+        Self {
+            limits,
+            store_quads_scanned: 0,
+            graph_quads_matched: 0,
+        }
+    }
+
     fn record_store_quad(&mut self) -> Result<(), String> {
         self.store_quads_scanned += 1;
-        if self.store_quads_scanned > PROV_READ_MAX_STORE_QUADS_SCANNED {
+        if self.store_quads_scanned > self.limits.max_store_quads_scanned {
             return Err(ERR_PROV_READ_STORE_SCAN_BUDGET.to_string());
         }
         Ok(())
@@ -595,7 +640,7 @@ impl ProvReadScanBudget {
 
     fn record_companion_graph_quad(&mut self) -> Result<(), String> {
         self.graph_quads_matched += 1;
-        if self.graph_quads_matched > PROV_READ_MAX_COMPANION_GRAPH_QUADS {
+        if self.graph_quads_matched > self.limits.max_companion_graph_quads {
             return Err(ERR_PROV_READ_GRAPH_QUAD_BUDGET.to_string());
         }
         Ok(())
@@ -605,15 +650,17 @@ impl ProvReadScanBudget {
 /// Yields only quads in one named graph. Still walks the backing store today; a
 /// follow-up can switch to graph-native iterators when Oxigraph exposes them.
 /// Scan cost is bounded; exceeding either budget fails closed with an error.
-fn for_each_quad_in_named_graph<F>(store: &Store, graph: &str, mut visit: F) -> Result<(), String>
+fn for_each_quad_in_named_graph<F>(
+    store: &Store,
+    graph: &str,
+    limits: ProvReadScanLimits,
+    mut visit: F,
+) -> Result<(), String>
 where
     F: FnMut(&Quad) -> Result<(), String>,
 {
     let graph_name = NamedNodeRef::new(graph).map_err(|e| format!("invalid graph IRI: {e}"))?;
-    let mut budget = ProvReadScanBudget {
-        store_quads_scanned: 0,
-        graph_quads_matched: 0,
-    };
+    let mut budget = ProvReadScanBudget::new(limits);
     for quad in store.iter() {
         let quad = quad.map_err(|e| format!("read graph failed: {e}"))?;
         budget.record_store_quad()?;
@@ -713,7 +760,9 @@ mod tests {
                 }],
             )
             .unwrap();
-        let terms = store.collect_fact_triple_terms_in_graph(&claims.graph_iri().unwrap());
+        let terms = store
+            .collect_fact_triple_terms_in_graph(&claims.graph_iri().unwrap())
+            .unwrap();
         assert_eq!(terms.len(), 1);
         store
             .record_rml_materialization_provenance(
@@ -865,6 +914,34 @@ mod tests {
             read_elapsed < Duration::from_secs(60),
             "read path must fail closed promptly (seed {seed_elapsed:?}, read {read_elapsed:?})"
         );
+    }
+
+    #[test]
+    fn prov_read_path_fail_closed_on_oversized_store_scan() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let claims = claims();
+        let over = 33usize;
+        let limits = ProvReadScanLimits {
+            max_store_quads_scanned: 32,
+            max_companion_graph_quads: PROV_READ_MAX_COMPANION_GRAPH_QUADS,
+        };
+        let batch = 16usize;
+        for start in (0..over).step_by(batch) {
+            let end = (start + batch).min(over);
+            let quads: Vec<super::super::types::RdfQuad> = (start..end)
+                .map(|i| super::super::types::RdfQuad {
+                    subject: format!("urn:store-bloat:{i}"),
+                    predicate: "urn:store-bloat:p".into(),
+                    object: super::super::types::RdfValue::Literal("padding".into()),
+                    graph: None,
+                })
+                .collect();
+            store.write_quads_for_claims(&claims, &quads).unwrap();
+        }
+        let graph = prov_graph_iri_for_claims(&claims).unwrap();
+        let err = for_each_quad_in_named_graph(store.store_arc(), &graph, limits, |_| Ok(()))
+            .expect_err("oversized backing store must fail closed on read scan");
+        assert!(err.contains("store scan budget"), "unexpected error: {err}");
     }
 
     #[test]
