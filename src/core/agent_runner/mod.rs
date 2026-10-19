@@ -1,12 +1,10 @@
-#![allow(deprecated)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::causal::fused::FusedRootCauseEngine;
 use crate::config::settings::AgentSettings;
@@ -612,16 +610,8 @@ impl AgentRunner {
                 }
                 Ok(kg) => kg,
             };
-            for m in guard.registry().all() {
-                let quads = m.to_kg_quads();
-                if let Err(e) = kg.write_quads(&quads, "graph:methodology") {
-                    warn!("Failed to seed methodology {} into KG: {}", m.id, e);
-                }
-            }
-            info!(
-                "Seeded {} methodology definitions into knowledge graph",
-                guard.registry().all().len()
-            );
+            let methodologies: Vec<_> = guard.registry().all().to_vec();
+            crate::methodology::kg_seed::seed_builtin_methodologies_once(&kg, &methodologies);
         }
         self.unified_graph_store = Some(store);
         self
