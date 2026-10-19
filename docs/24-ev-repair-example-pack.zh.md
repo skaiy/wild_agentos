@@ -15,7 +15,7 @@
 | `shacl/fault-code-shapes.ttl` | 虚构 `FaultCode` 的 SHACL 形状 |
 | `rdf/fictional-sample.ttl` | 门控校验用的示例 RDF |
 | `skills/fault-code-lookup/` | 带独立 golden 的租户 Skill 包 |
-| `audit/samples.json` | 虚构隔离审计样例（`isolation_verified: true`） |
+| `audit/samples.json` | 虚构审计样例；仅 `knowledge_pack.gate_passed` 可设 `isolation_verified: true` |
 | `tests/golden-input.json` / `golden-output.json` | 包级门控冻结契约 |
 
 内核内置种子（`ev-repair-fault-kb` / `ev-repair` 别名）仍是运行时绑定入口；本目录是
@@ -35,13 +35,22 @@ CI 任务 `knowledge-pack-gate` 执行：
 cargo test --lib knowledge_pack_gate_ --verbose
 ```
 
-门控会校验清单字段、SHA-256 冻结摘要、本体锚点与 `ev_repair_ontology()` 一致、
-虚构样本 SHACL、内嵌 Skill 包清单、审计样例结构，以及与冻结 golden 输出一致。
+门控会校验清单字段（含与种子包一致的 `spec.named_graph` /
+`spec.vector_namespace`）、包内相对路径不得含 `..`（已存在路径会做 symlink 逃逸检查）、SHA-256 冻结摘要、本体锚点与
+`ev_repair_ontology()` 一致、虚构样本 SHACL、内嵌 Skill 包清单、审计样例结构，以及与
+冻结 golden 输出一致。
+
+本 Showcase 的 SHACL **仅**覆盖 `ev:FaultCode`（`shacl/fault-code-shapes.ttl`）；
+`rdf/fictional-sample.ttl` 中的其他类型（如虚构 `ev:Brand`）不在包门控做形状校验。
+
+当 golden input 设置 `validate_shacl: false` 时，报告使用 `shacl_conforms: "skipped"`，
+不再误报为 `true`。
 
 ## 可选加载（演示）
 
-`./scripts/load-ev-repair-example-pack.sh` 当前与门控脚本相同，仅做校验。
-纳入 #416 一条命令本体治理 demo（导入 → 门控 → Agent 绑定）的编排留作后续。
+`./scripts/load-ev-repair-example-pack.sh` 为 **stub**：打印说明后执行与 CI 相同的
+文件系统门控，**不会**向线上 KB 导入或绑定 Agent。#416 一条命令 demo（导入 → 门控 →
+绑定）的编排留作后续。
 
 ## Agent 绑定
 
