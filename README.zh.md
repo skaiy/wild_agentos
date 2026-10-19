@@ -53,6 +53,20 @@ PDCA（计划、执行、检查、改进）组织智能体工作，帮助团队�
   提供尽力而为的能力。
 - **受治理的软件包：** Logic 和 Skill 软件包采用不可变版本、按租户可见，并记录安装、
   升级和回滚。正式上线需通过既定检查、审核证据和人工审批。
+- **事实溯源：** 服务端 mint 的 PROV-O 伴生图记录暂存事实与治理决策的来源；按作用域
+  提供的只读 API 返回链接或统一的“未找到”；扫描超预算时 fail-closed，不返回残缺结果。
+- **示例知识包：** CI 门控校验文件系统知识包（锚点、SHACL、冻结 golden I/O、审计样例）。
+  虚构的 `ev-repair-fault-kb` 展示包用于跑通门控，不写入生产数据。
+- **服务端托管的智能体定义：** 按作用域的智能体可保存不可变定义修订（提示词、模型、
+  可选输出结构）；在启用执行时，调用可在创建时固定某一修订版本。
+- **持久输入与计量：** 制品库接受不可变 `input_snapshot` JSON，支持按 kind 过滤列表，
+  并加强明文密钥检测（含 JSON 内伪装凭证）。生产调用路径在配置了成本来源时记录 token
+  与费用；否则 fail-closed，不会在没有用量的情况下记为成功。
+- **租户记忆边界：** 任务收尾写入该次运行自己的租户 L0，单进程有句柄上限与注册表上界；
+  已完成任务记录在重启后仍可读取。
+- **加固的服务边界：** gRPC 与 HTTP 一样要求已验证 JWT，并阻断会把已配置 LLM 网关
+  API 密钥发往其他 `base_url` 的改向。MCP Skill 暴露、发布门、核心写路由、事件入站
+  白名单与网关 SSE 路径均遵守租户/项目边界。
 
 ## v0.6：在线语料任务，始终由人把关
 
@@ -86,6 +100,10 @@ v0.6.0 新增了在同一租户/项目边界内运行的、已认证的在线语
 | **互操作性** | `IsolationClaims` 会过滤入站 MCP 工具目录；经过门控并明确发布的租户 Skill 可作为 MCP 工具。轻量出站 A2A 适配器默认关闭，且仅提供尽力而为的能力。 |
 | **知识与检索** | Oxigraph RDF/SPARQL 知识图谱、按隔离范围的数据写入和检索，以及内嵌 Hyperspace HNSW 向量检索。可选的 RDFS 查询时扩展默认关闭，且不会写入推导结果。 |
 | **制品与沙箱** | 按隔离范围保存的编程制品元数据与系统划定的文件前缀；外部 `SandboxProvider` HTTP 适配器默认关闭，当前仅定义对接契约，尚未接入智能体/工具运行时。 |
+| **事实溯源** | 服务端 mint 的 PROV-O 伴生图与只读 HTTP API；读/写路径扫描有预算，超限 fail-closed。 |
+| **知识包门控** | `knowledge-pack-gate` CI 与虚构 `ev-repair-fault-kb` 展示包（锚点、SHACL、golden I/O）。 |
+| **智能体定义与调用** | 按作用域的不可变定义修订；启用执行时可固定修订；生产路径记录用量与成本（需配置成本来源）。 |
+| **安全加固** | gRPC JWT、网关 `base_url` 改向拦截、MCP 暴露隔离、密钥扫描边界、写范围与事件 allowlist。 |
 
 配套的 Admin control-plane 和 online-job-list surface 已独立交付，不属于本
 仓库。
@@ -94,6 +112,7 @@ v0.6.0 新增了在同一租户/项目边界内运行的、已认证的在线语
 
 | 版本 | 日期 | 业务说明 |
 |---|---:|---|
+| **main（2026-10）** | — | PROV-O 事实溯源与 fail-closed 扫描预算；知识包 CI 门与 EV 维修展示包；运行时托管智能体定义；`input_snapshot` 制品与上传密钥守卫；租户 L0 配额与可读已完成任务；调用用量/成本计量；gRPC 鉴权与网关改向加固；MCP Skill 暴露隔离及更广安全门控。 |
 | **v0.7.0** | 2026-09-13 | 核心对话保持通用，按需启用示例包才会加入领域帮助；团队还能只查看自己范围内的任务、护栏记录和黑板数据，护栏查看会隐藏敏感细节。 |
 | **v0.6.1** | 2026-09-09 | 通用 Agent chat 与 completions 默认不再注入特定领域上下文；workload OIDC 现定义用于 `IsolationClaims` 的短期 JWT，且 BFF 不共享 `AGENTOS_JWT_SECRET`。 |
 | **v0.6.0** | 2026-09-08 | 已认证的在线语料任务记录、手动暂存执行器、仅入队的监视器、有限的来源追溯和运行记录、重试与容量控制，以及由 CI 验证的生产写入隔离。 |
@@ -155,7 +174,9 @@ configuration。
 - [本体 Action 数据沙箱](docs/15-ontology-action-sandbox.zh.md) — HITL staging、
   guardrail 与 audit
 - [本体 KE Golden Freeze Policy](docs/22-ontology-ke-golden-freeze-policy.zh.md)
+- [本体问责](docs/27-ontology-accountability.zh.md) — PROV-O 伴生图、只读 API 与扫描预算
 - [EV 维修示例知识包](docs/24-ev-repair-example-pack.zh.md) — 虚构展示包、SHACL 与包级 CI 门
+- [Invocations API](docs/29-invocations-api.zh.md) — 持久调用、用量/成本与定义修订固定（部分实现，见文档状态）
 - [Admin control-plane API matrix](docs/23-admin-control-plane-api-matrix.zh.md) —
   Admin 与内核 API 的当前覆盖范围及访问边界
 - [Outbound A2A adapter](docs/19-a2a-outbound.md)

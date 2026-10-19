@@ -86,8 +86,9 @@ substrings, and are case-sensitive like the issued format. The same detector
 keys fail the gate and other formats warn.
 For `input_snapshot`, the same rules also run on the parsed JSON: every
 decoded string value and object key, and `key=value` for string members, so a
-credential hidden behind JSON escapes (`\u0073k-…`, `\/`, an escaped separator)
-is rejected the same way. The raw-byte scan still applies to every kind.
+credential hidden behind JSON escapes (`\u0073k-…`, `\/`, an escaped separator,
+Unicode fullwidth colon `\uFF1A` before `sk-…`, ideographic space, or similar
+probes) is rejected the same way. The raw-byte scan still applies to every kind.
 
 | Rule | Matches |
 | --- | --- |

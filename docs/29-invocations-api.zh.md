@@ -2,9 +2,11 @@
 
 > *English version: [29-invocations-api.md](29-invocations-api.md).*
 
-> **状态：设计草案，尚未实现。** 跟踪 epic：
-> [#313](https://github.com/skaiy/wild_agentos/issues/313)，里程碑 v0.12.0。
-> 字段名和错误码在子 issue 落地前可能调整。本文不描述当前 `main` 的任何行为。
+> **状态：`main` 上部分实现。** 按作用域的 CRUD（`POST`/`GET`/`GET :id`/`POST :id/cancel`）、SSE
+> 事件、带**用量/成本**与工具调用计量的执行桥，以及可选 `input_ref` 解析已落地。执行仍受显式开关
+> 控制（生产默认关闭直至配置）。Epic
+> [#313](https://github.com/skaiy/wild_agentos/issues/313) 仍跟踪完整契约；v0.12.0 前字段与边角
+> 行为可能调整。
 
 ## 1. 目的
 

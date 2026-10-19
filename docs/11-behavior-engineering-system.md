@@ -397,6 +397,11 @@ Definitions reside in `MethodologyDefinition` and are initialized by `builtin_me
 
 Design principles: methodologies with `domain: "general"` work across domains; `domain: "programming"` expands through the `Methodology Skill Graph`; core flows (brainstorming → planning → execution → review → verification) apply to programming, writing, design, and other tasks; specialized domains expand independently through `Wild AgentOS Skills`, without being mixed into core methodologies.
 
+**KG seeding:** on startup the runner seeds built-in methodology metadata into the
+tenant/project knowledge graph only when verified **platform isolation claims** are
+configured (`platform` / `ops` scope). Without those claims the seed is skipped;
+callers cannot write methodology triples through ordinary graph update APIs.
+
 ### 4.3 MethodologyGate — trigger and blocking layer
 
 MethodologyGate maintains the **currently active methodology set**, determines whether to activate methodologies at each hook point, and checks anti-patterns before tool calls.

@@ -10,6 +10,23 @@ New user Agents are written with the `tenant_id` and `project_id` from authentic
 
 Domain-specific chat behavior belongs to an Agent-bound runtime asset or client, not core middleware; `ev-repair` is an optional example asset and bind alias for the persisted `ev-repair-fault-kb` pack, not a middleware requirement.
 
+### Runtime-managed agent definitions
+
+Scoped user agents can carry **immutable definition revisions** stored by the
+kernel (`system_prompt`, `model`, optional `output_schema`, monotonic revision
+ids, and an `active_revision` pointer). HTTP routes (all JWT + claims scoped):
+
+- `GET /api/v1/agents/:id/revisions` — list revisions for one agent in the
+  caller's tenant/project.
+- `POST /api/v1/agents/:id/revisions` — append a new immutable revision (cap:
+  100 per agent).
+- `POST /api/v1/agents/:id/revisions/:revision/activate` — move the active
+  pointer without deleting history.
+
+Invocations that reference `agent_id` resolve and persist one definition
+snapshot at create time; see [29-invocations-api.md](29-invocations-api.md).
+Legacy agents without a `revisions` array are not valid invocation targets.
+
 ### Business client chat
 
 A business client calls `POST /api/v1/agents/:id/chat` with verified JWT claims

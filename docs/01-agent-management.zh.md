@@ -16,6 +16,20 @@ Agent 不再被隐式共享。具体可信边界和 public API-key chat 的行�
 
 领域 chat 行为应由 Agent 绑定的运行时资产或客户端承载，而不是核心中间件；`ev-repair` 是持久化 `ev-repair-fault-kb` 包的可选示例运行时资产和绑定别名，并非中间件要求。
 
+### 运行时托管的智能体定义
+
+按作用域的用户 Agent 可由内核保存**不可变定义修订**（`system_prompt`、`model`、
+可选 `output_schema`、单调递增的 revision id，以及 `active_revision` 指针）。相关
+HTTP 路由（均需 JWT + claims 作用域）：
+
+- `GET /api/v1/agents/:id/revisions` — 列出本 tenant/project 下某 Agent 的修订。
+- `POST /api/v1/agents/:id/revisions` — 追加一条不可变修订（每 Agent 上限 100 条）。
+- `POST /api/v1/agents/:id/revisions/:revision/activate` — 移动活动指针，不删除历史。
+
+带 `agent_id` 的 Invocations 在创建时解析并持久化一份定义快照；见
+[29-invocations-api.zh.md](29-invocations-api.zh.md)。没有 `revisions` 数组的遗留
+Agent 不能作为 invocation 目标。
+
 ### 业务客户端 chat
 
 业务客户端使用已验证 JWT claims 调用 `POST /api/v1/agents/:id/chat`，请求体为

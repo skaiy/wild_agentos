@@ -2,10 +2,12 @@
 
 > *A Chinese version is available in [29-invocations-api.zh.md](29-invocations-api.zh.md).*
 
-> **Status: design draft, not implemented.** Tracking epic:
-> [#313](https://github.com/skaiy/wild_agentos/issues/313), milestone v0.12.0.
-> Field names and error codes may change before the sub-issues land. Nothing in
-> this document describes behavior on current `main`.
+> **Status: partial on `main`.** Scoped CRUD (`POST`/`GET`/`GET :id`/`POST :id/cancel`),
+> SSE events, the execution bridge with per-run **usage/cost** and tool-call
+> metering, and optional `input_ref` resolution are implemented. Execution
+> remains behind an explicit switch (off in production until configured). Epic
+> [#313](https://github.com/skaiy/wild_agentos/issues/313) still tracks the full
+> contract; field names and edge cases may change before v0.12.0.
 
 ## 1. Purpose
 

@@ -67,7 +67,12 @@ L0 是系统的永久 KV 层，将完整 JSON-LD 图数据写入 `l0.redb`，支
 即 `/data/l0/{tenant}` 合同。没有 claims 时，启动时由 `L0Store::new` 打开的
 历史共享存储保持只读，写入会 fail closed。历史
 `./data/l0_store/l0.redb` 尚未迁移；它不是 claims-scoped 路径。完整作用域和
-迁移边界请参阅 [17-isolation-contract.md](17-isolation-contract.md)。
+迁移边界请参阅 [17-isolation-contract.zh.md](17-isolation-contract.zh.md)。
+
+**租户 L0 注册表（生产运行）：** 进程级 `TenantL0Registry` 为每个租户提供一份可写的共享
+`l0.redb` 句柄（同一租户下各 project 共用）。默认上限为 `DEFAULT_MAX_TENANT_L0_HANDLES`
+（32）个已打开租户库；超出则返回存储错误而不再打开文件。运行租约释放后会关闭空闲句柄。
+任务收尾与 write-through 路径写入**该次运行**的租户句柄，而非启动时打开的只读共享 L0。
 
 **核心结构体**:
 
