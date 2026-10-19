@@ -18,8 +18,9 @@ use crate::core::execution_event::ExecutionEventKind;
 use crate::core::execution_event::ExecutionState;
 use crate::core::sa::SupervisorAgent;
 use crate::gateway::unified_gateway::UnifiedGateway;
+use crate::isolation::IsolationClaims;
 use crate::memory::consistency_engine::ConsistencyEngine;
-use crate::memory::l0_store::{L0Store, TenantL0Registry};
+use crate::memory::l0_store::{L0Store, TenantL0Lease, TenantL0Registry};
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::memory_bus::MemoryBus;
@@ -616,12 +617,64 @@ impl AgentOSService {
         }
     }
 
-    fn create_sa(&self, settings: &Settings) -> SupervisorAgent {
-        build_supervisor_agent(
-            self.gateway.clone(),
+    #[allow(clippy::result_large_err)]
+    fn apply_request_settings(&self, req: &impl RequestSettings) -> Result<Settings, Status> {
+        crate::api::grpc::llm_override::validate_grpc_llm_gateway_override(
+            req.llm_base_url(),
+            req.llm_api_key(),
+            &self.settings,
+            &self.gateway,
+        )?;
+        let mut settings = self.settings.clone();
+        req.apply_to(&mut settings);
+        Ok(settings)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn require_grpc_execution_enabled(&self) -> Result<(), Status> {
+        if !crate::api::http::invocations::InvocationsRuntime::execution_enabled_from_env() {
+            return Err(Status::unavailable(
+                "invocation execution is disabled on this server",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn require_runnable_task(
+        &self,
+        claims: &IsolationClaims,
+        task_iri: &str,
+    ) -> Result<(), Status> {
+        self.require_task_scope(claims, task_iri).await?;
+        if self
+            .blackboard
+            .task_record_is_closed(task_iri)
+            .unwrap_or(true)
+        {
+            return Err(crate::api::grpc::auth::not_found());
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn prepare_grpc_supervisor(
+        &self,
+        claims: &IsolationClaims,
+        settings: &Settings,
+    ) -> Result<GrpcSupervisorRun, Status> {
+        self.require_grpc_execution_enabled()?;
+        let lease = self.tenant_l0.lease();
+        let l0 = self
+            .tenant_l0
+            .get_or_open(claims)
+            .map_err(|error| Status::internal(format!("failed to open tenant L0: {error}")))?;
+        let usage_meter = Arc::new(crate::gateway::usage_meter::RunUsageMeter::new());
+        let run_gateway = Arc::new(self.gateway.with_usage_meter(usage_meter));
+        let mut supervisor = build_supervisor_agent(
+            run_gateway,
             self.skills.clone(),
             self.blackboard.clone(),
-            self.l0.clone(),
+            Arc::clone(&l0),
             self.memory_manager.clone(),
             self.templates.clone(),
             self.scheduler.clone(),
@@ -630,19 +683,32 @@ impl AgentOSService {
             self.event_bus.clone(),
             self.vector_store.clone(),
             settings,
-        )
+        );
+        supervisor = supervisor.with_isolation_claims(claims.clone());
+        Ok(GrpcSupervisorRun {
+            supervisor,
+            _lease: lease,
+            l0,
+        })
     }
 
-    fn apply_request_settings(&self, req: &impl RequestSettings) -> Settings {
-        let mut settings = self.settings.clone();
-        req.apply_to(&mut settings);
-        settings
+    fn flush_grpc_run(&self, task_iri: &str, l0: &L0Store) {
+        if let Err(error) = self.scheduler.on_run_end(task_iri, l0) {
+            let count = crate::memory::l0_store::note_l0_write_rejected("run_end");
+            tracing::warn!(error = %error, count, "L0 run-end flush rejected");
+        }
     }
+}
+
+struct GrpcSupervisorRun {
+    supervisor: SupervisorAgent,
+    _lease: TenantL0Lease,
+    l0: Arc<L0Store>,
 }
 
 /// 从共享运行态组件装配一个 SupervisorAgent（PDCA 管线）。
 ///
-/// gRPC 的 `create_sa` 与 HTTP 的 `HttpTaskExecutor` 共用此函数，避免重复装配逻辑，
+/// gRPC 的 `prepare_grpc_supervisor` 与 HTTP 的 `HttpTaskExecutor` 共用此函数，避免重复装配逻辑，
 /// 并确保两条入口用的是**同一套**共享运行态（EventBus / Blackboard / 内存分层 / KG）。
 #[allow(clippy::too_many_arguments)]
 fn build_supervisor_agent(
@@ -1093,6 +1159,8 @@ fn terminal_payload(
 }
 
 trait RequestSettings {
+    fn llm_base_url(&self) -> &str;
+    fn llm_api_key(&self) -> &str;
     fn apply_to(&self, settings: &mut Settings);
 }
 
@@ -1155,6 +1223,14 @@ impl AgentOSService {
 }
 
 impl RequestSettings for ExecuteStageRequest {
+    fn llm_base_url(&self) -> &str {
+        &self.llm_base_url
+    }
+
+    fn llm_api_key(&self) -> &str {
+        &self.llm_api_key
+    }
+
     fn apply_to(&self, settings: &mut Settings) {
         if !self.llm_api_key.is_empty() {
             settings.gateway.api_key = self.llm_api_key.clone();
@@ -1185,6 +1261,14 @@ impl RequestSettings for ExecuteStageRequest {
 }
 
 impl RequestSettings for ChatStreamRequest {
+    fn llm_base_url(&self) -> &str {
+        &self.llm_base_url
+    }
+
+    fn llm_api_key(&self) -> &str {
+        &self.llm_api_key
+    }
+
     fn apply_to(&self, settings: &mut Settings) {
         if !self.llm_api_key.is_empty() {
             settings.gateway.api_key = self.llm_api_key.clone();
@@ -1215,6 +1299,14 @@ impl RequestSettings for ChatStreamRequest {
 }
 
 impl RequestSettings for ExecuteTaskStreamRequest {
+    fn llm_base_url(&self) -> &str {
+        &self.llm_base_url
+    }
+
+    fn llm_api_key(&self) -> &str {
+        &self.llm_api_key
+    }
+
     fn apply_to(&self, settings: &mut Settings) {
         if !self.llm_api_key.is_empty() {
             settings.gateway.api_key = self.llm_api_key.clone();
@@ -1256,17 +1348,18 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
     ) -> Result<Response<ExecuteStageResponse>, Status> {
         let claims = crate::api::grpc::auth::claims_from_request(&request)?;
         let req = request.into_inner();
-        self.require_task_scope(&claims, &req.task_iri).await?;
-        let settings = self.apply_request_settings(&req);
+        self.require_runnable_task(&claims, &req.task_iri).await?;
+        let settings = self.apply_request_settings(&req)?;
+        let task_iri = req.task_iri.clone();
+        let mut run = self.prepare_grpc_supervisor(&claims, &settings)?;
 
-        let mut sa = self.create_sa(&settings);
-
-        let task_iri = req.task_iri;
-
-        let result = sa
+        let result = run
+            .supervisor
             .process_task(&req.prompt, &task_iri)
             .await
             .map_err(|e| Status::internal(format!("SA execution failed: {}", e)))?;
+        self.flush_grpc_run(&task_iri, run.l0.as_ref());
+        drop(run);
 
         let output_bytes = match &result.output {
             Some(v) => serde_json::to_vec(v).unwrap_or_default(),
@@ -1289,14 +1382,12 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
     ) -> Result<Response<Self::ChatStreamStream>, Status> {
         let claims = crate::api::grpc::auth::claims_from_request(&request)?;
         let req = request.into_inner();
-        self.require_task_scope(&claims, &req.task_iri).await?;
-        let settings = self.apply_request_settings(&req);
+        self.require_runnable_task(&claims, &req.task_iri).await?;
+        let settings = self.apply_request_settings(&req)?;
+        let task_iri = req.task_iri.clone();
+        let mut run = self.prepare_grpc_supervisor(&claims, &settings)?;
 
         let (tx, rx) = mpsc::channel::<Result<ChatStreamChunk, Status>>(64);
-
-        let mut sa = self.create_sa(&settings);
-
-        let task_iri = req.task_iri.clone();
 
         let _ = tx
             .send(Ok(ChatStreamChunk {
@@ -1306,7 +1397,7 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
             }))
             .await;
 
-        match sa.process_task(&req.prompt, &task_iri).await {
+        match run.supervisor.process_task(&req.prompt, &task_iri).await {
             Ok(result) => {
                 let content = extract_content(&result);
 
@@ -1323,6 +1414,8 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
                         .await
                         .is_err()
                     {
+                        self.flush_grpc_run(&task_iri, run.l0.as_ref());
+                        drop(run);
                         return Ok(Response::new(Box::pin(
                             tokio_stream::wrappers::ReceiverStream::new(rx),
                         )));
@@ -1347,6 +1440,8 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
                     .await;
             }
         }
+        self.flush_grpc_run(&task_iri, run.l0.as_ref());
+        drop(run);
 
         let output = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(output)))
@@ -1360,8 +1455,9 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         let req = request.into_inner();
         // Scope is checked before any subscription or execution, so an
         // out-of-scope caller never observes that task's events or request ids.
-        self.require_task_scope(&claims, &req.task_iri).await?;
-        let settings = self.apply_request_settings(&req);
+        self.require_runnable_task(&claims, &req.task_iri).await?;
+        let settings = self.apply_request_settings(&req)?;
+        self.require_grpc_execution_enabled()?;
 
         let (tx, rx) = mpsc::channel::<Result<seapp::ExecutionEvent, Status>>(256);
 
@@ -1418,20 +1514,58 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
             }
         });
 
-        let settings_clone = settings.clone();
-        let sa_settings = settings.clone();
         let prompt = req.prompt.clone();
         let task_iri_for_task = task_iri.clone();
-        let _tx_for_task = tx.clone();
         let event_bus_for_task = self.event_bus.clone();
         let shutdown = self.shutdown.clone();
+        let gateway = self.gateway.clone();
+        let skills = self.skills.clone();
+        let blackboard = self.blackboard.clone();
+        let tenant_l0 = self.tenant_l0.clone();
+        let memory_manager = self.memory_manager.clone();
+        let templates = self.templates.clone();
+        let scheduler = self.scheduler.clone();
+        let prefetch = self.prefetch.clone();
+        let unified_graph = self.unified_graph.clone();
+        let vector_store = self.vector_store.clone();
+        let claims_for_task = claims.clone();
 
         tokio::spawn(async move {
-            let mut sa = {
-                let service =
-                    AgentOSService::new(settings_clone).expect("AgentOSService::new failed");
-                service.create_sa(&sa_settings)
+            let lease = tenant_l0.lease();
+            let l0 = match tenant_l0.get_or_open(&claims_for_task) {
+                Ok(l0) => l0,
+                Err(error) => {
+                    let emitter = ExecutionEventEmitter::with_options(
+                        &task_iri_for_task,
+                        None,
+                        Some(event_bus_for_task.clone()),
+                        include_thought,
+                        include_tool_calls,
+                    );
+                    emitter.emit_error("L0InitializationError", &error.to_string(), "L0", false);
+                    emitter.emit_completion("failed", &error.to_string(), None);
+                    let mut states = states.write().await;
+                    states.remove(&task_iri_for_task);
+                    return;
+                }
             };
+            let usage_meter = Arc::new(crate::gateway::usage_meter::RunUsageMeter::new());
+            let run_gateway = Arc::new(gateway.with_usage_meter(usage_meter));
+            let mut sa = build_supervisor_agent(
+                run_gateway,
+                skills,
+                blackboard,
+                Arc::clone(&l0),
+                memory_manager,
+                templates,
+                scheduler.clone(),
+                prefetch,
+                unified_graph,
+                event_bus_for_task.clone(),
+                vector_store,
+                &settings,
+            );
+            sa = sa.with_isolation_claims(claims_for_task);
 
             let emitter = ExecutionEventEmitter::with_options(
                 &task_iri_for_task,
@@ -1446,6 +1580,13 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
             let result = tokio::select! {
                 _ = shutdown.cancelled() => {
                     tracing::info!(task_iri = %task_iri_for_task, "gRPC task cancelled during shutdown");
+                    if let Err(error) = scheduler.on_run_end(&task_iri_for_task, l0.as_ref()) {
+                        let count = crate::memory::l0_store::note_l0_write_rejected("run_end");
+                        tracing::warn!(error = %error, count, "L0 run-end flush rejected");
+                    }
+                    drop(sa);
+                    drop(l0);
+                    drop(lease);
                     let mut states = states.write().await;
                     states.remove(&task_iri_for_task);
                     return;
@@ -1461,6 +1602,13 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
                     emitter.emit_completion("failed", &e.to_string(), None);
                 }
             }
+            if let Err(error) = scheduler.on_run_end(&task_iri_for_task, l0.as_ref()) {
+                let count = crate::memory::l0_store::note_l0_write_rejected("run_end");
+                tracing::warn!(error = %error, count, "L0 run-end flush rejected");
+            }
+            drop(sa);
+            drop(l0);
+            drop(lease);
 
             {
                 let mut states = states.write().await;
@@ -1878,3 +2026,7 @@ mod executor_l0_concurrency_tests;
 #[cfg(test)]
 #[path = "auth_tests.rs"]
 mod auth_tests;
+
+#[cfg(test)]
+#[path = "llm_override_tests.rs"]
+mod llm_override_tests;
