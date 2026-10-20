@@ -59,6 +59,8 @@ L0 is the permanent KV layer. It writes complete JSON-LD graph data to `l0.redb`
 
 For HTTP task execution with JWT-verified `IsolationClaims`, L0 uses `L0Store::open_for_claims` to open the claims-minted tenant directory under the supplied L0 root, the `/data/l0/{tenant}` contract. Without claims, the legacy shared store opened at startup by `L0Store::new` remains read-only and writes fail closed. Legacy `./data/l0_store/l0.redb` has not been migrated and is not a claims-scoped path. For the complete scope and migration boundaries, see [17-isolation-contract.md](17-isolation-contract.md).
 
+**Tenant L0 registry (production runs):** a process-wide `TenantL0Registry` hands out one shared writable `l0.redb` handle per tenant (projects of the same tenant share it). The default cap is `DEFAULT_MAX_TENANT_L0_HANDLES` (32) open tenant databases per process; exceeding it returns a storage error instead of opening more files. Idle handles close when the run lease drops. Task completion and write-through paths flush into the **run's** tenant handle, not the read-only shared L0 opened at startup.
+
 ```rust
 pub struct L0Entry {
     pub iri: String,

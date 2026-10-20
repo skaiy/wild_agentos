@@ -63,6 +63,29 @@ such as `ev-repair`, not in the core middleware.
 - **Governed packages:** Logic and Skill packages have immutable versions,
   tenant-scoped visibility, and recorded install, upgrade, and rollback steps.
   Promotion requires defined gates, review evidence, and human approval.
+- **Fact provenance:** a server-minted PROV-O companion graph records where
+  staged facts and governance decisions came from. Scoped read APIs return
+  links or a uniform not-found response; oversized scans fail closed instead
+  of returning partial data.
+- **Example knowledge packs:** a CI gate checks filesystem packs (anchors,
+  SHACL, golden I/O, audit samples). The fictional `ev-repair-fault-kb`
+  showcase pack exercises that gate without touching production data.
+- **Server-held agent definitions:** scoped agents can store immutable
+  definition revisions (prompt, model, optional output shape). Invocations can
+  pin a revision at create time when execution is enabled.
+- **Durable inputs and metering:** the artifact store accepts immutable
+  `input_snapshot` JSON with kind filtering and strengthened secret detection
+  (including disguised credentials inside JSON). Production invocation runs
+  record token and cost usage when a cost source is configured; otherwise they
+  fail closed rather than reporting success without usage.
+- **Tenant memory bounds:** task completion archives into the run's own
+  tenant L0 store, with per-process handle limits and registry bounds. Completed
+  task records stay readable after restart.
+- **Hardened service edges:** gRPC requires the same verified JWT as HTTP and
+  blocks LLM gateway `base_url` redirects that would send configured API keys
+  elsewhere. MCP skill exposure, publish gates, scoped core writes, event
+  ingest allowlists, and gateway SSE paths follow the same tenant/project
+  boundaries.
 
 The companion Admin control-plane and online-job-list user interfaces are
 separate products and are not in this repository.
@@ -95,6 +118,7 @@ human-governed, auditable decisions.
 
 | Version | Date | Business summary |
 |---|---:|---|
+| **main (2026-10)** | — | PROV-O fact provenance with bounded fail-closed reads; knowledge-pack CI gate and EV-repair showcase pack; runtime-managed agent definitions; `input_snapshot` artifacts and stronger upload secret guards; tenant L0 quotas and readable completed tasks; invocation usage/cost metering; gRPC auth and gateway redirect hardening; MCP skill exposure isolation and broader security gates. |
 | **v0.7.0** | 2026-09-13 | Core chat stays general-purpose; optional example packs can add domain help when selected. Teams can also view only their own tasks, guard records, and blackboard data, with sensitive details removed from guard views. |
 | **v0.6.1** | 2026-09-09 | Generic Agent chat and completions are domain-neutral by default; workload OIDC now defines short-lived JWTs for `IsolationClaims` without sharing BFF signing secrets. |
 | **v0.6.0** | 2026-09-08 | Authenticated online-corpus job records, manual staging runner, queue-only watchers, bounded source tracing and operational records, retry/capacity controls, and CI-proven production-write isolation. |
@@ -176,8 +200,12 @@ production HS256 configuration.
 - [Ontology KE golden-freeze policy](docs/22-ontology-ke-golden-freeze-policy.md)
 - [Admin control-plane API matrix](docs/23-admin-control-plane-api-matrix.md) —
   current Admin-to-kernel API coverage and access boundaries
+- [Ontology accountability](docs/27-ontology-accountability.md) — PROV-O
+  companion graph, read API, and scan budgets
 - [EV-repair example knowledge pack](docs/24-ev-repair-example-pack.md) —
   fictional showcase pack, SHACL, and pack-level CI gate
+- [Invocations API](docs/29-invocations-api.md) — durable runs, usage/cost, and
+  agent-definition pinning (partial; see status in doc)
 - [Outbound A2A adapter](docs/19-a2a-outbound.md)
 - [Private-deployment benchmark](docs/19-private-deploy-benchmark.md)
 - [Design detail](docs/13-DESIGN_DETAIL.md)

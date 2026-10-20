@@ -32,6 +32,10 @@
   提供按图迭代前，底层仍可能全库遍历。每次读取有显式扫描预算，超限 fail-closed
   （见 `knowledge_graph::provenance` 中 `PROV_READ_MAX_STORE_QUADS_SCANNED`、
   `PROV_READ_MAX_COMPANION_GRAPH_QUADS`）。
+- **写路径扫描**：为溯源收集事实 triple term 的暂存/物化路径使用同样的有界全库遍历；
+  超过 store 扫描预算时 fail-closed，不写入残缺 activity。
+- **Activity 存在性检查**：`prov_activity_exists_for_claims` 在判断 activity id 是否存在于
+  mint 伴生图时使用同一套有界扫描，避免跨租户探测通过不同代码路径区分“不存在”与“超预算”。
 - **Oxigraph**：工作区依赖开启 `rdf-12` feature 以支持 triple term。
 
 ## 决策节点（规划中）

@@ -40,6 +40,13 @@ for follow-on work.
   iterators land. Each read is fail-closed with explicit scan budgets
   (`PROV_READ_MAX_STORE_QUADS_SCANNED`, `PROV_READ_MAX_COMPANION_GRAPH_QUADS` in
   `knowledge_graph::provenance`).
+- **Write-path scanning**: staging and materialization paths that collect fact
+  triple terms for provenance use the same bounded full-store walk. Exceeding the
+  store scan budget fails closed instead of recording a partial activity.
+- **Activity existence checks**: `prov_activity_exists_for_claims` uses the same
+  bounded scan when deciding whether an activity id is present in the minted
+  companion graph, so cross-tenant probes cannot distinguish “missing” from
+  “over budget” through a different code path.
 - **Oxigraph**: workspace dependency enables feature `rdf-12` for triple terms.
 
 ## Decision nodes (planned)

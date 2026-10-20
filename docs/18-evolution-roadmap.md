@@ -197,6 +197,45 @@ statistics, and claims-scoped Blackboard task and node lists. Task detail paths
 and several Admin APIs retain their documented mixed claims coverage; see the
 [Admin Control-Plane API Matrix](23-admin-control-plane-api-matrix.md).
 
+### Post-v0.7 iterations — merged on main (2026-10)
+
+These capabilities landed after the v0.7.0 tag. They extend governance,
+accountability, and production hardening without changing the core product
+boundary.
+
+- **PROV-O fact provenance (MVP):** server-minted companion graph with RDF 1.2
+  triple terms, scoped read APIs, and fail-closed read/write scan budgets.
+  Follow-up nits closed the MVP loop. See
+  [Ontology Accountability](27-ontology-accountability.md). Related merges:
+  #502, #506, #510, #514.
+- **Knowledge-pack CI gate:** `knowledge-pack-gate` job plus the fictional
+  `ev-repair-fault-kb` filesystem showcase pack; gate hardening followed.
+  See [EV-repair example knowledge pack](24-ev-repair-example-pack.md). Related
+  merges: #501, #505.
+- **Methodology KG seeding:** built-in methodology definitions seed into the
+  knowledge graph only through verified platform isolation claims, not ad hoc
+  writes. Related merge: #512.
+- **Runtime-managed agent definitions:** scoped agents store immutable
+  definition revisions; invocations can pin a revision when execution is enabled.
+  Related merge: #455.
+- **Artifacts and invocation inputs:** `input_snapshot` artifact kind with list
+  filtering, optional `task_iri`, upload secret guards (including JSON-decoded
+  probes), and an opt-in `wao-artifact://` `input_ref` resolver. Related merges:
+  #378, #377, #509, #347.
+- **Memory and tasks:** tenant L0 handle limits, archive writes on completion,
+  registry bounds, and completed tasks that remain readable after restart.
+  Related merges: #435, #434, #356.
+- **Invocation metering:** production execution records per-run token, cost, and
+  tool-call usage; missing cost configuration fails closed. Related merges:
+  #393, #424.
+- **Security and gRPC:** authenticated gRPC aligned with HTTP JWT scope;
+  gateway `base_url` redirect blocked when keys are configured; MCP skill
+  exposure isolation and publish gate; secret-scan boundaries; scoped core
+  writes, event ingest allowlists, and hardened gateway SSE. Related merges:
+  #448, #513, #426, #436, #427, and earlier security series on main.
+- **Documentation hygiene:** removed accidental line-number prefixes from the
+  Chinese knowledge-graph doc. Related merge: #520.
+
 ## Explicit non-goals
 
 1. No category-IV “microkernel OS” or bare-metal OS.
