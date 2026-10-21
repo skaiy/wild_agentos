@@ -144,6 +144,7 @@ const PROBE_QUERIES: &[(&str, &str)] = &[
     ("/api/v1/blackboard/nodes", "task_iri=a&task_iri=b"),
     ("/api/v1/skills", "iri=a&iri=b"),
     ("/api/v1/mcp/skill-exposures", "skill_iri=a&skill_iri=b"),
+    ("/api/v1/prompts/resolve", "role=%FF"),
     // Duplicate unknown `kind` must be 401 for an anonymous caller. A query
     // parser that runs first answers 400 and this route leaves the protected set.
     ("/api/v1/ontology/health", "kind=a&kind=b"),

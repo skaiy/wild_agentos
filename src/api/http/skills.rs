@@ -1503,11 +1503,18 @@ pub(crate) async fn list_pipeline_runs_handler(
     identity: UserIdentity,
     RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
-    let Some(claims) = identity.isolation_claims() else {
-        return identity
-            .require_verified_isolation_claims("pipeline run history")
-            .expect_err("missing claims must be rejected")
-            .into_response();
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "verified_isolation_claims_required",
+                    "message": "verified isolation claims required for pipeline run history",
+                })),
+            )
+                .into_response()
+        }
     };
     let q: PipelineRunsQuery = match parse_verified_query(raw.as_deref()) {
         Ok(query) => query,

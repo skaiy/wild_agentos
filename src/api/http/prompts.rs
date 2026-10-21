@@ -5,14 +5,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::prompt_registry::PromptVersion;
 
 use super::iam::UserIdentity;
-use super::AppState;
+use super::{parse_verified_query, AppState};
 
 /// GET /api/v1/prompts — 列举所有 Prompt 版本
 pub(crate) async fn list_prompts_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -158,13 +163,24 @@ pub(crate) async fn delete_prompt_handler(
 pub(crate) async fn resolve_prompt_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
-    let Some(claims) = identity.isolation_claims() else {
-        return identity
-            .require_verified_isolation_claims("prompt resolution")
-            .expect_err("missing claims must be rejected")
-            .into_response();
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "verified_isolation_claims_required",
+                    "message": "verified isolation claims required for prompt resolution",
+                })),
+            )
+                .into_response()
+        }
+    };
+    let params: HashMap<String, String> = match parse_verified_query(raw.as_deref()) {
+        Ok(params) => params,
+        Err(response) => return *response,
     };
     // Tenant and user scope come exclusively from verified claims. Query
     // parameters may choose a role but cannot resolve another tenant's rules.
