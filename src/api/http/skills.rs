@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, RawQuery, State},
+    extract::{RawQuery, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
@@ -778,11 +778,15 @@ spec:\n\
 pub(crate) async fn skill_manifest_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Query(q): Query<SkillManifestQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     if let Err(error) = identity.require_verified_isolation_claims("skill manifest access") {
         return error.into_response();
     }
+    let q: SkillManifestQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
     match state.core.skills.get_skill(&q.iri) {
         Some(skill) => {
             let sig = state.core.skills.verify_skill_signature(&skill);

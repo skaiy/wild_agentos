@@ -136,7 +136,7 @@ fn classify(status: &str) -> ProbeClass {
 /// Query strings that let a probe get past a required `Query` extractor, so the
 /// sweep observes the handler instead of a 400.
 const PROBE_QUERIES: &[(&str, &str)] = &[
-    ("/api/v1/skills/manifest", "iri=skill://sweep/probe"),
+    ("/api/v1/skills/manifest", "iri=a&iri=b"),
     ("/api/v1/skills/pipeline-runs", "limit=not-a-number"),
     ("/api/v1/market/packages", "name=%FF"),
     ("/api/v1/api-audit", "limit=not-a-number"),
