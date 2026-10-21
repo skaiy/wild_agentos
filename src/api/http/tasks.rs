@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{core_ops::task_is_in_scope, iam::UserIdentity};
-use super::{AppState, TaskExecSpec};
+use super::{parse_verified_query, AppState, TaskExecSpec};
 
 #[derive(Deserialize)]
 pub struct TaskRequest {
@@ -563,7 +563,7 @@ pub(crate) struct TaskTrendsQuery {
 pub(crate) async fn list_task_trends_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Query(q): Query<TaskTrendsQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     let Some(claims) = identity.isolation_claims() else {
         return (
@@ -571,6 +571,10 @@ pub(crate) async fn list_task_trends_handler(
             Json(json!({"error": "verified isolation claims are required"})),
         )
             .into_response();
+    };
+    let q: TaskTrendsQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
     };
     let days = q.days.unwrap_or(7).clamp(1, 90);
     let today = chrono::Utc::now().date_naive();

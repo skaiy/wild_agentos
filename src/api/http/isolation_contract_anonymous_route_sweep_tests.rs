@@ -38,16 +38,6 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
     ("GET", "/api/v1/skills", "issue: TBD-P2-skills-meta"),
     (
         "GET",
-        "/api/v1/skills/manifest",
-        "issue: TBD-P2-skills-meta",
-    ),
-    (
-        "GET",
-        "/api/v1/skills/pipeline-runs",
-        "issue: TBD-P2-skills-meta",
-    ),
-    (
-        "GET",
         "/api/v1/memory/unified-stats",
         "issue: TBD-P2-runtime-stats",
     ),
@@ -57,9 +47,8 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
         "issue: TBD-P2-ontology-types",
     ),
     ("GET", "/metrics", "issue: #324"),
-    // Prompt reads stay open for now; #302 gated the prompt writes only.
+    // Prompt list stays open for now; #302 gated the prompt writes only.
     ("GET", "/api/v1/prompts", "issue: #302"),
-    ("GET", "/api/v1/prompts/resolve", "issue: #302"),
 ];
 
 /// TEMPORARY: routes whose anonymous probe is rejected by a request extractor
@@ -68,9 +57,6 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
 /// shrink: an entry that starts answering 401 fails the sweep, and an unlisted
 /// route that answers 400/422 fails too.
 const INCONCLUSIVE: &[(&str, &str)] = &[
-    ("DELETE", "/api/v1/mcp/skill-exposures"),
-    ("DELETE", "/api/v1/skills"),
-    ("GET", "/api/v1/blackboard/nodes"),
     ("POST", "/api/v1/agents"),
     ("POST", "/api/v1/agents/:id/chat"),
     ("POST", "/api/v1/api-clients"),
@@ -151,6 +137,13 @@ fn classify(status: &str) -> ProbeClass {
 /// sweep observes the handler instead of a 400.
 const PROBE_QUERIES: &[(&str, &str)] = &[
     ("/api/v1/skills/manifest", "iri=skill://sweep/probe"),
+    ("/api/v1/skills/pipeline-runs", "limit=not-a-number"),
+    ("/api/v1/market/packages", "name=%FF"),
+    ("/api/v1/api-audit", "limit=not-a-number"),
+    ("/api/v1/tasks/trends", "days=not-a-number"),
+    ("/api/v1/blackboard/nodes", "task_iri=a&task_iri=b"),
+    ("/api/v1/skills", "iri=a&iri=b"),
+    ("/api/v1/mcp/skill-exposures", "skill_iri=a&skill_iri=b"),
     // Duplicate unknown `kind` must be 401 for an anonymous caller. A query
     // parser that runs first answers 400 and this route leaves the protected set.
     ("/api/v1/ontology/health", "kind=a&kind=b"),
@@ -180,6 +173,15 @@ const MUST_BE_PROTECTED: &[(&str, &str)] = &[
     ("POST", "/v1/invocations/:id/cancel"),
     ("GET", "/v1/invocations/:id/events"),
     ("GET", "/api/v1/ontology/health"),
+    ("GET", "/api/v1/skills/manifest"),
+    ("GET", "/api/v1/skills/pipeline-runs"),
+    ("GET", "/api/v1/market/packages"),
+    ("GET", "/api/v1/api-audit"),
+    ("GET", "/api/v1/tasks/trends"),
+    ("GET", "/api/v1/blackboard/nodes"),
+    ("DELETE", "/api/v1/skills"),
+    ("DELETE", "/api/v1/mcp/skill-exposures"),
+    ("GET", "/api/v1/prompts/resolve"),
 ];
 
 const ROUTER_SOURCE: &str = include_str!("mod.rs");

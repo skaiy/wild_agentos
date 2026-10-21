@@ -157,16 +157,19 @@ pub(crate) async fn delete_prompt_handler(
 /// GET /api/v1/prompts/resolve?tenant_id=&user_id=&role= — 灰度路由决策
 pub(crate) async fn resolve_prompt_handler(
     State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let tenant_id = params
-        .get("tenant_id")
-        .map(|s| s.as_str())
-        .unwrap_or("default");
-    let user_id = params
-        .get("user_id")
-        .map(|s| s.as_str())
-        .unwrap_or("anonymous");
+    let Some(claims) = identity.isolation_claims() else {
+        return identity
+            .require_verified_isolation_claims("prompt resolution")
+            .expect_err("missing claims must be rejected")
+            .into_response();
+    };
+    // Tenant and user scope come exclusively from verified claims. Query
+    // parameters may choose a role but cannot resolve another tenant's rules.
+    let tenant_id = claims.tenant_id();
+    let user_id = claims.actor_id();
     let role = params.get("role").map(|s| s.as_str()).unwrap_or("");
     match state.prompts.resolve(tenant_id, user_id, role) {
         Some(resolved) => Json(json!({ "status": "ok", "resolved": resolved })).into_response(),

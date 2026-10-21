@@ -7,7 +7,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -24,7 +24,7 @@ use crate::knowledge_graph::types::{EdgeDef, LLMExtractionOutput, NodeDef};
 use crate::memory::l2_blackboard::QueryFilter;
 
 use super::iam::UserIdentity;
-use super::AppState;
+use super::{parse_verified_query, AppState};
 
 #[derive(Deserialize)]
 pub struct NodeWriteRequest {
@@ -725,7 +725,7 @@ pub(crate) struct BlackboardNodesQuery {
 pub(crate) async fn list_blackboard_nodes_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Query(q): Query<BlackboardNodesQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     let Some(claims) = identity.isolation_claims() else {
         return (
@@ -733,6 +733,10 @@ pub(crate) async fn list_blackboard_nodes_handler(
             Json(json!({"error": "verified isolation claims required for blackboard access"})),
         )
             .into_response();
+    };
+    let q: BlackboardNodesQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
     };
     let task_iri = q.task_iri.trim().to_string();
     if task_iri.is_empty() {

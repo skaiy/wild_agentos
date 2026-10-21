@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Query},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Router,
+    Json, Router,
 };
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::batch::manager::BatchAgentManager;
@@ -52,6 +54,34 @@ pub(crate) mod provider_outbound;
 pub mod runtime;
 pub mod skills;
 pub mod tasks;
+
+/// Parse a query string only after the handler has authenticated the caller.
+///
+/// Axum's `Query` extractor rejects malformed input before a handler runs,
+/// which would otherwise expose parser behavior to unauthenticated callers.
+pub(crate) fn parse_verified_query<T: DeserializeOwned>(
+    raw: Option<&str>,
+) -> Result<T, Box<Response>> {
+    let uri = match raw {
+        Some(query) if !query.is_empty() => format!("http://localhost/?{query}"),
+        _ => "http://localhost/".to_string(),
+    };
+    let uri = uri
+        .parse()
+        .map_err(|_| Box::new(invalid_query_response()))?;
+    match Query::<T>::try_from_uri(&uri) {
+        Ok(Query(value)) => Ok(value),
+        Err(_) => Err(Box::new(invalid_query_response())),
+    }
+}
+
+pub(crate) fn invalid_query_response() -> Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "invalid query string"})),
+    )
+        .into_response()
+}
 
 use agents::{
     activate_agent_revision_handler, create_agent_handler, create_agent_revision_handler,
