@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::gateway::unified_gateway::{ChatContent, ChatMessage};
 use crate::isolation::IsolationClaims;
@@ -308,6 +309,166 @@ fn extract_fault_code_tokens(message: &str) -> Vec<String> {
     tokens
 }
 
+/// Extract literal diagnostic-code tokens for non-built-in pack RAG.
+///
+/// Numeric diagnostic codes are limited to four or five digits and cannot
+/// start with zero. Calendar years, phone fragments, VINs and VIN-like
+/// truncated values are excluded. Alphanumeric codes may include underscores
+/// (for example `CP_A055` and `NIO_WL_021`).
+fn extract_pack_fault_code_tokens(message: &str) -> Vec<String> {
+    let message = message.nfkc().collect::<String>();
+    let message = message.as_str();
+    let phone_fragments = separated_phone_fragments(message);
+    let lower_message = message.to_ascii_lowercase();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let flush = |current: &mut String, tokens: &mut Vec<String>| {
+        let is_numeric_code = (4..=5).contains(&current.len())
+            && current.chars().all(|character| character.is_ascii_digit())
+            && !current.starts_with('0')
+            && !is_year_number(current, message)
+            && !phone_fragments.contains(current)
+            && !is_mileage_number(current, &lower_message, message);
+        let is_alphanumeric_code = current.len() >= 4
+            && current
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            && current
+                .chars()
+                .any(|character| character.is_ascii_alphabetic())
+            && current.chars().any(|character| character.is_ascii_digit())
+            && !is_license_plate_like(current)
+            && !is_mileage_like(current)
+            && !is_usb_like(&current.to_ascii_uppercase())
+            && !contains_vin_like_run(current);
+        if is_numeric_code || is_alphanumeric_code {
+            tokens.push(current.to_ascii_lowercase());
+        }
+        current.clear();
+    };
+    for character in message.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            current.push(character);
+        } else {
+            flush(&mut current, &mut tokens);
+        }
+    }
+    flush(&mut current, &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn is_year_number(number: &str, message: &str) -> bool {
+    let Ok(year) = number.parse::<u16>() else {
+        return false;
+    };
+    if !(1990..=2035).contains(&year) {
+        return false;
+    }
+    message.match_indices(number).any(|(start, _)| {
+        let after = message[start + number.len()..].trim_start();
+        after.starts_with("年份") || after.starts_with("年款") || after.starts_with('年')
+    })
+}
+
+fn is_mileage_number(number: &str, lower_message: &str, message: &str) -> bool {
+    lower_message.contains(&format!("{number}km"))
+        || lower_message.contains(&format!("{number} km"))
+        || message.contains(&format!("里程{number}"))
+        || message.contains(&format!("里程 {number}"))
+}
+
+fn separated_phone_fragments(message: &str) -> std::collections::HashSet<String> {
+    let groups: Vec<(String, usize, usize)> =
+        message
+            .char_indices()
+            .fold(Vec::new(), |mut groups, (index, character)| {
+                if character.is_ascii_digit() {
+                    if let Some((digits, _, end)) = groups.last_mut() {
+                        if *end == index {
+                            digits.push(character);
+                            *end += character.len_utf8();
+                            return groups;
+                        }
+                    }
+                    groups.push((character.to_string(), index, index + character.len_utf8()));
+                }
+                groups
+            });
+    let mut fragments = std::collections::HashSet::new();
+    for start in 0..groups.len() {
+        let mut digits = String::new();
+        for end in start..groups.len() {
+            if end > start
+                && !message[groups[end - 1].2..groups[end].1]
+                    .chars()
+                    .all(|character| matches!(character, '+' | '-' | '(' | ')' | ' ' | '\t'))
+            {
+                break;
+            }
+            digits.push_str(&groups[end].0);
+            if digits.len() > 11 {
+                break;
+            }
+            if digits.len() == 11 && digits.starts_with('1') {
+                fragments.extend(
+                    groups[start..=end]
+                        .iter()
+                        .map(|(group, _, _)| group.clone()),
+                );
+            }
+        }
+    }
+    fragments
+}
+
+fn is_license_plate_like(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let leading_letters = bytes
+        .iter()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .count();
+    let trailing_digits = bytes[leading_letters..]
+        .iter()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    (1..=2).contains(&leading_letters)
+        && (5..=6).contains(&trailing_digits)
+        && leading_letters + trailing_digits == bytes.len()
+}
+
+fn is_mileage_like(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.strip_suffix("km").is_some_and(|number| {
+        !number.is_empty() && number.bytes().all(|character| character.is_ascii_digit())
+    })
+}
+
+fn is_usb_like(token: &str) -> bool {
+    token.strip_prefix("USB").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|character| character.is_ascii_digit())
+    })
+}
+
+/// A VIN uses a restricted uppercase alphabet; any 16/17-character contiguous
+/// run is treated as VIN-like so prefixes/suffixes cannot turn it into a code.
+fn contains_vin_like_run(token: &str) -> bool {
+    let mut run = 0usize;
+    for character in token.bytes() {
+        let allowed = character.is_ascii_alphanumeric();
+        if allowed {
+            run += 1;
+            if run >= 16 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
 fn ev_repair_retrieval_query(code_tokens: &[String]) -> Option<String> {
     if code_tokens.is_empty() {
         return None;
@@ -372,6 +533,48 @@ fn format_vector_hits_section(hits: &[ScoredEntry]) -> String {
     section
 }
 
+async fn format_pack_vector_hits_section(
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    hits: &[ScoredEntry],
+) -> String {
+    let bases = state.knowledge_bases.read().await;
+    let mut section = String::from("【向量知识库检索结果】\n");
+    for hit in hits {
+        let source = hit
+            .tags
+            .iter()
+            .find_map(|tag| tag.strip_prefix("kb:"))
+            .and_then(|kb_id| {
+                bases.iter().find_map(|base| {
+                    (base.get("id").and_then(Value::as_str) == Some(kb_id)
+                        && base.get("tenant_id").and_then(Value::as_str)
+                            == Some(claims.tenant_id())
+                        && base.get("project_id").and_then(Value::as_str)
+                            == Some(claims.project_id()))
+                    .then(|| base.get("name").and_then(Value::as_str))
+                    .flatten()
+                })
+            })
+            .unwrap_or("已挂载知识库");
+        if hit.score.is_nan() {
+            section.push_str(&format!(
+                "- （来源 {}）{}\n",
+                source,
+                truncate_retrieval_fact(&hit.text, 400)
+            ));
+        } else {
+            section.push_str(&format!(
+                "- （来源 {}，相关度 {:.2}）{}\n",
+                source,
+                hit.score,
+                truncate_retrieval_fact(&hit.text, 400)
+            ));
+        }
+    }
+    section
+}
+
 async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec<String> {
     let pack_ids: Vec<&str> = agent
         .get("knowledge_pack_ids")
@@ -423,9 +626,25 @@ async fn pack_scoped_vector_hits(
             message: "pack vector store unavailable".into(),
         });
     };
+    let exact_tokens = extract_pack_fault_code_tokens(question);
+    let mut exact_hits = Vec::new();
     let mut batches = Vec::with_capacity(kb_ids.len());
     for kb_id in kb_ids {
         let tag = kb_vector_tag(kb_id);
+        let mut exact_batch = store
+            .exact_matches_with_claims_and_required_tags(
+                claims,
+                std::slice::from_ref(&tag),
+                &exact_tokens,
+                3,
+            )
+            .await?;
+        for hit in &mut exact_batch {
+            // Exact code hits are ranked ahead of semantic results; a cosine
+            // score would be misleading to the model and customer.
+            hit.score = f32::NAN;
+        }
+        exact_hits.extend(exact_batch);
         let batch = store
             .search_with_claims_and_required_tags(
                 claims,
@@ -436,10 +655,18 @@ async fn pack_scoped_vector_hits(
             .await?;
         batches.push(batch);
     }
+    exact_hits.sort_by(|left, right| left.iri.cmp(&right.iri));
+    exact_hits.truncate(3);
+
     // Reserve one result per mounted KB before global ranking. This prevents a
     // large KB from consuming all eight response slots after prefiltering.
     let mut hits = Vec::with_capacity(PACK_VECTOR_RAG_TOTAL_LIMIT);
     let mut seen_iris = std::collections::HashSet::new();
+    for hit in exact_hits {
+        if seen_iris.insert(hit.iri.clone()) {
+            hits.push(hit);
+        }
+    }
     for batch in &batches {
         if let Some(hit) = batch.first() {
             if seen_iris.insert(hit.iri.clone()) {
@@ -601,7 +828,7 @@ async fn build_claims_scoped_prefix_messages(
         if hits.is_empty() {
             None
         } else {
-            Some(format_vector_hits_section(&hits))
+            Some(format_pack_vector_hits_section(state, claims, &hits).await)
         }
     } else if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
         ev_repair_legacy_vector_section(state, claims, &question).await?
@@ -1594,6 +1821,143 @@ mod tests {
             context.messages.last().unwrap().content.as_text(),
             "What does P0A80 mean?"
         );
+    }
+
+    #[test]
+    fn pack_fault_code_tokens_accept_codes_and_reject_dates_phone_and_vin() {
+        // fictional
+        let phone = "19900000000";
+        let separated_phone = "+86 199-0000-0000";
+        // fictional
+        let vin = "LTEST000000000001";
+        let truncated_vin = &vin[..16];
+        let vin_suffix = &vin[11..];
+        assert!(separated_phone_fragments(&separated_phone).contains("0000"));
+        assert!(contains_vin_like_run(&vin));
+        assert_eq!(
+            extract_pack_fault_code_tokens(&format!(
+                "Codes 1234 C1A10 CP_A055 NIO_WL_021; years 1999年 2024年 2099年; \
+                 phones {phone} {separated_phone}; VIN pre{vin}suffix \
+                 {truncated_vin} {vin_suffix}; ES8 京A12345 120000km",
+            ),),
+            vec![
+                "1234".to_string(),
+                "2099".to_string(),
+                "c1a10".to_string(),
+                "cp_a055".to_string(),
+                "nio_wl_021".to_string(),
+            ]
+        );
+        assert!(extract_pack_fault_code_tokens("odometer 12000 km; 里程 12345").is_empty());
+    }
+
+    #[test]
+    fn pack_fault_code_tokens_keep_unqualified_four_digit_codes() {
+        assert_eq!(
+            extract_pack_fault_code_tokens("故障码 2033；单独的 2027"),
+            vec!["2027", "2033"]
+        );
+    }
+
+    #[test]
+    fn pack_fault_code_tokens_accept_supported_diagnostic_code_forms() {
+        assert_eq!(
+            extract_pack_fault_code_tokens("2033 P0A01 BYD_WL_002 AITO_WL_038 PCS_A053"),
+            vec!["2033", "aito_wl_038", "byd_wl_002", "p0a01", "pcs_a053"]
+        );
+        assert!(extract_pack_fault_code_tokens("USB3 京AD12345").is_empty());
+    }
+
+    #[test]
+    fn pack_fault_code_tokens_reject_number_followed_by_year_marker() {
+        assert!(extract_pack_fault_code_tokens("2027年").is_empty());
+    }
+
+    #[test]
+    fn pack_fault_code_tokens_reject_model_year_context() {
+        assert!(extract_pack_fault_code_tokens("2024 年款").is_empty());
+    }
+
+    #[tokio::test]
+    async fn pack_rag_exact_code_match_precedes_vectors_and_stays_scoped() {
+        let state = make_state();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let foreign_claims =
+            IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
+        let vector_dir = std::env::temp_dir().join(format!("chat_exact_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vector_dir).unwrap();
+        let store = crate::memory::hyperspace_store::HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        let mounted_kb = "mounted-kb";
+        let unmounted_kb = "unmounted-kb";
+        store
+            .upsert_with_claims(
+                &claims,
+                "unrelated-vector-hit",
+                "general maintenance guidance unrelated to diagnostic codes",
+                &[kb_vector_tag(mounted_kb)],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "exact-mounted-hit",
+                "Fault code CP_A055: mounted KB repair procedure",
+                &[kb_vector_tag(mounted_kb)],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "exact-unmounted-hit",
+                "Fault code CP_A055: must not be retrieved from an unmounted KB",
+                &[kb_vector_tag(unmounted_kb)],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(
+                &foreign_claims,
+                "exact-foreign-hit",
+                "Fault code CP_A055: must not cross the tenant namespace",
+                &[kb_vector_tag(mounted_kb)],
+            )
+            .await
+            .unwrap();
+        state.vector_store.store(Some(Arc::new(store)));
+
+        let hits = pack_scoped_vector_hits(
+            &state,
+            &claims,
+            "How should I handle fault CP_A055?",
+            &[mounted_kb.to_string()],
+        )
+        .await;
+        let hits = hits.unwrap();
+
+        let expected_iri = format!("{}#exact-mounted-hit", claims.vector_namespace().unwrap());
+        assert_eq!(
+            hits.first().map(|hit| hit.iri.as_str()),
+            Some(expected_iri.as_str())
+        );
+        assert!(hits
+            .iter()
+            .all(|hit| !hit.text.contains("unmounted") && !hit.text.contains("cross the tenant")));
+        state.knowledge_bases.write().await.push(json!({
+            "id": mounted_kb,
+            "name": "Mounted repair manual",
+            "tenant_id": claims.tenant_id(),
+            "project_id": claims.project_id(),
+        }));
+        let rendered = format_pack_vector_hits_section(&state, &claims, &hits).await;
+        assert!(rendered.contains("Mounted repair manual"));
+        assert!(!rendered.contains(&expected_iri));
+        assert!(!rendered.contains("相关度 NaN"));
     }
 
     #[tokio::test]
