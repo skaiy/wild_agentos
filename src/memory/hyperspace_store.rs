@@ -740,6 +740,35 @@ impl HyperspaceStore {
         ))
     }
 
+    /// Finds case-insensitive literal token matches in chunks already limited
+    /// to a verified namespace and required tags. A metadata/filter miss
+    /// returns no rows; this method never falls back to a broader listing.
+    pub async fn exact_matches_with_claims_and_required_tags(
+        &self,
+        claims: &IsolationClaims,
+        required_tags: &[String],
+        tokens: &[String],
+        limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut matches: Vec<ScoredEntry> = self
+            .entries_with_claims_and_required_tags(claims, required_tags)
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                let text = entry.text.to_ascii_lowercase();
+                tokens
+                    .iter()
+                    .any(|token| contains_ascii_token(&text, token))
+            })
+            .collect();
+        matches.sort_by(|left, right| left.iri.cmp(&right.iri));
+        matches.truncate(limit as usize);
+        Ok(matches)
+    }
+
     async fn search_with_filter_inner(
         &self,
         query: &str,
@@ -905,6 +934,23 @@ impl HyperspaceStore {
     }
 }
 
+fn contains_ascii_token(text: &str, token: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let token = token.to_ascii_lowercase();
+    text.match_indices(&token).any(|(index, _)| {
+        let before_is_word = text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        let after_index = index + token.len();
+        let after_is_word = text[after_index..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        !before_is_word && !after_is_word
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,6 +1033,42 @@ mod tests {
             .search_with_claims_and_required_tags(&claims, "query", &[], 5)
             .await
             .is_err());
+    }
+
+    #[test]
+    fn exact_token_match_does_not_match_inside_larger_codes() {
+        assert!(contains_ascii_token("fault C1A10 confirmed", "c1a10"));
+        assert!(contains_ascii_token("fault 2033 confirmed", "2033"));
+        assert!(!contains_ascii_token("fault C1A100 confirmed", "c1a10"));
+        assert!(!contains_ascii_token("fault 12033 confirmed", "2033"));
+    }
+
+    #[tokio::test]
+    async fn exact_matches_respect_the_requested_limit() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        for index in 0..4 {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("entry-{index}"),
+                    "Fault C1A10 repair instruction",
+                    &["kb:kb-a".into()],
+                )
+                .await
+                .unwrap();
+        }
+
+        let matches = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:kb-a".into()],
+                &["c1a10".into()],
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 3);
     }
 
     #[tokio::test]
