@@ -785,14 +785,12 @@ mod tests {
     use serde_json::json;
 
     fn setup_engine(dir: &Path) -> HyperspaceEngineImpl {
-        HyperspaceEngineImpl::open(
-            dir,
-            WalSyncMode::Strict,
-            4,
-            Box::new(CosineMetric),
-            HnswConfig::default(),
-        )
-        .unwrap()
+        setup_engine_with_config(dir, HnswConfig::default())
+    }
+
+    fn setup_engine_with_config(dir: &Path, config: HnswConfig) -> HyperspaceEngineImpl {
+        HyperspaceEngineImpl::open(dir, WalSyncMode::Strict, 4, Box::new(CosineMetric), config)
+            .unwrap()
     }
 
     fn v(coords: Vec<f64>) -> EmbeddingVector {
@@ -801,6 +799,11 @@ mod tests {
 
     fn setup_async_engine(dir: &Path) -> HyperspaceEngineImpl {
         setup_engine(dir)
+    }
+
+    fn sequential_unit_vector(index: usize, total: usize) -> EmbeddingVector {
+        let angle = (index + 1) as f64 * std::f64::consts::FRAC_PI_2 / (total + 1) as f64;
+        v(vec![angle.cos(), angle.sin(), 0.0, 0.0])
     }
 
     #[tokio::test]
@@ -935,6 +938,55 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|h| h.iri == "doc:1"));
         assert!(results.iter().any(|h| h.iri == "note:1"));
+    }
+
+    #[tokio::test]
+    async fn test_sequential_inserts_preserve_self_recall_through_tag_filtering() {
+        let config = HnswConfig {
+            m: 16,
+            ef_search: 50,
+            level_mult: 0.0,
+            ..HnswConfig::default()
+        };
+        let tag_filter = JsonLdFilter::tag("tags", "self-recall");
+
+        for total in [64, 256, 1000] {
+            let dir = tempfile::tempdir().unwrap();
+            let eng = setup_engine_with_config(dir.path(), config.clone());
+
+            for index in 0..total {
+                eng.insert(
+                    &format!("recall:{index}"),
+                    sequential_unit_vector(index, total),
+                    json!({"tags": ["self-recall"]}),
+                )
+                .await
+                .unwrap();
+            }
+
+            for index in 0..total {
+                let query = sequential_unit_vector(index, total);
+                let expected_iri = format!("recall:{index}");
+                assert_eq!(
+                    eng.search(&query, 1, &[])
+                        .await
+                        .unwrap()
+                        .first()
+                        .map(|hit| hit.iri.as_str()),
+                    Some(expected_iri.as_str()),
+                    "unfiltered search should return vector {index} as its own nearest neighbor"
+                );
+                assert_eq!(
+                    eng.search(&query, 1, std::slice::from_ref(&tag_filter))
+                        .await
+                        .unwrap()
+                        .first()
+                        .map(|hit| hit.iri.as_str()),
+                    Some(expected_iri.as_str()),
+                    "tag-filtered search should return vector {index} as its own nearest neighbor"
+                );
+            }
+        }
     }
 
     #[tokio::test]

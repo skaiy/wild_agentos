@@ -197,20 +197,12 @@ impl IncrementalHNSW {
 
             // Set backward connections
             for &nid in &neighbor_ids {
-                let nu = nid as usize;
-                if nu < self.nodes.len() {
-                    if let Some(ref mut nbr) = self.nodes[nu] {
-                        if lvl == 0 {
-                            if nbr.neighbors0.len() < self.config.m0 {
-                                nbr.neighbors0.push(id);
-                            }
-                        } else if let Some(nbrs) = nbr.neighbors_upper.get_mut(lvl - 1) {
-                            if nbrs.len() < self.config.m {
-                                nbrs.push(id);
-                            }
-                        }
-                    }
-                }
+                let max_neighbors = if lvl == 0 {
+                    self.config.m0
+                } else {
+                    self.config.m
+                };
+                self.add_backlink(nid, id, lvl, max_neighbors);
             }
 
             if !nearest.is_empty() {
@@ -222,6 +214,49 @@ impl IncrementalHNSW {
         if level > ep_level {
             self.entry_point.store(id, Ordering::Release);
             self.max_layer.store(level, Ordering::Release);
+        }
+    }
+
+    /// Add a reciprocal edge while keeping the closest neighbors when a layer is full.
+    fn add_backlink(&mut self, neighbor_id: u32, id: u32, layer: usize, max_neighbors: usize) {
+        let source_vector = match self
+            .nodes
+            .get(neighbor_id as usize)
+            .and_then(|node| node.as_ref())
+        {
+            Some(node) => node.vector.clone(),
+            None => return,
+        };
+
+        let mut candidates = self.get_neighbors(neighbor_id, layer);
+        if !candidates.contains(&id) {
+            candidates.push(id);
+        }
+        candidates.sort_by(|left, right| {
+            let left_distance = self.metric.distance(
+                &source_vector,
+                &self.nodes[*left as usize].as_ref().unwrap().vector,
+            );
+            let right_distance = self.metric.distance(
+                &source_vector,
+                &self.nodes[*right as usize].as_ref().unwrap().vector,
+            );
+            left_distance
+                .partial_cmp(&right_distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(max_neighbors);
+
+        if let Some(node) = self
+            .nodes
+            .get_mut(neighbor_id as usize)
+            .and_then(|node| node.as_mut())
+        {
+            if layer == 0 {
+                node.neighbors0 = candidates;
+            } else if let Some(neighbors) = node.neighbors_upper.get_mut(layer - 1) {
+                *neighbors = candidates;
+            }
         }
     }
 
@@ -285,11 +320,15 @@ impl IncrementalHNSW {
             query_node,
             &self.nodes[entry as usize].as_ref().unwrap().vector,
         );
-        let mut c = vec![(entry, entry_dist)];
-        let mut i = 0;
+        let mut candidates = vec![(entry, entry_dist)];
+        let mut results = vec![(entry, entry_dist)];
+        self.visited_gen[entry as usize].store(gen, Ordering::Relaxed);
 
-        while i < c.len() {
-            let (current, _) = c[i];
+        while !candidates.is_empty() {
+            let (current, current_dist) = candidates.remove(0);
+            if results.len() >= ef && current_dist > results.last().unwrap().1 {
+                break;
+            }
             for &nid in &self.get_neighbors(current, layer) {
                 let nu = nid as usize;
                 if nu < self.visited_gen.len() {
@@ -302,23 +341,28 @@ impl IncrementalHNSW {
                     query_node,
                     &self.nodes[nid as usize].as_ref().unwrap().vector,
                 );
-                let pos = c
-                    .binary_search_by(|(_, dist)| {
-                        dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap_or_else(|e| e);
-                let already_in = pos < c.len() && c[pos].0 == nid;
-                if !already_in && (pos < ef || c.len() < ef) {
-                    c.insert(pos, (nid, d));
-                    if c.len() > ef {
-                        c.truncate(ef);
+                if results.len() < ef || d < results.last().unwrap().1 {
+                    let candidate_pos = candidates
+                        .binary_search_by(|(_, dist)| {
+                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap_or_else(|e| e);
+                    candidates.insert(candidate_pos, (nid, d));
+
+                    let result_pos = results
+                        .binary_search_by(|(_, dist)| {
+                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap_or_else(|e| e);
+                    results.insert(result_pos, (nid, d));
+                    if results.len() > ef {
+                        results.pop();
                     }
                 }
             }
-            i += 1;
         }
 
-        c.into_iter().map(|(id, _)| id).collect()
+        results.into_iter().map(|(id, _)| id).collect()
     }
 
     /// Public search: find nearest neighbors to a query vector.
@@ -423,11 +467,15 @@ impl IncrementalHNSW {
         let entry_dist = self
             .metric
             .distance(query, &self.nodes[entry as usize].as_ref().unwrap().vector);
-        let mut c = vec![(entry, entry_dist)];
-        let mut i = 0;
+        let mut candidates = vec![(entry, entry_dist)];
+        let mut results = vec![(entry, entry_dist)];
+        self.visited_gen[entry as usize].store(gen, Ordering::Relaxed);
 
-        while i < c.len() {
-            let (current, _) = c[i];
+        while !candidates.is_empty() {
+            let (current, current_dist) = candidates.remove(0);
+            if results.len() >= ef && current_dist > results.last().unwrap().1 {
+                break;
+            }
             let neighbors = self.get_neighbors(current, 0);
             for &nid in &neighbors {
                 let nu = nid as usize;
@@ -440,23 +488,28 @@ impl IncrementalHNSW {
                 let d = self
                     .metric
                     .distance(query, &self.nodes[nid as usize].as_ref().unwrap().vector);
-                let pos = c
-                    .binary_search_by(|(_, dist)| {
-                        dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap_or_else(|e| e);
-                let already_in = pos < c.len() && c[pos].0 == nid;
-                if !already_in && (pos < ef || c.len() < ef) {
-                    c.insert(pos, (nid, d));
-                    if c.len() > ef {
-                        c.truncate(ef);
+                if results.len() < ef || d < results.last().unwrap().1 {
+                    let candidate_pos = candidates
+                        .binary_search_by(|(_, dist)| {
+                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap_or_else(|e| e);
+                    candidates.insert(candidate_pos, (nid, d));
+
+                    let result_pos = results
+                        .binary_search_by(|(_, dist)| {
+                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap_or_else(|e| e);
+                    results.insert(result_pos, (nid, d));
+                    if results.len() > ef {
+                        results.pop();
                     }
                 }
             }
-            i += 1;
         }
 
-        c
+        results
     }
 
     /// Find the next available node ID (first live node).
@@ -499,13 +552,15 @@ impl IncrementalHNSW {
     }
 
     fn fix_entry_point(&self) {
-        let new_ep = self
+        let (new_ep, max_layer) = self
             .nodes
             .iter()
-            .position(|n| n.is_some())
-            .map(|i| i as u32)
-            .unwrap_or(u32::MAX);
+            .enumerate()
+            .filter_map(|(id, node)| node.as_ref().map(|node| (id as u32, node.level)))
+            .max_by_key(|&(_, level)| level)
+            .unwrap_or((u32::MAX, 0));
         self.entry_point.store(new_ep, Ordering::Release);
+        self.max_layer.store(max_layer, Ordering::Release);
     }
 
     fn fix_max_layer(&self) {
@@ -662,6 +717,49 @@ mod tests {
         assert_eq!(results.len(), 5);
         for (id, _) in &results {
             assert!(allowed.contains(*id), "ID {id} should be in allowed set");
+        }
+    }
+
+    fn sequential_unit_vector(index: usize, total: usize) -> EmbeddingVector {
+        let angle = (index + 1) as f64 * std::f64::consts::FRAC_PI_2 / (total + 1) as f64;
+        v(vec![angle.cos(), angle.sin(), 0.0, 0.0])
+    }
+
+    #[test]
+    fn test_sequential_inserts_preserve_self_recall_with_and_without_filter() {
+        let config = HnswConfig {
+            m: 16,
+            ef_search: 50,
+            level_mult: 0.0,
+            ..HnswConfig::default()
+        };
+
+        for total in [64, 256, 1000] {
+            let mut idx = IncrementalHNSW::new(Box::new(CosineMetric), config.clone());
+            let mut allowed = RoaringBitmap::new();
+
+            for id in 0..total as u32 {
+                idx.insert(id, sequential_unit_vector(id as usize, total));
+                allowed.insert(id);
+            }
+
+            for id in 0..total as u32 {
+                let query = sequential_unit_vector(id as usize, total);
+                assert_eq!(
+                    idx.search(&query, 1)
+                        .first()
+                        .map(|(result_id, _)| *result_id),
+                    Some(id),
+                    "unfiltered search should return vector {id} as its own nearest neighbor"
+                );
+                assert_eq!(
+                    idx.search_with_filter(&query, 1, Some(&allowed))
+                        .first()
+                        .map(|(result_id, _)| *result_id),
+                    Some(id),
+                    "filtered search should return vector {id} as its own nearest neighbor"
+                );
+            }
         }
     }
 
