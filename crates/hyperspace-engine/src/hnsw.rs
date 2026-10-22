@@ -111,8 +111,7 @@ impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> CmpOrdering {
         other
             .distance
-            .partial_cmp(&self.distance)
-            .unwrap_or(CmpOrdering::Equal)
+            .total_cmp(&self.distance)
             .then_with(|| other.id.cmp(&self.id))
     }
 }
@@ -273,9 +272,7 @@ impl IncrementalHNSW {
                 &source_vector,
                 &self.nodes[*right as usize].as_ref().unwrap().vector,
             );
-            left_distance
-                .partial_cmp(&right_distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            left_distance.total_cmp(&right_distance)
         });
         candidates.truncate(max_neighbors);
 
@@ -386,9 +383,7 @@ impl IncrementalHNSW {
                     });
 
                     let result_pos = results
-                        .binary_search_by(|(_, dist)| {
-                            dist.partial_cmp(&d).unwrap_or(CmpOrdering::Equal)
-                        })
+                        .binary_search_by(|(_, dist)| dist.total_cmp(&d))
                         .unwrap_or_else(|e| e);
                     results.insert(result_pos, (nid, d));
                     if results.len() > ef {
@@ -536,9 +531,7 @@ impl IncrementalHNSW {
                     });
 
                     let result_pos = results
-                        .binary_search_by(|(_, dist)| {
-                            dist.partial_cmp(&d).unwrap_or(CmpOrdering::Equal)
-                        })
+                        .binary_search_by(|(_, dist)| dist.total_cmp(&d))
                         .unwrap_or_else(|e| e);
                     results.insert(result_pos, (nid, d));
                     if results.len() > ef {

@@ -1021,20 +1021,17 @@ mod tests {
 
         let query_index = 23;
         let query = sequential_unit_vector(query_index * 2 + 1, 128);
-        let tenant_a_query_for_tenant_b =
-            JsonLdFilter::Must(vec![tenant_a_filter.clone(), tenant_b_filter.clone()]);
         let tenant_a_results = eng
-            .search(
-                &query,
-                1,
-                std::slice::from_ref(&tenant_a_query_for_tenant_b),
-            )
+            .search(&query, 10, std::slice::from_ref(&tenant_a_filter))
             .await
             .unwrap();
         assert!(
-            tenant_a_results.is_empty(),
-            "tenant A's filter must not match tenant B's content"
+            !tenant_a_results.is_empty(),
+            "tenant A should receive its own filtered results"
         );
+        assert!(tenant_a_results
+            .iter()
+            .all(|hit| hit.iri.starts_with("tenant-a:")));
 
         let tenant_b_results = eng
             .search(&query, 1, std::slice::from_ref(&tenant_b_filter))
