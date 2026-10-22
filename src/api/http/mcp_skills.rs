@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -28,7 +28,7 @@ use crate::tools::skill_registry::SkillMeta;
 
 use super::iam::{AuthMethod, UserIdentity};
 use super::{
-    data_dir,
+    data_dir, parse_verified_query,
     skills::{admission_snapshot, is_tenant_published_skill_async, skill_published_for_tenant},
     AppState,
 };
@@ -596,12 +596,16 @@ pub(crate) struct McpSkillExposureQuery {
 /// DELETE /api/v1/mcp/skill-exposures?skill_iri=... — DA-only unpublish.
 pub(crate) async fn delete_skill_exposure_handler(
     identity: UserIdentity,
-    Query(query): Query<McpSkillExposureQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     let (tenant_id, project_id) = match verified_exposure_scope(&identity, "skill exposure writes")
     {
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
+    };
+    let query: McpSkillExposureQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
     };
     let skill_iri = query.skill_iri;
     match run_exposure_blocking(move || delete_exposure_sync(tenant_id, project_id, skill_iri))

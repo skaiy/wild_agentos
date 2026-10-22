@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     http::{header, StatusCode},
     response::IntoResponse,
     Json,
@@ -18,7 +18,7 @@ use crate::tools::skill_pipeline::TenantPromotionReview;
 use crate::tools::skill_registry::SkillMeta;
 
 use super::iam::UserIdentity;
-use super::{data_dir, AppState};
+use super::{data_dir, parse_verified_query, AppState};
 
 /// 用户态注册技能的持久化文件路径（仅 POST 注册的技能，不含启动播种的默认技能）。
 fn skills_store_path() -> std::path::PathBuf {
@@ -777,8 +777,16 @@ spec:\n\
 /// GET /api/v1/skills/manifest?iri=... — 生成并下载指定技能的 skill.yaml。
 pub(crate) async fn skill_manifest_handler(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<SkillManifestQuery>,
+    identity: UserIdentity,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
+    if let Err(error) = identity.require_verified_isolation_claims("skill manifest access") {
+        return error.into_response();
+    }
+    let q: SkillManifestQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
     match state.core.skills.get_skill(&q.iri) {
         Some(skill) => {
             let sig = state.core.skills.verify_skill_signature(&skill);
@@ -912,12 +920,16 @@ pub(crate) async fn register_skill_handler(
 pub(crate) async fn delete_skill_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Query(q): Query<SkillManifestQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     // #302: process-global skill registry; platform administrator only.
     if let Err(e) = identity.require_platform_admin("skill registry writes") {
         return e.into_response();
     }
+    let q: SkillManifestQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
     if q.iri.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1476,25 +1488,49 @@ pub(crate) struct PipelineRunsQuery {
     limit: Option<usize>,
 }
 
-/// GET /api/v1/skills/pipeline-runs — 查询技能准入流水线运行记录（只读，无需鉴权）。
-/// 匿名响应去掉发布者 tenant/project；磁盘上的记录仍保留这两项。
+/// GET /api/v1/skills/pipeline-runs — 查询调用方 tenant/project 的运行记录。
 fn redact_pipeline_run(run: &crate::tools::skill_pipeline::PipelineRun) -> Value {
     let mut value = serde_json::to_value(run).unwrap_or(Value::Null);
     if let Some(object) = value.as_object_mut() {
         object.remove("publisher_tenant_id");
         object.remove("publisher_project_id");
+        object.remove("triggered_by");
     }
     value
 }
 
 pub(crate) async fn list_pipeline_runs_handler(
-    Query(q): Query<PipelineRunsQuery>,
+    identity: UserIdentity,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "verified_isolation_claims_required",
+                    "message": "verified isolation claims required for pipeline run history",
+                })),
+            )
+                .into_response()
+        }
+    };
+    let q: PipelineRunsQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let tenant_id = claims.tenant_id().to_string();
+    let project_id = claims.project_id().to_string();
     let mut runs = match tokio::task::spawn_blocking(pipeline_runs_snapshot).await {
         Ok(Ok(runs)) => runs,
         Ok(Err(error)) => return pipeline_store_failure(error),
         Err(error) => return pipeline_store_failure(error),
     };
+    runs.retain(|run| {
+        publisher_tenant(run) == Some(tenant_id.as_str())
+            && publisher_project(run) == Some(project_id.as_str())
+    });
     if let Some(iri) = q.iri.filter(|s| !s.is_empty()) {
         runs.retain(|r| r.skill_iri == iri);
     }
@@ -2293,11 +2329,19 @@ version: \"2.0.0\"\n\
             .route("/api/v1/skills/manifest", get(skill_manifest_handler))
             .with_state(state);
 
-        let req = axum::http::Request::builder()
+        let unauthenticated = axum::http::Request::builder()
             .uri("/api/v1/skills/manifest?iri=skill://test/hello")
             .body(axum::body::Body::empty())
             .unwrap();
+        let resp = router.clone().oneshot(unauthenticated).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
+        let _auth = platform_admin_env();
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/skills/manifest?iri=skill://test/hello")
+            .header("authorization", platform_admin_bearer())
+            .body(axum::body::Body::empty())
+            .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp
@@ -2337,8 +2381,10 @@ version: \"2.0.0\"\n\
             .route("/api/v1/skills/manifest", get(skill_manifest_handler))
             .with_state(state);
 
+        let _auth = platform_admin_env();
         let req = axum::http::Request::builder()
             .uri("/api/v1/skills/manifest?iri=skill://notfound/x")
+            .header("authorization", platform_admin_bearer())
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -2500,11 +2546,12 @@ version: \"2.0.0\"\n\
     }
 
     /// GET 一个 URI，返回 (状态码, 解析后的 body)。
-    async fn get_json(router: &Router, uri: &str) -> (StatusCode, Value) {
-        let req = axum::http::Request::builder()
-            .uri(uri)
-            .body(axum::body::Body::empty())
-            .unwrap();
+    async fn get_json(router: &Router, uri: &str, ident: Option<&str>) -> (StatusCode, Value) {
+        let mut builder = axum::http::Request::builder().uri(uri);
+        if let Some(ident) = ident {
+            builder = builder.header("authorization", ident);
+        }
+        let req = builder.body(axum::body::Body::empty()).unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
@@ -2512,6 +2559,73 @@ version: \"2.0.0\"\n\
             .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v)
+    }
+
+    fn tenant_bearer(tenant_id: &str, project_id: &str) -> String {
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: format!("{tenant_id}-user"),
+                tenant_id: tenant_id.into(),
+                project_id: Some(project_id.into()),
+                roles: vec![],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .unwrap();
+        format!("Bearer {token}")
+    }
+
+    #[tokio::test]
+    async fn pipeline_run_history_requires_auth_and_is_tenant_project_scoped() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = super::super::control_plane_route_auth_tests::EnvGuard::set(&[
+            ("AGENTOS_AUTH_MODE", "hs256".into()),
+            ("AGENTOS_AUTH_STRICT", "true".into()),
+            ("AGENTOS_JWT_SECRET", TEST_JWT_SECRET.into()),
+            (
+                "AGENTOS_DATA_DIR",
+                tmp.path().to_string_lossy().into_owned(),
+            ),
+        ]);
+        let state = make_state(tmp.path());
+        let registry = crate::tools::skill_registry::SkillRegistry::new();
+        let mut context = crate::tools::skill_pipeline::PipelineContext::local(
+            crate::tools::skill_pipeline::PipelineSource::Manual,
+            "sensitive-trigger",
+        );
+        context.record_publisher("tenant-a", "project-a");
+        let run = crate::tools::skill_pipeline::run_pipeline(
+            &registry,
+            &sample_skill(),
+            &context,
+            Box::new(|_| Ok("published".into())),
+        );
+        append_pipeline_run(&run).unwrap();
+        let router = Router::new()
+            .route(
+                "/api/v1/skills/pipeline-runs",
+                get(list_pipeline_runs_handler),
+            )
+            .with_state(state);
+
+        let (status, _) = get_json(&router, "/api/v1/skills/pipeline-runs", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let tenant_b = tenant_bearer("tenant-b", "project-b");
+        let (status, other_tenant) =
+            get_json(&router, "/api/v1/skills/pipeline-runs", Some(&tenant_b)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(other_tenant["count"], 0);
+
+        let tenant_a = tenant_bearer("tenant-a", "project-a");
+        let (status, own_tenant) =
+            get_json(&router, "/api/v1/skills/pipeline-runs", Some(&tenant_a)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(own_tenant["count"], 1);
+        assert!(own_tenant["runs"][0].get("triggered_by").is_none());
     }
 
     /// 合法技能注册 → 201 CREATED，门禁放行且已发布，运行记录持久化并可经查询接口检索。
@@ -2554,6 +2668,7 @@ version: \"2.0.0\"\n\
         let (st, listed) = get_json(
             &router,
             "/api/v1/skills/pipeline-runs?iri=skill://platform/ok",
+            Some(&ident),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -2621,6 +2736,7 @@ version: \"2.0.0\"\n\
         let (st, listed) = get_json(
             &router,
             "/api/v1/skills/pipeline-runs?iri=skill://platform/bad",
+            Some(&ident),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -2680,6 +2796,7 @@ version: \"2.0.0\"\n\
         let (st, listed) = get_json(
             &router,
             "/api/v1/skills/pipeline-runs?iri=skill://platform/rerun",
+            Some(&ident),
         )
         .await;
         assert_eq!(st, StatusCode::OK);

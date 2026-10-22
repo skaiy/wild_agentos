@@ -13,7 +13,7 @@ use std::{collections::HashMap, sync::LazyLock};
 use tokio::sync::Notify;
 
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use super::api_gov::{self, ApiClient, ApiKey};
 use super::iam::UserIdentity;
-use super::AppState;
+use super::{parse_verified_query, AppState};
 
 #[cfg(test)]
 type IssuePause = (Arc<Notify>, Arc<Notify>);
@@ -479,11 +479,15 @@ pub struct AuditQuery {
 pub(crate) async fn list_api_audit_handler(
     State(state): State<Arc<AppState>>,
     identity: UserIdentity,
-    Query(q): Query<AuditQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     if let Err(error) = identity.require_control_plane_da("API audit access") {
         return error.into_response();
     }
+    let q: AuditQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
     let tenant = identity
         .isolation_claims()
         .expect("DA claims required")

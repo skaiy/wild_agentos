@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, RawQuery, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -25,6 +25,7 @@ use crate::{
 
 use super::{
     iam::UserIdentity,
+    parse_verified_query,
     skills::{
         append_pipeline_runs_async, pipeline_write_response, reject_skill_iri_write,
         MARKET_PACKAGE_SKILL_CAP,
@@ -364,11 +365,15 @@ pub(crate) async fn publish_package_handler(
 /// GET /api/v1/market/packages — list only packages visible to verified claims.
 pub(crate) async fn list_packages_handler(
     identity: UserIdentity,
-    Query(query): Query<CatalogQuery>,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
     let claims = match claims_or_unauthorized(&identity) {
         Ok(claims) => claims,
         Err(response) => return response,
+    };
+    let query: CatalogQuery = match parse_verified_query(raw.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
     };
     let packages: Vec<_> = load_packages()
         .into_iter()

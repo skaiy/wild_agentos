@@ -5,14 +5,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::prompt_registry::PromptVersion;
 
 use super::iam::UserIdentity;
-use super::AppState;
+use super::{parse_verified_query, AppState};
 
 /// GET /api/v1/prompts — 列举所有 Prompt 版本
 pub(crate) async fn list_prompts_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -157,16 +162,30 @@ pub(crate) async fn delete_prompt_handler(
 /// GET /api/v1/prompts/resolve?tenant_id=&user_id=&role= — 灰度路由决策
 pub(crate) async fn resolve_prompt_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    identity: UserIdentity,
+    RawQuery(raw): RawQuery,
 ) -> impl IntoResponse {
-    let tenant_id = params
-        .get("tenant_id")
-        .map(|s| s.as_str())
-        .unwrap_or("default");
-    let user_id = params
-        .get("user_id")
-        .map(|s| s.as_str())
-        .unwrap_or("anonymous");
+    let claims = match identity.isolation_claims() {
+        Some(claims) => claims,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "verified_isolation_claims_required",
+                    "message": "verified isolation claims required for prompt resolution",
+                })),
+            )
+                .into_response()
+        }
+    };
+    let params: HashMap<String, String> = match parse_verified_query(raw.as_deref()) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    // Tenant and user scope come exclusively from verified claims. Query
+    // parameters may choose a role but cannot resolve another tenant's rules.
+    let tenant_id = claims.tenant_id();
+    let user_id = claims.actor_id();
     let role = params.get("role").map(|s| s.as_str()).unwrap_or("");
     match state.prompts.resolve(tenant_id, user_id, role) {
         Some(resolved) => Json(json!({ "status": "ok", "resolved": resolved })).into_response(),
