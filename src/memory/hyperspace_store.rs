@@ -592,15 +592,98 @@ impl HyperspaceStore {
         required_tags: &[String],
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let filter = HybridSearchFilter::new().with_must_tags(required_tags.to_vec());
-        let candidate_limit = self.count().await?.min(usize::MAX as u64);
-        Ok(self
-            .search_with_claims(claims, query, &filter, candidate_limit)
-            .await?
-            .into_iter()
-            .filter(|entry| required_tags.iter().all(|tag| entry.tags.contains(tag)))
-            .take(limit as usize)
-            .collect())
+        // HNSW applies its allowed bitmap after producing a global candidate
+        // beam. That lets a large KB crowd out a small, mounted KB before the
+        // required tag can be checked. Enumerate the already scoped/tagged
+        // candidates first, then score just that set. This is deliberately
+        // fail-closed: both the minted namespace and every required tag are
+        // verified from stored metadata before a vector is read.
+        let candidates = self
+            .entries_with_claims_and_required_tags(claims, required_tags)
+            .await?;
+        let query =
+            EmbeddingVector::from_f32_slice(&self.get_embedding(query).await, MetricKind::Cosine)
+                .map_err(|e| CoreError::Internal {
+                message: format!("EmbeddingVector: {e}"),
+            })?;
+        let mut scored = Vec::with_capacity(candidates.len());
+        for mut entry in candidates {
+            let Some(vector) =
+                self.engine
+                    .get_vector(&entry.iri)
+                    .await
+                    .map_err(|e| CoreError::Internal {
+                        message: format!("Hyperspace vector read: {e}"),
+                    })?
+            else {
+                continue;
+            };
+            // The store is configured with CosineMetric, whose engine score is
+            // negative distance (dot product minus one).
+            entry.score = query
+                .coords
+                .iter()
+                .zip(vector.coords.iter())
+                .map(|(left, right)| left * right)
+                .sum::<f64>() as f32
+                - 1.0;
+            scored.push(entry);
+        }
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(limit as usize);
+        Ok(scored)
+    }
+
+    /// Returns chunks in the verified namespace that carry every required
+    /// server-owned tag. This is intentionally not exposed as an unscoped
+    /// listing API: callers must supply verified claims and required tags.
+    async fn entries_with_claims_and_required_tags(
+        &self,
+        claims: &IsolationClaims,
+        required_tags: &[String],
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        if required_tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        let namespace_prefix = format!("{namespace}#");
+        let count = self.count().await?.min(usize::MAX as u64) as usize;
+        let hits = self
+            .engine
+            .list(0, count)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace list: {e}"),
+            })?;
+        Ok(Self::scored_hits_to_entries(
+            hits.into_iter()
+                .filter(|hit| {
+                    hit.iri.starts_with(&namespace_prefix)
+                        && hit
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.get("named_graph"))
+                            .and_then(Value::as_str)
+                            == Some(namespace.as_str())
+                        && required_tags.iter().all(|tag| {
+                            hit.payload
+                                .as_ref()
+                                .and_then(|payload| payload.get("tags"))
+                                .and_then(Value::as_array)
+                                .is_some_and(|tags| {
+                                    tags.iter().any(|stored| stored.as_str() == Some(tag))
+                                })
+                        })
+                })
+                .collect(),
+        ))
     }
 
     async fn search_with_filter_inner(

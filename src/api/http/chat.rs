@@ -428,7 +428,7 @@ async fn pack_scoped_vector_hits(
             .search_with_claims_and_required_tags(
                 claims,
                 question,
-                &[tag],
+                std::slice::from_ref(&tag),
                 PACK_VECTOR_RAG_PER_KB_LIMIT,
             )
             .await
@@ -449,6 +449,7 @@ async fn pack_scoped_vector_hits(
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    hits.dedup_by(|left, right| left.iri == right.iri);
     hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
     hits
 }
@@ -1568,6 +1569,54 @@ mod tests {
             context.messages.last().unwrap().content.as_text(),
             "What does P0A80 mean?"
         );
+    }
+
+    #[tokio::test]
+    async fn pack_rag_retrieves_relevant_small_mounted_kb_alongside_large_kb() {
+        let state = make_state();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let vector_dir = std::env::temp_dir().join(format!("chat_per_kb_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vector_dir).unwrap();
+        let store = crate::memory::hyperspace_store::HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        let large_kb = "large-kb";
+        let small_kb = "small-kb";
+        for index in 0..64 {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("large-{index}"),
+                    &format!("large library routine maintenance entry {index}"),
+                    &[kb_vector_tag(large_kb)],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_with_claims(
+                &claims,
+                "small-relevant",
+                "The compact inverter guide explains zircon pulse calibration.",
+                &[kb_vector_tag(small_kb)],
+            )
+            .await
+            .unwrap();
+        state.vector_store.store(Some(Arc::new(store)));
+
+        let hits = pack_scoped_vector_hits(
+            &state,
+            &claims,
+            "Where is zircon pulse calibration documented?",
+            &[large_kb.to_string(), small_kb.to_string()],
+        )
+        .await;
+
+        assert!(hits
+            .iter()
+            .any(|hit| hit.text.contains("zircon pulse calibration")));
     }
 
     #[tokio::test]
