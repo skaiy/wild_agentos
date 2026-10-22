@@ -414,43 +414,61 @@ async fn pack_scoped_vector_hits(
     claims: &IsolationClaims,
     question: &str,
     kb_ids: &[String],
-) -> Vec<ScoredEntry> {
+) -> Result<Vec<ScoredEntry>, crate::CoreError> {
     if kb_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(store) = state.vector_store.load_full() else {
-        return Vec::new();
+        return Err(crate::CoreError::Internal {
+            message: "pack vector store unavailable".into(),
+        });
     };
-    let mut hits = Vec::new();
+    let mut batches = Vec::with_capacity(kb_ids.len());
     for kb_id in kb_ids {
         let tag = kb_vector_tag(kb_id);
-        match store
+        let batch = store
             .search_with_claims_and_required_tags(
                 claims,
                 question,
-                &[tag],
+                std::slice::from_ref(&tag),
                 PACK_VECTOR_RAG_PER_KB_LIMIT,
             )
-            .await
-        {
-            Ok(batch) => hits.extend(batch),
-            Err(error) => {
-                tracing::warn!(
-                    kb_id = %kb_id,
-                    error = %error,
-                    "pack-scoped chat vector retrieval failed; omitting hits for this KB"
-                );
+            .await?;
+        batches.push(batch);
+    }
+    // Reserve one result per mounted KB before global ranking. This prevents a
+    // large KB from consuming all eight response slots after prefiltering.
+    let mut hits = Vec::with_capacity(PACK_VECTOR_RAG_TOTAL_LIMIT);
+    let mut seen_iris = std::collections::HashSet::new();
+    for batch in &batches {
+        if let Some(hit) = batch.first() {
+            if seen_iris.insert(hit.iri.clone()) {
+                hits.push(hit.clone());
+                if hits.len() == PACK_VECTOR_RAG_TOTAL_LIMIT {
+                    return Ok(hits);
+                }
             }
         }
     }
-    hits.sort_by(|left, right| {
+    let mut remaining: Vec<ScoredEntry> = batches
+        .into_iter()
+        .flat_map(|batch| batch.into_iter().skip(1))
+        .collect();
+    remaining.sort_by(|left, right| {
         right
             .score
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
-    hits
+    for hit in remaining {
+        if seen_iris.insert(hit.iri.clone()) {
+            hits.push(hit);
+            if hits.len() == PACK_VECTOR_RAG_TOTAL_LIMIT {
+                break;
+            }
+        }
+    }
+    Ok(hits)
 }
 
 async fn ev_repair_graph_retrieval(
@@ -571,7 +589,15 @@ async fn build_claims_scoped_prefix_messages(
     };
 
     let vector_section = if !pack_kb_ids.is_empty() {
-        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids).await;
+        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "pack-scoped chat vector retrieval unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({ "error": "知识包检索暂不可用，请稍后重试" }),
+                )
+            })?;
         if hits.is_empty() {
             None
         } else {
@@ -1568,6 +1594,55 @@ mod tests {
             context.messages.last().unwrap().content.as_text(),
             "What does P0A80 mean?"
         );
+    }
+
+    #[tokio::test]
+    async fn pack_rag_retrieves_relevant_small_mounted_kb_alongside_large_kb() {
+        let state = make_state();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let vector_dir = std::env::temp_dir().join(format!("chat_per_kb_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vector_dir).unwrap();
+        let store = crate::memory::hyperspace_store::HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        let large_kb = "large-kb";
+        let small_kb = "small-kb";
+        for index in 0..64 {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("large-{index}"),
+                    &format!("large library routine maintenance entry {index}"),
+                    &[kb_vector_tag(large_kb)],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_with_claims(
+                &claims,
+                "small-relevant",
+                "The compact inverter guide explains zircon pulse calibration.",
+                &[kb_vector_tag(small_kb)],
+            )
+            .await
+            .unwrap();
+        state.vector_store.store(Some(Arc::new(store)));
+
+        let hits = pack_scoped_vector_hits(
+            &state,
+            &claims,
+            "Where is zircon pulse calibration documented?",
+            &[large_kb.to_string(), small_kb.to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(hits
+            .iter()
+            .any(|hit| hit.text.contains("zircon pulse calibration")));
     }
 
     #[tokio::test]
