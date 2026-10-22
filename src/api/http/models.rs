@@ -66,7 +66,7 @@ fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn value_references_image(value: &Value, image_id: &str) -> bool {
+pub fn value_references_image(value: &Value, image_id: &str) -> bool {
     match value {
         Value::String(text) => {
             text == image_id

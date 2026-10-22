@@ -116,9 +116,13 @@ fn router(state: Arc<AppState>) -> Router {
         },
         kb::reindex_knowledge_base_handler,
         kb::{
-            create_kb_category_handler, create_knowledge_pack_handler, delete_kb_category_handler,
-            delete_knowledge_pack_handler, kb_document_raw_handler, update_kb_category_handler,
-            update_knowledge_pack_handler,
+            create_kb_category_handler, create_knowledge_base_handler,
+            create_knowledge_pack_handler, delete_kb_category_handler,
+            delete_knowledge_base_handler, delete_knowledge_pack_handler,
+            import_graph_knowledge_base_handler, ingest_knowledge_base_handler,
+            kb_document_raw_handler, materialize_rml_knowledge_base_handler,
+            update_kb_category_handler, update_knowledge_base_handler,
+            update_knowledge_pack_handler, upload_knowledge_base_handler,
         },
         market::{
             install_package_handler, publish_package_handler, rollback_package_handler,
@@ -164,6 +168,27 @@ fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/kb/categories/:id",
             put(update_kb_category_handler).delete(delete_kb_category_handler),
+        )
+        .route("/api/v1/kb/bases", post(create_knowledge_base_handler))
+        .route(
+            "/api/v1/kb/bases/:id",
+            put(update_knowledge_base_handler).delete(delete_knowledge_base_handler),
+        )
+        .route(
+            "/api/v1/kb/bases/:id/ingest",
+            post(ingest_knowledge_base_handler),
+        )
+        .route(
+            "/api/v1/kb/bases/:id/upload",
+            post(upload_knowledge_base_handler),
+        )
+        .route(
+            "/api/v1/kb/bases/:id/materialize-rml",
+            post(materialize_rml_knowledge_base_handler),
+        )
+        .route(
+            "/api/v1/kb/bases/:id/import-graph",
+            post(import_graph_knowledge_base_handler),
         )
         .route(
             "/api/v1/kb/bases/:id/documents/:doc_id/raw",
@@ -278,6 +303,33 @@ async fn isolation_contract_agent_and_kb_writes_reject_pa() {
             Method::DELETE,
             "/api/v1/kb/categories/category-a".to_string(),
             Value::Null,
+        ),
+        (Method::POST, "/api/v1/kb/bases".to_string(), json!({})),
+        (Method::PUT, "/api/v1/kb/bases/kb-a".to_string(), json!({})),
+        (
+            Method::DELETE,
+            "/api/v1/kb/bases/kb-a".to_string(),
+            Value::Null,
+        ),
+        (
+            Method::POST,
+            "/api/v1/kb/bases/kb-a/ingest".to_string(),
+            json!({}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/kb/bases/kb-a/upload".to_string(),
+            json!({}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/kb/bases/kb-a/materialize-rml".to_string(),
+            json!({}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/kb/bases/kb-a/import-graph".to_string(),
+            json!({}),
         ),
     ];
 
