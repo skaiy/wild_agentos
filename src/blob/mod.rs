@@ -30,6 +30,9 @@ pub trait BlobStore: Send + Sync {
         content_type: &str,
     ) -> Result<(), CoreError>;
     async fn get(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError>;
+    /// Read a historical tenant-scoped object. Callers must establish
+    /// tenant/project ownership from authoritative metadata before using it.
+    async fn get_legacy(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError>;
     async fn delete(&self, claims: &IsolationClaims, key: &str) -> Result<(), CoreError>;
     async fn exists(&self, claims: &IsolationClaims, key: &str) -> Result<bool, CoreError>;
     /// 后端标识（写入文档台账 blob_ref.backend）。
@@ -54,6 +57,20 @@ pub(crate) fn scoped_key(claims: &IsolationClaims, key: &str) -> Result<String, 
             message: format!("无法创建 blob tenant 前缀: {error}"),
         })?;
     Ok(format!("{prefix}{key}"))
+}
+
+pub(crate) fn legacy_scoped_key(claims: &IsolationClaims, key: &str) -> Result<String, CoreError> {
+    if key.is_empty()
+        || key.starts_with('/')
+        || key
+            .split('/')
+            .any(|component| component == "." || component == "..")
+    {
+        return Err(CoreError::Internal {
+            message: format!("非法相对 blob key: {key}"),
+        });
+    }
+    Ok(format!("{}/{}", claims.tenant_id(), key))
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -149,6 +166,14 @@ impl BlobStore for LocalFsBlobStore {
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("blob read: {e}"),
+            })
+    }
+    async fn get_legacy(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError> {
+        let path = self.safe_path(&legacy_scoped_key(claims, key)?)?;
+        tokio::fs::read(&path)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("blob legacy read: {e}"),
             })
     }
     async fn delete(&self, claims: &IsolationClaims, key: &str) -> Result<(), CoreError> {

@@ -22,11 +22,8 @@ use super::{
     iam::{JwtClaims, PLATFORM_ADMIN_ROLE, PLATFORM_ADMIN_TENANT_ENV},
     AppState, TEST_ENV_LOCK,
 };
+use crate::blob::LocalFsBlobStore;
 use crate::tools::prompt_registry::PromptVersion;
-use crate::{
-    blob::{BlobStore, LocalFsBlobStore},
-    isolation::IsolationClaims,
-};
 
 const SECRET: &str = "test-hs256-secret-at-least-32-bytes-long";
 
@@ -300,11 +297,22 @@ async fn isolation_contract_image_raw_is_isolated_per_project() {
     let mut state = test_state(dir.path());
     let blob = Arc::new(LocalFsBlobStore::new(dir.path().join("blobs")));
     Arc::get_mut(&mut state).unwrap().blob_store = Some(blob.clone());
-    let owner_claims = IsolationClaims::from_verified("tenant-a", "project-a", "owner").unwrap();
-    blob.put(&owner_claims, "images/image-a.png", b"image", "image/png")
-        .await
-        .unwrap();
-    let app = router(state);
+    std::fs::create_dir_all(dir.path().join("blobs/tenant-a/images")).unwrap();
+    std::fs::write(
+        dir.path().join("blobs/tenant-a/images/image-a.png"),
+        b"image",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("blobs/tenant-a/images/orphan.png"),
+        b"orphan",
+    )
+    .unwrap();
+    state.knowledge_bases.write().await.push(json!({
+        "id": "kb-a", "tenant_id": "tenant-a", "project_id": "project-a",
+        "documents": [{"image_id": "image-a.png"}]
+    }));
+    let app = router(state.clone());
 
     let foreign = token("tenant-a", &["PA"], Some("project-b"));
     let (status, _) = call(
@@ -327,6 +335,29 @@ async fn isolation_contract_image_raw_is_isolated_per_project() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+
+    state.knowledge_bases.write().await.push(json!({
+        "id": "kb-b", "tenant_id": "tenant-a", "project_id": "project-b",
+        "documents": [{"image_id": "image-a.png"}]
+    }));
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/v1/images/image-a.png/raw",
+        Caller::Bearer(&owner),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "ambiguous legacy image");
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/v1/images/orphan.png/raw",
+        Caller::Bearer(&owner),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "orphan legacy image");
 }
 
 /// KB document raw retrieval checks the ledger's tenant/project ownership
@@ -339,10 +370,8 @@ async fn isolation_contract_kb_document_raw_is_isolated_per_project() {
     let mut state = test_state(dir.path());
     let blob = Arc::new(LocalFsBlobStore::new(dir.path().join("blobs")));
     Arc::get_mut(&mut state).unwrap().blob_store = Some(blob.clone());
-    let owner_claims = IsolationClaims::from_verified("tenant-a", "project-a", "owner").unwrap();
-    blob.put(&owner_claims, "kb/kb-a/doc-a", b"document", "text/plain")
-        .await
-        .unwrap();
+    std::fs::create_dir_all(dir.path().join("blobs/tenant-a/kb/kb-a")).unwrap();
+    std::fs::write(dir.path().join("blobs/tenant-a/kb/kb-a/doc-a"), b"document").unwrap();
     state.knowledge_bases.write().await.push(json!({
         "id": "kb-a",
         "tenant_id": "tenant-a",
@@ -366,6 +395,16 @@ async fn isolation_contract_kb_document_raw_is_isolated_per_project() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let owner = token("tenant-a", &["PA"], Some("project-a"));
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/v1/kb/bases/kb-a/documents/doc-a/raw",
+        Caller::Bearer(&owner),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 fn prompt_body() -> Value {

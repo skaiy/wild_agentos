@@ -1618,7 +1618,13 @@ pub(crate) async fn kb_document_raw_handler(
         }
     };
     let key = format!("kb/{id}/{doc_id}");
-    match blob.get(claims, &key).await {
+    let bytes = match blob.get(claims, &key).await {
+        Ok(bytes) => Ok(bytes),
+        // The KB/document ledger was scoped to claims above, so a legacy
+        // tenant-only object may be read only for its recorded owner.
+        Err(_) => blob.get_legacy(claims, &key).await,
+    };
+    match bytes {
         Ok(bytes) => {
             let ct = doc
                 .get("content_type")
