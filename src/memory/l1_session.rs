@@ -1043,12 +1043,9 @@ mod tests {
     #[test]
     fn test_set_identity() {
         let mut session = L1Session::new("agent_1", "DA", "iri://task/abc");
-        session.set_identity(
-            Some("user_42".to_string()),
-            Some("tenant_dianlv".to_string()),
-        );
+        session.set_identity(Some("user_42".to_string()), Some("tenant_demo".to_string()));
         assert_eq!(session.user_id(), Some("user_42"));
-        assert_eq!(session.tenant_id(), Some("tenant_dianlv"));
+        assert_eq!(session.tenant_id(), Some("tenant_demo"));
     }
 
     #[test]
@@ -1062,13 +1059,10 @@ mod tests {
     #[test]
     fn test_summarize_propagates_identity() {
         let mut session = L1Session::new("agent_1", "DA", "iri://task/abc");
-        session.set_identity(
-            Some("user_42".to_string()),
-            Some("tenant_dianlv".to_string()),
-        );
+        session.set_identity(Some("user_42".to_string()), Some("tenant_demo".to_string()));
         session.add_summary("assistant", "done", None);
         let summary = session.summarize();
         assert_eq!(summary.user_id.as_deref(), Some("user_42"));
-        assert_eq!(summary.tenant_id.as_deref(), Some("tenant_dianlv"));
+        assert_eq!(summary.tenant_id.as_deref(), Some("tenant_demo"));
     }
 }
