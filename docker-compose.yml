@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: 10.0.0.33/wild-agentos/core:latest
+    image: ${AGENT_OS_IMAGE:-example.com/wild-agentos/core:latest}
     container_name: wild-agentos-core
     restart: unless-stopped
     ports:

@@ -162,7 +162,7 @@ guard before a connection is made:
 
 - absolute `http`/`https` URL without user credentials;
 - `PROVIDER_OUTBOUND_ALLOWED_ORIGINS` (comma-separated origins, e.g.
-  `https://llm.example.test,http://10.20.0.5:3000`), when set, is an exact
+  `https://llm.example.test,http://provider.example.test:3000`), when set, is an exact
   allowlist; a listed origin may resolve to private or loopback addresses;
   a malformed entry denies everything. **A hostname on the allowlist may
   resolve to an internal address**: whoever controls that name's DNS

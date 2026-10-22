@@ -31,7 +31,7 @@ const Settings: React.FC = () => {
             <Input value={server.wsBaseUrl} onChange={(e) => updateServerConfig({ wsBaseUrl: e.target.value })} placeholder="ws://localhost:8080" />
           </Form.Item>
           <Form.Item label="Temporal Server 地址">
-            <Input value={server.temporalHost} onChange={(e) => updateServerConfig({ temporalHost: e.target.value })} placeholder="172.17.15.197:7233" />
+            <Input value={server.temporalHost} onChange={(e) => updateServerConfig({ temporalHost: e.target.value })} placeholder="temporal.example.com:7233" />
           </Form.Item>
         </Form>
       ),

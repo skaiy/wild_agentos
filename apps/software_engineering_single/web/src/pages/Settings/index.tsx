@@ -45,7 +45,7 @@ const Settings: React.FC = () => {
             <Input
               value={server.temporalHost}
               onChange={(e) => updateServerConfig({ temporalHost: e.target.value })}
-              placeholder="172.17.15.197:7233"
+              placeholder="temporal.example.com:7233"
             />
           </Form.Item>
         </Form>

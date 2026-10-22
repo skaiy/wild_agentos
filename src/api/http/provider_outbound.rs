@@ -316,8 +316,8 @@ mod tests {
                 );
             }
             // Public literal addresses are allowed without an allowlist.
-            assert_eq!(vet("https://8.8.8.8/v1/models"), Ok(()));
-            assert_eq!(vet("https://[2002:808:808::1]/v1/models"), Ok(()));
+            assert_eq!(vet("https://192.0.2.1/v1/models"), Ok(()));
+            assert_eq!(vet("https://[2002:c000:201::1]/v1/models"), Ok(()));
         });
     }
 
