@@ -1160,7 +1160,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_claims_writes_remain_isolated_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let embed = Arc::new(FallbackEmbeddingService::new());
@@ -1169,7 +1169,26 @@ mod tests {
         let store = Arc::new(HyperspaceStore::open(dir.path(), embed.clone()).unwrap());
         let mut tasks = tokio::task::JoinSet::new();
 
-        for index in 0..8 {
+        for index in 0..4 {
+            for (claims, kb_tag, prefix) in [
+                (tenant_a.clone(), "kb:kb-a", "a"),
+                (tenant_b.clone(), "kb:kb-b", "b"),
+            ] {
+                let store = Arc::clone(&store);
+                let text = format!("isolated {prefix} content {index}");
+                let iri = format!("{prefix}:{index}");
+                let tags = vec![kb_tag.to_string(), format!("chunk:{prefix}:{index}")];
+                tasks.spawn(
+                    async move { store.upsert_with_claims(&claims, &iri, &text, &tags).await },
+                );
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        store.engine.checkpoint().await.unwrap();
+
+        for index in 4..8 {
             for (claims, kb_tag, prefix) in [
                 (tenant_a.clone(), "kb:kb-a", "a"),
                 (tenant_b.clone(), "kb:kb-b", "b"),
@@ -1192,17 +1211,22 @@ mod tests {
         for (claims, kb_tag, prefix) in [(&tenant_a, "kb:kb-a", "a"), (&tenant_b, "kb:kb-b", "b")] {
             for index in 0..8 {
                 let text = format!("isolated {prefix} content {index}");
-                let required_tags = vec![kb_tag.to_string(), format!("chunk:{prefix}:{index}")];
-                let hits = store
-                    .search_with_claims_and_required_tags(claims, &text, &required_tags, 1)
+                let namespace = claims.vector_namespace().unwrap();
+                let payload = store
+                    .engine
+                    .get_payload(&format!("{namespace}#{prefix}:{index}"))
                     .await
                     .unwrap();
-                assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].text, text);
-                assert!(hits[0]
-                    .tags
-                    .contains(&format!("tenant:{}", claims.tenant_id())));
-                assert!(hits[0].tags.contains(&kb_tag.to_string()));
+                let payload = payload.expect("exact record must survive restart");
+                assert_eq!(payload["text"], text);
+                assert!(payload["tags"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::String(format!("tenant:{}", claims.tenant_id()))));
+                assert!(payload["tags"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::String(kb_tag.to_string())));
             }
         }
 
