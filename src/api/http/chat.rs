@@ -1547,8 +1547,7 @@ mod tests {
 
         assert!(context.messages.len() >= 3);
         assert_eq!(context.messages[0].role, "system");
-        assert!(context
-            .messages[0]
+        assert!(context.messages[0]
             .content
             .as_text()
             .contains("Refuse to invent VIN"));
