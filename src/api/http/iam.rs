@@ -140,6 +140,19 @@ impl UserIdentity {
             )),
         }
     }
+    /// Require either a DA with verified isolation claims or the deployment's
+    /// platform administrator. Platform administrators additionally require
+    /// their configured platform tenant and explicit JWT scope.
+    pub(crate) fn require_control_plane_da_or_platform_admin(
+        &self,
+        resource: &str,
+    ) -> Result<(), (StatusCode, Json<Value>)> {
+        self.require_verified_isolation_claims(resource)?;
+        if self.has_role(PLATFORM_ADMIN_ROLE) {
+            return self.require_platform_admin(resource);
+        }
+        self.require_role("DA")
+    }
     /// Gate process-global configuration writes on a verified JWT with explicit
     /// non-empty tenant_id and project_id claims, the exact PLATFORM_ADMIN role,
     /// and tenant_id matching the deployment-configured platform tenant. DA is

@@ -23,6 +23,10 @@ use super::{
     AppState, TEST_ENV_LOCK,
 };
 use crate::tools::prompt_registry::PromptVersion;
+use crate::{
+    blob::{BlobStore, LocalFsBlobStore},
+    isolation::IsolationClaims,
+};
 
 const SECRET: &str = "test-hs256-secret-at-least-32-bytes-long";
 
@@ -109,7 +113,16 @@ async fn call(
 
 fn router(state: Arc<AppState>) -> Router {
     use super::{
+        agents::{
+            activate_agent_revision_handler, create_agent_handler, create_agent_revision_handler,
+            delete_agent_handler, update_agent_handler,
+        },
         kb::reindex_knowledge_base_handler,
+        kb::{
+            create_kb_category_handler, create_knowledge_pack_handler, delete_kb_category_handler,
+            delete_knowledge_pack_handler, kb_document_raw_handler, update_kb_category_handler,
+            update_knowledge_pack_handler,
+        },
         market::{
             install_package_handler, publish_package_handler, rollback_package_handler,
             upgrade_package_handler,
@@ -118,6 +131,7 @@ fn router(state: Arc<AppState>) -> Router {
             delete_skill_exposure_handler, list_skill_exposures_handler, skill_mcp_handler,
             upsert_skill_exposure_handler,
         },
+        models::image_raw_handler,
         prompts::{
             activate_prompt_handler, canary_prompt_handler, create_prompt_handler,
             delete_prompt_handler,
@@ -128,6 +142,37 @@ fn router(state: Arc<AppState>) -> Router {
         },
     };
     Router::new()
+        .route("/api/v1/agents", post(create_agent_handler))
+        .route(
+            "/api/v1/agents/:id",
+            put(update_agent_handler).delete(delete_agent_handler),
+        )
+        .route(
+            "/api/v1/agents/:id/revisions",
+            post(create_agent_revision_handler),
+        )
+        .route(
+            "/api/v1/agents/:id/revisions/:revision/activate",
+            post(activate_agent_revision_handler),
+        )
+        .route(
+            "/api/v1/knowledge-packs",
+            post(create_knowledge_pack_handler),
+        )
+        .route(
+            "/api/v1/knowledge-packs/:id",
+            put(update_knowledge_pack_handler).delete(delete_knowledge_pack_handler),
+        )
+        .route("/api/v1/kb/categories", post(create_kb_category_handler))
+        .route(
+            "/api/v1/kb/categories/:id",
+            put(update_kb_category_handler).delete(delete_kb_category_handler),
+        )
+        .route(
+            "/api/v1/kb/bases/:id/documents/:doc_id/raw",
+            get(kb_document_raw_handler),
+        )
+        .route("/api/v1/images/:image_id/raw", get(image_raw_handler))
         .route("/api/v1/prompts", post(create_prompt_handler))
         .route(
             "/api/v1/prompts/:id/activate",
@@ -169,6 +214,158 @@ fn router(state: Arc<AppState>) -> Router {
             post(reindex_knowledge_base_handler),
         )
         .with_state(state)
+}
+
+/// Agent, knowledge-pack, and category writes all require a tenant control
+/// plane DA or a platform administrator; PA cannot mutate any of them.
+#[tokio::test]
+async fn isolation_contract_agent_and_kb_writes_reject_pa() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), true);
+    let app = router(test_state(dir.path()));
+    let pa = token("tenant-a", &["PA"], Some("project-a"));
+
+    let routes = [
+        (
+            Method::POST,
+            "/api/v1/agents".to_string(),
+            json!({"name": "agent"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/agents/agent-a/revisions".to_string(),
+            json!({"system_prompt": "prompt", "model": "model"}),
+        ),
+        (
+            Method::POST,
+            "/api/v1/agents/agent-a/revisions/1/activate".to_string(),
+            Value::Null,
+        ),
+        (
+            Method::PUT,
+            "/api/v1/agents/agent-a".to_string(),
+            json!({"name": "updated"}),
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/agents/agent-a".to_string(),
+            Value::Null,
+        ),
+        (
+            Method::POST,
+            "/api/v1/knowledge-packs".to_string(),
+            json!({"name": "pack"}),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/knowledge-packs/pack-a".to_string(),
+            json!({"name": "updated"}),
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/knowledge-packs/pack-a".to_string(),
+            Value::Null,
+        ),
+        (
+            Method::POST,
+            "/api/v1/kb/categories".to_string(),
+            json!({"name": "category"}),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/kb/categories/category-a".to_string(),
+            json!({"name": "updated"}),
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/kb/categories/category-a".to_string(),
+            Value::Null,
+        ),
+    ];
+
+    for (method, uri, body) in routes {
+        let (status, _) = call(&app, method, &uri, Caller::Bearer(&pa), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+}
+
+/// Raw blobs are addressed through the verified tenant/project prefix. A
+/// caller from another project receives the same 404 as for a missing image.
+#[tokio::test]
+async fn isolation_contract_image_raw_is_isolated_per_project() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), true);
+    let mut state = test_state(dir.path());
+    let blob = Arc::new(LocalFsBlobStore::new(dir.path().join("blobs")));
+    Arc::get_mut(&mut state).unwrap().blob_store = Some(blob.clone());
+    let owner_claims = IsolationClaims::from_verified("tenant-a", "project-a", "owner").unwrap();
+    blob.put(&owner_claims, "images/image-a.png", b"image", "image/png")
+        .await
+        .unwrap();
+    let app = router(state);
+
+    let foreign = token("tenant-a", &["PA"], Some("project-b"));
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/v1/images/image-a.png/raw",
+        Caller::Bearer(&foreign),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let owner = token("tenant-a", &["PA"], Some("project-a"));
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/v1/images/image-a.png/raw",
+        Caller::Bearer(&owner),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// KB document raw retrieval checks the ledger's tenant/project ownership
+/// before it resolves the claims-scoped blob key.
+#[tokio::test]
+async fn isolation_contract_kb_document_raw_is_isolated_per_project() {
+    let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _env = env(dir.path(), true);
+    let mut state = test_state(dir.path());
+    let blob = Arc::new(LocalFsBlobStore::new(dir.path().join("blobs")));
+    Arc::get_mut(&mut state).unwrap().blob_store = Some(blob.clone());
+    let owner_claims = IsolationClaims::from_verified("tenant-a", "project-a", "owner").unwrap();
+    blob.put(&owner_claims, "kb/kb-a/doc-a", b"document", "text/plain")
+        .await
+        .unwrap();
+    state.knowledge_bases.write().await.push(json!({
+        "id": "kb-a",
+        "tenant_id": "tenant-a",
+        "project_id": "project-a",
+        "documents": [{
+            "doc_id": "doc-a",
+            "filename": "document.txt",
+            "content_type": "text/plain",
+            "blob_ref": {"key": "kb/kb-a/doc-a"}
+        }]
+    }));
+    let app = router(state);
+
+    let foreign = token("tenant-a", &["PA"], Some("project-b"));
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/v1/kb/bases/kb-a/documents/doc-a/raw",
+        Caller::Bearer(&foreign),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 fn prompt_body() -> Value {

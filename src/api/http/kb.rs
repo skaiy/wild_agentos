@@ -318,7 +318,8 @@ pub(crate) async fn create_knowledge_pack_handler(
     identity: UserIdentity,
     Json(req): Json<KnowledgePackCreateRequest>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_platform_admin("knowledge pack writes") {
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge pack writes")
+    {
         return error;
     }
     if req.name.trim().is_empty() {
@@ -371,7 +372,8 @@ pub(crate) async fn update_knowledge_pack_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(patch): Json<Value>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_platform_admin("knowledge pack writes") {
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge pack writes")
+    {
         return error;
     }
     let extract_ids = |k: &str| -> Vec<String> {
@@ -426,7 +428,8 @@ pub(crate) async fn delete_knowledge_pack_handler(
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_platform_admin("knowledge pack writes") {
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge pack writes")
+    {
         return error;
     }
     let mut guard = state.knowledge_packs.write().await;
@@ -463,7 +466,9 @@ pub(crate) async fn create_kb_category_handler(
     identity: UserIdentity,
     Json(req): Json<KbCategoryCreateRequest>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_platform_admin("knowledge base category writes") {
+    if let Err(error) =
+        identity.require_control_plane_da_or_platform_admin("knowledge base category writes")
+    {
         return error;
     }
     if req.name.trim().is_empty() {
@@ -495,7 +500,9 @@ pub(crate) async fn update_kb_category_handler(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(patch): Json<Value>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_platform_admin("knowledge base category writes") {
+    if let Err(error) =
+        identity.require_control_plane_da_or_platform_admin("knowledge base category writes")
+    {
         return error;
     }
     let mut guard = state.kb_categories.write().await;
@@ -533,7 +540,9 @@ pub(crate) async fn delete_kb_category_handler(
     identity: UserIdentity,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if let Err(error) = identity.require_platform_admin("knowledge base category writes") {
+    if let Err(error) =
+        identity.require_control_plane_da_or_platform_admin("knowledge base category writes")
+    {
         return error;
     }
     let mut guard = state.kb_categories.write().await;

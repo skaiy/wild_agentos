@@ -641,10 +641,10 @@ async fn call(
     )
 }
 
-/// Knowledge packs and KB categories are platform-level shared objects:
-/// tenant DA may list but not write; only a platform admin may write.
+/// Knowledge packs and KB categories accept either a DA or a platform
+/// administrator for writes.
 #[tokio::test]
-async fn isolation_contract_kb_shared_registries_require_platform_admin_writes() {
+async fn isolation_contract_kb_shared_registries_allow_da_writes() {
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let _env = setup(dir.path());
@@ -660,7 +660,7 @@ async fn isolation_contract_kb_shared_registries_require_platform_admin_writes()
             "knowledge_pack",
         ),
     ] {
-        let (status, _) = call(
+        let (status, created_by_da) = call(
             &router,
             Method::POST,
             collection,
@@ -668,7 +668,9 @@ async fn isolation_contract_kb_shared_registries_require_platform_admin_writes()
             serde_json::json!({"name": "tenant-made"}),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{collection} DA create");
+        assert_eq!(status, StatusCode::CREATED, "{collection} DA create");
+        let da_id = created_by_da["id"].as_str().unwrap().to_string();
+        let da_item = format!("{collection}/{da_id}");
 
         let (status, created) = call(
             &router,
@@ -685,23 +687,23 @@ async fn isolation_contract_kb_shared_registries_require_platform_admin_writes()
         let (status, _) = call(
             &router,
             Method::PUT,
-            &item,
+            &da_item,
             &tenant_da,
             serde_json::json!({"name": "hijacked"}),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{item} DA update");
+        assert_eq!(status, StatusCode::OK, "{da_item} DA update");
         let (status, _) = call(
             &router,
             Method::DELETE,
-            &item,
+            &da_item,
             &tenant_da,
             serde_json::Value::Null,
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{item} DA delete");
+        assert_eq!(status, StatusCode::OK, "{da_item} DA delete");
 
-        // Tenant DA may read; data is unchanged.
+        // The deleted item is absent from tenant DA's read result.
         let (status, listed) = call(
             &router,
             Method::GET,
@@ -711,14 +713,12 @@ async fn isolation_contract_kb_shared_registries_require_platform_admin_writes()
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{collection} DA list");
-        let entry = listed[list_key]
+        assert!(listed[list_key]
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["id"] == id.as_str())
-            .cloned()
-            .expect("entry survives DA delete");
-        assert_eq!(entry["name"], "shared");
+            .find(|entry| entry["id"] == da_id.as_str())
+            .is_none());
 
         let (status, updated) = call(
             &router,

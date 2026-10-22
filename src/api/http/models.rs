@@ -185,7 +185,6 @@ pub(crate) async fn image_raw_handler(
     }
     let ext = image_id.rsplit('.').next().unwrap_or("");
     let ct = image_ct_from_ext(ext).to_string();
-    let key = format!("images/{image_id}");
     let claims = match identity.isolation_claims() {
         Some(claims) => claims,
         None => {
@@ -196,6 +195,10 @@ pub(crate) async fn image_raw_handler(
                 .into_response()
         }
     };
+    // BlobStore scopes every relative key with the verified tenant/project
+    // prefix. Resolving the key only after claims verification makes a
+    // cross-scope image indistinguishable from a missing image.
+    let key = format!("images/{image_id}");
     let blob = match &state.blob_store {
         Some(b) => b.clone(),
         None => {

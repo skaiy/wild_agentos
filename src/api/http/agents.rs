@@ -427,6 +427,9 @@ pub(crate) async fn create_agent_handler(
                 .into_response()
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
+        return error.into_response();
+    }
     let is_definition = req.id.is_some()
         || req.system_prompt.is_some()
         || req.model.is_some()
@@ -574,6 +577,9 @@ pub(crate) async fn create_agent_revision_handler(
         )
             .into_response();
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
+        return error.into_response();
+    }
     let req: AgentRevisionCreateRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(_) => {
@@ -668,6 +674,9 @@ pub(crate) async fn activate_agent_revision_handler(
         )
             .into_response();
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
+        return error.into_response();
+    }
     let mut guard = state.user_agents.write().await;
     let Some(index) = guard.iter().position(|agent| {
         agent.get("id").and_then(Value::as_str) == Some(id.as_str())
@@ -724,6 +733,9 @@ pub(crate) async fn update_agent_handler(
         )
             .into_response();
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
+        return error.into_response();
+    }
     let mut guard = state.user_agents.write().await;
     let found = guard.iter().position(|agent| {
         agent.get("id").and_then(Value::as_str) == Some(id.as_str())
@@ -791,6 +803,9 @@ pub(crate) async fn delete_agent_handler(
         )
             .into_response();
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
+        return error.into_response();
+    }
     let mut guard = state.user_agents.write().await;
     let before = guard.len();
     let mut next = guard.clone();
@@ -899,7 +914,7 @@ mod tests {
                 sub: "test-user".into(),
                 tenant_id: tenant_id.into(),
                 project_id: Some(project_id.into()),
-                roles: vec![],
+                roles: vec!["DA".into()],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
             &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),

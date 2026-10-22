@@ -18,7 +18,7 @@ pub use minio::MinioBlobStore;
 /// Tenant-scoped object storage.
 ///
 /// Callers provide a key relative to the verified claims prefix, such as
-/// `kb/<kbid>/<sha256>`. The backend mints `{tenant}/` with
+/// `kb/<kbid>/<sha256>`. The backend mints `{tenant}/{project}/` with
 /// [`IsolationClaims::object_key_prefix`]; there is no unscoped operation.
 #[async_trait]
 pub trait BlobStore: Send + Sync {
@@ -176,20 +176,20 @@ mod tests {
     use crate::isolation::IsolationClaims;
 
     #[tokio::test]
-    async fn tenant_cannot_get_another_tenants_new_object() {
+    async fn project_cannot_get_another_projects_new_object() {
         let root = std::env::temp_dir().join(format!("wild-agentos-blob-{}", uuid::Uuid::new_v4()));
         let store = LocalFsBlobStore::new(root.clone());
-        let tenant_a = IsolationClaims::from_verified("tenant-a", "project", "actor-a").unwrap();
-        let tenant_b = IsolationClaims::from_verified("tenant-b", "project", "actor-b").unwrap();
+        let project_a = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let project_b = IsolationClaims::from_verified("tenant-a", "project-b", "actor-b").unwrap();
         let key = "kb/source/chunk";
 
         store
-            .put(&tenant_a, key, b"tenant-a data", "text/plain")
+            .put(&project_a, key, b"project-a data", "text/plain")
             .await
             .unwrap();
 
-        assert_eq!(store.get(&tenant_a, key).await.unwrap(), b"tenant-a data");
-        assert!(store.get(&tenant_b, key).await.is_err());
+        assert_eq!(store.get(&project_a, key).await.unwrap(), b"project-a data");
+        assert!(store.get(&project_b, key).await.is_err());
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
