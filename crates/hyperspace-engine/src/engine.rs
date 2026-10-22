@@ -990,6 +990,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tag_filtering_does_not_return_other_tenant_vectors() {
+        let config = HnswConfig {
+            m: 16,
+            ef_search: 50,
+            level_mult: 0.0,
+            ..HnswConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let eng = setup_engine_with_config(dir.path(), config);
+        let tenant_a_filter = JsonLdFilter::tag("tags", "tenant-a");
+        let tenant_b_filter = JsonLdFilter::tag("tags", "tenant-b");
+
+        for index in 0..64 {
+            eng.insert(
+                &format!("tenant-a:{index}"),
+                sequential_unit_vector(index * 2, 128),
+                json!({"tags": ["tenant-a"]}),
+            )
+            .await
+            .unwrap();
+            eng.insert(
+                &format!("tenant-b:{index}"),
+                sequential_unit_vector(index * 2 + 1, 128),
+                json!({"tags": ["tenant-b"]}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let query_index = 23;
+        let query = sequential_unit_vector(query_index * 2 + 1, 128);
+        let tenant_a_query_for_tenant_b =
+            JsonLdFilter::Must(vec![tenant_a_filter.clone(), tenant_b_filter.clone()]);
+        let tenant_a_results = eng
+            .search(
+                &query,
+                1,
+                std::slice::from_ref(&tenant_a_query_for_tenant_b),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tenant_a_results.is_empty(),
+            "tenant A's filter must not match tenant B's content"
+        );
+
+        let tenant_b_results = eng
+            .search(&query, 1, std::slice::from_ref(&tenant_b_filter))
+            .await
+            .unwrap();
+        assert_eq!(
+            tenant_b_results.first().map(|hit| hit.iri.as_str()),
+            Some("tenant-b:23")
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_payload() {
         let dir = tempfile::tempdir().unwrap();
         let eng = setup_async_engine(dir.path());

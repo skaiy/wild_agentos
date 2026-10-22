@@ -12,6 +12,8 @@
 //! - Serializable node format for snapshot persistence
 //! - Optional filter bitmap integration for filtered search
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use rand::Rng;
@@ -83,6 +85,36 @@ struct Node {
     neighbors0: Vec<u32>,
     neighbors_upper: Vec<Vec<u32>>,
     level: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    id: u32,
+    distance: f64,
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.distance.to_bits() == other.distance.to_bits()
+    }
+}
+
+impl Eq for Candidate {}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .distance
+            .partial_cmp(&self.distance)
+            .unwrap_or(CmpOrdering::Equal)
+            .then_with(|| other.id.cmp(&self.id))
+    }
 }
 
 /// Incremental HNSW index with runtime metric switching.
@@ -320,12 +352,18 @@ impl IncrementalHNSW {
             query_node,
             &self.nodes[entry as usize].as_ref().unwrap().vector,
         );
-        let mut candidates = vec![(entry, entry_dist)];
+        let mut candidates = BinaryHeap::from([Candidate {
+            id: entry,
+            distance: entry_dist,
+        }]);
         let mut results = vec![(entry, entry_dist)];
         self.visited_gen[entry as usize].store(gen, Ordering::Relaxed);
 
-        while !candidates.is_empty() {
-            let (current, current_dist) = candidates.remove(0);
+        while let Some(Candidate {
+            id: current,
+            distance: current_dist,
+        }) = candidates.pop()
+        {
             if results.len() >= ef && current_dist > results.last().unwrap().1 {
                 break;
             }
@@ -342,16 +380,14 @@ impl IncrementalHNSW {
                     &self.nodes[nid as usize].as_ref().unwrap().vector,
                 );
                 if results.len() < ef || d < results.last().unwrap().1 {
-                    let candidate_pos = candidates
-                        .binary_search_by(|(_, dist)| {
-                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .unwrap_or_else(|e| e);
-                    candidates.insert(candidate_pos, (nid, d));
+                    candidates.push(Candidate {
+                        id: nid,
+                        distance: d,
+                    });
 
                     let result_pos = results
                         .binary_search_by(|(_, dist)| {
-                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
+                            dist.partial_cmp(&d).unwrap_or(CmpOrdering::Equal)
                         })
                         .unwrap_or_else(|e| e);
                     results.insert(result_pos, (nid, d));
@@ -377,8 +413,11 @@ impl IncrementalHNSW {
         top_k: usize,
         allowed: Option<&RoaringBitmap>,
     ) -> Vec<(u32, f64)> {
-        self.fix_entry_point();
-        let ep = self.entry_point.load(Ordering::Relaxed);
+        let mut ep = self.entry_point.load(Ordering::Relaxed);
+        if ep != u32::MAX && !self.contains(ep) {
+            self.fix_entry_point();
+            ep = self.entry_point.load(Ordering::Acquire);
+        }
         if ep == u32::MAX {
             return Vec::new();
         }
@@ -388,10 +427,6 @@ impl IncrementalHNSW {
 
         // Multi-layer descent
         let mut curr_ep = ep;
-        let curr_id = self.next_available_id();
-        if curr_id == u32::MAX {
-            return Vec::new();
-        }
 
         // Beam search at layer 0
         if max_layer > 0 {
@@ -467,12 +502,18 @@ impl IncrementalHNSW {
         let entry_dist = self
             .metric
             .distance(query, &self.nodes[entry as usize].as_ref().unwrap().vector);
-        let mut candidates = vec![(entry, entry_dist)];
+        let mut candidates = BinaryHeap::from([Candidate {
+            id: entry,
+            distance: entry_dist,
+        }]);
         let mut results = vec![(entry, entry_dist)];
         self.visited_gen[entry as usize].store(gen, Ordering::Relaxed);
 
-        while !candidates.is_empty() {
-            let (current, current_dist) = candidates.remove(0);
+        while let Some(Candidate {
+            id: current,
+            distance: current_dist,
+        }) = candidates.pop()
+        {
             if results.len() >= ef && current_dist > results.last().unwrap().1 {
                 break;
             }
@@ -489,16 +530,14 @@ impl IncrementalHNSW {
                     .metric
                     .distance(query, &self.nodes[nid as usize].as_ref().unwrap().vector);
                 if results.len() < ef || d < results.last().unwrap().1 {
-                    let candidate_pos = candidates
-                        .binary_search_by(|(_, dist)| {
-                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .unwrap_or_else(|e| e);
-                    candidates.insert(candidate_pos, (nid, d));
+                    candidates.push(Candidate {
+                        id: nid,
+                        distance: d,
+                    });
 
                     let result_pos = results
                         .binary_search_by(|(_, dist)| {
-                            dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
+                            dist.partial_cmp(&d).unwrap_or(CmpOrdering::Equal)
                         })
                         .unwrap_or_else(|e| e);
                     results.insert(result_pos, (nid, d));
@@ -510,15 +549,6 @@ impl IncrementalHNSW {
         }
 
         results
-    }
-
-    /// Find the next available node ID (first live node).
-    fn next_available_id(&self) -> u32 {
-        self.nodes
-            .iter()
-            .position(|n| n.is_some())
-            .map(|i| i as u32)
-            .unwrap_or(u32::MAX)
     }
 
     fn get_neighbors(&self, node_id: u32, layer: usize) -> Vec<u32> {
@@ -546,9 +576,9 @@ impl IncrementalHNSW {
         let ep = self.entry_point.load(Ordering::Relaxed);
         if ep == id {
             self.fix_entry_point();
+        } else {
+            self.fix_max_layer();
         }
-        // Also update max_layer
-        self.fix_max_layer();
     }
 
     fn fix_entry_point(&self) {
@@ -630,7 +660,6 @@ impl IncrementalHNSW {
             })
             .collect();
         self.fix_entry_point();
-        self.fix_max_layer();
         // Resize visited_gen
         self.visited_gen.resize_with(
             self.visited_gen.len().max(self.nodes.len()).max(1024),
