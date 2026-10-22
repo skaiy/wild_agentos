@@ -467,7 +467,7 @@ const (
 {
   "apiBaseUrl": "http://localhost:8080",
   "wsBaseUrl": "ws://localhost:8080",
-  "temporalHost": "172.17.15.197:7233"
+  "temporalHost": "temporal.example.com:7233"
 }
 
 // LLMConfig

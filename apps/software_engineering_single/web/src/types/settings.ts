@@ -39,7 +39,7 @@ export interface ConfigValidationRequest {
 export const DEFAULT_SERVER_CONFIG: ServerConfig = {
   apiBaseUrl: 'http://localhost:8090',
   wsBaseUrl: 'ws://localhost:8090',
-  temporalHost: '172.17.15.197:7233',
+  temporalHost: '',
 };
 
 export const DEFAULT_LLM_CONFIG: LLMConfig = {

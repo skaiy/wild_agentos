@@ -479,7 +479,7 @@ interface SettingsState {
 interface ServerConfig {
   apiBaseUrl: string;        // Go 应用层 API 地址，如 "http://localhost:8080"
   wsBaseUrl: string;         // WebSocket 地址，如 "ws://localhost:8080"
-  temporalHost: string;      // Temporal Server 地址，如 "172.17.15.197:7233"
+  temporalHost: string;      // Temporal Server 地址，如 "temporal.example.com:7233"
 }
 
 interface LLMConfig {

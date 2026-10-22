@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: core
-          image: 10.0.0.33/wild-agentos/core:latest   # 33 Harbor
+          image: example.com/wild-agentos/core:latest
           imagePullPolicy: IfNotPresent
           ports:
             - { name: http, containerPort: 8080 }  # /metrics is on this port; no separate metrics listener

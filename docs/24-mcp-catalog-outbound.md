@@ -54,11 +54,13 @@ origins when the deployment needs an explicit network allowlist:
 
 ```sh
 MCP_OUTBOUND_ALLOWED_ORIGINS=https://mcp.example.test,http://127.0.0.1:8080
-MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS=10.20.0.0/16,fd00:1::/64
+MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS=PRIVATE_NETWORK_CIDR,fd00:1::/64
 MCP_OUTBOUND_CONNECT_TIMEOUT_MS=5000
 MCP_OUTBOUND_TIMEOUT_MS=15000
 MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
 ```
+
+Replace `PRIVATE_NETWORK_CIDR` with the CIDR routed by your private network.
 
 When the allowlist is unset, only each catalog entry's registered origin is
 allowed. Invalid or changed endpoints are rejected before any outbound request.

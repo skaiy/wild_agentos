@@ -127,7 +127,7 @@ key，其他 key 返回与不存在的 key 相同的 `404`）。只有调用方 
 
 - 绝对 `http`/`https` URL，且不带用户凭据；
 - `PROVIDER_OUTBOUND_ALLOWED_ORIGINS`（逗号分隔的 origin，例如
-  `https://llm.example.test,http://10.20.0.5:3000`）一旦设置即为精确白名单；
+  `https://llm.example.test,http://provider.example.test:3000`）一旦设置即为精确白名单；
   白名单内的 origin 可以解析到私网或回环地址；任一条目格式错误则全部拒绝。
   **白名单里的主机名可以解析到内网地址**：谁控制该域名的 DNS，谁就决定探测发往
   哪里，因此只把自己控制的域名（或 IP 字面量）加入白名单；
