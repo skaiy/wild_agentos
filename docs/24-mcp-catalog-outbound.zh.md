@@ -46,11 +46,13 @@ endpoint。
 
 ```sh
 MCP_OUTBOUND_ALLOWED_ORIGINS=https://mcp.example.test,http://127.0.0.1:8080
-MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS=${MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS:?set-a-private-cidr},fd00:1::/64
+MCP_OUTBOUND_ALLOWED_PRIVATE_CIDRS=PRIVATE_NETWORK_CIDR,fd00:1::/64
 MCP_OUTBOUND_CONNECT_TIMEOUT_MS=5000
 MCP_OUTBOUND_TIMEOUT_MS=15000
 MCP_OUTBOUND_MAX_RESPONSE_BYTES=1048576
 ```
+
+请将 `PRIVATE_NETWORK_CIDR` 替换为您的私有网络所路由的 CIDR。
 
 未设置 allowlist 时，只允许每个 Catalog 条目已登记的 origin。无效或已改变的
 endpoint 会在发送任何出站请求前被拒绝。超时和响应大小设置均为可选的正整数；

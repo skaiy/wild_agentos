@@ -1476,7 +1476,6 @@ mod tests {
             ("::ffff:192.0.2.1", false),
             ("192.0.2.1", false),
             ("2606:4700::1", false),
-            ("192.0.2.1", false),
             ("2001:db8::1", false),
             ("64:ff9b::a9fe:a9fe", true),
             ("64:ff9b::7f00:1", true),
