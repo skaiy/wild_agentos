@@ -1008,19 +1008,19 @@ async fn isolation_contract_config_persist_failure_does_not_leak_paths() {
 #[cfg(unix)]
 #[tokio::test]
 async fn isolation_contract_embedding_reload_failure_does_not_leak_paths() {
-    use std::os::unix::fs::symlink;
-
     let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let _env = setup(dir.path());
+    let _fixture = EnvGuard::set(&[("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE", "open".into())]);
+    let _restore = RestoreMode {
+        path: dir.path().join("vector_store"),
+        mode: 0o755,
+    };
+    if permissions_ignored(dir.path()) {
+        eprintln!("skipping: running with permission override");
+        return;
+    }
     let router = app(test_state(dir.path()));
-    // A broken symlink: `create_dir_all` fails with an error whose Display
-    // includes `os error` and, on some platforms, the absolute path.
-    symlink(
-        "/no/such/vector-store-target",
-        dir.path().join("vector_store"),
-    )
-    .unwrap();
 
     let (status, text) = send(
         &router,
@@ -1038,7 +1038,7 @@ async fn isolation_contract_embedding_reload_failure_does_not_leak_paths() {
         body["message"],
         json!(format!(
             "配置已持久化，但向量库热切换失败：{}（重启后仍会按新配置生效）",
-            std::io::ErrorKind::AlreadyExists
+            "open_failed"
         ))
     );
     for leaked in [
@@ -1046,7 +1046,6 @@ async fn isolation_contract_embedding_reload_failure_does_not_leak_paths() {
         "/tmp",
         "os error",
         "vector_store",
-        "no/such",
     ] {
         assert!(
             !text.contains(leaked),

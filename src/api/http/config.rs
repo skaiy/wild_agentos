@@ -889,9 +889,9 @@ pub(crate) async fn hot_reload_embedding(
     Ok((old_dim.unwrap_or(0), new_dim, dim_changed, reindex_queued))
 }
 
-/// Test-only. `AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE=open` makes the fresh
-/// store directory unwritable. `=read` leaves an unreadable `active.wal` for
-/// the store open to read. Absent in release builds.
+/// Test-only. `AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE=open` creates an invalid
+/// WAL path. `=read` leaves an unreadable `active.wal` for the store open to
+/// read. Absent in release builds.
 #[cfg(test)]
 fn plant_embedding_reload_fixture(vdir: &std::path::Path) {
     let Ok(mode) = std::env::var("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE") else {
@@ -902,7 +902,7 @@ fn plant_embedding_reload_fixture(vdir: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         match mode.as_str() {
             "open" => {
-                let _ = std::fs::set_permissions(vdir, std::fs::Permissions::from_mode(0o555));
+                let _ = std::fs::create_dir(vdir.join("active.wal"));
             }
             "read" => {
                 let wal = vdir.join("active.wal");
