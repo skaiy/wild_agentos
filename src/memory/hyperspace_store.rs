@@ -396,10 +396,15 @@ impl HyperspaceStore {
             message: format!("invalid verified vector namespace: {e}"),
         })?;
         let scoped_iri = format!("{namespace}#{iri}");
+        let mut scoped_tags = tags.to_vec();
+        let tenant_tag = format!("tenant:{}", claims.tenant_id());
+        if !scoped_tags.contains(&tenant_tag) {
+            scoped_tags.push(tenant_tag);
+        }
         self.upsert_with_metadata_inner(
             &scoped_iri,
             text,
-            tags,
+            &scoped_tags,
             importance,
             jsonld_types,
             Some(&namespace),
@@ -448,6 +453,11 @@ impl HyperspaceStore {
         jsonld_types: Option<&[String]>,
         named_graph: Option<&str>,
     ) -> Result<u32, CoreError> {
+        if text.trim().is_empty() {
+            return Err(CoreError::ValidationFailed {
+                message: "vector text must not be empty".into(),
+            });
+        }
         let vector = self.get_embedding(text).await;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
@@ -1148,5 +1158,63 @@ mod tests {
             tenant_b_hits.is_empty(),
             "tenant B must not recall tenant A's namespaced vector"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_writes_remain_isolated_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let embed = Arc::new(FallbackEmbeddingService::new());
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let tenant_b = IsolationClaims::from_verified("tenant-b", "project-b", "actor-b").unwrap();
+        let store = Arc::new(HyperspaceStore::open(dir.path(), embed.clone()).unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for index in 0..8 {
+            for (claims, kb_tag, prefix) in [
+                (tenant_a.clone(), "kb:kb-a", "a"),
+                (tenant_b.clone(), "kb:kb-b", "b"),
+            ] {
+                let store = Arc::clone(&store);
+                let text = format!("isolated {prefix} content {index}");
+                let iri = format!("{prefix}:{index}");
+                let tags = vec![kb_tag.to_string(), format!("chunk:{prefix}:{index}")];
+                tasks.spawn(
+                    async move { store.upsert_with_claims(&claims, &iri, &text, &tags).await },
+                );
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        drop(store);
+
+        let store = HyperspaceStore::open(dir.path(), embed).unwrap();
+        for (claims, kb_tag, prefix) in [(&tenant_a, "kb:kb-a", "a"), (&tenant_b, "kb:kb-b", "b")] {
+            for index in 0..8 {
+                let text = format!("isolated {prefix} content {index}");
+                let required_tags = vec![kb_tag.to_string(), format!("chunk:{prefix}:{index}")];
+                let hits = store
+                    .search_with_claims_and_required_tags(claims, &text, &required_tags, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].text, text);
+                assert!(hits[0]
+                    .tags
+                    .contains(&format!("tenant:{}", claims.tenant_id())));
+                assert!(hits[0].tags.contains(&kb_tag.to_string()));
+            }
+        }
+
+        let cross_tenant = store
+            .search_with_claims_and_required_tags(
+                &tenant_a,
+                "isolated b content 0",
+                &["kb:kb-b".to_string(), "chunk:b:0".to_string()],
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(cross_tenant.is_empty());
     }
 }

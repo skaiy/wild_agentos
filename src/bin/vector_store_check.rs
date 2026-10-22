@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "tag_count": health.tag_count,
             "missing_text_count": health.missing_text_count(),
             "missing_tag_count": health.missing_tag_count(),
+            "corrupt_count": health.corrupt_count,
             "retrieval_ready": health.is_consistent(),
         })
     );

@@ -20,6 +20,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -54,11 +55,14 @@ pub struct PersistenceHealth {
     pub vector_count: u32,
     pub text_count: u32,
     pub tag_count: u32,
+    pub corrupt_count: u32,
 }
 
 impl PersistenceHealth {
     pub fn is_consistent(self) -> bool {
-        self.vector_count == self.text_count && self.vector_count == self.tag_count
+        self.corrupt_count == 0
+            && self.vector_count == self.text_count
+            && self.vector_count == self.tag_count
     }
 
     pub fn missing_text_count(self) -> u32 {
@@ -68,6 +72,61 @@ impl PersistenceHealth {
     pub fn missing_tag_count(self) -> u32 {
         self.vector_count.saturating_sub(self.tag_count)
     }
+}
+
+#[derive(Default)]
+struct HealthCounters {
+    vector_count: AtomicU32,
+    text_count: AtomicU32,
+    tag_count: AtomicU32,
+    corrupt_count: AtomicU32,
+}
+
+impl HealthCounters {
+    fn report(&self) -> PersistenceHealth {
+        PersistenceHealth {
+            vector_count: self.vector_count.load(Ordering::Acquire),
+            text_count: self.text_count.load(Ordering::Acquire),
+            tag_count: self.tag_count.load(Ordering::Acquire),
+            corrupt_count: self.corrupt_count.load(Ordering::Acquire),
+        }
+    }
+
+    fn reset(&self, health: PersistenceHealth) {
+        self.vector_count
+            .store(health.vector_count, Ordering::Release);
+        self.text_count.store(health.text_count, Ordering::Release);
+        self.tag_count.store(health.tag_count, Ordering::Release);
+    }
+
+    fn record_corruption(&self) {
+        self.corrupt_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn apply_delta(counter: &AtomicU32, before: bool, after: bool) {
+        match (before, after) {
+            (false, true) => {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                counter.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_entry_change(&self, before: EntryPresence, after: EntryPresence) {
+        Self::apply_delta(&self.vector_count, before.vector, after.vector);
+        Self::apply_delta(&self.text_count, before.text, after.text);
+        Self::apply_delta(&self.tag_count, before.tags, after.tags);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EntryPresence {
+    vector: bool,
+    text: bool,
+    tags: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -342,6 +401,7 @@ pub trait HyperspaceEngine: Send + Sync {
 pub struct HyperspaceEngineImpl {
     inner: Mutex<EngineInner>,
     metadata: JsonLdMetadataIndex,
+    health: HealthCounters,
     iri_registry: Mutex<IriRegistry>,
     wal: EngineWal,
     data_dir: PathBuf,
@@ -372,6 +432,7 @@ impl HyperspaceEngineImpl {
                 clock: 0,
             }),
             metadata,
+            health: HealthCounters::default(),
             iri_registry: Mutex::new(iri_registry),
             wal,
             data_dir: dir.to_owned(),
@@ -407,8 +468,16 @@ impl HyperspaceEngineImpl {
                     }
                     // Restore forward metadata (JSON strings → Values)
                     for (id, payload_str) in snap.forward_meta {
-                        if let Ok(payload) = serde_json::from_str(&payload_str) {
-                            engine.metadata.index(id, &payload);
+                        match serde_json::from_str(&payload_str) {
+                            Ok(payload) => engine.metadata.index(id, &payload),
+                            Err(error) => {
+                                engine.health.record_corruption();
+                                tracing::error!(
+                                    id,
+                                    error = %error,
+                                    "Unreadable snapshot metadata; retrieval will remain unavailable"
+                                );
+                            }
                         }
                     }
                     // Restore deleted IDs
@@ -418,6 +487,7 @@ impl HyperspaceEngineImpl {
                     drop(inner);
                 }
                 Err(e) => {
+                    engine.health.record_corruption();
                     warn!("Failed to load snapshot, falling back to WAL replay: {e}");
                 }
             }
@@ -425,6 +495,7 @@ impl HyperspaceEngineImpl {
         // Replay every uncheckpointed operation, including frozen WAL
         // segments left behind by a crash during checkpoint rotation.
         engine.recover()?;
+        engine.initialize_health();
         engine.log_retrieval_health();
 
         Ok(engine)
@@ -443,7 +514,12 @@ impl HyperspaceEngineImpl {
                         let record = match WalRecord::decode(data) {
                             Ok(record) => record,
                             Err(error) => {
-                                warn!(id, error = %error, "Ignoring malformed durable vector record");
+                                self.health.record_corruption();
+                                tracing::error!(
+                                    id,
+                                    error = %error,
+                                    "Unreadable durable vector record; retrieval will remain unavailable"
+                                );
                                 return;
                             }
                         };
@@ -457,11 +533,27 @@ impl HyperspaceEngineImpl {
                                 (data.to_vec(), None, None)
                             }
                         };
-                        let _ = inner.store.set(id, &vector_bytes);
+                        if let Err(error) = inner.store.set(id, &vector_bytes) {
+                            self.health.record_corruption();
+                            tracing::error!(
+                                id,
+                                error = %error,
+                                "Invalid recovered vector record; retrieval will remain unavailable"
+                            );
+                            return;
+                        }
                         if !vector_bytes.is_empty() {
                             let dim = (vector_bytes.len().saturating_sub(12)) / 8;
-                            if let Ok(vec) = EmbeddingVector::from_bytes(&vector_bytes, dim) {
-                                inner.index.insert(id, vec);
+                            match EmbeddingVector::from_bytes(&vector_bytes, dim) {
+                                Ok(vec) => inner.index.insert(id, vec),
+                                Err(error) => {
+                                    self.health.record_corruption();
+                                    tracing::error!(
+                                        id,
+                                        error = %error,
+                                        "Unreadable vector payload; retrieval will remain unavailable"
+                                    );
+                                }
                             }
                         }
                         if let Some(iri) = iri {
@@ -476,7 +568,12 @@ impl HyperspaceEngineImpl {
                                     self.metadata.undelete(id);
                                 }
                                 Err(error) => {
-                                    warn!(id, error = %error, "Ignoring malformed durable metadata");
+                                    self.health.record_corruption();
+                                    tracing::error!(
+                                        id,
+                                        error = %error,
+                                        "Unreadable durable metadata; retrieval will remain unavailable"
+                                    );
                                 }
                             }
                         }
@@ -495,7 +592,7 @@ impl HyperspaceEngineImpl {
         Ok(())
     }
 
-    fn persistence_health(&self) -> PersistenceHealth {
+    fn scan_persistence_health(&self) -> PersistenceHealth {
         let inner = self.inner.lock().unwrap();
         let vector_count = inner.store.active_count();
         let (text_count, tag_count) =
@@ -522,16 +619,23 @@ impl HyperspaceEngineImpl {
             vector_count,
             text_count,
             tag_count,
+            corrupt_count: self.health.corrupt_count.load(Ordering::Acquire),
         }
     }
 
+    fn initialize_health(&self) {
+        let health = self.scan_persistence_health();
+        self.health.reset(health);
+    }
+
     fn log_retrieval_health(&self) {
-        let health = self.persistence_health();
+        let health = self.health.report();
         if !health.is_consistent() {
             tracing::error!(
                 vector_count = health.vector_count,
                 text_count = health.text_count,
                 tag_count = health.tag_count,
+                corrupt_count = health.corrupt_count,
                 missing_text_count = health.missing_text_count(),
                 missing_tag_count = health.missing_tag_count(),
                 "Vector store integrity check failed; retrieval is unavailable until records are repaired"
@@ -541,12 +645,34 @@ impl HyperspaceEngineImpl {
 
     /// Report vectors lacking persisted text without modifying the store.
     pub fn persistence_health_report(&self) -> PersistenceHealth {
-        self.persistence_health()
+        self.health.report()
     }
 
     /// Return whether every active vector has both a text payload and tags.
     pub fn is_retrieval_ready(&self) -> bool {
-        self.persistence_health().is_consistent()
+        self.health.report().is_consistent()
+    }
+
+    fn payload_presence(payload: Option<Value>) -> (bool, bool) {
+        let text = payload
+            .as_ref()
+            .and_then(|payload| payload.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty());
+        let tags = payload
+            .as_ref()
+            .and_then(|payload| payload.get("tags"))
+            .is_some_and(Value::is_array);
+        (text, tags)
+    }
+
+    fn entry_presence(&self, inner: &EngineInner, id: u32) -> EntryPresence {
+        let (text, tags) = Self::payload_presence(self.metadata.get_payload(id));
+        EntryPresence {
+            vector: inner.store.get(id).is_some(),
+            text,
+            tags,
+        }
     }
 
     /// Create a Searcher (read-only snapshot) for concurrent querying.
@@ -579,35 +705,29 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         vector: EmbeddingVector,
         jsonld: Value,
     ) -> Result<u32, EngineError> {
-        let id = {
-            let mut reg = self.iri_registry.lock().unwrap();
-            reg.register(iri)
-        };
         let bytes = vector.as_bytes();
-
         let wal_record = WalRecord::encode(iri, &bytes, Some(&jsonld))?;
-
-        // WAL first: vector, IRI, and metadata share one CRC-protected record.
+        let mut inner = self.inner.lock().unwrap();
+        let mut reg = self.iri_registry.lock().unwrap();
+        let id = reg.register(iri);
+        let before = self.entry_presence(&inner, id);
+        inner.clock += 1;
+        // Keep WAL append and in-memory application under one lock so two
+        // writers cannot interleave the record identity and payload.
         self.wal.append(
             &WalOp::Insert {
                 id,
                 iri: iri.to_string(),
             },
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.clock += 1;
-                inner.clock
-            },
+            inner.clock,
             &wal_record,
         )?;
-
-        // Apply to store + index + metadata
-        let mut inner = self.inner.lock().unwrap();
         inner.store.set(id, &bytes)?;
         inner.index.insert(id, vector);
         self.metadata.index(id, &jsonld);
-        // Clear deleted flag in case this is a re-insert of the same IRI
         self.metadata.undelete(id);
+        let after = self.entry_presence(&inner, id);
+        self.health.apply_entry_change(before, after);
 
         Ok(id)
     }
@@ -620,31 +740,27 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         vector: EmbeddingVector,
         jsonld: Value,
     ) -> Result<u32, EngineError> {
-        let id = {
-            let mut reg = self.iri_registry.lock().unwrap();
-            reg.register(iri)
-        };
         let bytes = vector.as_bytes();
         let wal_record = WalRecord::encode(iri, &bytes, Some(&jsonld))?;
-
+        let mut inner = self.inner.lock().unwrap();
+        let mut reg = self.iri_registry.lock().unwrap();
+        let id = reg.register(iri);
+        let before = self.entry_presence(&inner, id);
+        inner.clock += 1;
         self.wal.append(
             &WalOp::Upsert {
                 id,
                 iri: iri.to_string(),
             },
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.clock += 1;
-                inner.clock
-            },
+            inner.clock,
             &wal_record,
         )?;
-
-        let mut inner = self.inner.lock().unwrap();
         inner.store.set(id, &bytes)?;
         inner.index.insert(id, vector);
         self.metadata.index(id, &jsonld);
         self.metadata.undelete(id);
+        let after = self.entry_presence(&inner, id);
+        self.health.apply_entry_change(before, after);
 
         Ok(id)
     }
@@ -652,29 +768,32 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
     // ── Delete ──────────────────────────────────────────────────────────────
 
     async fn delete(&self, iri: &str) -> Result<(), EngineError> {
-        let id = {
-            let reg = self.iri_registry.lock().unwrap();
-            reg.resolve(iri)
-                .ok_or_else(|| EngineError::NotFound(iri.to_string()))?
-        };
-
+        let mut inner = self.inner.lock().unwrap();
+        let reg = self.iri_registry.lock().unwrap();
+        let id = reg
+            .resolve(iri)
+            .ok_or_else(|| EngineError::NotFound(iri.to_string()))?;
+        let before = self.entry_presence(&inner, id);
+        inner.clock += 1;
         self.wal.append(
             &WalOp::Delete {
                 id,
                 iri: iri.to_string(),
             },
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.clock += 1;
-                inner.clock
-            },
+            inner.clock,
             &[],
         )?;
-
-        let mut inner = self.inner.lock().unwrap();
         inner.store.remove(id);
         inner.index.remove(id);
         self.metadata.remove(id);
+        self.health.apply_entry_change(
+            before,
+            EntryPresence {
+                vector: false,
+                text: false,
+                tags: false,
+            },
+        );
 
         Ok(())
     }
@@ -1143,8 +1262,30 @@ mod tests {
                 vector_count: 1,
                 text_count: 0,
                 tag_count: 0,
+                corrupt_count: 0,
             }
         );
+        assert!(!eng.is_retrieval_ready());
+    }
+
+    #[test]
+    fn test_unreadable_wal_record_blocks_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let wal = EngineWal::open(dir.path(), WalSyncMode::Strict).unwrap();
+            wal.append(
+                &WalOp::Insert {
+                    id: 1,
+                    iri: "corrupt:1".into(),
+                },
+                1,
+                b"HSR1not-a-valid-record",
+            )
+            .unwrap();
+        }
+
+        let eng = setup_engine(dir.path());
+        assert_eq!(eng.persistence_health_report().corrupt_count, 1);
         assert!(!eng.is_retrieval_ready());
     }
 

@@ -84,6 +84,8 @@ impl EngineWal {
 
     pub fn open(dir: &Path, sync_mode: WalSyncMode) -> Result<Self, EngineError> {
         fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
 
         let active_path = dir.join("active.wal");
         let lock_path = dir.join("wal.lock");
@@ -97,6 +99,7 @@ impl EngineWal {
                 .read(true)
                 .write(true)
                 .open(&lock_path)?;
+            lf.set_permissions(fs::Permissions::from_mode(0o600))?;
             let fd = lf.as_raw_fd();
             let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
             if ret != 0 {
@@ -116,6 +119,8 @@ impl EngineWal {
             .append(true)
             .read(true)
             .open(&active_path)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
         let current_size = file.metadata()?.len();
 
@@ -276,6 +281,8 @@ impl EngineWal {
             .append(true)
             .read(true)
             .open(&self.active_path)?;
+        #[cfg(unix)]
+        new_file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
         let mut inner = self
             .inner
@@ -462,6 +469,8 @@ impl EngineWal {
     }
 }
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
