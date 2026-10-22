@@ -304,7 +304,11 @@ async fn isolation_contract_agent_and_kb_writes_reject_pa() {
             "/api/v1/kb/categories/category-a".to_string(),
             Value::Null,
         ),
-        (Method::POST, "/api/v1/kb/bases".to_string(), json!({})),
+        (
+            Method::POST,
+            "/api/v1/kb/bases".to_string(),
+            json!({"name": "base", "kb_type": "vector"}),
+        ),
         (Method::PUT, "/api/v1/kb/bases/kb-a".to_string(), json!({})),
         (
             Method::DELETE,

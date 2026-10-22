@@ -76,9 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if old.is_file() {
                     kb += 1;
                     if execute {
-                        fs::create_dir_all(new.parent().unwrap())?;
-                        fs::copy(old, new)?;
-                        copied += 1;
+                        if !new.exists() {
+                            fs::create_dir_all(new.parent().unwrap())?;
+                            fs::copy(old, new)?;
+                            copied += 1;
+                        }
                     }
                 }
             }
@@ -121,9 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .join(project)
                             .join("images")
                             .join(&id);
-                        fs::create_dir_all(target.parent().unwrap())?;
-                        fs::copy(image.path(), target)?;
-                        copied += 1;
+                        if !target.exists() {
+                            fs::create_dir_all(target.parent().unwrap())?;
+                            fs::copy(image.path(), target)?;
+                            copied += 1;
+                        }
                     }
                 }
                 [] => orphan += 1,
