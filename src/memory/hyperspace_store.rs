@@ -162,6 +162,11 @@ impl HyperspaceStore {
         self.embed.dimension()
     }
 
+    /// Whether every persisted vector has both a text payload and tags.
+    pub fn is_retrieval_ready(&self) -> bool {
+        self.engine.is_retrieval_ready()
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
     /// Embed text, falling back to a zero vector on failure.
@@ -609,6 +614,11 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
+        if !self.is_retrieval_ready() {
+            return Err(CoreError::StorageError {
+                message: "vector store integrity check failed; retrieval unavailable".into(),
+            });
+        }
         let vector = self.get_embedding(query).await;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {

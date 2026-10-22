@@ -1166,6 +1166,13 @@ pub(crate) async fn search_knowledge_base_handler(
             )
         }
     };
+    if !store.is_retrieval_ready() {
+        tracing::error!("KB search rejected because vector store integrity validation failed");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "vector store integrity check failed; retrieval unavailable" })),
+        );
+    }
     let limit = req.limit.unwrap_or(5).clamp(1, 20);
     match store
         .search_with_claims_and_required_tags(claims, &query, &[kb_vector_tag(&id)], limit)

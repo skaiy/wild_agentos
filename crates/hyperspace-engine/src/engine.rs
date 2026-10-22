@@ -52,7 +52,22 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistenceHealth {
     pub vector_count: u32,
-    pub missing_text_count: u32,
+    pub text_count: u32,
+    pub tag_count: u32,
+}
+
+impl PersistenceHealth {
+    pub fn is_consistent(self) -> bool {
+        self.vector_count == self.text_count && self.vector_count == self.tag_count
+    }
+
+    pub fn missing_text_count(self) -> u32 {
+        self.vector_count.saturating_sub(self.text_count)
+    }
+
+    pub fn missing_tag_count(self) -> u32 {
+        self.vector_count.saturating_sub(self.tag_count)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -410,7 +425,7 @@ impl HyperspaceEngineImpl {
         // Replay every uncheckpointed operation, including frozen WAL
         // segments left behind by a crash during checkpoint rotation.
         engine.recover()?;
-        engine.warn_on_missing_text();
+        engine.log_retrieval_health();
 
         Ok(engine)
     }
@@ -483,31 +498,43 @@ impl HyperspaceEngineImpl {
     fn persistence_health(&self) -> PersistenceHealth {
         let inner = self.inner.lock().unwrap();
         let vector_count = inner.store.active_count();
-        let missing_text_count = inner
-            .store
-            .iter_active()
-            .filter(|(id, _)| {
-                self.metadata.get_payload(*id).is_none_or(|payload| {
-                    payload
-                        .get("text")
+        let (text_count, tag_count) =
+            inner
+                .store
+                .iter_active()
+                .fold((0, 0), |(text_count, tag_count), (id, _)| {
+                    let payload = self.metadata.get_payload(id);
+                    let has_text = payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("text"))
                         .and_then(Value::as_str)
-                        .is_none_or(str::is_empty)
-                })
-            })
-            .count() as u32;
+                        .is_some_and(|text| !text.is_empty());
+                    let has_tags = payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("tags"))
+                        .is_some_and(Value::is_array);
+                    (
+                        text_count + u32::from(has_text),
+                        tag_count + u32::from(has_tags),
+                    )
+                });
         PersistenceHealth {
             vector_count,
-            missing_text_count,
+            text_count,
+            tag_count,
         }
     }
 
-    fn warn_on_missing_text(&self) {
+    fn log_retrieval_health(&self) {
         let health = self.persistence_health();
-        if health.missing_text_count > 0 {
-            warn!(
+        if !health.is_consistent() {
+            tracing::error!(
                 vector_count = health.vector_count,
-                missing_text_count = health.missing_text_count,
-                "Vector store contains records without persisted text; re-ingest affected records"
+                text_count = health.text_count,
+                tag_count = health.tag_count,
+                missing_text_count = health.missing_text_count(),
+                missing_tag_count = health.missing_tag_count(),
+                "Vector store integrity check failed; retrieval is unavailable until records are repaired"
             );
         }
     }
@@ -515,6 +542,11 @@ impl HyperspaceEngineImpl {
     /// Report vectors lacking persisted text without modifying the store.
     pub fn persistence_health_report(&self) -> PersistenceHealth {
         self.persistence_health()
+    }
+
+    /// Return whether every active vector has both a text payload and tags.
+    pub fn is_retrieval_ready(&self) -> bool {
+        self.persistence_health().is_consistent()
     }
 
     /// Create a Searcher (read-only snapshot) for concurrent querying.
@@ -1052,7 +1084,7 @@ mod tests {
             results[0].payload.as_ref().unwrap()["text"],
             "persisted content"
         );
-        assert_eq!(eng.persistence_health_report().missing_text_count, 0);
+        assert_eq!(eng.persistence_health_report().missing_text_count(), 0);
     }
 
     #[tokio::test]
@@ -1087,8 +1119,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_legacy_vector_records_are_reported_as_missing_text() {
+    #[tokio::test]
+    async fn test_legacy_vector_records_are_reported_as_missing_text() {
         let dir = tempfile::tempdir().unwrap();
         let raw_vector = v(vec![1.0, 0.0, 0.0, 0.0]).as_bytes();
         {
@@ -1109,9 +1141,59 @@ mod tests {
             eng.persistence_health_report(),
             PersistenceHealth {
                 vector_count: 1,
-                missing_text_count: 1,
+                text_count: 0,
+                tag_count: 0,
             }
         );
+        assert!(!eng.is_retrieval_ready());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_writes_keep_vectors_text_and_tags_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = std::sync::Arc::new(
+            HyperspaceEngineImpl::open(
+                dir.path(),
+                WalSyncMode::Strict,
+                16,
+                Box::new(CosineMetric),
+                HnswConfig::default(),
+            )
+            .unwrap(),
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for index in 0..16 {
+            let eng = std::sync::Arc::clone(&eng);
+            tasks.spawn(async move {
+                let mut coords = vec![0.0; 16];
+                coords[index] = 1.0;
+                eng.insert(
+                    &format!("record:{index}"),
+                    v(coords),
+                    json!({
+                        "text": format!("parallel content {index}"),
+                        "tags": [format!("kb:{index}")],
+                    }),
+                )
+                .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        for index in 0..16 {
+            let mut coords = vec![0.0; 16];
+            coords[index] = 1.0;
+            let results = eng.search(&v(coords), 1, &[]).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].iri, format!("record:{index}"));
+            let payload = results[0].payload.as_ref().unwrap();
+            assert_eq!(payload["text"], format!("parallel content {index}"));
+            assert_eq!(payload["tags"][0], format!("kb:{index}"));
+        }
+        assert!(eng.is_retrieval_ready());
     }
 
     #[tokio::test]

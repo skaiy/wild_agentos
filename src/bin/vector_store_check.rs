@@ -51,7 +51,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::json!({
             "data_dir": data_dir,
             "vector_count": health.vector_count,
-            "missing_text_count": health.missing_text_count,
+            "text_count": health.text_count,
+            "tag_count": health.tag_count,
+            "missing_text_count": health.missing_text_count(),
+            "missing_tag_count": health.missing_tag_count(),
+            "retrieval_ready": health.is_consistent(),
         })
     );
     Ok(())
