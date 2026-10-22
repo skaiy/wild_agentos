@@ -24,11 +24,16 @@ use crate::knowledge_graph::ontology_layer::{
     EV_REPAIR_RUNTIME_ASSET_ID,
 };
 use crate::knowledge_graph::store::KnowledgeGraphStore;
-use crate::memory::hyperspace_store::HybridSearchFilter;
+use crate::memory::hyperspace_store::{HybridSearchFilter, ScoredEntry};
 
+use super::agents::resolve_definition_revision;
 use super::api_gov;
 use super::iam::UserIdentity;
+use super::kb::kb_vector_tag;
 use super::AppState;
+
+const PACK_VECTOR_RAG_PER_KB_LIMIT: u64 = 5;
+const PACK_VECTOR_RAG_TOTAL_LIMIT: usize = 8;
 
 #[derive(Deserialize)]
 pub struct AgentChatRequest {
@@ -335,20 +340,126 @@ fn truncate_retrieval_fact(value: &str, maximum: usize) -> String {
     }
 }
 
-async fn ev_repair_context(
-    state: &Arc<AppState>,
-    claims: &IsolationClaims,
-    messages: &[ChatMessage],
-    agent_name: &str,
-) -> Result<Vec<ChatMessage>, (StatusCode, Value)> {
-    let question = messages
+fn latest_user_question(messages: &[ChatMessage]) -> String {
+    messages
         .iter()
         .rev()
         .find(|message| message.role == "user")
         .map(|message| message.content.as_text())
+        .unwrap_or_default()
+}
+
+fn system_chat_message(content: impl Into<ChatContent>) -> ChatMessage {
+    ChatMessage {
+        role: "system".into(),
+        content: content.into(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
+fn format_vector_hits_section(hits: &[ScoredEntry]) -> String {
+    let mut section = String::from("【向量知识库检索结果】\n");
+    for hit in hits {
+        section.push_str(&format!(
+            "- （相关度 {:.2}）{}\n",
+            hit.score,
+            truncate_retrieval_fact(&hit.text, 400)
+        ));
+    }
+    section
+}
+
+async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec<String> {
+    let pack_ids: Vec<&str> = agent
+        .get("knowledge_pack_ids")
+        .and_then(Value::as_array)
+        .map(|packs| {
+            packs
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
+    if pack_ids.is_empty() {
+        return Vec::new();
+    }
+    let packs = state.knowledge_packs.read().await;
+    let mut kb_ids = Vec::new();
+    for pack_id in pack_ids {
+        let Some(pack) = packs
+            .iter()
+            .find(|pack| pack.get("id").and_then(Value::as_str) == Some(pack_id))
+        else {
+            continue;
+        };
+        if let Some(ids) = pack.get("vector_kb_ids").and_then(Value::as_array) {
+            for id in ids {
+                if let Some(kb_id) = id.as_str() {
+                    if !kb_id.is_empty() && !kb_ids.iter().any(|existing| existing == kb_id) {
+                        kb_ids.push(kb_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    kb_ids
+}
+
+async fn pack_scoped_vector_hits(
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    question: &str,
+    kb_ids: &[String],
+) -> Vec<ScoredEntry> {
+    if kb_ids.is_empty() {
+        return Vec::new();
+    }
+    let Some(store) = state.vector_store.load_full() else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for kb_id in kb_ids {
+        let tag = kb_vector_tag(kb_id);
+        match store
+            .search_with_claims_and_required_tags(
+                claims,
+                question,
+                &[tag],
+                PACK_VECTOR_RAG_PER_KB_LIMIT,
+            )
+            .await
+        {
+            Ok(batch) => hits.extend(batch),
+            Err(error) => {
+                tracing::warn!(
+                    kb_id = %kb_id,
+                    error = %error,
+                    "pack-scoped chat vector retrieval failed; omitting hits for this KB"
+                );
+            }
+        }
+    }
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
+    hits
+}
+
+async fn ev_repair_graph_retrieval(
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    question: &str,
+) -> Result<String, (StatusCode, Value)> {
     let mut facts = String::new();
-    if let Some(query) = ev_repair_retrieval_query(&extract_fault_code_tokens(&question)) {
+    if let Some(query) = ev_repair_retrieval_query(&extract_fault_code_tokens(question)) {
         let graph =
             KnowledgeGraphStore::with_shared_store(state.kg_store.clone()).map_err(|e| {
                 (
@@ -376,71 +487,119 @@ async fn ev_repair_context(
             ));
         }
     }
-    let mut retrieval = if facts.is_empty() {
+    Ok(if facts.is_empty() {
         "【知识图谱检索结果】\n（未检索到相关故障码记录）".to_string()
     } else {
         format!("【知识图谱检索结果】\n{facts}")
-    };
-    if let Some(store) = state.vector_store.load_full() {
-        let hits = store
-            .search_with_claims(claims, &question, &HybridSearchFilter::new(), 5)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({ "error": format!("chat vector retrieval failed: {e}") }),
-                )
-            })?;
-        if !hits.is_empty() {
-            retrieval.push_str("\n【向量知识库检索结果】\n");
-            for hit in hits {
-                retrieval.push_str(&format!(
-                    "- （相关度 {:.2}）{}\n",
-                    hit.score,
-                    truncate_retrieval_fact(&hit.text, 400)
-                ));
-            }
-        }
-    }
-    Ok(vec![
-        ChatMessage {
-            role: "system".into(),
-            content: EV_REPAIR_PROMPT_TEMPLATE
-                .replace("{{agent_name}}", agent_name)
-                .into(),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-        ChatMessage {
-            role: "system".into(),
-            content: retrieval.into(),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-    ])
+    })
 }
 
-async fn builtin_runtime_context(
-    asset: BuiltinRuntimeAsset,
+async fn ev_repair_legacy_vector_section(
     state: &Arc<AppState>,
     claims: &IsolationClaims,
-    messages: &[ChatMessage],
-    agent_name: &str,
-) -> Result<Vec<ChatMessage>, (StatusCode, Value)> {
-    match asset {
-        BuiltinRuntimeAsset::EvRepair => {
-            ev_repair_context(state, claims, messages, agent_name).await
-        }
+    question: &str,
+) -> Result<Option<String>, (StatusCode, Value)> {
+    let Some(store) = state.vector_store.load_full() else {
+        return Ok(None);
+    };
+    let hits = store
+        .search_with_claims(claims, question, &HybridSearchFilter::new(), 5)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("chat vector retrieval failed: {e}") }),
+            )
+        })?;
+    if hits.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format_vector_hits_section(&hits)))
     }
 }
 
-/// Single-turn native chat requests become a regular user message. The generic
-/// HTTP paths deliberately add neither a default system message nor retrieval
-/// context, so an Agent can be used by businesses other than EV repair.
+fn active_definition_system_prompt(
+    agents: &[Value],
+    claims: &IsolationClaims,
+    agent_id: &str,
+) -> Option<String> {
+    resolve_definition_revision(
+        agents,
+        claims.tenant_id(),
+        claims.project_id(),
+        agent_id,
+        None,
+    )
+    .ok()
+    .map(|definition| definition.system_prompt)
+    .filter(|prompt| !prompt.trim().is_empty())
+}
+
+/// Claims-scoped chat prepends the active revision system prompt and optional
+/// pack-scoped vector RAG. Built-in EV repair graph retrieval still runs when
+/// the allowlisted runtime asset is mounted.
+async fn build_claims_scoped_prefix_messages(
+    state: &Arc<AppState>,
+    claims: &IsolationClaims,
+    agent: &Value,
+    messages: &[ChatMessage],
+) -> Result<Vec<ChatMessage>, (StatusCode, Value)> {
+    let question = latest_user_question(messages);
+    let agent_id = agent.get("id").and_then(Value::as_str).unwrap_or_default();
+    let agents_snapshot = state.user_agents.read().await.clone();
+    let definition_prompt = active_definition_system_prompt(&agents_snapshot, claims, agent_id);
+    let builtin_asset = mounted_builtin_runtime_asset(state, agent).await;
+    let agent_name = agent
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("维修助手");
+
+    let mut prefix = Vec::new();
+    if let Some(prompt) = definition_prompt {
+        prefix.push(system_chat_message(prompt));
+    } else if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
+        prefix.push(system_chat_message(
+            EV_REPAIR_PROMPT_TEMPLATE.replace("{{agent_name}}", agent_name),
+        ));
+    }
+
+    let pack_kb_ids = mounted_pack_vector_kb_ids(state, agent).await;
+    let graph_retrieval = if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
+        Some(ev_repair_graph_retrieval(state, claims, &question).await?)
+    } else {
+        None
+    };
+
+    let vector_section = if !pack_kb_ids.is_empty() {
+        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids).await;
+        if hits.is_empty() {
+            None
+        } else {
+            Some(format_vector_hits_section(&hits))
+        }
+    } else if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
+        ev_repair_legacy_vector_section(state, claims, &question).await?
+    } else {
+        None
+    };
+
+    let mut retrieval = graph_retrieval.unwrap_or_default();
+    if let Some(vector) = vector_section {
+        if !retrieval.is_empty() {
+            retrieval.push('\n');
+        }
+        retrieval.push_str(&vector);
+    }
+    if !retrieval.trim().is_empty() {
+        prefix.push(system_chat_message(retrieval));
+    }
+
+    Ok(prefix)
+}
+
+/// Single-turn native chat requests become a regular user message. Claims-scoped
+/// chat may prepend the active revision system prompt and pack retrieval in
+/// [`build_claims_scoped_prefix_messages`]; unauthenticated public chat does not.
 fn single_user_message(message: &str, images: &[String]) -> Vec<ChatMessage> {
     let content = if images.is_empty() {
         ChatContent::text(message)
@@ -459,9 +618,8 @@ fn single_user_message(message: &str, images: &[String]) -> Vec<ChatMessage> {
     }]
 }
 
-/// Validate Agent accessibility and choose its chat/vision model. Callers'
-/// messages are forwarded unchanged unless this claims-scoped Agent explicitly
-/// mounts a known built-in runtime asset.
+/// Validate Agent accessibility and choose its chat/vision model. Claims-scoped
+/// chat prepends revision prompts and retrieval; public callers are unchanged.
 async fn build_chat_context(
     state: &Arc<AppState>,
     id: &str,
@@ -541,18 +699,10 @@ async fn build_chat_context_with_fallback(
         ));
     }
     let messages = if let Some(claims) = claims {
-        if let Some(asset) = mounted_builtin_runtime_asset(state, &agent).await {
-            let agent_name = agent
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("维修助手");
-            let mut asset_messages =
-                builtin_runtime_context(asset, state, claims, &messages, agent_name).await?;
-            asset_messages.extend(messages);
-            asset_messages
-        } else {
-            messages
-        }
+        let mut scoped_messages =
+            build_claims_scoped_prefix_messages(state, claims, &agent, &messages).await?;
+        scoped_messages.extend(messages);
+        scoped_messages
     } else {
         messages
     };
@@ -1340,6 +1490,129 @@ mod tests {
             Ok(_) => panic!("tenant B accessed tenant A's agent"),
         };
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn agent_with_revision_system_prompt_and_pack_vector_kb_gets_rag_context() {
+        let state = make_state();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let vector_dir = std::env::temp_dir().join(format!("chat_vec_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vector_dir).unwrap();
+        let vector_store = crate::memory::hyperspace_store::HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        let kb_id = "demo-vector-kb";
+        vector_store
+            .upsert_with_claims(
+                &claims,
+                "baowai-fact-1",
+                "cite baowai manual section 3.2 for P0A80 battery isolation",
+                &[kb_vector_tag(kb_id)],
+            )
+            .await
+            .unwrap();
+        state.vector_store.store(Some(Arc::new(vector_store)));
+
+        {
+            let mut packs = state.knowledge_packs.write().await;
+            packs.push(json!({
+                "id": "demo-pack",
+                "vector_kb_ids": [kb_id],
+            }));
+            let mut agents = state.user_agents.write().await;
+            let agent = agents
+                .iter_mut()
+                .find(|agent| agent["id"] == "agent-a")
+                .unwrap();
+            agent["knowledge_pack_ids"] = json!(["demo-pack"]);
+            agent["active_revision"] = json!("1");
+            agent["revisions"] = json!([{
+                "revision": "1",
+                "system_prompt": "Refuse to invent VIN or owner. Always cite baowai.",
+                "model": "test-model",
+                "created_at": "2026-01-01T00:00:00Z"
+            }]);
+        }
+
+        let context = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("What does P0A80 mean?", &[]),
+            Some(&claims),
+        )
+        .await
+        .unwrap();
+
+        assert!(context.messages.len() >= 3);
+        assert_eq!(context.messages[0].role, "system");
+        assert!(context
+            .messages[0]
+            .content
+            .as_text()
+            .contains("Refuse to invent VIN"));
+        assert!(
+            context
+                .messages
+                .iter()
+                .any(|message| message.content.as_text().contains("【向量知识库检索结果】")),
+            "expected pack-scoped vector retrieval system message"
+        );
+        assert!(context.messages.iter().any(|message| {
+            message
+                .content
+                .as_text()
+                .contains("baowai manual section 3.2")
+        }));
+        assert_eq!(
+            context.messages.last().unwrap().content.as_text(),
+            "What does P0A80 mean?"
+        );
+    }
+
+    #[tokio::test]
+    async fn ev_repair_mount_uses_definition_system_prompt_when_revision_present() {
+        let state = make_state();
+        let tenant_a = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        insert_fault(&state.kg_store, &tenant_a, "P0A80");
+        {
+            let mut agents = state.user_agents.write().await;
+            let agent = agents
+                .iter_mut()
+                .find(|agent| agent["id"] == "agent-a")
+                .unwrap();
+            agent["knowledge_pack_ids"] = json!([EV_REPAIR_KNOWLEDGE_PACK_ID]);
+            agent["active_revision"] = json!("1");
+            agent["revisions"] = json!([{
+                "revision": "1",
+                "system_prompt": "Custom EV demo prompt wins over built-in template.",
+                "model": "test-model",
+                "created_at": "2026-01-01T00:00:00Z"
+            }]);
+        }
+
+        let context = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("Explain P0A80", &[]),
+            Some(&tenant_a),
+        )
+        .await
+        .unwrap();
+
+        assert!(context.messages[0]
+            .content
+            .as_text()
+            .contains("Custom EV demo prompt"));
+        assert!(!context.messages[0]
+            .content
+            .as_text()
+            .contains("新能源汽车故障诊断与维修"));
+        assert!(context.messages[1]
+            .content
+            .as_text()
+            .contains("故障码 P0A80"));
     }
 
     #[tokio::test]

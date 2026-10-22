@@ -573,7 +573,7 @@ fn kb_belongs_to_claims(kb: &Value, claims: &IsolationClaims) -> bool {
 }
 
 /// Server-derived filter tag that separates KBs sharing a claims namespace.
-fn kb_vector_tag(kb_id: &str) -> String {
+pub(crate) fn kb_vector_tag(kb_id: &str) -> String {
     format!("kb:{kb_id}")
 }
 
