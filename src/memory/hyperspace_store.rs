@@ -574,7 +574,13 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vec = self.get_query_embedding(query).await?;
+        let embedding = self.get_embedding(query).await;
+        let vec =
+            EmbeddingVector::from_f32_slice(&embedding, MetricKind::Cosine).map_err(|error| {
+                CoreError::Internal {
+                    message: format!("EmbeddingVector: {error}"),
+                }
+            })?;
 
         let filters = self.to_jsonld_filters(filter);
         let results = self
@@ -656,7 +662,10 @@ impl HyperspaceStore {
                 missing_vectors += 1;
                 continue;
             };
-            Self::normalize_for_cosine(&mut vector, "stored")?;
+            if Self::normalize_for_cosine(&mut vector, "stored").is_err() {
+                missing_vectors += 1;
+                continue;
+            }
             // The store is configured with CosineMetric, whose engine score is
             // negative distance (dot product minus one).
             entry.score = query
@@ -671,7 +680,7 @@ impl HyperspaceStore {
         if missing_vectors > 0 {
             warn!(
                 missing_vectors,
-                "scoped vector retrieval skipped entries with no stored vector"
+                "scoped vector retrieval skipped entries with missing or invalid stored vectors"
             );
         }
         scored.sort_by(|left, right| {
@@ -737,7 +746,13 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vec = self.get_query_embedding(query).await?;
+        let embedding = self.get_embedding(query).await;
+        let vec =
+            EmbeddingVector::from_f32_slice(&embedding, MetricKind::Cosine).map_err(|error| {
+                CoreError::Internal {
+                    message: format!("EmbeddingVector: {error}"),
+                }
+            })?;
 
         let filters = self.to_jsonld_filters(filter);
         let results = self

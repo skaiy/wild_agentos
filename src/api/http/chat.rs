@@ -419,9 +419,11 @@ async fn pack_scoped_vector_hits(
         return Ok(Vec::new());
     }
     let Some(store) = state.vector_store.load_full() else {
-        return Ok(Vec::new());
+        return Err(crate::CoreError::Internal {
+            message: "pack vector store unavailable".into(),
+        });
     };
-    let mut hits = Vec::new();
+    let mut batches = Vec::with_capacity(kb_ids.len());
     for kb_id in kb_ids {
         let tag = kb_vector_tag(kb_id);
         let batch = store
@@ -432,16 +434,40 @@ async fn pack_scoped_vector_hits(
                 PACK_VECTOR_RAG_PER_KB_LIMIT,
             )
             .await?;
-        hits.extend(batch);
+        batches.push(batch);
     }
-    hits.sort_by(|left, right| {
+    // Reserve one result per mounted KB before global ranking. This prevents a
+    // large KB from consuming all eight response slots after prefiltering.
+    let mut hits = Vec::with_capacity(PACK_VECTOR_RAG_TOTAL_LIMIT);
+    let mut seen_iris = std::collections::HashSet::new();
+    for batch in &batches {
+        if let Some(hit) = batch.first() {
+            if seen_iris.insert(hit.iri.clone()) {
+                hits.push(hit.clone());
+                if hits.len() == PACK_VECTOR_RAG_TOTAL_LIMIT {
+                    return Ok(hits);
+                }
+            }
+        }
+    }
+    let mut remaining: Vec<ScoredEntry> = batches
+        .into_iter()
+        .flat_map(|batch| batch.into_iter().skip(1))
+        .collect();
+    remaining.sort_by(|left, right| {
         right
             .score
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.dedup_by(|left, right| left.iri == right.iri);
-    hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
+    for hit in remaining {
+        if seen_iris.insert(hit.iri.clone()) {
+            hits.push(hit);
+            if hits.len() == PACK_VECTOR_RAG_TOTAL_LIMIT {
+                break;
+            }
+        }
+    }
     Ok(hits)
 }
 
@@ -566,9 +592,10 @@ async fn build_claims_scoped_prefix_messages(
         let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids)
             .await
             .map_err(|error| {
+                tracing::warn!(error = %error, "pack-scoped chat vector retrieval unavailable");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    json!({ "error": format!("pack vector retrieval unavailable: {error}") }),
+                    json!({ "error": "知识包检索暂不可用，请稍后重试" }),
                 )
             })?;
         if hits.is_empty() {
