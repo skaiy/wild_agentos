@@ -446,9 +446,9 @@ fn is_mileage_like(token: &str) -> bool {
 }
 
 fn is_usb_like(token: &str) -> bool {
-    token
-        .strip_prefix("USB")
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|character| character.is_ascii_digit()))
+    token.strip_prefix("USB").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|character| character.is_ascii_digit())
+    })
 }
 
 /// A VIN uses a restricted uppercase alphabet; any 16/17-character contiguous
@@ -1839,13 +1839,13 @@ mod tests {
                 "Codes 1234 C1A10 CP_A055 NIO_WL_021; years 1999年 2024年 2099年; \
                  phones {phone} {separated_phone}; VIN pre{vin}suffix \
                  {truncated_vin} {vin_suffix}; ES8 京A12345 120000km",
-            ),
+            ),),
             vec![
                 "1234".to_string(),
+                "2099".to_string(),
                 "c1a10".to_string(),
                 "cp_a055".to_string(),
                 "nio_wl_021".to_string(),
-                "2099".to_string(),
             ]
         );
         assert!(extract_pack_fault_code_tokens("odometer 12000 km; 里程 12345").is_empty());
