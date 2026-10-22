@@ -2865,7 +2865,7 @@ mod isolation_contract {
                 sub: format!("{tenant_id}-user"),
                 tenant_id: tenant_id.to_string(),
                 project_id: project_id.map(str::to_owned),
-                roles: vec![],
+                roles: vec!["DA".into()],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
             &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
