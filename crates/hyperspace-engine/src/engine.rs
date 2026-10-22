@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -45,6 +46,55 @@ pub struct SearchHit {
     pub iri: String,
     pub score: f32,
     pub payload: Option<Value>,
+}
+
+/// Read-only persistence health information for a vector store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistenceHealth {
+    pub vector_count: u32,
+    pub missing_text_count: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WalRecord {
+    iri: String,
+    vector: Vec<u8>,
+    payload: Option<String>,
+}
+
+impl WalRecord {
+    const MAGIC: &'static [u8; 4] = b"HSR1";
+
+    fn encode(iri: &str, vector: &[u8], payload: Option<&Value>) -> Result<Vec<u8>, EngineError> {
+        let mut bytes = Self::MAGIC.to_vec();
+        bytes.extend(
+            bincode::serialize(&Self {
+                iri: iri.to_owned(),
+                vector: vector.to_vec(),
+                payload: payload
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| EngineError::StorageError {
+                        message: format!("WAL payload serialization: {e}"),
+                    })?,
+            })
+            .map_err(|e| EngineError::StorageError {
+                message: format!("WAL record serialization: {e}"),
+            })?,
+        );
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Option<Self>, EngineError> {
+        if !bytes.starts_with(Self::MAGIC) {
+            return Ok(None);
+        }
+        bincode::deserialize(&bytes[Self::MAGIC.len()..])
+            .map(Some)
+            .map_err(|e| EngineError::StorageError {
+                message: format!("WAL record deserialization: {e}"),
+            })
+    }
 }
 
 // ── IriRegistry ──────────────────────────────────────────────────────────────
@@ -88,6 +138,15 @@ impl IriRegistry {
         self.iri_to_id.insert(iri.to_string(), id);
         self.id_to_iri.insert(id, iri.to_string());
         id
+    }
+
+    /// Restore an IRI with its persisted ID during WAL replay.
+    pub fn register_id(&mut self, id: u32, iri: &str) {
+        self.iri_to_id.insert(iri.to_string(), id);
+        self.id_to_iri.insert(id, iri.to_string());
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
     }
 
     /// Resolve an IRI to its numeric ID (if registered).
@@ -315,8 +374,6 @@ impl HyperspaceEngineImpl {
                         snap.nodes.len(),
                         snap.clock
                     );
-                    eprintln!("DEBUG: snapshot forward_meta len={}, deleted_ids len={}, iri_registry len={}",
-                        snap.forward_meta.len(), snap.deleted_ids.len(), snap.iri_registry.len());
                     let mut inner = engine.inner.lock().unwrap();
                     let metric_kind = inner.index.metric().kind();
                     inner.index.import_nodes(snap.nodes.clone());
@@ -347,50 +404,117 @@ impl HyperspaceEngineImpl {
                 }
                 Err(e) => {
                     warn!("Failed to load snapshot, falling back to WAL replay: {e}");
-                    engine.recover()?;
                 }
             }
-        } else {
-            // No snapshot — full WAL replay
-            engine.recover()?;
         }
+        // Replay every uncheckpointed operation, including frozen WAL
+        // segments left behind by a crash during checkpoint rotation.
+        engine.recover()?;
+        engine.warn_on_missing_text();
 
         Ok(engine)
     }
 
-    /// Recover state by replaying the WAL into store + index.
+    /// Recover state by replaying WAL records into store, index, and metadata.
     fn recover(&self) -> Result<(), EngineError> {
-        let wal_path = self.wal.active_path().to_owned();
         let mut inner = self.inner.lock().unwrap();
 
-        let _count = EngineWal::replay(&wal_path, |op, ts, data| {
-            inner.clock = inner.clock.max(ts);
-            match op {
-                WalOp::Insert { id, iri } | WalOp::Upsert { id, iri } => {
-                    let _ = inner.store.set(id, data);
-                    if !data.is_empty() {
-                        let dim = (data.len().saturating_sub(12)) / 8;
-                        if let Ok(vec) = EmbeddingVector::from_bytes(data, dim) {
-                            inner.index.insert(id, vec);
+        let mut total = 0;
+        for wal_path in self.wal.pending_paths()? {
+            total += EngineWal::replay(&wal_path, |op, ts, data| {
+                inner.clock = inner.clock.max(ts);
+                match op {
+                    WalOp::Insert { id, .. } | WalOp::Upsert { id, .. } => {
+                        let record = match WalRecord::decode(data) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                warn!(id, error = %error, "Ignoring malformed durable vector record");
+                                return;
+                            }
+                        };
+                        let (vector_bytes, iri, payload) = match record {
+                            Some(record) => (record.vector, Some(record.iri), record.payload),
+                            None => {
+                                warn!(
+                                    id,
+                                    "Recovered legacy vector record without text or metadata"
+                                );
+                                (data.to_vec(), None, None)
+                            }
+                        };
+                        let _ = inner.store.set(id, &vector_bytes);
+                        if !vector_bytes.is_empty() {
+                            let dim = (vector_bytes.len().saturating_sub(12)) / 8;
+                            if let Ok(vec) = EmbeddingVector::from_bytes(&vector_bytes, dim) {
+                                inner.index.insert(id, vec);
+                            }
+                        }
+                        if let Some(iri) = iri {
+                            if let Ok(mut reg) = self.iri_registry.lock() {
+                                reg.register_id(id, &iri);
+                            }
+                        }
+                        if let Some(payload) = payload {
+                            match serde_json::from_str(&payload) {
+                                Ok(payload) => {
+                                    self.metadata.index(id, &payload);
+                                    self.metadata.undelete(id);
+                                }
+                                Err(error) => {
+                                    warn!(id, error = %error, "Ignoring malformed durable metadata");
+                                }
+                            }
                         }
                     }
-                    if !iri.is_empty() {
-                        if let Ok(mut reg) = self.iri_registry.lock() {
-                            reg.register(&iri);
-                        }
+                    WalOp::Delete { id, .. } => {
+                        inner.store.remove(id);
+                        inner.index.remove(id);
+                        self.metadata.remove(id);
                     }
+                    WalOp::MetadataUpdate { .. } => {}
                 }
-                WalOp::Delete { id, .. } => {
-                    inner.store.remove(id);
-                    inner.index.remove(id);
-                    self.metadata.remove(id);
-                }
-                WalOp::MetadataUpdate { .. } => {}
-            }
-        })?;
+            })?;
+        }
 
-        info!("WAL replay complete: {} entries", _count);
+        info!("WAL replay complete: {} entries", total);
         Ok(())
+    }
+
+    fn persistence_health(&self) -> PersistenceHealth {
+        let inner = self.inner.lock().unwrap();
+        let vector_count = inner.store.active_count();
+        let missing_text_count = inner
+            .store
+            .iter_active()
+            .filter(|(id, _)| {
+                self.metadata.get_payload(*id).is_none_or(|payload| {
+                    payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                })
+            })
+            .count() as u32;
+        PersistenceHealth {
+            vector_count,
+            missing_text_count,
+        }
+    }
+
+    fn warn_on_missing_text(&self) {
+        let health = self.persistence_health();
+        if health.missing_text_count > 0 {
+            warn!(
+                vector_count = health.vector_count,
+                missing_text_count = health.missing_text_count,
+                "Vector store contains records without persisted text; re-ingest affected records"
+            );
+        }
+    }
+
+    /// Report vectors lacking persisted text without modifying the store.
+    pub fn persistence_health_report(&self) -> PersistenceHealth {
+        self.persistence_health()
     }
 
     /// Create a Searcher (read-only snapshot) for concurrent querying.
@@ -429,7 +553,9 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         };
         let bytes = vector.as_bytes();
 
-        // WAL first
+        let wal_record = WalRecord::encode(iri, &bytes, Some(&jsonld))?;
+
+        // WAL first: vector, IRI, and metadata share one CRC-protected record.
         self.wal.append(
             &WalOp::Insert {
                 id,
@@ -440,7 +566,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
                 inner.clock += 1;
                 inner.clock
             },
-            &bytes,
+            &wal_record,
         )?;
 
         // Apply to store + index + metadata
@@ -467,6 +593,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
             reg.register(iri)
         };
         let bytes = vector.as_bytes();
+        let wal_record = WalRecord::encode(iri, &bytes, Some(&jsonld))?;
 
         self.wal.append(
             &WalOp::Upsert {
@@ -478,13 +605,14 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
                 inner.clock += 1;
                 inner.clock
             },
-            &bytes,
+            &wal_record,
         )?;
 
         let mut inner = self.inner.lock().unwrap();
         inner.store.set(id, &bytes)?;
         inner.index.insert(id, vector);
         self.metadata.index(id, &jsonld);
+        self.metadata.undelete(id);
 
         Ok(id)
     }
@@ -881,6 +1009,109 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].iri, "p");
+    }
+
+    #[tokio::test]
+    async fn test_wal_recovery_preserves_text_and_tags_without_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let eng = setup_async_engine(dir.path());
+            eng.insert(
+                "record:1",
+                v(vec![1.0, 0.0, 0.0, 0.0]),
+                json!({"text": "persisted content", "tags": ["kb:alpha"]}),
+            )
+            .await
+            .unwrap();
+            assert!(dir.path().join("active.wal").metadata().unwrap().len() > 0);
+        }
+
+        assert!(dir.path().join("active.wal").metadata().unwrap().len() > 0);
+        let replayed = EngineWal::replay(&dir.path().join("active.wal"), |_, _, data| {
+            assert!(WalRecord::decode(data).unwrap().unwrap().payload.is_some());
+        })
+        .unwrap();
+        assert_eq!(replayed, 1);
+        let eng = setup_async_engine(dir.path());
+        assert_eq!(eng.count().await.unwrap(), 1);
+        assert_eq!(
+            eng.get_payload("record:1").await.unwrap().unwrap()["text"],
+            "persisted content"
+        );
+        let results = eng
+            .search(
+                &v(vec![1.0, 0.0, 0.0, 0.0]),
+                5,
+                &[JsonLdFilter::tag("tags", "kb:alpha")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].iri, "record:1");
+        assert_eq!(
+            results[0].payload.as_ref().unwrap()["text"],
+            "persisted content"
+        );
+        assert_eq!(eng.persistence_health_report().missing_text_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_recovery_replays_frozen_wal_after_interrupted_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let eng = setup_async_engine(dir.path());
+            eng.insert(
+                "record:2",
+                v(vec![1.0, 0.0, 0.0, 0.0]),
+                json!({"text": "atomic record", "tags": ["kb:beta"]}),
+            )
+            .await
+            .unwrap();
+            eng.wal.rotate().unwrap();
+        }
+
+        let eng = setup_async_engine(dir.path());
+        assert_eq!(eng.count().await.unwrap(), 1);
+        let results = eng
+            .search(
+                &v(vec![1.0, 0.0, 0.0, 0.0]),
+                5,
+                &[JsonLdFilter::tag("tags", "kb:beta")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].payload.as_ref().unwrap()["text"],
+            "atomic record"
+        );
+    }
+
+    #[test]
+    fn test_legacy_vector_records_are_reported_as_missing_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_vector = v(vec![1.0, 0.0, 0.0, 0.0]).as_bytes();
+        {
+            let wal = EngineWal::open(dir.path(), WalSyncMode::Strict).unwrap();
+            wal.append(
+                &WalOp::Insert {
+                    id: 1,
+                    iri: "legacy:1".into(),
+                },
+                1,
+                &raw_vector,
+            )
+            .unwrap();
+        }
+
+        let eng = setup_engine(dir.path());
+        assert_eq!(
+            eng.persistence_health_report(),
+            PersistenceHealth {
+                vector_count: 1,
+                missing_text_count: 1,
+            }
+        );
     }
 
     #[tokio::test]

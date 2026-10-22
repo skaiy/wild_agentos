@@ -81,6 +81,7 @@ impl JsonLdMetadataIndex {
     /// Index a JSON-LD value for the given ID.
     /// Automatically extracts @type, @context, named_graph, tags, and numeric values.
     pub fn index(&self, id: u32, jsonld: &Value) {
+        self.remove_from_indexes(id);
         // @type
         if let Some(types) = jsonld.get("@type").and_then(|v| v.as_array()) {
             for t in types {
@@ -153,10 +154,52 @@ impl JsonLdMetadataIndex {
 
     /// Remove ID from all indexes.
     pub fn remove(&self, id: u32) {
+        self.remove_from_indexes(id);
         if let Ok(mut del) = self.deleted.write() {
             del.insert(id);
         }
+    }
+
+    fn remove_from_indexes(&self, id: u32) {
         self.forward.remove(&id);
+        for index in [
+            &self.inverted,
+            &self.type_index,
+            &self.graph_index,
+            &self.context_index,
+        ] {
+            let keys: Vec<String> = index
+                .iter()
+                .filter(|entry| entry.value().contains(id))
+                .map(|entry| entry.key().clone())
+                .collect();
+            for key in keys {
+                if let Some(mut bitmap) = index.get_mut(&key) {
+                    bitmap.remove(id);
+                    if bitmap.is_empty() {
+                        drop(bitmap);
+                        index.remove(&key);
+                    }
+                }
+            }
+        }
+        for entry in self.numeric.iter() {
+            if let Ok(mut tree) = entry.value().write() {
+                let keys: Vec<i64> = tree
+                    .iter()
+                    .filter(|(_, bitmap)| bitmap.contains(id))
+                    .map(|(key, _)| *key)
+                    .collect();
+                for key in keys {
+                    if let Some(bitmap) = tree.get_mut(&key) {
+                        bitmap.remove(id);
+                        if bitmap.is_empty() {
+                            tree.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn undelete(&self, id: u32) {

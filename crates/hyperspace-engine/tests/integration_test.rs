@@ -112,6 +112,41 @@ async fn test_crash_recovery() {
 }
 
 #[tokio::test]
+async fn test_restart_preserves_text_and_tags_without_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let eng = setup(dir.path());
+        eng.insert(
+            "chunk:restart",
+            v(vec![1.0, 0.0, 0.0, 0.0]),
+            json!({"text": "retained chunk text", "tags": ["kb:retained"]}),
+        )
+        .await
+        .unwrap();
+    }
+
+    let eng = setup(dir.path());
+    let results = eng
+        .search(
+            &v(vec![1.0, 0.0, 0.0, 0.0]),
+            5,
+            &[hyperspace_engine::filter::JsonLdFilter::tag(
+                "tags",
+                "kb:retained",
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].iri, "chunk:restart");
+    assert_eq!(
+        results[0].payload.as_ref().unwrap()["text"],
+        "retained chunk text"
+    );
+}
+
+#[tokio::test]
 async fn test_upsert_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let eng = setup(dir.path());

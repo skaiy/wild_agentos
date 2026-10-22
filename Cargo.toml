@@ -183,6 +183,10 @@ path = "src/bin/isolation_migrate.rs"
 name = "private-deploy-bench"
 path = "src/bin/private_deploy_bench.rs"
 
+[[bin]]
+name = "vector-store-check"
+path = "src/bin/vector_store_check.rs"
+
 [[bench]]
 name = "bench_graph_backend"
 harness = false
