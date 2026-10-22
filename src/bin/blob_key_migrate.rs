@@ -55,12 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .join(doc_id);
                 if old.is_file() {
                     kb += 1;
-                    if execute {
-                        if !new.exists() {
-                            fs::create_dir_all(new.parent().unwrap())?;
-                            fs::copy(old, new)?;
-                            copied += 1;
-                        }
+                    if execute && !new.exists() {
+                        fs::create_dir_all(new.parent().unwrap())?;
+                        fs::copy(old, new)?;
+                        copied += 1;
                     }
                 }
             }
@@ -100,17 +98,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match owners.as_slice() {
                 [(owner_tenant, project)] if owner_tenant == &tenant_name => {
                     images += 1;
-                    if execute {
-                        let target = blobs
-                            .join(owner_tenant)
-                            .join(project)
-                            .join("images")
-                            .join(&id);
-                        if !target.exists() {
-                            fs::create_dir_all(target.parent().unwrap())?;
-                            fs::copy(image.path(), target)?;
-                            copied += 1;
-                        }
+                    let target = blobs
+                        .join(owner_tenant)
+                        .join(project)
+                        .join("images")
+                        .join(&id);
+                    if execute && !target.exists() {
+                        fs::create_dir_all(target.parent().unwrap())?;
+                        fs::copy(image.path(), target)?;
+                        copied += 1;
                     }
                 }
                 [] => orphan += 1,
