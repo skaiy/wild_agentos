@@ -18,7 +18,7 @@ pub use minio::MinioBlobStore;
 /// Tenant-scoped object storage.
 ///
 /// Callers provide a key relative to the verified claims prefix, such as
-/// `kb/<kbid>/<sha256>`. The backend mints `{tenant}/` with
+/// `kb/<kbid>/<sha256>`. The backend mints `{tenant}/{project}/` with
 /// [`IsolationClaims::object_key_prefix`]; there is no unscoped operation.
 #[async_trait]
 pub trait BlobStore: Send + Sync {
@@ -30,6 +30,9 @@ pub trait BlobStore: Send + Sync {
         content_type: &str,
     ) -> Result<(), CoreError>;
     async fn get(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError>;
+    /// Read a historical tenant-scoped object. Callers must establish
+    /// tenant/project ownership from authoritative metadata before using it.
+    async fn get_legacy(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError>;
     async fn delete(&self, claims: &IsolationClaims, key: &str) -> Result<(), CoreError>;
     async fn exists(&self, claims: &IsolationClaims, key: &str) -> Result<bool, CoreError>;
     /// 后端标识（写入文档台账 blob_ref.backend）。
@@ -54,6 +57,20 @@ pub(crate) fn scoped_key(claims: &IsolationClaims, key: &str) -> Result<String, 
             message: format!("无法创建 blob tenant 前缀: {error}"),
         })?;
     Ok(format!("{prefix}{key}"))
+}
+
+pub(crate) fn legacy_scoped_key(claims: &IsolationClaims, key: &str) -> Result<String, CoreError> {
+    if key.is_empty()
+        || key.starts_with('/')
+        || key
+            .split('/')
+            .any(|component| component == "." || component == "..")
+    {
+        return Err(CoreError::Internal {
+            message: format!("非法相对 blob key: {key}"),
+        });
+    }
+    Ok(format!("{}/{}", claims.tenant_id(), key))
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -151,6 +168,14 @@ impl BlobStore for LocalFsBlobStore {
                 message: format!("blob read: {e}"),
             })
     }
+    async fn get_legacy(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError> {
+        let path = self.safe_path(&legacy_scoped_key(claims, key)?)?;
+        tokio::fs::read(&path)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("blob legacy read: {e}"),
+            })
+    }
     async fn delete(&self, claims: &IsolationClaims, key: &str) -> Result<(), CoreError> {
         let path = self.safe_path(&scoped_key(claims, key)?)?;
         match tokio::fs::remove_file(&path).await {
@@ -176,20 +201,20 @@ mod tests {
     use crate::isolation::IsolationClaims;
 
     #[tokio::test]
-    async fn tenant_cannot_get_another_tenants_new_object() {
+    async fn project_cannot_get_another_projects_new_object() {
         let root = std::env::temp_dir().join(format!("wild-agentos-blob-{}", uuid::Uuid::new_v4()));
         let store = LocalFsBlobStore::new(root.clone());
-        let tenant_a = IsolationClaims::from_verified("tenant-a", "project", "actor-a").unwrap();
-        let tenant_b = IsolationClaims::from_verified("tenant-b", "project", "actor-b").unwrap();
+        let project_a = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let project_b = IsolationClaims::from_verified("tenant-a", "project-b", "actor-b").unwrap();
         let key = "kb/source/chunk";
 
         store
-            .put(&tenant_a, key, b"tenant-a data", "text/plain")
+            .put(&project_a, key, b"project-a data", "text/plain")
             .await
             .unwrap();
 
-        assert_eq!(store.get(&tenant_a, key).await.unwrap(), b"tenant-a data");
-        assert!(store.get(&tenant_b, key).await.is_err());
+        assert_eq!(store.get(&project_a, key).await.unwrap(), b"project-a data");
+        assert!(store.get(&project_b, key).await.is_err());
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

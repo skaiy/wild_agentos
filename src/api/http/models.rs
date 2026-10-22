@@ -13,6 +13,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 use super::config::{
     hot_reload_embedding, json_deep_merge, same_provider_endpoint, save_config_override_off_runtime,
@@ -62,6 +63,45 @@ fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
         Some("gif")
     } else {
         None
+    }
+}
+
+pub fn value_references_image(value: &Value, image_id: &str) -> bool {
+    match value {
+        Value::String(text) => {
+            text == image_id
+                || text.ends_with(&format!("/images/{image_id}/raw"))
+                || text.contains(&format!("images/{image_id}/raw"))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_references_image(value, image_id)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_references_image(value, image_id)),
+        _ => false,
+    }
+}
+
+async fn legacy_image_owner(
+    state: &AppState,
+    image_id: &str,
+) -> Result<(String, String), &'static str> {
+    let bases = state.knowledge_bases.read().await;
+    let owners: BTreeSet<_> = bases
+        .iter()
+        .filter(|kb| value_references_image(kb, image_id))
+        .filter_map(|kb| {
+            Some((
+                kb.get("tenant_id")?.as_str()?.to_owned(),
+                kb.get("project_id")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    match owners.len() {
+        0 => Err("orphan"),
+        1 => Ok(owners.into_iter().next().expect("one owner")),
+        _ => Err("ambiguous"),
     }
 }
 
@@ -185,7 +225,6 @@ pub(crate) async fn image_raw_handler(
     }
     let ext = image_id.rsplit('.').next().unwrap_or("");
     let ct = image_ct_from_ext(ext).to_string();
-    let key = format!("images/{image_id}");
     let claims = match identity.isolation_claims() {
         Some(claims) => claims,
         None => {
@@ -196,6 +235,10 @@ pub(crate) async fn image_raw_handler(
                 .into_response()
         }
     };
+    // BlobStore scopes every relative key with the verified tenant/project
+    // prefix. Resolving the key only after claims verification makes a
+    // cross-scope image indistinguishable from a missing image.
+    let key = format!("images/{image_id}");
     let blob = match &state.blob_store {
         Some(b) => b.clone(),
         None => {
@@ -208,11 +251,35 @@ pub(crate) async fn image_raw_handler(
     };
     match blob.get(claims, &key).await {
         Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "图片不存在" })),
-        )
-            .into_response(),
+        Err(_) => match legacy_image_owner(&state, &image_id).await {
+            Ok((tenant_id, project_id))
+                if tenant_id == claims.tenant_id() && project_id == claims.project_id() =>
+            {
+                match blob.get_legacy(claims, &key).await {
+                    Ok(bytes) => {
+                        (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response()
+                    }
+                    Err(_) => (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": "图片不存在" })),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(reason) => {
+                tracing::warn!(image_id = %image_id, reason, "legacy image ownership is unresolved");
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "图片不存在" })),
+                )
+                    .into_response()
+            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "图片不存在" })),
+            )
+                .into_response(),
+        },
     }
 }
 

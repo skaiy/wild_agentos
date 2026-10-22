@@ -620,6 +620,10 @@ pub(crate) async fn create_knowledge_base_handler(
             )
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge base writes")
+    {
+        return error;
+    }
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -734,6 +738,10 @@ pub(crate) async fn delete_knowledge_base_handler(
             )
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge base writes")
+    {
+        return error;
+    }
     let mut guard = state.knowledge_bases.write().await;
     let removed = guard
         .iter()
@@ -804,6 +812,10 @@ pub(crate) async fn update_knowledge_base_handler(
             )
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge base writes")
+    {
+        return error;
+    }
     // 校验分类存在（若指定非空）
     if let Some(cat_id) = req.category_id.as_deref().filter(|s| !s.is_empty()) {
         let exists = state
@@ -1020,6 +1032,10 @@ pub(crate) async fn ingest_knowledge_base_handler(
             )
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge base writes")
+    {
+        return error;
+    }
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -1257,6 +1273,10 @@ pub(crate) async fn upload_knowledge_base_handler(
             )
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge base writes")
+    {
+        return error;
+    }
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -1616,7 +1636,13 @@ pub(crate) async fn kb_document_raw_handler(
         }
     };
     let key = format!("kb/{id}/{doc_id}");
-    match blob.get(claims, &key).await {
+    let bytes = match blob.get(claims, &key).await {
+        Ok(bytes) => Ok(bytes),
+        // The KB/document ledger was scoped to claims above, so a legacy
+        // tenant-only object may be read only for its recorded owner.
+        Err(_) => blob.get_legacy(claims, &key).await,
+    };
+    match bytes {
         Ok(bytes) => {
             let ct = doc
                 .get("content_type")
@@ -2086,6 +2112,10 @@ pub(crate) async fn materialize_rml_knowledge_base_handler(
             )
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge base writes")
+    {
+        return error;
+    }
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -2372,6 +2402,10 @@ pub(crate) async fn import_graph_knowledge_base_handler(
             )
         }
     };
+    if let Err(error) = identity.require_control_plane_da_or_platform_admin("knowledge base writes")
+    {
+        return error;
+    }
     let kb = {
         let guard = state.knowledge_bases.read().await;
         guard
@@ -2838,7 +2872,7 @@ mod isolation_contract {
                 sub: format!("{tenant_id}-user"),
                 tenant_id: tenant_id.to_string(),
                 project_id: project_id.map(str::to_owned),
-                roles: vec![],
+                roles: vec!["DA".into()],
                 exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
             },
             &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),

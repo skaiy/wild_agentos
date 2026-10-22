@@ -5,7 +5,7 @@ use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
 
-use super::{env_nonempty, scoped_key, BlobStore};
+use super::{env_nonempty, legacy_scoped_key, scoped_key, BlobStore};
 use crate::isolation::IsolationClaims;
 use crate::CoreError;
 
@@ -84,6 +84,24 @@ impl BlobStore for MinioBlobStore {
         if !(200..300).contains(&code) {
             return Err(CoreError::Internal {
                 message: format!("minio get status {code}"),
+            });
+        }
+        Ok(resp.bytes().to_vec())
+    }
+
+    async fn get_legacy(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError> {
+        let key = legacy_scoped_key(claims, key)?;
+        let resp = self
+            .bucket
+            .get_object(&key)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("minio legacy get: {e}"),
+            })?;
+        let code = resp.status_code();
+        if !(200..300).contains(&code) {
+            return Err(CoreError::Internal {
+                message: format!("minio legacy get status {code}"),
             });
         }
         Ok(resp.bytes().to_vec())

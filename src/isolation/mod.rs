@@ -150,10 +150,12 @@ impl IsolationClaims {
         Ok(format!("graph://{}/{}", self.tenant_id, self.project_id))
     }
 
-    /// Mints the tenant object-key prefix without accessing object storage.
+    /// Mints the tenant/project object-key prefix without accessing object
+    /// storage.
     pub fn object_key_prefix(&self) -> Result<String, IsolationError> {
         assert_tenant_id(&self.tenant_id)?;
-        Ok(format!("{}/", self.tenant_id))
+        assert_project_id(&self.project_id)?;
+        Ok(format!("{}/{}/", self.tenant_id, self.project_id))
     }
 
     /// Mints the tenant/project vector namespace without accessing a vector store.
@@ -220,7 +222,7 @@ mod tests {
         assert_eq!(claims.project_id(), "research_1");
         assert_eq!(claims.actor_id(), "agent-7");
         assert_eq!(claims.graph_iri().unwrap(), "graph://acme/research_1");
-        assert_eq!(claims.object_key_prefix().unwrap(), "acme/");
+        assert_eq!(claims.object_key_prefix().unwrap(), "acme/research_1/");
         assert_eq!(
             claims.vector_namespace().unwrap(),
             "vector://acme/research_1"
