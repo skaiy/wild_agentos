@@ -108,6 +108,26 @@ async fn call(
     )
 }
 
+async fn call_multipart_pa(router: &Router, uri: &str, token: &str) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header(
+                    "content-type",
+                    "multipart/form-data; boundary=test-boundary",
+                )
+                .body(Body::from("--test-boundary--\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
 fn router(state: Arc<AppState>) -> Router {
     use super::{
         agents::{
@@ -320,26 +340,22 @@ async fn isolation_contract_agent_and_kb_writes_reject_pa() {
             "/api/v1/kb/bases/kb-a/ingest".to_string(),
             json!({}),
         ),
-        (
-            Method::POST,
-            "/api/v1/kb/bases/kb-a/upload".to_string(),
-            json!({}),
-        ),
-        (
-            Method::POST,
-            "/api/v1/kb/bases/kb-a/materialize-rml".to_string(),
-            json!({}),
-        ),
-        (
-            Method::POST,
-            "/api/v1/kb/bases/kb-a/import-graph".to_string(),
-            json!({}),
-        ),
     ];
 
     for (method, uri, body) in routes {
         let (status, _) = call(&app, method, &uri, Caller::Bearer(&pa), body).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    for uri in [
+        "/api/v1/kb/bases/kb-a/upload",
+        "/api/v1/kb/bases/kb-a/materialize-rml",
+        "/api/v1/kb/bases/kb-a/import-graph",
+    ] {
+        assert_eq!(
+            call_multipart_pa(&app, uri, &pa).await,
+            StatusCode::FORBIDDEN,
+            "{uri}"
+        );
     }
 }
 

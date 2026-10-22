@@ -1,25 +1,6 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use serde_json::Value;
-
-fn image_refs(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::String(value) => {
-            if let Some(id) = value
-                .split("/images/")
-                .nth(1)
-                .and_then(|v| v.split('/').next())
-            {
-                out.push(id.to_owned());
-            } else if value.contains('.') && !value.contains('/') {
-                out.push(value.to_owned());
-            }
-        }
-        Value::Array(values) => values.iter().for_each(|value| image_refs(value, out)),
-        Value::Object(values) => values.values().for_each(|value| image_refs(value, out)),
-        _ => {}
-    }
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -44,7 +25,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bases: Vec<Value> = serde_json::from_slice(&fs::read(root.join("knowledge_bases.json"))?)?;
     let mut copied = 0usize;
     let mut kb = 0usize;
-    let mut image_owners: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for base in &bases {
         let (Some(tenant), Some(project), Some(id)) = (
             base.get("tenant_id").and_then(Value::as_str),
@@ -84,14 +64,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            let mut refs = Vec::new();
-            image_refs(doc, &mut refs);
-            for image in refs {
-                image_owners
-                    .entry(image)
-                    .or_default()
-                    .push((tenant.into(), project.into()));
-            }
         }
     }
     let mut images = 0usize;
@@ -111,7 +83,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let id = image.file_name().to_string_lossy().into_owned();
-            let mut owners = image_owners.remove(&id).unwrap_or_default();
+            let mut owners: Vec<_> = bases
+                .iter()
+                .filter(|base| {
+                    wild_agent_os_core::api::http::models::value_references_image(base, &id)
+                })
+                .filter_map(|base| {
+                    Some((
+                        base.get("tenant_id")?.as_str()?.to_owned(),
+                        base.get("project_id")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect();
             owners.sort();
             owners.dedup();
             match owners.as_slice() {
