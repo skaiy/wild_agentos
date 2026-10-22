@@ -414,34 +414,25 @@ async fn pack_scoped_vector_hits(
     claims: &IsolationClaims,
     question: &str,
     kb_ids: &[String],
-) -> Vec<ScoredEntry> {
+) -> Result<Vec<ScoredEntry>, crate::CoreError> {
     if kb_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(store) = state.vector_store.load_full() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut hits = Vec::new();
     for kb_id in kb_ids {
         let tag = kb_vector_tag(kb_id);
-        match store
+        let batch = store
             .search_with_claims_and_required_tags(
                 claims,
                 question,
                 std::slice::from_ref(&tag),
                 PACK_VECTOR_RAG_PER_KB_LIMIT,
             )
-            .await
-        {
-            Ok(batch) => hits.extend(batch),
-            Err(error) => {
-                tracing::warn!(
-                    kb_id = %kb_id,
-                    error = %error,
-                    "pack-scoped chat vector retrieval failed; omitting hits for this KB"
-                );
-            }
-        }
+            .await?;
+        hits.extend(batch);
     }
     hits.sort_by(|left, right| {
         right
@@ -451,7 +442,7 @@ async fn pack_scoped_vector_hits(
     });
     hits.dedup_by(|left, right| left.iri == right.iri);
     hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
-    hits
+    Ok(hits)
 }
 
 async fn ev_repair_graph_retrieval(
@@ -572,7 +563,14 @@ async fn build_claims_scoped_prefix_messages(
     };
 
     let vector_section = if !pack_kb_ids.is_empty() {
-        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids).await;
+        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({ "error": format!("pack vector retrieval unavailable: {error}") }),
+                )
+            })?;
         if hits.is_empty() {
             None
         } else {
@@ -1612,7 +1610,8 @@ mod tests {
             "Where is zircon pulse calibration documented?",
             &[large_kb.to_string(), small_kb.to_string()],
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(hits
             .iter()

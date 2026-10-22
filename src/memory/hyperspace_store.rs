@@ -175,6 +175,46 @@ impl HyperspaceStore {
         }
     }
 
+    /// Query embeddings must be usable: continuing with a fallback all-zero
+    /// vector turns an embedding outage into arbitrary retrieval.
+    async fn get_query_embedding(&self, text: &str) -> Result<EmbeddingVector, CoreError> {
+        let embedding = self
+            .embed
+            .embed(text)
+            .await
+            .map_err(|error| CoreError::Internal {
+                message: format!("query embedding failed: {error}"),
+            })?;
+        let mut vector =
+            EmbeddingVector::from_f32_slice(&embedding, MetricKind::Cosine).map_err(|error| {
+                CoreError::Internal {
+                    message: format!("query EmbeddingVector: {error}"),
+                }
+            })?;
+        Self::normalize_for_cosine(&mut vector, "query")?;
+        Ok(vector)
+    }
+
+    fn normalize_for_cosine(vector: &mut EmbeddingVector, kind: &str) -> Result<(), CoreError> {
+        let norm = vector
+            .coords
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        if !norm.is_finite() || norm <= f64::EPSILON {
+            return Err(CoreError::Internal {
+                message: format!("{kind} embedding is empty or all-zero"),
+            });
+        }
+        if (norm - 1.0).abs() > 1e-6 {
+            for value in &mut vector.coords {
+                *value /= norm;
+            }
+        }
+        Ok(())
+    }
+
     /// Convert a `HybridSearchFilter` to a `Vec<JsonLdFilter>` for the engine.
     ///
     /// Semantics matches the original Qdrant filter:
@@ -534,12 +574,7 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vector = self.get_embedding(query).await;
-        let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
-            CoreError::Internal {
-                message: format!("EmbeddingVector: {e}"),
-            }
-        })?;
+        let vec = self.get_query_embedding(query).await?;
 
         let filters = self.to_jsonld_filters(filter);
         let results = self
@@ -592,6 +627,11 @@ impl HyperspaceStore {
         required_tags: &[String],
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
+        if required_tags.is_empty() {
+            return Err(CoreError::Internal {
+                message: "required tags must not be empty".into(),
+            });
+        }
         // HNSW applies its allowed bitmap after producing a global candidate
         // beam. That lets a large KB crowd out a small, mounted KB before the
         // required tag can be checked. Enumerate the already scoped/tagged
@@ -601,14 +641,11 @@ impl HyperspaceStore {
         let candidates = self
             .entries_with_claims_and_required_tags(claims, required_tags)
             .await?;
-        let query =
-            EmbeddingVector::from_f32_slice(&self.get_embedding(query).await, MetricKind::Cosine)
-                .map_err(|e| CoreError::Internal {
-                message: format!("EmbeddingVector: {e}"),
-            })?;
+        let query = self.get_query_embedding(query).await?;
         let mut scored = Vec::with_capacity(candidates.len());
+        let mut missing_vectors = 0usize;
         for mut entry in candidates {
-            let Some(vector) =
+            let Some(mut vector) =
                 self.engine
                     .get_vector(&entry.iri)
                     .await
@@ -616,8 +653,10 @@ impl HyperspaceStore {
                         message: format!("Hyperspace vector read: {e}"),
                     })?
             else {
+                missing_vectors += 1;
                 continue;
             };
+            Self::normalize_for_cosine(&mut vector, "stored")?;
             // The store is configured with CosineMetric, whose engine score is
             // negative distance (dot product minus one).
             entry.score = query
@@ -628,6 +667,12 @@ impl HyperspaceStore {
                 .sum::<f64>() as f32
                 - 1.0;
             scored.push(entry);
+        }
+        if missing_vectors > 0 {
+            warn!(
+                missing_vectors,
+                "scoped vector retrieval skipped entries with no stored vector"
+            );
         }
         scored.sort_by(|left, right| {
             right
@@ -692,12 +737,7 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vector = self.get_embedding(query).await;
-        let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
-            CoreError::Internal {
-                message: format!("EmbeddingVector: {e}"),
-            }
-        })?;
+        let vec = self.get_query_embedding(query).await?;
 
         let filters = self.to_jsonld_filters(filter);
         let results = self
@@ -854,7 +894,21 @@ impl HyperspaceStore {
 mod tests {
     use super::*;
     use crate::isolation::IsolationClaims;
-    use crate::memory::embedding_service::FallbackEmbeddingService;
+    use crate::memory::embedding_service::{EmbeddingService, FallbackEmbeddingService};
+    use async_trait::async_trait;
+
+    struct UnavailableEmbeddingService;
+
+    #[async_trait]
+    impl EmbeddingService for UnavailableEmbeddingService {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Err("embedding backend unavailable".into())
+        }
+
+        fn dimension(&self) -> usize {
+            128
+        }
+    }
 
     fn setup_store() -> HyperspaceStore {
         let dir = tempfile::tempdir().unwrap();
@@ -891,6 +945,33 @@ mod tests {
         let store = setup_store();
         let results = store.search("nothing", 10).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claims_scoped_search_errors_when_query_embedding_is_unavailable() {
+        let mut store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        store
+            .upsert_with_claims(&claims, "entry", "scoped text", &["kb:kb-a".into()])
+            .await
+            .unwrap();
+        store.embed = Arc::new(UnavailableEmbeddingService);
+
+        let error = store
+            .search_with_claims_and_required_tags(&claims, "query", &["kb:kb-a".into()], 5)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("query embedding failed"));
+    }
+
+    #[tokio::test]
+    async fn claims_scoped_search_rejects_empty_required_tags() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        assert!(store
+            .search_with_claims_and_required_tags(&claims, "query", &[], 5)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
