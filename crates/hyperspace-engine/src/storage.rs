@@ -10,6 +10,8 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -162,6 +164,8 @@ impl VectorStore {
         let tmp_path = path.with_extension("bin.tmp");
         {
             let mut f = File::create(&tmp_path)?;
+            #[cfg(unix)]
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
             f.write_all(&bytes)?;
             f.sync_all()?;
         }

@@ -20,9 +20,11 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -45,6 +47,128 @@ pub struct SearchHit {
     pub iri: String,
     pub score: f32,
     pub payload: Option<Value>,
+}
+
+/// Read-only persistence health information for a vector store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistenceHealth {
+    pub vector_count: u32,
+    pub text_count: u32,
+    pub tag_count: u32,
+    pub corrupt_count: u32,
+}
+
+impl PersistenceHealth {
+    pub fn is_consistent(self) -> bool {
+        self.corrupt_count == 0
+            && self.vector_count == self.text_count
+            && self.vector_count == self.tag_count
+    }
+
+    pub fn missing_text_count(self) -> u32 {
+        self.vector_count.saturating_sub(self.text_count)
+    }
+
+    pub fn missing_tag_count(self) -> u32 {
+        self.vector_count.saturating_sub(self.tag_count)
+    }
+}
+
+#[derive(Default)]
+struct HealthCounters {
+    vector_count: AtomicU32,
+    text_count: AtomicU32,
+    tag_count: AtomicU32,
+    corrupt_count: AtomicU32,
+}
+
+impl HealthCounters {
+    fn report(&self) -> PersistenceHealth {
+        PersistenceHealth {
+            vector_count: self.vector_count.load(Ordering::Acquire),
+            text_count: self.text_count.load(Ordering::Acquire),
+            tag_count: self.tag_count.load(Ordering::Acquire),
+            corrupt_count: self.corrupt_count.load(Ordering::Acquire),
+        }
+    }
+
+    fn reset(&self, health: PersistenceHealth) {
+        self.vector_count
+            .store(health.vector_count, Ordering::Release);
+        self.text_count.store(health.text_count, Ordering::Release);
+        self.tag_count.store(health.tag_count, Ordering::Release);
+    }
+
+    fn record_corruption(&self) {
+        self.corrupt_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn apply_delta(counter: &AtomicU32, before: bool, after: bool) {
+        match (before, after) {
+            (false, true) => {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                counter.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_entry_change(&self, before: EntryPresence, after: EntryPresence) {
+        Self::apply_delta(&self.vector_count, before.vector, after.vector);
+        Self::apply_delta(&self.text_count, before.text, after.text);
+        Self::apply_delta(&self.tag_count, before.tags, after.tags);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EntryPresence {
+    vector: bool,
+    text: bool,
+    tags: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WalRecord {
+    iri: String,
+    vector: Vec<u8>,
+    payload: Option<String>,
+}
+
+impl WalRecord {
+    const MAGIC: &'static [u8; 4] = b"HSR1";
+
+    fn encode(iri: &str, vector: &[u8], payload: Option<&Value>) -> Result<Vec<u8>, EngineError> {
+        let mut bytes = Self::MAGIC.to_vec();
+        bytes.extend(
+            bincode::serialize(&Self {
+                iri: iri.to_owned(),
+                vector: vector.to_vec(),
+                payload: payload
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| EngineError::StorageError {
+                        message: format!("WAL payload serialization: {e}"),
+                    })?,
+            })
+            .map_err(|e| EngineError::StorageError {
+                message: format!("WAL record serialization: {e}"),
+            })?,
+        );
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Option<Self>, EngineError> {
+        if !bytes.starts_with(Self::MAGIC) {
+            return Ok(None);
+        }
+        bincode::deserialize(&bytes[Self::MAGIC.len()..])
+            .map(Some)
+            .map_err(|e| EngineError::StorageError {
+                message: format!("WAL record deserialization: {e}"),
+            })
+    }
 }
 
 // ── IriRegistry ──────────────────────────────────────────────────────────────
@@ -88,6 +212,15 @@ impl IriRegistry {
         self.iri_to_id.insert(iri.to_string(), id);
         self.id_to_iri.insert(id, iri.to_string());
         id
+    }
+
+    /// Restore an IRI with its persisted ID during WAL replay.
+    pub fn register_id(&mut self, id: u32, iri: &str) {
+        self.iri_to_id.insert(iri.to_string(), id);
+        self.id_to_iri.insert(id, iri.to_string());
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
     }
 
     /// Resolve an IRI to its numeric ID (if registered).
@@ -268,6 +401,7 @@ pub trait HyperspaceEngine: Send + Sync {
 pub struct HyperspaceEngineImpl {
     inner: Mutex<EngineInner>,
     metadata: JsonLdMetadataIndex,
+    health: HealthCounters,
     iri_registry: Mutex<IriRegistry>,
     wal: EngineWal,
     data_dir: PathBuf,
@@ -298,6 +432,7 @@ impl HyperspaceEngineImpl {
                 clock: 0,
             }),
             metadata,
+            health: HealthCounters::default(),
             iri_registry: Mutex::new(iri_registry),
             wal,
             data_dir: dir.to_owned(),
@@ -315,8 +450,6 @@ impl HyperspaceEngineImpl {
                         snap.nodes.len(),
                         snap.clock
                     );
-                    eprintln!("DEBUG: snapshot forward_meta len={}, deleted_ids len={}, iri_registry len={}",
-                        snap.forward_meta.len(), snap.deleted_ids.len(), snap.iri_registry.len());
                     let mut inner = engine.inner.lock().unwrap();
                     let metric_kind = inner.index.metric().kind();
                     inner.index.import_nodes(snap.nodes.clone());
@@ -335,8 +468,16 @@ impl HyperspaceEngineImpl {
                     }
                     // Restore forward metadata (JSON strings → Values)
                     for (id, payload_str) in snap.forward_meta {
-                        if let Ok(payload) = serde_json::from_str(&payload_str) {
-                            engine.metadata.index(id, &payload);
+                        match serde_json::from_str(&payload_str) {
+                            Ok(payload) => engine.metadata.index(id, &payload),
+                            Err(error) => {
+                                engine.health.record_corruption();
+                                tracing::error!(
+                                    id,
+                                    error = %error,
+                                    "Unreadable snapshot metadata; retrieval will remain unavailable"
+                                );
+                            }
                         }
                     }
                     // Restore deleted IDs
@@ -346,51 +487,192 @@ impl HyperspaceEngineImpl {
                     drop(inner);
                 }
                 Err(e) => {
+                    engine.health.record_corruption();
                     warn!("Failed to load snapshot, falling back to WAL replay: {e}");
-                    engine.recover()?;
                 }
             }
-        } else {
-            // No snapshot — full WAL replay
-            engine.recover()?;
         }
+        // Replay every uncheckpointed operation, including frozen WAL
+        // segments left behind by a crash during checkpoint rotation.
+        engine.recover()?;
+        engine.initialize_health();
+        engine.log_retrieval_health();
 
         Ok(engine)
     }
 
-    /// Recover state by replaying the WAL into store + index.
+    /// Recover state by replaying WAL records into store, index, and metadata.
     fn recover(&self) -> Result<(), EngineError> {
-        let wal_path = self.wal.active_path().to_owned();
         let mut inner = self.inner.lock().unwrap();
 
-        let _count = EngineWal::replay(&wal_path, |op, ts, data| {
-            inner.clock = inner.clock.max(ts);
-            match op {
-                WalOp::Insert { id, iri } | WalOp::Upsert { id, iri } => {
-                    let _ = inner.store.set(id, data);
-                    if !data.is_empty() {
-                        let dim = (data.len().saturating_sub(12)) / 8;
-                        if let Ok(vec) = EmbeddingVector::from_bytes(data, dim) {
-                            inner.index.insert(id, vec);
+        let mut total = 0;
+        for wal_path in self.wal.pending_paths()? {
+            total += EngineWal::replay(&wal_path, |op, ts, data| {
+                inner.clock = inner.clock.max(ts);
+                match op {
+                    WalOp::Insert { id, .. } | WalOp::Upsert { id, .. } => {
+                        let record = match WalRecord::decode(data) {
+                            Ok(record) => record,
+                            Err(error) => {
+                                self.health.record_corruption();
+                                tracing::error!(
+                                    id,
+                                    error = %error,
+                                    "Unreadable durable vector record; retrieval will remain unavailable"
+                                );
+                                return;
+                            }
+                        };
+                        let (vector_bytes, iri, payload) = match record {
+                            Some(record) => (record.vector, Some(record.iri), record.payload),
+                            None => {
+                                warn!(
+                                    id,
+                                    "Recovered legacy vector record without text or metadata"
+                                );
+                                (data.to_vec(), None, None)
+                            }
+                        };
+                        if let Err(error) = inner.store.set(id, &vector_bytes) {
+                            self.health.record_corruption();
+                            tracing::error!(
+                                id,
+                                error = %error,
+                                "Invalid recovered vector record; retrieval will remain unavailable"
+                            );
+                            return;
+                        }
+                        if !vector_bytes.is_empty() {
+                            let dim = (vector_bytes.len().saturating_sub(12)) / 8;
+                            match EmbeddingVector::from_bytes(&vector_bytes, dim) {
+                                Ok(vec) => inner.index.insert(id, vec),
+                                Err(error) => {
+                                    self.health.record_corruption();
+                                    tracing::error!(
+                                        id,
+                                        error = %error,
+                                        "Unreadable vector payload; retrieval will remain unavailable"
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(iri) = iri {
+                            if let Ok(mut reg) = self.iri_registry.lock() {
+                                reg.register_id(id, &iri);
+                            }
+                        }
+                        if let Some(payload) = payload {
+                            match serde_json::from_str(&payload) {
+                                Ok(payload) => {
+                                    self.metadata.index(id, &payload);
+                                    self.metadata.undelete(id);
+                                }
+                                Err(error) => {
+                                    self.health.record_corruption();
+                                    tracing::error!(
+                                        id,
+                                        error = %error,
+                                        "Unreadable durable metadata; retrieval will remain unavailable"
+                                    );
+                                }
+                            }
                         }
                     }
-                    if !iri.is_empty() {
-                        if let Ok(mut reg) = self.iri_registry.lock() {
-                            reg.register(&iri);
-                        }
+                    WalOp::Delete { id, .. } => {
+                        inner.store.remove(id);
+                        inner.index.remove(id);
+                        self.metadata.remove(id);
                     }
+                    WalOp::MetadataUpdate { .. } => {}
                 }
-                WalOp::Delete { id, .. } => {
-                    inner.store.remove(id);
-                    inner.index.remove(id);
-                    self.metadata.remove(id);
-                }
-                WalOp::MetadataUpdate { .. } => {}
-            }
-        })?;
+            })?;
+        }
 
-        info!("WAL replay complete: {} entries", _count);
+        info!("WAL replay complete: {} entries", total);
         Ok(())
+    }
+
+    fn scan_persistence_health(&self) -> PersistenceHealth {
+        let inner = self.inner.lock().unwrap();
+        let vector_count = inner.store.active_count();
+        let (text_count, tag_count) =
+            inner
+                .store
+                .iter_active()
+                .fold((0, 0), |(text_count, tag_count), (id, _)| {
+                    let payload = self.metadata.get_payload(id);
+                    let has_text = payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("text"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty());
+                    let has_tags = payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("tags"))
+                        .is_some_and(Value::is_array);
+                    (
+                        text_count + u32::from(has_text),
+                        tag_count + u32::from(has_tags),
+                    )
+                });
+        PersistenceHealth {
+            vector_count,
+            text_count,
+            tag_count,
+            corrupt_count: self.health.corrupt_count.load(Ordering::Acquire),
+        }
+    }
+
+    fn initialize_health(&self) {
+        let health = self.scan_persistence_health();
+        self.health.reset(health);
+    }
+
+    fn log_retrieval_health(&self) {
+        let health = self.health.report();
+        if !health.is_consistent() {
+            tracing::error!(
+                vector_count = health.vector_count,
+                text_count = health.text_count,
+                tag_count = health.tag_count,
+                corrupt_count = health.corrupt_count,
+                missing_text_count = health.missing_text_count(),
+                missing_tag_count = health.missing_tag_count(),
+                "Vector store integrity check failed; retrieval is unavailable until records are repaired"
+            );
+        }
+    }
+
+    /// Report vectors lacking persisted text without modifying the store.
+    pub fn persistence_health_report(&self) -> PersistenceHealth {
+        self.health.report()
+    }
+
+    /// Return whether every active vector has both a text payload and tags.
+    pub fn is_retrieval_ready(&self) -> bool {
+        self.health.report().is_consistent()
+    }
+
+    fn payload_presence(payload: Option<Value>) -> (bool, bool) {
+        let text = payload
+            .as_ref()
+            .and_then(|payload| payload.get("text"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty());
+        let tags = payload
+            .as_ref()
+            .and_then(|payload| payload.get("tags"))
+            .is_some_and(Value::is_array);
+        (text, tags)
+    }
+
+    fn entry_presence(&self, inner: &EngineInner, id: u32) -> EntryPresence {
+        let (text, tags) = Self::payload_presence(self.metadata.get_payload(id));
+        EntryPresence {
+            vector: inner.store.get(id).is_some(),
+            text,
+            tags,
+        }
     }
 
     /// Create a Searcher (read-only snapshot) for concurrent querying.
@@ -423,33 +705,29 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         vector: EmbeddingVector,
         jsonld: Value,
     ) -> Result<u32, EngineError> {
-        let id = {
-            let mut reg = self.iri_registry.lock().unwrap();
-            reg.register(iri)
-        };
         let bytes = vector.as_bytes();
-
-        // WAL first
+        let wal_record = WalRecord::encode(iri, &bytes, Some(&jsonld))?;
+        let mut inner = self.inner.lock().unwrap();
+        let mut reg = self.iri_registry.lock().unwrap();
+        let id = reg.register(iri);
+        let before = self.entry_presence(&inner, id);
+        inner.clock += 1;
+        // Keep WAL append and in-memory application under one lock so two
+        // writers cannot interleave the record identity and payload.
         self.wal.append(
             &WalOp::Insert {
                 id,
                 iri: iri.to_string(),
             },
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.clock += 1;
-                inner.clock
-            },
-            &bytes,
+            inner.clock,
+            &wal_record,
         )?;
-
-        // Apply to store + index + metadata
-        let mut inner = self.inner.lock().unwrap();
         inner.store.set(id, &bytes)?;
         inner.index.insert(id, vector);
         self.metadata.index(id, &jsonld);
-        // Clear deleted flag in case this is a re-insert of the same IRI
         self.metadata.undelete(id);
+        let after = self.entry_presence(&inner, id);
+        self.health.apply_entry_change(before, after);
 
         Ok(id)
     }
@@ -462,29 +740,27 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         vector: EmbeddingVector,
         jsonld: Value,
     ) -> Result<u32, EngineError> {
-        let id = {
-            let mut reg = self.iri_registry.lock().unwrap();
-            reg.register(iri)
-        };
         let bytes = vector.as_bytes();
-
+        let wal_record = WalRecord::encode(iri, &bytes, Some(&jsonld))?;
+        let mut inner = self.inner.lock().unwrap();
+        let mut reg = self.iri_registry.lock().unwrap();
+        let id = reg.register(iri);
+        let before = self.entry_presence(&inner, id);
+        inner.clock += 1;
         self.wal.append(
             &WalOp::Upsert {
                 id,
                 iri: iri.to_string(),
             },
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.clock += 1;
-                inner.clock
-            },
-            &bytes,
+            inner.clock,
+            &wal_record,
         )?;
-
-        let mut inner = self.inner.lock().unwrap();
         inner.store.set(id, &bytes)?;
         inner.index.insert(id, vector);
         self.metadata.index(id, &jsonld);
+        self.metadata.undelete(id);
+        let after = self.entry_presence(&inner, id);
+        self.health.apply_entry_change(before, after);
 
         Ok(id)
     }
@@ -492,29 +768,32 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
     // ── Delete ──────────────────────────────────────────────────────────────
 
     async fn delete(&self, iri: &str) -> Result<(), EngineError> {
-        let id = {
-            let reg = self.iri_registry.lock().unwrap();
-            reg.resolve(iri)
-                .ok_or_else(|| EngineError::NotFound(iri.to_string()))?
-        };
-
+        let mut inner = self.inner.lock().unwrap();
+        let reg = self.iri_registry.lock().unwrap();
+        let id = reg
+            .resolve(iri)
+            .ok_or_else(|| EngineError::NotFound(iri.to_string()))?;
+        let before = self.entry_presence(&inner, id);
+        inner.clock += 1;
         self.wal.append(
             &WalOp::Delete {
                 id,
                 iri: iri.to_string(),
             },
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.clock += 1;
-                inner.clock
-            },
+            inner.clock,
             &[],
         )?;
-
-        let mut inner = self.inner.lock().unwrap();
         inner.store.remove(id);
         inner.index.remove(id);
         self.metadata.remove(id);
+        self.health.apply_entry_change(
+            before,
+            EntryPresence {
+                vector: false,
+                text: false,
+                tags: false,
+            },
+        );
 
         Ok(())
     }
@@ -884,6 +1163,181 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].iri, "p");
+    }
+
+    #[tokio::test]
+    async fn test_wal_recovery_preserves_text_and_tags_without_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let eng = setup_async_engine(dir.path());
+            eng.insert(
+                "record:1",
+                v(vec![1.0, 0.0, 0.0, 0.0]),
+                json!({"text": "persisted content", "tags": ["kb:alpha"]}),
+            )
+            .await
+            .unwrap();
+            assert!(dir.path().join("active.wal").metadata().unwrap().len() > 0);
+        }
+
+        assert!(dir.path().join("active.wal").metadata().unwrap().len() > 0);
+        let replayed = EngineWal::replay(&dir.path().join("active.wal"), |_, _, data| {
+            assert!(WalRecord::decode(data).unwrap().unwrap().payload.is_some());
+        })
+        .unwrap();
+        assert_eq!(replayed, 1);
+        let eng = setup_async_engine(dir.path());
+        assert_eq!(eng.count().await.unwrap(), 1);
+        assert_eq!(
+            eng.get_payload("record:1").await.unwrap().unwrap()["text"],
+            "persisted content"
+        );
+        let results = eng
+            .search(
+                &v(vec![1.0, 0.0, 0.0, 0.0]),
+                5,
+                &[JsonLdFilter::tag("tags", "kb:alpha")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].iri, "record:1");
+        assert_eq!(
+            results[0].payload.as_ref().unwrap()["text"],
+            "persisted content"
+        );
+        assert_eq!(eng.persistence_health_report().missing_text_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_recovery_replays_frozen_wal_after_interrupted_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let eng = setup_async_engine(dir.path());
+            eng.insert(
+                "record:2",
+                v(vec![1.0, 0.0, 0.0, 0.0]),
+                json!({"text": "atomic record", "tags": ["kb:beta"]}),
+            )
+            .await
+            .unwrap();
+            eng.wal.rotate().unwrap();
+        }
+
+        let eng = setup_async_engine(dir.path());
+        assert_eq!(eng.count().await.unwrap(), 1);
+        let results = eng
+            .search(
+                &v(vec![1.0, 0.0, 0.0, 0.0]),
+                5,
+                &[JsonLdFilter::tag("tags", "kb:beta")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].payload.as_ref().unwrap()["text"],
+            "atomic record"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_vector_records_are_reported_as_missing_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_vector = v(vec![1.0, 0.0, 0.0, 0.0]).as_bytes();
+        {
+            let wal = EngineWal::open(dir.path(), WalSyncMode::Strict).unwrap();
+            wal.append(
+                &WalOp::Insert {
+                    id: 1,
+                    iri: "legacy:1".into(),
+                },
+                1,
+                &raw_vector,
+            )
+            .unwrap();
+        }
+
+        let eng = setup_engine(dir.path());
+        assert_eq!(
+            eng.persistence_health_report(),
+            PersistenceHealth {
+                vector_count: 1,
+                text_count: 0,
+                tag_count: 0,
+                corrupt_count: 0,
+            }
+        );
+        assert!(!eng.is_retrieval_ready());
+    }
+
+    #[test]
+    fn test_unreadable_wal_record_blocks_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let wal = EngineWal::open(dir.path(), WalSyncMode::Strict).unwrap();
+            wal.append(
+                &WalOp::Insert {
+                    id: 1,
+                    iri: "corrupt:1".into(),
+                },
+                1,
+                b"HSR1not-a-valid-record",
+            )
+            .unwrap();
+        }
+
+        let eng = setup_engine(dir.path());
+        assert_eq!(eng.persistence_health_report().corrupt_count, 1);
+        assert!(!eng.is_retrieval_ready());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_writes_keep_vectors_text_and_tags_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = std::sync::Arc::new(
+            HyperspaceEngineImpl::open(
+                dir.path(),
+                WalSyncMode::Strict,
+                16,
+                Box::new(CosineMetric),
+                HnswConfig::default(),
+            )
+            .unwrap(),
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for index in 0..16 {
+            let eng = std::sync::Arc::clone(&eng);
+            tasks.spawn(async move {
+                let mut coords = vec![0.0; 16];
+                coords[index] = 1.0;
+                eng.insert(
+                    &format!("record:{index}"),
+                    v(coords),
+                    json!({
+                        "text": format!("parallel content {index}"),
+                        "tags": [format!("kb:{index}")],
+                    }),
+                )
+                .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        for index in 0..16 {
+            let mut coords = vec![0.0; 16];
+            coords[index] = 1.0;
+            let results = eng.search(&v(coords), 1, &[]).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].iri, format!("record:{index}"));
+            let payload = results[0].payload.as_ref().unwrap();
+            assert_eq!(payload["text"], format!("parallel content {index}"));
+            assert_eq!(payload["tags"][0], format!("kb:{index}"));
+        }
+        assert!(eng.is_retrieval_ready());
     }
 
     #[tokio::test]

@@ -846,6 +846,14 @@ pub(crate) async fn hot_reload_embedding(
     let old_dim = state.vector_store.load_full().map(|s| s.dimension());
     let dim_changed = old_dim != Some(new_dim);
     let vdir = data_dir().join("vector_store");
+    // Do not follow a dangling path while preparing a replacement store. Apart
+    // from making the reload result ambiguous, that would allow a stale link
+    // to redirect storage creation outside the configured data directory.
+    if let Ok(metadata) = std::fs::symlink_metadata(&vdir) {
+        if metadata.file_type().is_symlink() && !vdir.exists() {
+            return Err(EmbeddingReloadError::Io(std::io::ErrorKind::AlreadyExists));
+        }
+    }
     // 任何 embedding 变更都需换库重建（旧向量来自旧模型，语义不可混用；维度变更更是结构不兼容）。
     // 用全新目录打开，旧库整体移为 .bak-<ts> 便于回滚，同时避免与仍被引用的旧句柄争用同一文件。
     if vdir.exists() {
@@ -881,9 +889,9 @@ pub(crate) async fn hot_reload_embedding(
     Ok((old_dim.unwrap_or(0), new_dim, dim_changed, reindex_queued))
 }
 
-/// Test-only. `AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE=open` makes the fresh
-/// store directory unwritable. `=read` leaves an unreadable `active.wal` for
-/// the store open to read. Absent in release builds.
+/// Test-only. `AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE=open` creates an invalid
+/// WAL path. `=read` leaves an unreadable `active.wal` for the store open to
+/// read. Absent in release builds.
 #[cfg(test)]
 fn plant_embedding_reload_fixture(vdir: &std::path::Path) {
     let Ok(mode) = std::env::var("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE") else {
@@ -894,7 +902,7 @@ fn plant_embedding_reload_fixture(vdir: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         match mode.as_str() {
             "open" => {
-                let _ = std::fs::set_permissions(vdir, std::fs::Permissions::from_mode(0o555));
+                let _ = std::fs::create_dir(vdir.join("active.wal"));
             }
             "read" => {
                 let wal = vdir.join("active.wal");

@@ -36,7 +36,9 @@ pub mod wal;
 
 // Re-exports for convenience
 pub use config::HyperspaceEngineConfig;
-pub use engine::{HyperspaceEngine, HyperspaceEngineImpl, IriRegistry, SearchHit, Searcher};
+pub use engine::{
+    HyperspaceEngine, HyperspaceEngineImpl, IriRegistry, PersistenceHealth, SearchHit, Searcher,
+};
 pub use error::EngineError;
 pub use filter::{compile_filter, CompiledFilter, JsonLdFilter};
 pub use hnsw::{HnswConfig, IncrementalHNSW, SerializableNode};

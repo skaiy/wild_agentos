@@ -84,6 +84,8 @@ impl EngineWal {
 
     pub fn open(dir: &Path, sync_mode: WalSyncMode) -> Result<Self, EngineError> {
         fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
 
         let active_path = dir.join("active.wal");
         let lock_path = dir.join("wal.lock");
@@ -97,6 +99,7 @@ impl EngineWal {
                 .read(true)
                 .write(true)
                 .open(&lock_path)?;
+            lf.set_permissions(fs::Permissions::from_mode(0o600))?;
             let fd = lf.as_raw_fd();
             let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
             if ret != 0 {
@@ -110,15 +113,14 @@ impl EngineWal {
         #[cfg(not(unix))]
         let lock_file = None;
 
-        // Recover any frozen WAL files from prior crash
-        Self::recover_frozen_wals(dir)?;
-
         // Open active WAL
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&active_path)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
         let current_size = file.metadata()?.len();
 
@@ -279,6 +281,8 @@ impl EngineWal {
             .append(true)
             .read(true)
             .open(&self.active_path)?;
+        #[cfg(unix)]
+        new_file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
         let mut inner = self
             .inner
@@ -413,29 +417,6 @@ impl EngineWal {
         Ok(count)
     }
 
-    // ── Frozen WAL recovery ───────────────────────────────────────────────
-
-    fn recover_frozen_wals(dir: &Path) -> Result<(), EngineError> {
-        let mut entries: Vec<_> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let n = e.file_name();
-                let s = n.to_string_lossy();
-                s.starts_with("frozen.") && s.ends_with(".wal")
-            })
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-
-        for entry in &entries {
-            let name = entry.file_name();
-            tracing::info!("Recovering frozen WAL: {}", name.to_string_lossy());
-            // Replay into current active (done externally)
-            Self::replay(&entry.path(), |_op, _clock, _data| {})?;
-            fs::remove_file(entry.path())?;
-        }
-        Ok(())
-    }
-
     // ── Len (total bytes written) ─────────────────────────────────────────
 
     pub fn len(&self) -> u64 {
@@ -448,6 +429,25 @@ impl EngineWal {
 
     pub fn active_path(&self) -> &Path {
         &self.active_path
+    }
+
+    /// Return WAL files that may contain operations not represented in a
+    /// snapshot. Frozen segments are returned before the active segment so
+    /// callers replay operations in write order after an interrupted
+    /// checkpoint.
+    pub fn pending_paths(&self) -> Result<Vec<PathBuf>, EngineError> {
+        let mut paths: Vec<_> = fs::read_dir(&self.dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("frozen.") && name.ends_with(".wal")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        paths.sort();
+        paths.push(self.active_path.clone());
+        Ok(paths)
     }
 
     /// Delete all frozen WAL segments (called after successful checkpoint).
@@ -469,6 +469,8 @@ impl EngineWal {
     }
 }
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 

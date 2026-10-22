@@ -18,6 +18,8 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -69,6 +71,8 @@ pub fn save_snapshot(path: &Path, snapshot: &EngineSnapshot) -> Result<(), Engin
 
     {
         let mut f = File::create(&tmp_path)?;
+        #[cfg(unix)]
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
         f.write_all(&bytes)?;
         f.sync_all()?;
     }

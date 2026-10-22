@@ -414,12 +414,15 @@ async fn pack_scoped_vector_hits(
     claims: &IsolationClaims,
     question: &str,
     kb_ids: &[String],
-) -> Vec<ScoredEntry> {
+) -> Result<Vec<ScoredEntry>, (StatusCode, Value)> {
     if kb_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(store) = state.vector_store.load_full() else {
-        return Vec::new();
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "chat vector retrieval unavailable" }),
+        ));
     };
     let mut hits = Vec::new();
     for kb_id in kb_ids {
@@ -435,11 +438,15 @@ async fn pack_scoped_vector_hits(
         {
             Ok(batch) => hits.extend(batch),
             Err(error) => {
-                tracing::warn!(
+                tracing::error!(
                     kb_id = %kb_id,
                     error = %error,
-                    "pack-scoped chat vector retrieval failed; omitting hits for this KB"
+                    "pack-scoped chat vector retrieval failed"
                 );
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({ "error": "chat vector retrieval unavailable" }),
+                ));
             }
         }
     }
@@ -450,7 +457,7 @@ async fn pack_scoped_vector_hits(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
-    hits
+    Ok(hits)
 }
 
 async fn ev_repair_graph_retrieval(
@@ -571,7 +578,7 @@ async fn build_claims_scoped_prefix_messages(
     };
 
     let vector_section = if !pack_kb_ids.is_empty() {
-        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids).await;
+        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids).await?;
         if hits.is_empty() {
             None
         } else {

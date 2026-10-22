@@ -1014,13 +1014,8 @@ async fn isolation_contract_embedding_reload_failure_does_not_leak_paths() {
     let dir = tempfile::tempdir().unwrap();
     let _env = setup(dir.path());
     let router = app(test_state(dir.path()));
-    // A broken symlink: `create_dir_all` fails with an error whose Display
-    // includes `os error` and, on some platforms, the absolute path.
-    symlink(
-        "/no/such/vector-store-target",
-        dir.path().join("vector_store"),
-    )
-    .unwrap();
+    let target = dir.path().join("missing-vector-store-target");
+    symlink(&target, dir.path().join("vector_store")).unwrap();
 
     let (status, text) = send(
         &router,
@@ -1041,31 +1036,18 @@ async fn isolation_contract_embedding_reload_failure_does_not_leak_paths() {
             std::io::ErrorKind::AlreadyExists
         ))
     );
+    let target = target.to_string_lossy();
     for leaked in [
         dir.path().to_string_lossy().as_ref(),
+        target.as_ref(),
         "/tmp",
         "os error",
         "vector_store",
-        "no/such",
     ] {
         assert!(
             !text.contains(leaked),
             "reload body leaks {leaked:?}: {text}"
         );
-    }
-}
-
-#[cfg(unix)]
-struct RestoreMode {
-    path: std::path::PathBuf,
-    mode: u32,
-}
-
-#[cfg(unix)]
-impl Drop for RestoreMode {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
     }
 }
 
@@ -1098,8 +1080,8 @@ fn assert_embedding_reload_hides_cause(text: &str, dir: &std::path::Path, detail
     }
 }
 
-/// #400: `HyperspaceStore::open` fails after `create_dir_all` (the fresh
-/// directory is not writable) and the HTTP body is `open_failed`.
+/// #400: a malformed fresh WAL path makes `HyperspaceStore::open` fail and the
+/// HTTP body is `open_failed`.
 #[cfg(unix)]
 #[tokio::test]
 async fn isolation_contract_embedding_reload_open_failure_does_not_leak_paths() {
@@ -1107,14 +1089,6 @@ async fn isolation_contract_embedding_reload_open_failure_does_not_leak_paths() 
     let dir = tempfile::tempdir().unwrap();
     let _env = setup(dir.path());
     let _fixture = EnvGuard::set(&[("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE", "open".into())]);
-    let _restore = RestoreMode {
-        path: dir.path().join("vector_store"),
-        mode: 0o755,
-    };
-    if permissions_ignored(dir.path()) {
-        eprintln!("skipping: running with permission override");
-        return;
-    }
     let router = app(test_state(dir.path()));
 
     let (status, text) = send(
@@ -1138,14 +1112,6 @@ async fn isolation_contract_embedding_reload_read_failure_does_not_leak_paths() 
     let dir = tempfile::tempdir().unwrap();
     let _env = setup(dir.path());
     let _fixture = EnvGuard::set(&[("AGENTOS_TEST_EMBEDDING_RELOAD_FIXTURE", "read".into())]);
-    let _restore = RestoreMode {
-        path: dir.path().join("vector_store").join("active.wal"),
-        mode: 0o644,
-    };
-    if permissions_ignored(dir.path()) {
-        eprintln!("skipping: running with permission override");
-        return;
-    }
     let router = app(test_state(dir.path()));
 
     let (status, text) = send(
@@ -1158,19 +1124,4 @@ async fn isolation_contract_embedding_reload_read_failure_does_not_leak_paths() 
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
     assert_embedding_reload_hides_cause(&text, dir.path(), "open_failed");
-}
-
-/// Root and other privileged users ignore mode `0o000` / `0o555`.
-#[cfg(unix)]
-fn permissions_ignored(dir: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let probe = dir.join("perm-probe");
-    if std::fs::write(&probe, b"x").is_err() {
-        return true;
-    }
-    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let readable = std::fs::read(&probe).is_ok();
-    let _ = std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o644));
-    let _ = std::fs::remove_file(&probe);
-    readable
 }
