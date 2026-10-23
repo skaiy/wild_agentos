@@ -1030,6 +1030,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn secure_vector_data_root_returns_a_clear_error_for_an_invalid_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data-file");
+        std::fs::write(&root, "not a directory").unwrap();
+        let error = secure_vector_data_root(&root).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ),
+            "unexpected startup filesystem error: {error}"
+        );
+    }
+
     /// 构造一个最小可用的 UnifiedGateway（不触网，仅满足 AppState 依赖）。
     fn test_gateway() -> UnifiedGateway {
         UnifiedGateway::new(&crate::config::GatewaySettings {
