@@ -215,12 +215,21 @@ impl HyperspaceStore {
     /// An unavailable provider must fail the operation rather than silently
     /// substituting a placeholder vector.
     async fn get_query_embedding(&self, text: &str) -> Result<Vec<f32>, CoreError> {
-        self.embed.embed(text).await.map_err(|error| {
+        let embedding = self.embed.embed(text).await.map_err(|error| {
             warn!(error = %error, "Embedding service failed; vector operation rejected");
             CoreError::StorageError {
                 message: "embedding provider unavailable".into(),
             }
-        })
+        })?;
+        if embedding.len() != self.embed.dimension()
+            || embedding.iter().any(|value| !value.is_finite())
+            || embedding.iter().all(|value| *value == 0.0)
+        {
+            return Err(CoreError::StorageError {
+                message: "embedding provider returned an invalid vector".into(),
+            });
+        }
+        Ok(embedding)
     }
 
     /// Convert a `HybridSearchFilter` to a `Vec<JsonLdFilter>` for the engine.
@@ -861,6 +870,22 @@ mod tests {
         }
     }
 
+    struct InvalidEmbeddingService {
+        vector: Vec<f32>,
+        dimension: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for InvalidEmbeddingService {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Ok(self.vector.clone())
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+    }
+
     fn setup_store() -> HyperspaceStore {
         let dir = tempfile::tempdir().unwrap();
         let embed = Arc::new(FallbackEmbeddingService::new());
@@ -906,6 +931,19 @@ mod tests {
         let result = store.search("unavailable provider", 10).await;
         assert!(result.is_err());
         assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_query_embeddings_are_rejected() {
+        for (vector, dimension) in [(vec![0.0; 3], 3), (vec![f32::NAN; 3], 3), (vec![1.0; 2], 3)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = HyperspaceStore::open(
+                dir.path(),
+                Arc::new(InvalidEmbeddingService { vector, dimension }),
+            )
+            .unwrap();
+            assert!(store.search("query", 1).await.is_err());
+        }
     }
 
     #[tokio::test]

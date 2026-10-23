@@ -670,8 +670,12 @@ pub(crate) async fn vector_records_match_kb_ownership(
             if !bases.iter().any(|kb| {
                 kb.get("id").and_then(Value::as_str) == Some(kb_id)
                     && kb.get("kb_type").and_then(Value::as_str) == Some("vector")
-                    && kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
-                    && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+                    // Historical catalog entries may predate ownership fields.
+                    // Their record namespace is still claims-minted and must
+                    // match above; this compatibility path never grants a
+                    // caller access to a different namespace.
+                    && kb.get("tenant_id").and_then(Value::as_str).is_none_or(|tenant| tenant == claims.tenant_id())
+                    && kb.get("project_id").and_then(Value::as_str).is_none_or(|project| project == claims.project_id())
             }) {
                 tracing::error!(iri = %hit.iri, "Vector record KB tag is not owned by its scope");
                 store.cache_ownership_health_if_current(cache_key, generation, false);
