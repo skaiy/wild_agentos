@@ -39,8 +39,14 @@ fn backfill(
         if base.get("tenant_id").and_then(Value::as_str).is_some()
             && base.get("project_id").and_then(Value::as_str).is_some()
         {
-            if assigns.contains_key(&id) {
-                report.push(json!({"id": id, "status": "already_scoped"}));
+            if let Some((tenant, project)) = assigns.get(&id) {
+                if base.get("tenant_id").and_then(Value::as_str) == Some(tenant)
+                    && base.get("project_id").and_then(Value::as_str) == Some(project)
+                {
+                    report.push(json!({"id": id, "status": "already_scoped"}));
+                } else {
+                    report.push(json!({"id": id, "status": "conflict"}));
+                }
             }
             continue;
         }
@@ -203,11 +209,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|record| record["status"] == "unambiguous" || record["status"] == "assigned")
             .map(|record| {
                 json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
-                    "kb_id": record["id"],
-                    "after": {"tenant_id": record["tenant_id"], "project_id": record["project_id"]},
-                    "source": record["status"],
-                })
+                        "at": chrono::Utc::now().to_rfc3339(),
+                        "kb_id": record["id"],
+                "before": record.get("before").cloned().unwrap_or(Value::Null),
+                "after": {"tenant_id": record["tenant_id"], "project_id": record["project_id"]},
+                        "source": record["status"],
+                    })
             })
             .collect();
         append_audit(&root, &audit)?;
@@ -296,11 +303,11 @@ mod tests {
         ];
         let mut assignments = BTreeMap::new();
         assignments.insert("evidence".into(), ("other".into(), "p".into()));
-        assignments.insert("scoped".into(), ("t".into(), "p".into()));
+        assignments.insert("scoped".into(), ("other".into(), "p".into()));
         let (changed, report) = backfill(&mut bases, true, &assignments).unwrap();
         assert_eq!(changed, 0);
         assert_eq!(report[0]["status"], "conflict");
-        assert_eq!(report[1]["status"], "already_scoped");
+        assert_eq!(report[1]["status"], "conflict");
         assert!(bases[0].get("tenant_id").is_none());
     }
 
