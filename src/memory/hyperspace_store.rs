@@ -618,6 +618,35 @@ impl HyperspaceStore {
             .collect())
     }
 
+    /// Finds literal ASCII token matches only after applying the same verified
+    /// namespace and required-tag filters used for semantic retrieval.
+    pub async fn exact_matches_with_claims_and_required_tags(
+        &self,
+        claims: &IsolationClaims,
+        required_tags: &[String],
+        tokens: &[String],
+        limit: u64,
+    ) -> Result<Vec<ScoredEntry>, CoreError> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidate_limit = self.count().await?.min(usize::MAX as u64);
+        let query = tokens.join(" ");
+        let mut matches: Vec<ScoredEntry> = self
+            .search_with_claims_and_required_tags(claims, &query, required_tags, candidate_limit)
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                tokens
+                    .iter()
+                    .any(|token| contains_ascii_token(&entry.text, token))
+            })
+            .collect();
+        matches.sort_by(|left, right| left.iri.cmp(&right.iri));
+        matches.truncate(limit as usize);
+        Ok(matches)
+    }
+
     async fn search_with_filter_inner(
         &self,
         query: &str,
@@ -785,6 +814,23 @@ impl HyperspaceStore {
                 message: format!("Hyperspace lookup_id: {e}"),
             })
     }
+}
+
+fn contains_ascii_token(text: &str, token: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let token = token.to_ascii_lowercase();
+    text.match_indices(&token).any(|(index, _)| {
+        let before_is_word = text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        let after_index = index + token.len();
+        let after_is_word = text[after_index..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        !before_is_word && !after_is_word
+    })
 }
 
 #[cfg(test)]

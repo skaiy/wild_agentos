@@ -2,6 +2,7 @@
 //!
 //! 路由仍由 `mod.rs` 的 `build_router` 组装。
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -34,6 +35,9 @@ use super::AppState;
 
 const PACK_VECTOR_RAG_PER_KB_LIMIT: u64 = 5;
 const PACK_VECTOR_RAG_TOTAL_LIMIT: usize = 8;
+const MAX_PACK_TOKEN_RULES: usize = 16;
+const MAX_PACK_TOKEN_RULE_VALUES: usize = 16;
+const MAX_PACK_TOKEN_RULE_VALUE_LENGTH: usize = 32;
 
 #[derive(Deserialize)]
 pub struct AgentChatRequest {
@@ -372,7 +376,24 @@ fn format_vector_hits_section(hits: &[ScoredEntry]) -> String {
     section
 }
 
-async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec<String> {
+#[derive(Clone, Debug)]
+struct PackVectorSearch {
+    kb_id: String,
+    token_rules: Vec<PackTokenRule>,
+}
+
+#[derive(Clone, Debug)]
+struct PackTokenRule {
+    prefixes: Vec<String>,
+    digit_count: usize,
+    excluded_suffixes: Vec<String>,
+    excluded_shapes: HashSet<String>,
+}
+
+async fn mounted_pack_vector_searches(
+    state: &Arc<AppState>,
+    agent: &Value,
+) -> Vec<PackVectorSearch> {
     let pack_ids: Vec<&str> = agent
         .get("knowledge_pack_ids")
         .and_then(Value::as_array)
@@ -388,7 +409,7 @@ async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec
         return Vec::new();
     }
     let packs = state.knowledge_packs.read().await;
-    let mut kb_ids = Vec::new();
+    let mut searches = Vec::new();
     for pack_id in pack_ids {
         let Some(pack) = packs
             .iter()
@@ -396,26 +417,209 @@ async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec
         else {
             continue;
         };
+        let token_rules = if pack.get("builtin").and_then(Value::as_bool) == Some(false) {
+            pack_token_rules(pack)
+        } else {
+            Vec::new()
+        };
         if let Some(ids) = pack.get("vector_kb_ids").and_then(Value::as_array) {
             for id in ids {
                 if let Some(kb_id) = id.as_str() {
-                    if !kb_id.is_empty() && !kb_ids.iter().any(|existing| existing == kb_id) {
-                        kb_ids.push(kb_id.to_string());
+                    if !kb_id.is_empty()
+                        && !searches
+                            .iter()
+                            .any(|search: &PackVectorSearch| search.kb_id == kb_id)
+                    {
+                        searches.push(PackVectorSearch {
+                            kb_id: kb_id.to_string(),
+                            token_rules: token_rules.clone(),
+                        });
                     }
                 }
             }
         }
     }
-    kb_ids
+    searches
+}
+
+fn pack_token_rules(pack: &Value) -> Vec<PackTokenRule> {
+    let Some(rules) = pack
+        .get("keyword_retrieval")
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("rules"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    rules
+        .iter()
+        .take(MAX_PACK_TOKEN_RULES)
+        .filter_map(|rule| {
+            let object = rule.as_object()?;
+            let digit_count = object.get("digit_count")?.as_u64()?;
+            let digit_count = usize::try_from(digit_count)
+                .ok()
+                .filter(|count| (1..=16).contains(count))?;
+            let prefixes = pack_rule_strings(object.get("prefixes"), true)?;
+            let excluded_suffixes = pack_rule_strings(object.get("exclude_followed_by"), false)?;
+            let excluded_shapes = pack_rule_strings(object.get("exclude_shapes"), false)?
+                .into_iter()
+                .filter(|shape| {
+                    matches!(
+                        shape.as_str(),
+                        "ascii_alphanumeric_run_16_17"
+                            | "eleven_digit_run"
+                            | "separated_eleven_digit_run"
+                    )
+                })
+                .collect();
+            Some(PackTokenRule {
+                prefixes,
+                digit_count,
+                excluded_suffixes,
+                excluded_shapes,
+            })
+        })
+        .collect()
+}
+
+fn pack_rule_strings(value: Option<&Value>, prefixes: bool) -> Option<Vec<String>> {
+    let values = value?.as_array()?;
+    if values.len() > MAX_PACK_TOKEN_RULE_VALUES {
+        return None;
+    }
+    values
+        .iter()
+        .map(Value::as_str)
+        .map(|value| {
+            let value = value?;
+            if value.is_empty()
+                || value.len() > MAX_PACK_TOKEN_RULE_VALUE_LENGTH
+                || (prefixes && !value.bytes().all(|byte| byte.is_ascii_alphabetic()))
+            {
+                return None;
+            }
+            Some(if prefixes {
+                value.to_ascii_uppercase()
+            } else {
+                value.to_string()
+            })
+        })
+        .collect()
+}
+
+fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
+    if rules.is_empty() {
+        return Vec::new();
+    }
+    let separated_fragments = separated_eleven_digit_fragments(question);
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let flush = |current: &mut String, following: &str, tokens: &mut Vec<String>| {
+        if current.is_empty() {
+            return;
+        }
+        let upper = current.to_ascii_uppercase();
+        if rules
+            .iter()
+            .any(|rule| token_matches_rule(&upper, following, rule, &separated_fragments))
+        {
+            tokens.push(upper.to_ascii_lowercase());
+        }
+        current.clear();
+    };
+    for (index, character) in question.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            current.push(character);
+        } else {
+            flush(&mut current, &question[index..], &mut tokens);
+        }
+    }
+    flush(&mut current, "", &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn token_matches_rule(
+    token: &str,
+    following: &str,
+    rule: &PackTokenRule,
+    separated_fragments: &HashSet<String>,
+) -> bool {
+    let prefix_matches =
+        rule.prefixes.is_empty() || rule.prefixes.iter().any(|prefix| token.starts_with(prefix));
+    if !prefix_matches {
+        return false;
+    }
+    let suffix = rule
+        .prefixes
+        .iter()
+        .find_map(|prefix| token.strip_prefix(prefix))
+        .unwrap_or(token);
+    if suffix.len() != rule.digit_count || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if excluded_by_suffix(following, &rule.excluded_suffixes)
+        || (rule
+            .excluded_shapes
+            .contains("ascii_alphanumeric_run_16_17")
+            && (16..=17).contains(&token.len()))
+        || (rule.excluded_shapes.contains("eleven_digit_run")
+            && token.len() == 11
+            && token.bytes().all(|byte| byte.is_ascii_digit()))
+        || (rule.excluded_shapes.contains("separated_eleven_digit_run")
+            && separated_fragments.contains(token))
+    {
+        return false;
+    }
+    true
+}
+
+fn excluded_by_suffix(following: &str, suffixes: &[String]) -> bool {
+    let mut remaining = following;
+    for _ in 0..3 {
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        remaining = &remaining[character.len_utf8()..];
+    }
+    suffixes.iter().any(|suffix| remaining.starts_with(suffix))
+}
+
+fn separated_eleven_digit_fragments(message: &str) -> HashSet<String> {
+    let groups: Vec<String> = message
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|group| !group.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut fragments = HashSet::new();
+    for start in 0..groups.len() {
+        let mut digits = String::new();
+        for end in start..groups.len().min(start + 4) {
+            digits.push_str(&groups[end]);
+            if digits.len() == 11 && digits.starts_with('1') {
+                fragments.extend(groups[start..=end].iter().cloned());
+                break;
+            }
+            if digits.len() >= 11 {
+                break;
+            }
+        }
+    }
+    fragments
 }
 
 async fn pack_scoped_vector_hits(
     state: &Arc<AppState>,
     claims: &IsolationClaims,
     question: &str,
-    kb_ids: &[String],
+    searches: &[PackVectorSearch],
 ) -> Result<Vec<ScoredEntry>, (StatusCode, Value)> {
-    if kb_ids.is_empty() {
+    if searches.is_empty() {
         return Ok(Vec::new());
     }
     let Some(store) = state.vector_store.load_full() else {
@@ -424,9 +628,40 @@ async fn pack_scoped_vector_hits(
             json!({ "error": "chat vector retrieval unavailable" }),
         ));
     };
+    let mut exact_hits = Vec::new();
     let mut hits = Vec::new();
-    for kb_id in kb_ids {
-        let tag = kb_vector_tag(kb_id);
+    for search in searches {
+        let tag = kb_vector_tag(&search.kb_id);
+        let tokens = extract_pack_tokens(question, &search.token_rules);
+        if !tokens.is_empty() {
+            match store
+                .exact_matches_with_claims_and_required_tags(
+                    claims,
+                    std::slice::from_ref(&tag),
+                    &tokens,
+                    PACK_VECTOR_RAG_PER_KB_LIMIT,
+                )
+                .await
+            {
+                Ok(mut batch) => {
+                    for hit in &mut batch {
+                        hit.score = f32::NAN;
+                    }
+                    exact_hits.extend(batch);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        kb_id = %search.kb_id,
+                        error = %error,
+                        "pack-scoped exact retrieval failed"
+                    );
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({ "error": "chat vector retrieval unavailable" }),
+                    ));
+                }
+            }
+        }
         match store
             .search_with_claims_and_required_tags(
                 claims,
@@ -439,7 +674,7 @@ async fn pack_scoped_vector_hits(
             Ok(batch) => hits.extend(batch),
             Err(error) => {
                 tracing::error!(
-                    kb_id = %kb_id,
+                    kb_id = %search.kb_id,
                     error = %error,
                     "pack-scoped chat vector retrieval failed"
                 );
@@ -450,14 +685,24 @@ async fn pack_scoped_vector_hits(
             }
         }
     }
-    hits.sort_by(|left, right| {
+    exact_hits.sort_by(|left, right| left.iri.cmp(&right.iri));
+    exact_hits.dedup_by(|left, right| left.iri == right.iri);
+    let mut seen_iris = HashSet::new();
+    exact_hits.retain(|hit| seen_iris.insert(hit.iri.clone()));
+    hits.retain(|hit| seen_iris.insert(hit.iri.clone()));
+    exact_hits.append(&mut hits);
+    let exact_count = exact_hits
+        .iter()
+        .take_while(|hit| hit.score.is_nan())
+        .count();
+    exact_hits[exact_count..].sort_by(|left, right| {
         right
             .score
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
-    Ok(hits)
+    exact_hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
+    Ok(exact_hits)
 }
 
 async fn ev_repair_graph_retrieval(
@@ -570,15 +815,15 @@ async fn build_claims_scoped_prefix_messages(
         ));
     }
 
-    let pack_kb_ids = mounted_pack_vector_kb_ids(state, agent).await;
+    let pack_vector_searches = mounted_pack_vector_searches(state, agent).await;
     let graph_retrieval = if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
         Some(ev_repair_graph_retrieval(state, claims, &question).await?)
     } else {
         None
     };
 
-    let vector_section = if !pack_kb_ids.is_empty() {
-        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids).await?;
+    let vector_section = if !pack_vector_searches.is_empty() {
+        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_vector_searches).await?;
         if hits.is_empty() {
             None
         } else {
@@ -1428,6 +1673,118 @@ mod tests {
             invocations: crate::api::http::invocations::InvocationsRuntime::unavailable(),
             shutdown: tokio_util::sync::CancellationToken::new(),
         })
+    }
+
+    #[test]
+    fn configured_pack_token_rules_are_opt_in_and_exclude_marked_values() {
+        let pack = json!({
+            "builtin": false,
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年", "年份", "年款"],
+                    "exclude_shapes": [
+                        "ascii_alphanumeric_run_16_17",
+                        "eleven_digit_run",
+                        "separated_eleven_digit_run"
+                    ]
+                }, {
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年", "年份", "年款"],
+                    "exclude_shapes": [
+                        "ascii_alphanumeric_run_16_17",
+                        "eleven_digit_run",
+                        "separated_eleven_digit_run"
+                    ]
+                }]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        assert_eq!(extract_pack_tokens("报B2033", &rules), vec!["b2033"]);
+        assert_eq!(
+            extract_pack_tokens("B2040 是什么故障", &rules),
+            vec!["b2040"]
+        );
+        assert!(extract_pack_tokens("故障码2033年", &rules).is_empty());
+        assert!(extract_pack_tokens("2023年", &rules).is_empty());
+        assert!(extract_pack_tokens("LTEST000000000001", &rules).is_empty());
+        assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
+        assert!(extract_pack_tokens("B2033", &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_pack_exact_retrieval_is_scoped_and_precedes_vectors() {
+        let state = make_state();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let foreign_claims =
+            IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
+        let vector_dir = std::env::temp_dir().join(format!("chat_pack_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vector_dir).unwrap();
+        let store = crate::memory::hyperspace_store::HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "exact-local",
+                "B2033 exact-local placeholder entry",
+                &[kb_vector_tag("kb-local")],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(
+                &foreign_claims,
+                "exact-foreign",
+                "B2033 foreign placeholder entry",
+                &[kb_vector_tag("kb-local")],
+            )
+            .await
+            .unwrap();
+        state.vector_store.store(Some(Arc::new(store)));
+        *state.knowledge_packs.write().await = vec![
+            json!({
+                "id": "pack-config-a",
+                "builtin": false,
+                "vector_kb_ids": ["kb-local"],
+                "keyword_retrieval": {
+                    "rules": [{
+                        "prefixes": ["B"],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年", "年份", "年款"],
+                        "exclude_shapes": []
+                    }]
+                }
+            }),
+            json!({
+                "id": "pack-config-b",
+                "builtin": false,
+                "vector_kb_ids": ["kb-local"],
+                "keyword_retrieval": {
+                    "rules": [{
+                        "prefixes": ["B"],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年", "年份", "年款"],
+                        "exclude_shapes": []
+                    }]
+                }
+            }),
+        ];
+        let agent = json!({ "knowledge_pack_ids": ["pack-config-b"] });
+        let searches = mounted_pack_vector_searches(&state, &agent).await;
+        let hits = pack_scoped_vector_hits(&state, &claims, "报B2033", &searches)
+            .await
+            .unwrap();
+        assert!(hits
+            .first()
+            .is_some_and(|hit| hit.text.contains("exact-local")));
+        assert!(hits.first().is_some_and(|hit| hit.score.is_nan()));
+        assert!(hits.iter().all(|hit| !hit.text.contains("foreign")));
+        let _ = std::fs::remove_dir_all(vector_dir);
     }
 
     #[tokio::test]
