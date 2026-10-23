@@ -2208,4 +2208,36 @@ mod tests {
                 .unwrap();
         assert_eq!(body, json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }));
     }
+
+    #[tokio::test]
+    async fn chat_pack_cannot_mount_a_foreign_tenant_kb() {
+        let state = make_state();
+        state.knowledge_bases.write().await.push(json!({
+            "id": "foreign-kb",
+            "kb_type": "vector",
+            "tenant_id": "tenant-b",
+            "project_id": "project-1"
+        }));
+        state
+            .knowledge_packs
+            .write()
+            .await
+            .iter_mut()
+            .find(|pack| pack["id"] == "attacker-pack")
+            .unwrap()["vector_kb_ids"] = json!(["foreign-kb"]);
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let error = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("retrieve", &[]),
+            Some(&claims),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.1,
+            json!({ "error": "knowledge base not found", "id": "foreign-kb" })
+        );
+    }
 }
