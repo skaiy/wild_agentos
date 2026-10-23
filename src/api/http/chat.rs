@@ -1049,7 +1049,7 @@ async fn build_claims_scoped_prefix_messages(
         } else {
             let mut section = format_vector_hits_section(&retrieval.hits);
             if retrieval.exact_truncated {
-                section.push_str("【精确检索已截断】\n");
+                section.push_str("[exact retrieval truncated]\n");
             }
             Some(section)
         }
