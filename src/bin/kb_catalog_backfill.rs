@@ -127,6 +127,26 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+fn append_audit(root: &Path, records: &[Value]) -> std::io::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let path = root.join("kb_catalog_backfill.audit.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    for record in records {
+        writeln!(file, "{}", serde_json::to_string(record)?)?;
+    }
+    file.sync_all()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut data_root = None;
@@ -162,6 +182,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (changed, report) = backfill(&mut bases, apply, &assigns)?;
     if apply && changed > 0 {
         atomic_write(&path, &serde_json::to_vec_pretty(&bases)?)?;
+        let audit: Vec<Value> = report
+            .iter()
+            .filter(|record| record["status"] == "unambiguous" || record["status"] == "assigned")
+            .map(|record| {
+                json!({
+                    "at": chrono::Utc::now().to_rfc3339(),
+                    "kb_id": record["id"],
+                    "after": {"tenant_id": record["tenant_id"], "project_id": record["project_id"]},
+                    "source": record["status"],
+                })
+            })
+            .collect();
+        append_audit(&root, &audit)?;
     }
     println!(
         "{}",
