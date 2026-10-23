@@ -889,10 +889,8 @@ pub(crate) async fn delete_knowledge_base_handler(
             && kb_belongs_to_claims(b, claims))
     });
     let _ = save_knowledge_bases(&guard);
-    if removed.get("kb_type").and_then(Value::as_str) == Some("vector") {
-        if let Some(store) = state.vector_store.load_full() {
-            store.invalidate_ownership_cache();
-        }
+    if let Some(store) = state.vector_store.load_full() {
+        store.invalidate_ownership_cache();
     }
     (
         StatusCode::OK,
@@ -987,10 +985,8 @@ pub(crate) async fn update_knowledge_base_handler(
         let _ = save_knowledge_bases(&guard);
         (updated, is_graph, graph_iri, name_changed)
     };
-    if updated.get("kb_type").and_then(Value::as_str) == Some("vector") {
-        if let Some(store) = state.vector_store.load_full() {
-            store.invalidate_ownership_cache();
-        }
+    if let Some(store) = state.vector_store.load_full() {
+        store.invalidate_ownership_cache();
     }
 
     // 图类型改名：同步命名图 kbName 元三元组
