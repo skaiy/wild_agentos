@@ -2051,8 +2051,17 @@ mod tests {
         store
             .upsert_with_claims(
                 &claims,
+                "contains-local",
+                "prefix B2033 suffix",
+                &[kb_vector_tag("kb-local")],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
                 "exact-local",
-                "B2033 exact-local placeholder entry",
+                "B2033",
                 &[kb_vector_tag("kb-local")],
             )
             .await
@@ -2100,10 +2109,10 @@ mod tests {
         let hits = pack_scoped_vector_hits(&state, &claims, "报B2033", &searches)
             .await
             .unwrap();
-        assert!(hits
-            .hits
-            .first()
-            .is_some_and(|hit| hit.text.contains("exact-local")));
+        assert_eq!(
+            hits.hits.first().map(|hit| hit.text.as_str()),
+            Some("B2033")
+        );
         assert!(hits
             .hits
             .first()
