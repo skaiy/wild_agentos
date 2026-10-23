@@ -3337,6 +3337,8 @@ mod isolation_contract {
         state.knowledge_bases.write().await.push(json!({
             "id": "graph-kb",
             "kb_type": "graph",
+            "tenant_id": "tenant-a",
+            "project_id": "default",
             "graph": "graph:world"
         }));
         let app = Router::new()
@@ -3437,6 +3439,8 @@ exit 2
         state.knowledge_bases.write().await.push(json!({
             "id": "graph-kb",
             "kb_type": "graph",
+            "tenant_id": "tenant-a",
+            "project_id": "default",
             "graph": "client:ignored"
         }));
         let app = Router::new()
