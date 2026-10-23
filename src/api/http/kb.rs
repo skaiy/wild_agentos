@@ -2886,6 +2886,21 @@ mod isolation_contract {
         jwt_for_scope(tenant_id, None)
     }
 
+    fn platform_jwt(tenant_id: &str) -> String {
+        encode(
+            &Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: format!("{tenant_id}-admin"),
+                tenant_id: tenant_id.to_string(),
+                project_id: Some("project-a".into()),
+                roles: vec!["PLATFORM_ADMIN".into()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
     fn jwt_for_scope(tenant_id: &str, project_id: Option<&str>) -> String {
         encode(
             &Header::default(),
@@ -2909,6 +2924,72 @@ mod isolation_contract {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn knowledge_pack_unknown_rule_fields_are_rejected_without_persistence() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        let previous_platform_tenant =
+            std::env::var_os(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
+        std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, "tenant-a");
+        let state = test_state(tmp.path());
+        state.knowledge_packs.write().await.push(json!({
+            "id": "existing-pack",
+            "builtin": false,
+            "vector_kb_ids": []
+        }));
+        let app = Router::new()
+            .route("/packs", post(create_knowledge_pack_handler))
+            .route("/packs/:id", put(update_knowledge_pack_handler))
+            .with_state(state.clone());
+        let token = platform_jwt("tenant-a");
+        let invalid = json!({
+            "name": "invalid",
+            "keyword_retrieval": {"mode":"x","rules":[]}
+        });
+        let (status, _) = response_json(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/packs")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(invalid.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.knowledge_packs.read().await.len(), 1);
+        let (status, _) = response_json(
+            &app,
+            Request::builder()
+                .method("PUT")
+                .uri("/packs/existing-pack")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"keyword_retrieval":{"mode":"x","rules":[]}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state.knowledge_packs.read().await[0]
+            .get("keyword_retrieval")
+            .is_none());
+        if let Some(previous) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", previous);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
+        if let Some(previous) = previous_platform_tenant {
+            std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, previous);
+        } else {
+            std::env::remove_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        }
     }
 
     #[tokio::test]
