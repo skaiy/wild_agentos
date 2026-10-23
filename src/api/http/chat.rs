@@ -495,8 +495,12 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
                 if value.is_empty() || value.len() > MAX_PACK_TOKEN_RULE_VALUE_LENGTH {
                     return Err(format!("{field} contains an invalid value"));
                 }
-                if prefixes && !value.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-                    return Err("prefixes must be ASCII alphabetic".into());
+                if prefixes
+                    && !value.bytes().all(|byte| {
+                        byte.is_ascii_alphabetic() || matches!(byte, b'-' | b'_' | b'/')
+                    })
+                {
+                    return Err("prefixes must use configured ASCII separators".into());
                 }
                 if field == "exclude_shapes"
                     && !matches!(
@@ -570,7 +574,10 @@ fn pack_rule_strings(value: Option<&Value>, prefixes: bool) -> Option<Vec<String
             let value = value?;
             if value.is_empty()
                 || value.len() > MAX_PACK_TOKEN_RULE_VALUE_LENGTH
-                || (prefixes && !value.bytes().all(|byte| byte.is_ascii_alphabetic()))
+                || (prefixes
+                    && !value.bytes().all(|byte| {
+                        byte.is_ascii_alphabetic() || matches!(byte, b'-' | b'_' | b'/')
+                    }))
             {
                 return None;
             }
@@ -604,7 +611,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         current.clear();
     };
     for (index, character) in question.char_indices() {
-        if character.is_ascii_alphanumeric() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '/') {
             current.push(character);
         } else {
             flush(&mut current, &question[index..], &mut tokens);
@@ -1818,6 +1825,15 @@ mod tests {
         assert_eq!(
             extract_pack_tokens("BA1234", &pack_token_rules(&pack)),
             vec!["ba1234"]
+        );
+    }
+
+    #[test]
+    fn pack_token_rules_support_separator_prefixes() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["TKT-"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}});
+        assert_eq!(
+            extract_pack_tokens("TKT-0002", &pack_token_rules(&pack)),
+            vec!["tkt-0002"]
         );
     }
 
