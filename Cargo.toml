@@ -187,6 +187,10 @@ path = "src/bin/private_deploy_bench.rs"
 name = "vector-store-check"
 path = "src/bin/vector_store_check.rs"
 
+[[bin]]
+name = "kb-catalog-backfill"
+path = "src/bin/kb_catalog_backfill.rs"
+
 [[bench]]
 name = "bench_graph_backend"
 harness = false

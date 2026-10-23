@@ -279,6 +279,15 @@ Search uses `POST /api/v1/kb/bases/:id/search` with `{ "query", "limit?" }`
 
 ## 10. Embedding is replaceable; foundations are not
 
+### Legacy catalog scope backfill
+
+`kb-catalog-backfill --data-root <PATH>` is an explicit dry-run command for
+catalog records missing `tenant_id` or `project_id`. It lists every unscoped KB
+and any document-level scope evidence. Pass `--apply` only after review: it
+assigns a scope when exactly one tenant/project pair is evidenced, skips
+ambiguous or evidence-free records, and is idempotent. Runtime reads never
+infer a scope from an unscoped record.
+
 `src/config/settings.rs` configures `embedding`: `ollama` by default, plus
 `oneapi` and `fallback`. Changing it hot-switches vector dimensions/model and
 queues `reindex`; `POST /api/v1/embedding/activate` activates a registered
