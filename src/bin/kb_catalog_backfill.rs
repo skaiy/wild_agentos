@@ -28,7 +28,7 @@ fn backfill(
 ) -> Result<(usize, Vec<Value>), String> {
     let mut report = Vec::new();
     let mut changed = 0usize;
-    for base in bases {
+    for base in &mut *bases {
         if base.get("tenant_id").and_then(Value::as_str).is_some()
             && base.get("project_id").and_then(Value::as_str).is_some()
         {
@@ -200,6 +200,41 @@ mod tests {
         assert_eq!(bases[0]["tenant_id"], "existing");
         assert!(bases[0].get("project_id").is_none());
         assert_eq!(report[0]["status"], "conflict");
+    }
+
+    #[test]
+    fn assignment_parser_rejects_invalid_and_duplicate_ids() {
+        assert!(parse_assignment("bad").is_err());
+        assert!(parse_assignment("id=tenant").is_err());
+        let (id, scope) = parse_assignment("kb-a=tenant/project").unwrap();
+        assert_eq!(id, "kb-a");
+        assert_eq!(scope, ("tenant".into(), "project".into()));
+        let mut assignments = BTreeMap::new();
+        assert!(assignments.insert(id.clone(), scope).is_none());
+        assert!(assignments
+            .insert(id, ("other".into(), "project".into()))
+            .is_some());
+    }
+
+    #[test]
+    fn assignment_applies_only_missing_scope_and_rejects_unknown_ids() {
+        let mut bases = vec![
+            json!({"id":"assigned","documents":[]}),
+            json!({
+                "id":"conflict","tenant_id":"existing",
+                "documents":[{"tenant_id":"evidence","project_id":"project"}]
+            }),
+        ];
+        let mut assignments = BTreeMap::new();
+        assignments.insert("assigned".into(), ("tenant".into(), "project".into()));
+        let (changed, report) = backfill(&mut bases, true, &assignments).unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(bases[0]["tenant_id"], "tenant");
+        assert_eq!(report[0]["status"], "assigned");
+        assert_eq!(bases[1]["tenant_id"], "existing");
+        let mut unknown = BTreeMap::new();
+        unknown.insert("missing".into(), ("tenant".into(), "project".into()));
+        assert!(backfill(&mut bases, false, &unknown).is_err());
     }
 
     #[cfg(unix)]
