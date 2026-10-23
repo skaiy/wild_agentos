@@ -669,7 +669,26 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
             .any(|rule| token_matches_rule(&upper, following, rule))
             && !blocked_fragments.contains(&upper)
         {
-            tokens.push(upper.to_ascii_lowercase());
+            let canonical = rules
+                .iter()
+                .find_map(|rule| {
+                    rule.prefixes.iter().find_map(|prefix| {
+                        let separator = prefix.chars().last()?;
+                        if !matches!(separator, '-' | '_' | '/') {
+                            return None;
+                        }
+                        let stem = &prefix[..prefix.len() - separator.len_utf8()];
+                        upper
+                            .strip_prefix(stem)
+                            .filter(|suffix| {
+                                suffix.len() == rule.digit_count
+                                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                            })
+                            .map(|suffix| format!("{prefix}{suffix}"))
+                    })
+                })
+                .unwrap_or(upper);
+            tokens.push(canonical.to_ascii_lowercase());
         }
         current.clear();
     };
@@ -764,9 +783,20 @@ fn token_matches_rule(token: &str, following: &str, rule: &PackTokenRule) -> boo
         token.len() == rule.digit_count && token.bytes().all(|byte| byte.is_ascii_digit())
     } else {
         rule.prefixes.iter().any(|prefix| {
-            token.strip_prefix(prefix).is_some_and(|suffix| {
-                suffix.len() == rule.digit_count && suffix.bytes().all(|byte| byte.is_ascii_digit())
-            })
+            token
+                .strip_prefix(prefix)
+                .or_else(|| {
+                    let separator = prefix.chars().last()?;
+                    if matches!(separator, '-' | '_' | '/') {
+                        token.strip_prefix(&prefix[..prefix.len() - separator.len_utf8()])
+                    } else {
+                        None
+                    }
+                })
+                .is_some_and(|suffix| {
+                    suffix.len() == rule.digit_count
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
         })
     };
     if !prefix_matches {
@@ -1980,6 +2010,15 @@ mod tests {
             extract_pack_tokens("TKT-0002", &pack_token_rules(&pack)),
             vec!["tkt-0002"]
         );
+    }
+
+    #[test]
+    fn pack_token_rules_normalize_optional_prefix_separators() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["TKT-", "TKT_"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
+        let rules = pack_token_rules(&pack);
+        assert_eq!(extract_pack_tokens("TKT-0002", &rules), vec!["tkt-0002"]);
+        assert_eq!(extract_pack_tokens("TKT0002", &rules), vec!["tkt-0002"]);
+        assert_eq!(extract_pack_tokens("TKT_0002", &rules), vec!["tkt_0002"]);
     }
 
     #[test]
