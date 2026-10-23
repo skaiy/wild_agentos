@@ -159,12 +159,14 @@ fn append_audit(root: &Path, records: &[Value]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::fs::PermissionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path)?;
     #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     for record in records {
         writeln!(file, "{}", serde_json::to_string(record)?)?;
     }
@@ -205,13 +207,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bases: Vec<Value> = serde_json::from_slice(&fs::read(&path)?)?;
     let (changed, report) = backfill(&mut bases, apply, &assigns)?;
     if apply && changed > 0 {
-        atomic_write(&path, &serde_json::to_vec_pretty(&bases)?)?;
         let audit: Vec<Value> = report
             .iter()
             .filter(|record| record["status"] == "unambiguous" || record["status"] == "assigned")
             .map(|record| {
                 json!({
                         "at": chrono::Utc::now().to_rfc3339(),
+                        "status": "pending",
                         "kb_id": record["id"],
                 "before": record.get("before").cloned().unwrap_or(Value::Null),
                 "after": {"tenant_id": record["tenant_id"], "project_id": record["project_id"]},
@@ -220,6 +222,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         append_audit(&root, &audit)?;
+        atomic_write(&path, &serde_json::to_vec_pretty(&bases)?)?;
+        let committed: Vec<Value> = audit
+            .iter()
+            .cloned()
+            .map(|mut record| {
+                record["at"] = json!(chrono::Utc::now().to_rfc3339());
+                record["status"] = json!("committed");
+                record
+            })
+            .collect();
+        append_audit(&root, &committed)?;
     }
     println!(
         "{}",
