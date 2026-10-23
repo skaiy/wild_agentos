@@ -287,6 +287,7 @@ and any document-level scope evidence. Pass `--apply` only after review: it
 assigns a scope when exactly one tenant/project pair is evidenced, skips
 ambiguous or evidence-free records, and is idempotent. Runtime reads never
 infer a scope from an unscoped record.
+Stop Core before applying the backfill.
 
 `src/config/settings.rs` configures `embedding`: `ollama` by default, plus
 `oneapi` and `fallback`. Changing it hot-switches vector dimensions/model and

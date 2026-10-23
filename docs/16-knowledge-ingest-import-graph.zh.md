@@ -436,6 +436,7 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/search" \
 scope 证据。审核后才传 `--apply`：仅当证据唯一指向一个 tenant/project
 组合时写入；证据歧义或缺失的记录保持不变并报告；重复执行幂等。运行时读取
 不会从未 scoped 记录推断 scope。
+应用 backfill 前须先停止 Core。
 
 配置段 `embedding`（`src/config/settings.rs`）：`provider` 默认 `ollama`，另有 `oneapi`、`fallback`。HTTP 侧：
 
