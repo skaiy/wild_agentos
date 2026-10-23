@@ -3641,16 +3641,11 @@ exit 2
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         std::fs::write(&legacy_path, "owned historical source text").unwrap();
 
-        run_kb_reindex(
-            state.clone(),
-            claims,
-            kb_id.to_string(),
-            state.knowledge_bases.read().await[0]["documents"]
-                .as_array()
-                .unwrap()
-                .clone(),
-        )
-        .await;
+        let docs = state.knowledge_bases.read().await[0]["documents"]
+            .as_array()
+            .unwrap()
+            .clone();
+        run_kb_reindex(state.clone(), claims, kb_id.to_string(), docs).await;
 
         let kb = state.knowledge_bases.read().await[0].clone();
         assert_eq!(kb["reindex_status"], json!("ready"));
