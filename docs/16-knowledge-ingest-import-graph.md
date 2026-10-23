@@ -288,6 +288,9 @@ assigns a scope when exactly one tenant/project pair is evidenced, skips
 ambiguous or evidence-free records, and is idempotent. Runtime reads never
 infer a scope from an unscoped record.
 Stop Core before applying the backfill.
+Use `--assign <kb_id>=<tenant>/<project>` for an evidence-free record; repeat
+the option for multiple records. Existing scope fields are never overwritten:
+conflicting evidence or assignments are reported and skipped.
 
 `src/config/settings.rs` configures `embedding`: `ollama` by default, plus
 `oneapi` and `fallback`. Changing it hot-switches vector dimensions/model and
