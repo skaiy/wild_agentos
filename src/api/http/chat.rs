@@ -895,7 +895,15 @@ fn grouped_exclude_shape_fragments(
             if code_like_groups.iter().filter(|matches| **matches).count() > 1
                 && (candidate_matches_shape
                     || (shape.min_len as usize..=shape.max_len as usize)
-                        .contains(&normalized_groups.concat().len()))
+                        .contains(&normalized_groups.concat().len())
+                    || shape.leading.is_some_and(|leading| {
+                        normalized_groups
+                            .first()
+                            .is_some_and(|first| first.starts_with(leading))
+                    })
+                    || normalized_groups
+                        .first()
+                        .is_some_and(|first| first.starts_with('L')))
             {
                 blocked.extend(
                     trimmed_groups
@@ -940,10 +948,16 @@ fn grouped_exclude_shape_fragments(
                 );
             }
             if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && group_count <= max_groups as usize
                 && !code_like_groups.first().copied().unwrap_or(false)
                 && normalized_groups.iter().any(|group| {
                     !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
                 })
+                && ((shape.min_len as usize..=shape.max_len as usize)
+                    .contains(&normalized_groups.concat().len())
+                    || normalized_groups
+                        .first()
+                        .is_some_and(|first| first.len() == 4))
             {
                 blocked.extend(
                     trimmed_groups
@@ -1016,7 +1030,9 @@ fn grouped_exclude_shape_fragments(
                             normalized_groups
                                 .first()
                                 .is_some_and(|first| first.starts_with(leading))
-                        }) || (!code_like_groups.first().copied().unwrap_or(false)
+                        }) || (normalized_groups
+                            .first()
+                            .is_some_and(|first| first.starts_with('L') || first.len() == 4)
                             && normalized_groups.iter().any(|group| {
                                 !group.is_empty()
                                     && group.bytes().all(|character| character.is_ascii_digit())
@@ -2289,6 +2305,12 @@ mod tests {
             extract_pack_tokens("B2033 and B2044", &rules),
             vec!["b2033", "b2044"]
         );
+        let plain_pair_since = extract_pack_tokens("Codes B2033 B2044 since 2023", &rules);
+        assert!(plain_pair_since.contains(&"b2033".to_string()));
+        assert!(plain_pair_since.contains(&"b2044".to_string()));
+        let plain_pair_time = extract_pack_tokens("Please check B2033 B2044 0800", &rules);
+        assert!(plain_pair_time.contains(&"b2033".to_string()));
+        assert!(plain_pair_time.contains(&"b2044".to_string()));
         let code_pair_since = extract_pack_tokens("B2033 B2044 since 2023", &rules);
         assert!(code_pair_since.contains(&"b2033".to_string()));
         assert!(code_pair_since.contains(&"b2044".to_string()));
@@ -2365,19 +2387,13 @@ mod tests {
         );
         // fictional
         let before_phone = extract_pack_tokens("B2033 199 0000 0000", &rules);
-        assert!(!before_phone
-            .iter()
-            .any(|token| token == "199" || token == "0000"));
+        assert_eq!(before_phone, vec!["b2033"]);
         // fictional
         let after_phone = extract_pack_tokens("199 0000 0000 B2033", &rules);
-        assert!(!after_phone
-            .iter()
-            .any(|token| token == "199" || token == "0000"));
+        assert_eq!(after_phone, vec!["b2033"]);
         // fictional
         let long_phone = extract_pack_tokens("Please inspect 199 0000 0000 B2033 today", &rules);
-        assert!(!long_phone
-            .iter()
-            .any(|token| token == "199" || token == "0000"));
+        assert_eq!(long_phone, vec!["b2033"]);
         // fictional
         assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
         // fictional
