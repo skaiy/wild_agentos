@@ -3721,6 +3721,37 @@ exit 2
                 br#"{"error":"knowledge base not found","id":"foreign-kb"}"#
             );
         }
+        let foreign = raw_response(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/kb/foreign-kb/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"x"}"#))
+                .unwrap(),
+        )
+        .await;
+        let missing = raw_response(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/kb/missing-kb/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"x"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(foreign.0, missing.0);
+        assert_eq!(
+            String::from_utf8(foreign.1)
+                .unwrap()
+                .replace("foreign-kb", "<id>"),
+            String::from_utf8(missing.1)
+                .unwrap()
+                .replace("missing-kb", "<id>")
+        );
     }
 
     #[tokio::test]
