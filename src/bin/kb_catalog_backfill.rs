@@ -18,6 +18,8 @@ fn parse_assignment(value: &str) -> Result<(String, (String, String)), String> {
     if id.is_empty() || tenant.is_empty() || project.is_empty() || project.contains('/') {
         return Err("assignment must be <kb_id>=<tenant>/<project>".into());
     }
+    wild_agent_os_core::isolation::IsolationClaims::from_verified(tenant, project, "backfill")
+        .map_err(|error| format!("invalid assignment scope: {error}"))?;
     Ok((id.into(), (tenant.into(), project.into())))
 }
 
@@ -81,12 +83,17 @@ fn backfill(
             } else {
                 report.push(json!({"id": id, "status": if assigns.contains_key(&id) {"assigned"} else {"unambiguous"}, "tenant_id": tenant, "project_id": project}));
                 if apply {
+                    let before = json!({
+                        "tenant_id": base.get("tenant_id").cloned().unwrap_or(Value::Null),
+                        "project_id": base.get("project_id").cloned().unwrap_or(Value::Null),
+                    });
                     if base.get("tenant_id").and_then(Value::as_str).is_none() {
                         base["tenant_id"] = json!(tenant);
                     }
                     if base.get("project_id").and_then(Value::as_str).is_none() {
                         base["project_id"] = json!(project);
                     }
+                    report.last_mut().unwrap()["before"] = before;
                     changed += 1;
                 }
             }
@@ -248,6 +255,7 @@ mod tests {
     fn assignment_parser_rejects_invalid_and_duplicate_ids() {
         assert!(parse_assignment("bad").is_err());
         assert!(parse_assignment("id=tenant").is_err());
+        assert!(parse_assignment("id=tenant!/project").is_err());
         let (id, scope) = parse_assignment("kb-a=tenant/project").unwrap();
         assert_eq!(id, "kb-a");
         assert_eq!(scope, ("tenant".into(), "project".into()));
@@ -273,6 +281,7 @@ mod tests {
         assert_eq!(changed, 1);
         assert_eq!(bases[0]["tenant_id"], "tenant");
         assert_eq!(report[0]["status"], "assigned");
+        assert_eq!(report[0]["before"]["tenant_id"], Value::Null);
         assert_eq!(bases[1]["tenant_id"], "existing");
         let mut unknown = BTreeMap::new();
         unknown.insert("missing".into(), ("tenant".into(), "project".into()));
