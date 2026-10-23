@@ -38,6 +38,7 @@ const PACK_VECTOR_RAG_TOTAL_LIMIT: usize = 8;
 const MAX_PACK_TOKEN_RULES: usize = 16;
 const MAX_PACK_TOKEN_RULE_VALUES: usize = 16;
 const MAX_PACK_TOKEN_RULE_VALUE_LENGTH: usize = 32;
+const MAX_PACK_EXTRACTED_TOKENS: usize = 16;
 
 #[derive(Deserialize)]
 pub struct AgentChatRequest {
@@ -449,7 +450,74 @@ async fn mounted_pack_vector_searches(
     searches
 }
 
+pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), String> {
+    if pack.get("keyword_retrieval").is_none() {
+        return Ok(());
+    }
+    let rules = pack
+        .get("keyword_retrieval")
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("rules"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "keyword_retrieval.rules must be an array".to_string())?;
+    if rules.is_empty() || rules.len() > MAX_PACK_TOKEN_RULES {
+        return Err("keyword_retrieval.rules must contain 1..=16 entries".into());
+    }
+    for rule in rules {
+        let object = rule
+            .as_object()
+            .ok_or_else(|| "keyword retrieval rule must be an object".to_string())?;
+        let digit_count = object
+            .get("digit_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "digit_count is required".to_string())?;
+        if !(1..=16).contains(&digit_count) {
+            return Err("digit_count must be in 1..=16".into());
+        }
+        for (field, prefixes) in [
+            ("prefixes", true),
+            ("exclude_followed_by", false),
+            ("exclude_shapes", false),
+        ] {
+            let values = object
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{field} is required"))?;
+            if values.is_empty() || values.len() > MAX_PACK_TOKEN_RULE_VALUES {
+                return Err(format!(
+                    "{field} exceeds {MAX_PACK_TOKEN_RULE_VALUES} values"
+                ));
+            }
+            for value in values {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| format!("{field} values must be strings"))?;
+                if value.is_empty() || value.len() > MAX_PACK_TOKEN_RULE_VALUE_LENGTH {
+                    return Err(format!("{field} contains an invalid value"));
+                }
+                if prefixes && !value.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                    return Err("prefixes must be ASCII alphabetic".into());
+                }
+                if field == "exclude_shapes"
+                    && !matches!(
+                        value,
+                        "ascii_alphanumeric_run_16_17"
+                            | "eleven_digit_run"
+                            | "separated_eleven_digit_run"
+                    )
+                {
+                    return Err(format!("unknown exclude_shapes value: {value}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pack_token_rules(pack: &Value) -> Vec<PackTokenRule> {
+    if validate_keyword_retrieval_config(pack).is_err() {
+        return Vec::new();
+    }
     let Some(rules) = pack
         .get("keyword_retrieval")
         .and_then(Value::as_object)
@@ -545,6 +613,13 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
     flush(&mut current, "", &mut tokens);
     tokens.sort();
     tokens.dedup();
+    if tokens.len() > MAX_PACK_EXTRACTED_TOKENS {
+        tracing::warn!(
+            cap = MAX_PACK_EXTRACTED_TOKENS,
+            "pack exact token cap reached"
+        );
+        tokens.truncate(MAX_PACK_EXTRACTED_TOKENS);
+    }
     tokens
 }
 
@@ -1696,15 +1771,6 @@ mod tests {
                         "eleven_digit_run",
                         "separated_eleven_digit_run"
                     ]
-                }, {
-                    "prefixes": [],
-                    "digit_count": 4,
-                    "exclude_followed_by": ["年", "年份", "年款"],
-                    "exclude_shapes": [
-                        "ascii_alphanumeric_run_16_17",
-                        "eleven_digit_run",
-                        "separated_eleven_digit_run"
-                    ]
                 }]
             }
         });
@@ -1719,6 +1785,28 @@ mod tests {
         assert!(extract_pack_tokens("LTEST000000000001", &rules).is_empty());
         assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
+    }
+
+    #[test]
+    fn keyword_retrieval_configuration_rejects_invalid_rules() {
+        let base = || json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}});
+        for patch in [
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["unknown"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":[],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["非"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":0,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":17,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+        ] {
+            assert!(validate_keyword_retrieval_config(&patch).is_err());
+        }
+        let mut too_many = base();
+        too_many["keyword_retrieval"]["rules"] = Value::Array(
+            (0..17)
+                .map(|_| base()["keyword_retrieval"]["rules"][0].clone())
+                .collect(),
+        );
+        assert!(validate_keyword_retrieval_config(&too_many).is_err());
+        assert!(validate_keyword_retrieval_config(&json!({"builtin": false})).is_ok());
     }
 
     #[tokio::test]
@@ -1763,7 +1851,7 @@ mod tests {
                         "prefixes": ["B"],
                         "digit_count": 4,
                         "exclude_followed_by": ["年", "年份", "年款"],
-                        "exclude_shapes": []
+                    "exclude_shapes": ["ascii_alphanumeric_run_16_17"]
                     }]
                 }
             }),
@@ -1776,7 +1864,7 @@ mod tests {
                         "prefixes": ["B"],
                         "digit_count": 4,
                         "exclude_followed_by": ["年", "年份", "年款"],
-                        "exclude_shapes": []
+                    "exclude_shapes": ["ascii_alphanumeric_run_16_17"]
                     }]
                 }
             }),

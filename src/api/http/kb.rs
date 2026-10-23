@@ -270,6 +270,8 @@ pub struct KnowledgePackCreateRequest {
     pub graph_kb_ids: Vec<String>,
     #[serde(default)]
     pub vector_kb_ids: Vec<String>,
+    #[serde(default)]
+    pub keyword_retrieval: Option<Value>,
 }
 
 /// 校验知识包关联的分类/图库/向量库 id 均存在且类型匹配；返回 Err(错误消息)。
@@ -327,6 +329,14 @@ pub(crate) async fn create_knowledge_pack_handler(
             Json(json!({ "error": "name 不能为空" })),
         );
     }
+    let keyword_pack = req
+        .keyword_retrieval
+        .as_ref()
+        .map(|config| json!({ "keyword_retrieval": config }))
+        .unwrap_or_else(|| json!({}));
+    if let Err(error) = crate::api::http::chat::validate_keyword_retrieval_config(&keyword_pack) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(e) = validate_pack_refs(
         &state,
         &req.category_ids,
@@ -352,6 +362,7 @@ pub(crate) async fn create_knowledge_pack_handler(
         "category_ids": req.category_ids,
         "graph_kb_ids": req.graph_kb_ids,
         "vector_kb_ids": req.vector_kb_ids,
+        "keyword_retrieval": req.keyword_retrieval,
         "builtin": false,
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
@@ -390,6 +401,15 @@ pub(crate) async fn update_knowledge_pack_handler(
     let vks = extract_ids("vector_kb_ids");
     if let Err(e) = validate_pack_refs(&state, &cat, &gks, &vks).await {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+    }
+    if patch.get("keyword_retrieval").is_some() {
+        let validation_pack =
+            json!({ "keyword_retrieval": patch.get("keyword_retrieval").cloned() });
+        if let Err(error) =
+            crate::api::http::chat::validate_keyword_retrieval_config(&validation_pack)
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+        }
     }
     let mut guard = state.knowledge_packs.write().await;
     let found = guard
