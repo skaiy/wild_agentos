@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
@@ -126,6 +127,7 @@ pub struct HyperspaceStore {
     engine: Arc<HyperspaceEngineImpl>,
     embed: Arc<dyn EmbeddingService>,
     ownership_cache: RwLock<OwnershipCacheState>,
+    ownership_generation: AtomicU64,
 }
 
 #[derive(Default)]
@@ -163,6 +165,7 @@ impl HyperspaceStore {
             engine: Arc::new(engine),
             embed,
             ownership_cache: RwLock::new(OwnershipCacheState::default()),
+            ownership_generation: AtomicU64::new(0),
         })
     }
 
@@ -182,6 +185,7 @@ impl HyperspaceStore {
             .ownership_cache
             .write()
             .unwrap_or_else(|error| error.into_inner());
+        self.ownership_generation.fetch_add(1, Ordering::AcqRel);
         let keys: Vec<String> = cache.entries.keys().cloned().collect();
         for key in keys {
             *cache.generations.entry(key.clone()).or_default() += 1;
@@ -201,13 +205,7 @@ impl HyperspaceStore {
     }
 
     pub fn ownership_generation(&self, _key: &str) -> u64 {
-        *self
-            .ownership_cache
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .generations
-            .get(_key)
-            .unwrap_or(&0)
+        self.ownership_generation.load(Ordering::Acquire)
     }
 
     pub fn cached_ownership_health(&self, key: &str) -> Option<bool> {
@@ -215,7 +213,7 @@ impl HyperspaceStore {
             .ownership_cache
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        let generation = *cache.generations.get(key).unwrap_or(&0);
+        let generation = self.ownership_generation.load(Ordering::Acquire);
         cache
             .entries
             .get(key)
@@ -229,7 +227,7 @@ impl HyperspaceStore {
             .ownership_cache
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        if *cache.generations.get(&key).unwrap_or(&0) == generation {
+        if self.ownership_generation.load(Ordering::Acquire) == generation {
             cache.entries.insert(key, (generation, healthy));
         }
     }
@@ -1244,7 +1242,7 @@ mod tests {
         let store = setup_store();
         let key = "vector://tenant/project#kb-a";
         let scan_generation = store.ownership_generation(key);
-        store.invalidate_ownership_cache_for(key);
+        store.invalidate_ownership_cache();
         store.cache_ownership_health_if_current(key.into(), scan_generation, true);
 
         assert!(
