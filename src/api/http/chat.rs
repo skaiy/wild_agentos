@@ -787,7 +787,7 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
                 .split(|character| shape.separators.contains(&character))
                 .filter(|group| !group.is_empty())
                 .collect();
-            blocked.extend(grouped_exclude_shape_fragments(&groups, shape));
+            blocked.extend(grouped_exclude_shape_fragments(&groups, shape, rules));
         } else {
             for raw in question.split(|character: char| {
                 !character.is_ascii_alphanumeric()
@@ -821,7 +821,11 @@ fn normalized_matches_exclude_shape_window(normalized: &str, shape: &ExcludeShap
     })
 }
 
-fn grouped_exclude_shape_fragments(groups: &[&str], shape: &ExcludeShape) -> Vec<String> {
+fn grouped_exclude_shape_fragments(
+    groups: &[&str],
+    shape: &ExcludeShape,
+    rules: &[PackTokenRule],
+) -> Vec<String> {
     let (Some(max_groups), Some(group_min_len), Some(group_max_len)) =
         (shape.max_groups, shape.group_min_len, shape.group_max_len)
     else {
@@ -829,7 +833,7 @@ fn grouped_exclude_shape_fragments(groups: &[&str], shape: &ExcludeShape) -> Vec
     };
     let mut blocked = Vec::new();
     for start in 0..groups.len() {
-        for group_count in 1..=max_groups as usize {
+        for group_count in 1..=max_groups as usize + 1 {
             let Some(candidate_groups) = groups.get(start..start + group_count) else {
                 break;
             };
@@ -842,19 +846,68 @@ fn grouped_exclude_shape_fragments(groups: &[&str], shape: &ExcludeShape) -> Vec
                         .collect()
                 })
                 .collect();
-            if candidate_groups.iter().all(|group| {
+            let group_lengths_match = candidate_groups.iter().all(|group| {
                 group
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '+')
             }) && normalized_groups.iter().all(|group| {
                 (group_min_len as usize..=group_max_len as usize).contains(&group.len())
-            }) && normalized_matches_exclude_shape(&normalized_groups.concat(), shape)
+            });
+            if group_count <= max_groups as usize
+                && group_lengths_match
+                && normalized_matches_exclude_shape(&normalized_groups.concat(), shape)
             {
                 blocked.extend(
                     candidate_groups
                         .iter()
                         .map(|group| group.to_ascii_uppercase()),
                 );
+            }
+
+            let starts_with_shape_leading = shape.leading.is_some_and(|leading| {
+                normalized_groups
+                    .first()
+                    .is_some_and(|group| group.starts_with(leading))
+            });
+            if !starts_with_shape_leading {
+                continue;
+            }
+            for (index, group) in normalized_groups.iter().enumerate() {
+                if !rules
+                    .iter()
+                    .any(|rule| !rule.prefixes.is_empty() && token_matches_rule(group, "", rule))
+                {
+                    continue;
+                }
+                let remaining: Vec<&String> = normalized_groups
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(other_index, group)| (other_index != index).then_some(group))
+                    .collect();
+                let retains_complete_shape = remaining.len() <= max_groups as usize
+                    && remaining.iter().all(|group| {
+                        (group_min_len as usize..=group_max_len as usize).contains(&group.len())
+                    })
+                    && normalized_matches_exclude_shape(
+                        &remaining
+                            .into_iter()
+                            .map(String::as_str)
+                            .collect::<String>(),
+                        shape,
+                    );
+                if retains_complete_shape {
+                    blocked.extend(candidate_groups.iter().enumerate().filter_map(
+                        |(other_index, group)| {
+                            (other_index != index).then_some(group.to_ascii_uppercase())
+                        },
+                    ));
+                } else {
+                    blocked.extend(
+                        candidate_groups
+                            .iter()
+                            .map(|group| group.to_ascii_uppercase()),
+                    );
+                }
             }
         }
     }
@@ -2061,6 +2114,8 @@ mod tests {
         // fictional
         assert!(extract_pack_tokens("LTEST000000000001", &rules).is_empty());
         // fictional
+        assert!(extract_pack_tokens("19900000000", &rules).is_empty());
+        // fictional
         assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
         assert_eq!(extract_pack_tokens("故障码 2033", &rules), vec!["2033"]);
         // fictional
@@ -2068,7 +2123,7 @@ mod tests {
         // fictional
         assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
         assert_eq!(
-            extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules),
+            extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules),
             vec!["b2033"]
         );
         // fictional
@@ -2077,6 +2132,10 @@ mod tests {
         assert!(extract_pack_tokens("199 0000 0000 trailing words", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("leading words 199 0000 0000", &rules).is_empty());
+        // fictional: the code interrupts the configured grouped shape, so fail closed.
+        assert!(extract_pack_tokens("LTEST B2033 0000 0000 01", &rules).is_empty());
+        // fictional: concatenated values are not tokenized and therefore do not retrieve.
+        assert!(extract_pack_tokens("B2033LTEST000000000001", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
@@ -2121,10 +2180,10 @@ mod tests {
             group_max_len: Some(8),
         };
         assert_eq!(
-            grouped_exclude_shape_fragments(&["ABCDEFGH"], &shape),
+            grouped_exclude_shape_fragments(&["ABCDEFGH"], &shape, &[]),
             vec!["ABCDEFGH"]
         );
-        assert!(grouped_exclude_shape_fragments(&["ABCD", "EFGH"], &shape).is_empty());
+        assert!(grouped_exclude_shape_fragments(&["ABCD", "EFGH"], &shape, &[]).is_empty());
     }
 
     #[test]
