@@ -1559,6 +1559,12 @@ mod tests {
         )
         .unwrap();
         let kb_id = "demo-vector-kb";
+        state.knowledge_bases.write().await.push(json!({
+            "id": kb_id,
+            "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "project-1"
+        }));
         vector_store
             .upsert_with_claims(
                 &claims,
