@@ -133,7 +133,6 @@ pub struct HyperspaceStore {
 #[derive(Default)]
 struct OwnershipCacheState {
     entries: HashMap<String, (u64, bool)>,
-    generations: HashMap<String, u64>,
 }
 
 #[cfg(not(test))]
@@ -186,22 +185,7 @@ impl HyperspaceStore {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         self.ownership_generation.fetch_add(1, Ordering::AcqRel);
-        let keys: Vec<String> = cache.entries.keys().cloned().collect();
-        for key in keys {
-            *cache.generations.entry(key.clone()).or_default() += 1;
-        }
         cache.entries.clear();
-    }
-
-    /// Invalidates one claims namespace/KB cache entry without evicting
-    /// unrelated KBs.
-    pub fn invalidate_ownership_cache_for(&self, key: &str) {
-        let mut cache = self
-            .ownership_cache
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        *cache.generations.entry(key.to_owned()).or_default() += 1;
-        cache.entries.remove(key);
     }
 
     pub fn ownership_generation(&self, _key: &str) -> u64 {
@@ -1249,18 +1233,6 @@ mod tests {
             store.cached_ownership_health(key).is_none(),
             "a scan that started before a write must not restore a stale healthy cache entry"
         );
-    }
-
-    #[test]
-    fn invalidating_one_kb_preserves_other_kb_cache_entries() {
-        let store = setup_store();
-        let a = "vector://tenant/project#kb-a";
-        let b = "vector://tenant/project#kb-b";
-        store.cache_ownership_health_if_current(a.into(), store.ownership_generation(a), true);
-        store.cache_ownership_health_if_current(b.into(), store.ownership_generation(b), true);
-        store.invalidate_ownership_cache_for(a);
-        assert!(store.cached_ownership_health(a).is_none());
-        assert_eq!(store.cached_ownership_health(b), Some(true));
     }
 
     #[tokio::test]
