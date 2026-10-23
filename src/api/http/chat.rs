@@ -514,7 +514,10 @@ async fn ev_repair_legacy_vector_section(
     question: &str,
 ) -> Result<Option<String>, (StatusCode, Value)> {
     let Some(store) = state.vector_store.load_full() else {
-        return Ok(None);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
+        ));
     };
     let bases = state.knowledge_bases.read().await.clone();
     let kb_ids: Vec<String> = bases

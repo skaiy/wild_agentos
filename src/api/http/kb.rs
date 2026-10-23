@@ -650,8 +650,8 @@ pub(crate) async fn vector_records_match_kb_ownership(
                     .as_deref()
                     .unwrap_or_default()
             {
-                store.cache_ownership_health_if_current(cache_key, generation, false);
-                return false;
+                tracing::warn!(iri = %hit.iri, "Ignoring foreign-namespace record with matching KB tag during ownership validation");
+                continue;
             }
             let tenant_tags: Vec<&str> = tags
                 .iter()
@@ -1983,6 +1983,17 @@ async fn run_kb_reindex(
         } else {
             key.to_string()
         };
+        if !key.starts_with(&format!("kb/{id}/")) {
+            any_failed = true;
+            if let Some(o) = doc.as_object_mut() {
+                o.insert("status".into(), json!("failed"));
+                o.insert("skipped_reason".into(), json!("invalid ledger blob key"));
+                o.insert("chunks".into(), json!(0));
+                o.insert("chunk_iris".into(), json!([]));
+            }
+            updated.push(doc);
+            continue;
+        }
         let bytes = match blob.get(&claims, &key).await {
             Ok(b) => b,
             // The selected document ledger has already been scope-checked
