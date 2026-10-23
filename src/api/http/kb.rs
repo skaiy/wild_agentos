@@ -1988,13 +1988,16 @@ async fn run_kb_reindex(
             // The selected document ledger has already been scope-checked
             // before this background task was started. Preserve that
             // authorization boundary while reading the prior tenant-only key.
-            Err(_) => match blob.get_legacy(&claims, &key).await {
+            Err(current_error) => match blob.get_legacy(&claims, &key).await {
                 Ok(b) => b,
                 Err(e) => {
                     any_failed = true;
                     if let Some(o) = doc.as_object_mut() {
                         o.insert("status".into(), json!("failed"));
-                        o.insert("skipped_reason".into(), json!(format!("原文读取失败: {e}")));
+                        o.insert(
+                            "skipped_reason".into(),
+                            json!(format!("原文读取失败: current={current_error}; legacy={e}")),
+                        );
                         o.insert("chunks".into(), json!(0));
                         o.insert("chunk_iris".into(), json!([]));
                     }
