@@ -785,6 +785,7 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
         if shape.max_groups.is_some() {
             let groups: Vec<&str> = question
                 .split(|character| is_shape_separator(shape, character))
+                .flat_map(|group| group.split(|character: char| !character.is_ascii_alphanumeric()))
                 .filter(|group| !group.is_empty())
                 .collect();
             blocked.extend(grouped_exclude_shape_fragments(&groups, shape, rules));
@@ -873,12 +874,24 @@ fn grouped_exclude_shape_fragments(
                     })
                 })
                 .count();
-            let contains_prefixed_token = prefixed_token_count > 0;
-            if candidate_matches_shape && (shape.leading.is_some() || !contains_prefixed_token) {
+            if candidate_matches_shape && prefixed_token_count == 0 {
                 blocked.extend(
                     trimmed_groups
                         .iter()
                         .map(|group| group.to_ascii_uppercase()),
+                );
+            } else if candidate_matches_shape {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, group)| {
+                            (!rules.iter().any(|rule| {
+                                !rule.prefixes.is_empty()
+                                    && token_matches_rule(&normalized_groups[index], "", rule)
+                            }))
+                            .then_some(group.to_ascii_uppercase())
+                        }),
                 );
             }
 
@@ -908,28 +921,31 @@ fn grouped_exclude_shape_fragments(
                     })
                     && normalized_matches_exclude_shape(
                         &remaining
-                            .into_iter()
-                            .map(String::as_str)
+                            .iter()
+                            .map(|group| group.as_str())
                             .collect::<String>(),
                         shape,
                     );
+                let remaining_len: usize = remaining.iter().map(|group| group.len()).sum();
+                let remaining_looks_like_shape = (shape.min_len as usize)
+                    .saturating_sub(group_max_len as usize)
+                    <= remaining_len
+                    && remaining_len <= shape.max_len as usize
+                    && remaining.iter().any(|group| {
+                        !group.is_empty()
+                            && group.bytes().all(|character| character.is_ascii_digit())
+                    });
                 if retains_complete_shape {
                     blocked.extend(trimmed_groups.iter().enumerate().filter_map(
                         |(other_index, group)| {
                             (other_index != index).then_some(group.to_ascii_uppercase())
                         },
                     ));
-                } else if candidate_matches_shape
-                    || (prefixed_token_count > 1 && group_lengths_match)
-                    || (group_count > max_groups as usize
-                        && normalized_groups
-                            .iter()
-                            .filter(|group| {
-                                (group_min_len as usize..=group_max_len as usize)
-                                    .contains(&group.len())
-                            })
-                            .count()
-                            >= max_groups as usize)
+                } else if (prefixed_token_count > 1
+                    && (group_lengths_match
+                        || (shape.min_len as usize..=shape.max_len as usize)
+                            .contains(&normalized_groups.concat().len())))
+                    || remaining_looks_like_shape
                 {
                     blocked.extend(
                         trimmed_groups
@@ -2138,6 +2154,22 @@ mod tests {
             extract_pack_tokens("What does B2033 mean", &rules),
             vec!["b2033"]
         );
+        assert_eq!(
+            extract_pack_tokens("Lamp shows B2033 when cold", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Look into B2033 code", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Let me check B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LED fault B2033", &rules),
+            vec!["b2033"]
+        );
         assert!(extract_pack_tokens("故障码2033年", &rules).is_empty());
         assert!(extract_pack_tokens("2023年", &rules).is_empty());
         // fictional
@@ -2171,6 +2203,22 @@ mod tests {
             extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules),
             vec!["b2033"]
         );
+        assert_eq!(
+            extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("LTEST 0000 0000 0001和B2033", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("B2033，LTEST 0000 0000 0001", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTEST 0000 0000 0001 trailing words", &rules).is_empty());
         // fictional
@@ -2182,7 +2230,7 @@ mod tests {
         // fictional: concatenated values are not tokenized and therefore do not retrieve.
         assert!(extract_pack_tokens("B2033LTEST000000000001", &rules).is_empty());
         // fictional: multiple code-like groups inside the grouped shape fail closed.
-        assert!(extract_pack_tokens("LTEST B2033 B2040 0001", &rules).is_empty());
+        assert!(extract_pack_tokens("LTEST B2033 B2040 00", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
@@ -2213,6 +2261,11 @@ mod tests {
         );
         assert_eq!(
             extract_pack_tokens("LED fault B2033", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("ABCD B2033 0000 0000", &rules),
             vec!["b2033"]
         );
     }
@@ -2309,6 +2362,8 @@ mod tests {
         let rules = pack_token_rules(&legacy_pack);
         // fictional
         assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
+        // fictional: a newline is a hard boundary for legacy separator matching.
+        assert_eq!(extract_pack_tokens("199-\n0000-0000", &rules), vec!["0000"]);
         // fictional
         assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
     }
