@@ -1834,13 +1834,13 @@ mod tests {
     #[test]
     fn pack_fault_code_tokens_accept_codes_and_reject_dates_phone_and_vin() {
         // fictional
-        let phone = "11111111111";
-        let separated_phone = "+00 111-1111-1111";
+        let phone = "19900000000";
+        let separated_phone = "+86 199-0000-0000";
         // fictional
-        let vin = "ACME0000000000001";
+        let vin = "LTEST000000000001";
         let truncated_vin = &vin[..16];
         let vin_suffix = &vin[11..];
-        assert!(separated_phone_fragments(&separated_phone).contains("1111"));
+        assert!(separated_phone_fragments(&separated_phone).contains("0000"));
         assert!(contains_vin_like_run(&vin));
         assert_eq!(
             extract_pack_fault_code_tokens(&format!(
