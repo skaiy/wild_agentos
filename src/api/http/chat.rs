@@ -390,6 +390,11 @@ struct PackVectorSearch {
     token_rules: Vec<PackTokenRule>,
 }
 
+struct PackVectorHits {
+    hits: Vec<ScoredEntry>,
+    exact_truncated: bool,
+}
+
 #[derive(Clone, Debug)]
 struct PackTokenRule {
     prefixes: Vec<String>,
@@ -813,9 +818,12 @@ async fn pack_scoped_vector_hits(
     claims: &IsolationClaims,
     question: &str,
     searches: &[PackVectorSearch],
-) -> Result<Vec<ScoredEntry>, (StatusCode, Value)> {
+) -> Result<PackVectorHits, (StatusCode, Value)> {
     if searches.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PackVectorHits {
+            hits: Vec::new(),
+            exact_truncated: false,
+        });
     }
     let Some(store) = state.vector_store.load_full() else {
         return Err((
@@ -824,6 +832,7 @@ async fn pack_scoped_vector_hits(
         ));
     };
     let mut exact_hits = Vec::new();
+    let mut exact_truncated = false;
     let mut hits = Vec::new();
     for search in searches {
         let tag = kb_vector_tag(&search.kb_id);
@@ -840,6 +849,7 @@ async fn pack_scoped_vector_hits(
             {
                 Ok(result) => {
                     if result.truncated {
+                        exact_truncated = true;
                         tracing::warn!(kb_id = %search.kb_id, "pack exact retrieval scan was truncated");
                     }
                     let mut batch = result.entries;
@@ -900,7 +910,10 @@ async fn pack_scoped_vector_hits(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     exact_hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
-    Ok(exact_hits)
+    Ok(PackVectorHits {
+        hits: exact_hits,
+        exact_truncated,
+    })
 }
 
 async fn ev_repair_graph_retrieval(
@@ -1029,11 +1042,16 @@ async fn build_claims_scoped_prefix_messages(
     };
 
     let vector_section = if !pack_vector_searches.is_empty() {
-        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_vector_searches).await?;
-        if hits.is_empty() {
+        let retrieval =
+            pack_scoped_vector_hits(state, claims, &question, &pack_vector_searches).await?;
+        if retrieval.hits.is_empty() {
             None
         } else {
-            Some(format_vector_hits_section(&hits))
+            let mut section = format_vector_hits_section(&retrieval.hits);
+            if retrieval.exact_truncated {
+                section.push_str("【精确检索已截断】\n");
+            }
+            Some(section)
         }
     } else if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
         ev_repair_legacy_vector_section(state, claims, &question).await?
@@ -2083,12 +2101,14 @@ mod tests {
             .await
             .unwrap();
         assert!(hits
+            .hits
             .first()
             .is_some_and(|hit| hit.text.contains("exact-local")));
         assert!(hits
+            .hits
             .first()
             .is_some_and(|hit| hit.match_kind == MatchKind::Exact));
-        assert!(hits.iter().all(|hit| !hit.text.contains("foreign")));
+        assert!(hits.hits.iter().all(|hit| !hit.text.contains("foreign")));
         let _ = std::fs::remove_dir_all(vector_dir);
     }
 
