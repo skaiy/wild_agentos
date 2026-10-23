@@ -1567,7 +1567,8 @@ pub(crate) async fn upload_knowledge_base_handler(
                         chunk_iris.push(iri);
                     }
                     Err(e) => {
-                        file_err = Some(format!("写入失败: {e}"));
+                        tracing::error!(error = %e, "KB upload vector write failed");
+                        file_err = Some("向量写入失败".to_string());
                         break;
                     }
                 }
@@ -2037,7 +2038,8 @@ async fn run_kb_reindex(
             match store.upsert_with_claims(&claims, &iri, &chunk, &tags).await {
                 Ok(_) => new_iris.push(iri),
                 Err(e) => {
-                    err = Some(format!("写入失败: {e}"));
+                    tracing::error!(error = %e, "KB reindex vector write failed");
+                    err = Some("向量写入失败".to_string());
                     break;
                 }
             }
