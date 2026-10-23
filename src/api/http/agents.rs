@@ -430,6 +430,26 @@ pub(crate) async fn create_agent_handler(
     if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
         return error.into_response();
     }
+    {
+        let packs = state.knowledge_packs.read().await;
+        for pack_id in &req.knowledge_pack_ids {
+            let Some(pack) = packs
+                .iter()
+                .find(|pack| pack.get("id").and_then(Value::as_str) == Some(pack_id.as_str()))
+            else {
+                continue;
+            };
+            if let Err(error) = crate::api::http::chat::validate_keyword_retrieval_config(pack) {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(
+                        json!({ "error": format!("invalid mounted pack configuration: {error}") }),
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    }
     let is_definition = req.id.is_some()
         || req.system_prompt.is_some()
         || req.model.is_some()
