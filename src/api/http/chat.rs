@@ -892,12 +892,33 @@ fn grouped_exclude_shape_fragments(
                         .map(|group| group.to_ascii_uppercase()),
                 );
             }
-            if code_like_groups.iter().filter(|matches| **matches).count() > 1 {
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && (candidate_matches_shape
+                    || group_count == max_groups as usize + 1
+                    || normalized_groups.iter().any(|group| {
+                        !group.is_empty()
+                            && group.bytes().all(|character| character.is_ascii_digit())
+                    })
+                    || shape.leading.is_some_and(|leading| {
+                        normalized_groups
+                            .first()
+                            .is_some_and(|first| first.starts_with(leading))
+                    }))
+            {
                 blocked.extend(
                     trimmed_groups
                         .iter()
                         .map(|group| group.to_ascii_uppercase()),
                 );
+            }
+            let candidate_charset_matches = normalized_groups.iter().all(|group| {
+                group.chars().all(|character| match shape.charset {
+                    ShapeCharset::Digits => character.is_ascii_digit(),
+                    ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
+                })
+            });
+            if !candidate_charset_matches {
+                continue;
             }
             for (index, _group) in normalized_groups.iter().enumerate() {
                 if !code_like_groups[index] {
@@ -919,7 +940,17 @@ fn grouped_exclude_shape_fragments(
                             .collect::<String>(),
                         shape,
                     );
-                if retains_complete_shape {
+                if retains_complete_shape
+                    || shape.leading.is_some()
+                        && code_removal_forms_complete_shape(
+                            groups,
+                            start + index,
+                            shape,
+                            max_groups,
+                            group_min_len,
+                            group_max_len,
+                        )
+                {
                     blocked.extend(trimmed_groups.iter().enumerate().filter_map(
                         |(other_index, group)| {
                             (other_index != index).then_some(group.to_ascii_uppercase())
@@ -936,6 +967,47 @@ fn grouped_exclude_shape_fragments(
         }
     }
     blocked
+}
+
+fn code_removal_forms_complete_shape(
+    groups: &[&str],
+    code_position: usize,
+    shape: &ExcludeShape,
+    max_groups: u8,
+    group_min_len: u8,
+    group_max_len: u8,
+) -> bool {
+    for start in 0..=code_position {
+        for group_count in 1..=max_groups as usize + 1 {
+            let end = start + group_count;
+            let Some(window) = groups.get(start..end) else {
+                break;
+            };
+            if !(start..end).contains(&code_position) {
+                continue;
+            }
+            let remaining: Vec<&str> = window
+                .iter()
+                .enumerate()
+                .filter_map(|(index, group)| {
+                    (start + index != code_position).then_some(trimmed_shape_group(group))
+                })
+                .collect();
+            if remaining.len() <= max_groups as usize
+                && remaining.iter().all(|group| {
+                    !group.is_empty()
+                        && group
+                            .bytes()
+                            .all(|character| character.is_ascii_alphanumeric())
+                        && (group_min_len as usize..=group_max_len as usize).contains(&group.len())
+                })
+                && normalized_matches_exclude_shape(&remaining.concat().to_ascii_uppercase(), shape)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn normalized_matches_exclude_shape(normalized: &str, shape: &ExcludeShape) -> bool {
@@ -2133,8 +2205,10 @@ mod tests {
             extract_pack_tokens("What does B2033 mean", &rules),
             vec!["b2033"]
         );
-        // Intentional safety tradeoff: overlapping leading-shaped windows fail closed.
-        assert!(extract_pack_tokens("Lamp shows B2033 when cold", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("Lamp shows B2033 when cold", &rules),
+            vec!["b2033"]
+        );
         // Intentional safety tradeoff: this is a complete leading-shaped window.
         assert!(extract_pack_tokens("Look into B2033 code", &rules).is_empty());
         assert_eq!(
@@ -2178,12 +2252,33 @@ mod tests {
         assert!(extract_pack_tokens("199\n0000\n0000", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTEST 0000\n0000 0001", &rules).is_empty());
-        assert!(extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules).is_empty());
-        assert!(extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules),
+            vec!["b2033"]
+        );
         // fictional
-        assert!(extract_pack_tokens("LTEST 0000 0000 0001和B2033", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("LTEST 0000 0000 0001和B2033", &rules),
+            vec!["b2033"]
+        );
         // fictional
-        assert!(extract_pack_tokens("B2033，LTEST 0000 0000 0001", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("车架号LTEST 0000 0000 0001，故障B2033。", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("B2033，LTEST 0000 0000 0001", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 and B2044", &rules),
+            vec!["b2033", "b2044"]
+        );
         // fictional
         assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
         // fictional
