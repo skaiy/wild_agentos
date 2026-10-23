@@ -579,16 +579,25 @@ pub(crate) fn kb_vector_tag(kb_id: &str) -> String {
 
 pub(crate) const VECTOR_RETRIEVAL_UNAVAILABLE: &str = "vector retrieval unavailable";
 
-/// Verify that every stored vector has exactly one tenant and KB tag matching
-/// the tenant/project encoded in its claims-minted namespace and the KB
-/// catalog. The catalog is authoritative for ownership; tags alone never
-/// grant access.
+/// Validates the requested KB's records and caches the result by
+/// claims-minted namespace and KB id. A bad record therefore disables only
+/// its KB, not retrieval for unrelated tenants or KBs.
 pub(crate) async fn vector_records_match_kb_ownership(
-    state: &Arc<AppState>,
     store: &crate::memory::hyperspace_store::HyperspaceStore,
+    bases: &[Value],
+    claims: &IsolationClaims,
+    kb_id: &str,
 ) -> bool {
     if !store.is_retrieval_ready() {
         return false;
+    }
+    let namespace = match claims.vector_namespace() {
+        Ok(namespace) => namespace,
+        Err(_) => return false,
+    };
+    let cache_key = format!("{namespace}#{kb_id}");
+    if let Some(healthy) = store.cached_ownership_health(&cache_key) {
+        return healthy;
     }
     let count = match store.count().await {
         Ok(count) => count,
@@ -609,61 +618,68 @@ pub(crate) async fn vector_records_match_kb_ownership(
         if hits.is_empty() {
             break;
         }
-        let bases = state.knowledge_bases.read().await;
         for hit in &hits {
-            let Some((namespace, _)) = hit.iri.split_once('#') else {
-                tracing::error!(iri = %hit.iri, "Vector record has no claims namespace");
-                return false;
-            };
-            let Some(scope) = namespace.strip_prefix("vector://") else {
-                tracing::error!(iri = %hit.iri, "Vector record has an invalid claims namespace");
-                return false;
-            };
-            let mut scope_parts = scope.split('/');
-            let (Some(tenant_id), Some(project_id), None) =
-                (scope_parts.next(), scope_parts.next(), scope_parts.next())
-            else {
-                tracing::error!(iri = %hit.iri, "Vector record has an invalid tenant/project scope");
-                return false;
-            };
+            // This check is scoped to the requested KB. Records for other KBs
+            // cannot make this KB unhealthy.
             let tags = hit
                 .payload
                 .as_ref()
                 .and_then(|payload| payload.get("tags"))
                 .and_then(Value::as_array);
             let Some(tags) = tags else {
-                return false;
+                continue;
             };
-            let tenant_tags: Vec<&str> = tags
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|tag| tag.starts_with("tenant:"))
-                .collect();
             let kb_tags: Vec<&str> = tags
                 .iter()
                 .filter_map(Value::as_str)
                 .filter(|tag| tag.starts_with("kb:"))
                 .collect();
-            let expected_tenant = format!("tenant:{tenant_id}");
-            if tenant_tags.as_slice() != [expected_tenant.as_str()] || kb_tags.len() != 1 {
-                tracing::error!(iri = %hit.iri, "Vector record has inconsistent ownership tags");
+            if !kb_tags.iter().any(|tag| *tag == kb_vector_tag(kb_id)) {
+                continue;
+            }
+            let Some((namespace, _)) = hit.iri.split_once('#') else {
+                tracing::error!(iri = %hit.iri, "Vector record has no claims namespace");
+                store.cache_ownership_health(cache_key, false);
+                return false;
+            };
+            if namespace
+                != claims
+                    .vector_namespace()
+                    .ok()
+                    .as_deref()
+                    .unwrap_or_default()
+            {
+                store.cache_ownership_health(cache_key, false);
                 return false;
             }
-            let kb_id = &kb_tags[0]["kb:".len()..];
-            if kb_id.is_empty()
-                || !bases.iter().any(|kb| {
-                    kb.get("id").and_then(Value::as_str) == Some(kb_id)
-                        && kb.get("kb_type").and_then(Value::as_str) == Some("vector")
-                        && kb.get("tenant_id").and_then(Value::as_str) == Some(tenant_id)
-                        && kb.get("project_id").and_then(Value::as_str) == Some(project_id)
-                })
+            let tenant_tags: Vec<&str> = tags
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|tag| tag.starts_with("tenant:"))
+                .collect();
+            let expected_tenant = format!("tenant:{}", claims.tenant_id());
+            let expected_kb = kb_vector_tag(kb_id);
+            if tenant_tags.as_slice() != [expected_tenant.as_str()]
+                || kb_tags.as_slice() != [expected_kb.as_str()]
             {
+                tracing::error!(iri = %hit.iri, "Vector record has inconsistent ownership tags");
+                store.cache_ownership_health(cache_key, false);
+                return false;
+            }
+            if !bases.iter().any(|kb| {
+                kb.get("id").and_then(Value::as_str) == Some(kb_id)
+                    && kb.get("kb_type").and_then(Value::as_str) == Some("vector")
+                    && kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+                    && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+            }) {
                 tracing::error!(iri = %hit.iri, "Vector record KB tag is not owned by its scope");
+                store.cache_ownership_health(cache_key, false);
                 return false;
             }
         }
         offset += hits.len();
     }
+    store.cache_ownership_health(cache_key, true);
     true
 }
 
@@ -1279,7 +1295,7 @@ pub(crate) async fn search_knowledge_base_handler(
             Json(json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE })),
         );
     }
-    if !vector_records_match_kb_ownership(&state, &store).await {
+    if !vector_records_match_kb_ownership(&store, &[kb.clone()], claims, &id).await {
         tracing::error!("KB search rejected because vector ownership validation failed");
         return (
             StatusCode::SERVICE_UNAVAILABLE,

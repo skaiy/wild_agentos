@@ -488,10 +488,29 @@ pub fn build_router(
     if let Some(store) = state.vector_store.load_full() {
         let state_for_validation = state.clone();
         tokio::spawn(async move {
-            if !kb::vector_records_match_kb_ownership(&state_for_validation, &store).await {
-                tracing::error!(
-                    "Vector ownership validation failed at startup; KB retrieval will fail closed"
-                );
+            let bases = state_for_validation.knowledge_bases.read().await.clone();
+            for base in bases.iter().filter(|base| {
+                base.get("kb_type").and_then(serde_json::Value::as_str) == Some("vector")
+            }) {
+                let Some(kb_id) = base.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let (Some(tenant), Some(project)) = (
+                    base.get("tenant_id").and_then(serde_json::Value::as_str),
+                    base.get("project_id").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                let Ok(claims) = crate::isolation::IsolationClaims::from_verified(
+                    tenant,
+                    project,
+                    "startup-validation",
+                ) else {
+                    continue;
+                };
+                if !kb::vector_records_match_kb_ownership(&store, &bases, &claims, kb_id).await {
+                    tracing::error!(kb_id, "Vector ownership validation failed at startup");
+                }
             }
         });
     }

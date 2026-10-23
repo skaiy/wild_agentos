@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use hyperspace_engine::engine::{HyperspaceEngine, HyperspaceEngineImpl, SearchHit};
@@ -124,6 +125,7 @@ pub struct ScoredEntry {
 pub struct HyperspaceStore {
     engine: Arc<HyperspaceEngineImpl>,
     embed: Arc<dyn EmbeddingService>,
+    ownership_cache: RwLock<HashMap<String, bool>>,
 }
 
 #[cfg(not(test))]
@@ -154,6 +156,7 @@ impl HyperspaceStore {
         Ok(Self {
             engine: Arc::new(engine),
             embed,
+            ownership_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -165,6 +168,29 @@ impl HyperspaceStore {
     /// Whether every persisted vector has both a text payload and tags.
     pub fn is_retrieval_ready(&self) -> bool {
         self.engine.is_retrieval_ready()
+    }
+
+    /// Drops cached KB ownership-validation results after a vector mutation.
+    pub fn invalidate_ownership_cache(&self) {
+        self.ownership_cache
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    pub fn cached_ownership_health(&self, key: &str) -> Option<bool> {
+        self.ownership_cache
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .copied()
+    }
+
+    pub fn cache_ownership_health(&self, key: String, healthy: bool) {
+        self.ownership_cache
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, healthy);
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -512,6 +538,7 @@ impl HyperspaceStore {
             .map_err(|e| CoreError::Internal {
                 message: format!("Hyperspace upsert: {e}"),
             })?;
+        self.invalidate_ownership_cache();
 
         debug!(iri = %iri, point_id = point_id, "Vector stored via HyperspaceEngine");
         Ok(point_id)
@@ -758,6 +785,7 @@ impl HyperspaceStore {
             .map_err(|e| CoreError::Internal {
                 message: format!("Hyperspace delete: {e}"),
             })?;
+        self.invalidate_ownership_cache();
         Ok(())
     }
 
@@ -863,6 +891,19 @@ mod tests {
         let result = store.search("unavailable provider", 10).await;
         assert!(result.is_err());
         assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn vector_writes_invalidate_cached_ownership_health() {
+        let store = setup_store();
+        store.cache_ownership_health("vector://tenant/project#kb-a".into(), true);
+        store
+            .upsert("cache:1", "invalidate ownership cache", &[])
+            .await
+            .unwrap();
+        assert!(store
+            .cached_ownership_health("vector://tenant/project#kb-a")
+            .is_none());
     }
 
     #[tokio::test]

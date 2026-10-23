@@ -29,7 +29,7 @@ use crate::memory::hyperspace_store::{HybridSearchFilter, ScoredEntry};
 use super::agents::resolve_definition_revision;
 use super::api_gov;
 use super::iam::UserIdentity;
-use super::kb::{kb_vector_tag, VECTOR_RETRIEVAL_UNAVAILABLE};
+use super::kb::{kb_vector_tag, vector_records_match_kb_ownership, VECTOR_RETRIEVAL_UNAVAILABLE};
 use super::AppState;
 
 const PACK_VECTOR_RAG_PER_KB_LIMIT: u64 = 5;
@@ -424,8 +424,15 @@ async fn pack_scoped_vector_hits(
             json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
         ));
     };
+    let bases = state.knowledge_bases.read().await.clone();
     let mut hits = Vec::new();
     for kb_id in kb_ids {
+        if !vector_records_match_kb_ownership(&store, &bases, claims, kb_id).await {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
+            ));
+        }
         let tag = kb_vector_tag(kb_id);
         match store
             .search_with_claims_and_required_tags(
@@ -509,6 +516,24 @@ async fn ev_repair_legacy_vector_section(
     let Some(store) = state.vector_store.load_full() else {
         return Ok(None);
     };
+    let bases = state.knowledge_bases.read().await.clone();
+    let kb_ids: Vec<String> = bases
+        .iter()
+        .filter(|kb| {
+            kb.get("kb_type").and_then(Value::as_str) == Some("vector")
+                && kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+                && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+        })
+        .filter_map(|kb| kb.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for kb_id in kb_ids {
+        if !vector_records_match_kb_ownership(&store, &bases, claims, &kb_id).await {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
+            ));
+        }
+    }
     let hits = store
         .search_with_claims(claims, question, &HybridSearchFilter::new(), 5)
         .await

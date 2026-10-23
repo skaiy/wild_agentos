@@ -1021,10 +1021,10 @@ impl ToolExecutor {
             "type": "object",
             "properties": {
                 "query": {"type":"string","description":"Natural-language query for semantic retrieval."},
-                "namespace": {"type":"string","description":"Vector namespace to restrict search to a specific knowledge base (optional)."},
+                "kb_id": {"type":"string","description":"Server-owned knowledge-base id to search."},
                 "limit": {"type":"integer","description":"Max number of results (1-20, default 5)."}
             },
-            "required": ["query"]
+            "required": ["query", "kb_id"]
         }), Arc::new(move |input: Value| {
             let vstore = vector_store_for_search.read().clone();
             Box::pin(async move { builtins::execute_kb_vector_search(input, vstore).await })
