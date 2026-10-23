@@ -401,7 +401,7 @@ struct PackTokenRule {
 async fn mounted_pack_vector_searches(
     state: &Arc<AppState>,
     agent: &Value,
-) -> Vec<PackVectorSearch> {
+) -> Result<Vec<PackVectorSearch>, String> {
     let pack_ids: Vec<&str> = agent
         .get("knowledge_pack_ids")
         .and_then(Value::as_array)
@@ -414,7 +414,7 @@ async fn mounted_pack_vector_searches(
         })
         .unwrap_or_default();
     if pack_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let packs = state.knowledge_packs.read().await;
     let mut searches = Vec::new();
@@ -426,6 +426,7 @@ async fn mounted_pack_vector_searches(
             continue;
         };
         let token_rules = if pack.get("builtin").and_then(Value::as_bool) == Some(false) {
+            validate_keyword_retrieval_config(pack)?;
             pack_token_rules(pack)
         } else {
             Vec::new()
@@ -447,7 +448,7 @@ async fn mounted_pack_vector_searches(
             }
         }
     }
-    searches
+    Ok(searches)
 }
 
 pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), String> {
@@ -907,7 +908,15 @@ async fn build_claims_scoped_prefix_messages(
         ));
     }
 
-    let pack_vector_searches = mounted_pack_vector_searches(state, agent).await;
+    let pack_vector_searches =
+        mounted_pack_vector_searches(state, agent)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    json!({ "error": format!("invalid mounted pack configuration: {error}") }),
+                )
+            })?;
     let graph_retrieval = if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
         Some(ev_repair_graph_retrieval(state, claims, &question).await?)
     } else {
@@ -1849,9 +1858,32 @@ mod tests {
             &state,
             &json!({ "knowledge_pack_ids": ["pack-without-rules"] }),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(searches.len(), 1);
         assert!(searches[0].token_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_mounted_pack_configuration_is_rejected() {
+        let state = make_state();
+        *state.knowledge_packs.write().await = vec![json!({
+            "id": "invalid-pack",
+            "builtin": false,
+            "vector_kb_ids": ["kb-invalid"],
+            "keyword_retrieval": {"rules": [{
+                "prefixes": ["B"],
+                "digit_count": 4,
+                "exclude_followed_by": ["年"],
+                "exclude_shapes": ["unknown"]
+            }]}
+        })];
+        let result = mounted_pack_vector_searches(
+            &state,
+            &json!({ "knowledge_pack_ids": ["invalid-pack"] }),
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1915,7 +1947,7 @@ mod tests {
             }),
         ];
         let agent = json!({ "knowledge_pack_ids": ["pack-config-b"] });
-        let searches = mounted_pack_vector_searches(&state, &agent).await;
+        let searches = mounted_pack_vector_searches(&state, &agent).await.unwrap();
         let hits = pack_scoped_vector_hits(&state, &claims, "报B2033", &searches)
             .await
             .unwrap();
