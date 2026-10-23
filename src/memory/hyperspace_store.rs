@@ -891,6 +891,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_matches_scan_large_scoped_library_without_embeddings() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let foreign = IsolationClaims::from_verified("tenant-b", "project-a", "actor-b").unwrap();
+        for index in 0..5_001 {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("entry-{index}"),
+                    if index == 5_000 {
+                        "B2033 marker"
+                    } else {
+                        "placeholder"
+                    },
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_with_claims(&foreign, "foreign", "B2033 foreign", &["kb:local".into()])
+            .await
+            .unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["b2033".into()],
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.entries[0].text.contains("marker"));
+    }
+
+    #[tokio::test]
     async fn test_upsert_and_count() {
         let store = setup_store();
         store.upsert("v:1", "hello world", &[]).await.unwrap();
