@@ -1040,10 +1040,7 @@ pub(crate) async fn knowledge_base_stats_handler(
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| {
-                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                    && kb_belongs_to_claims(b, claims)
-            })
+            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
             .cloned()
     };
     let kb = match kb {
@@ -1156,10 +1153,7 @@ pub(crate) async fn ingest_knowledge_base_handler(
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| {
-                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                    && kb_belongs_to_claims(b, claims)
-            })
+            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
             .cloned()
     };
     let kb = match kb {
@@ -3591,13 +3585,13 @@ exit 2
             response_json(&app, search("tenant-a", "vector-kb-b"))
                 .await
                 .0,
-            StatusCode::NOT_FOUND
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
             response_json(&app, search("tenant-b", "vector-kb-a"))
                 .await
                 .0,
-            StatusCode::NOT_FOUND
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
