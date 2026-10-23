@@ -471,7 +471,7 @@ async fn mounted_pack_vector_searches(
 }
 
 pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), String> {
-    if pack.get("keyword_retrieval").is_none() {
+    if pack.get("keyword_retrieval").is_none_or(Value::is_null) {
         return Ok(());
     }
     let rules = pack
@@ -1922,6 +1922,7 @@ mod tests {
         );
         assert!(validate_keyword_retrieval_config(&too_many).is_err());
         assert!(validate_keyword_retrieval_config(&json!({"builtin": false})).is_ok());
+        assert!(validate_keyword_retrieval_config(&json!({"keyword_retrieval": null})).is_ok());
     }
 
     #[test]
