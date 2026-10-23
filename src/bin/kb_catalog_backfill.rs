@@ -1,5 +1,10 @@
 //! Explicit, idempotent scope backfill for legacy KB catalog entries.
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use serde_json::{json, Value};
 
@@ -62,6 +67,36 @@ fn backfill(bases: &mut [Value], apply: bool) -> (usize, Vec<Value>) {
     (changed, report)
 }
 
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("catalog path has no parent"))?;
+    let temp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("catalog")
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut data_root = None;
@@ -88,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bases: Vec<Value> = serde_json::from_slice(&fs::read(&path)?)?;
     let (changed, report) = backfill(&mut bases, apply);
     if apply && changed > 0 {
-        fs::write(&path, serde_json::to_vec_pretty(&bases)?)?;
+        atomic_write(&path, &serde_json::to_vec_pretty(&bases)?)?;
     }
     println!(
         "{}",
@@ -127,5 +162,28 @@ mod tests {
         assert_eq!(bases[0]["tenant_id"], "existing");
         assert!(bases[0].get("project_id").is_none());
         assert_eq!(report[0]["status"], "conflict");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("knowledge_bases.json");
+        atomic_write(&path, b"[]").unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn atomic_write_failure_keeps_original_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog");
+        fs::write(&path, b"original").unwrap();
+        let error = atomic_write(&path.join("child"), b"new").unwrap_err();
+        assert!(matches!(error.kind(), std::io::ErrorKind::NotADirectory));
+        assert_eq!(fs::read(&path).unwrap(), b"original");
     }
 }
