@@ -10,12 +10,63 @@ use crate::tools::builtin::permissions::{PermissionMode, PermissionPolicy};
 #[allow(clippy::module_inception)]
 mod tests {
     use super::*;
+    use crate::memory::embedding_service::FallbackEmbeddingService;
+    use crate::memory::HyperspaceStore;
     use crate::tools::tool_executor::tool_description_lint::{
         check_role_schema_budget, lint_registry, role_schema_bytes,
     };
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Runtime::new().expect("Failed to create runtime")
+    }
+
+    #[test]
+    fn kb_vector_search_returns_err_for_unhealthy_kb_ownership() {
+        let _guard = crate::api::http::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let data = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_DATA_DIR", data.path());
+        std::fs::write(
+            data.path().join("knowledge_bases.json"),
+            r#"[{"id":"kb-a","kb_type":"vector","tenant_id":"tenant-a","project_id":"project"}]"#,
+        )
+        .unwrap();
+        let store = Arc::new(
+            HyperspaceStore::open(
+                &data.path().join("vectors"),
+                Arc::new(FallbackEmbeddingService::new()),
+            )
+            .unwrap(),
+        );
+        let claims = IsolationClaims::from_verified("tenant-a", "project", "actor").unwrap();
+        rt().block_on(async {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    "bad",
+                    "must not be returned",
+                    &["kb:kb-a".into(), "tenant:wrong".into()],
+                )
+                .await
+                .unwrap();
+            let mut executor = ToolExecutor::new();
+            executor.set_vector_store(store);
+            let error = executor
+                .execute_with_claims(
+                    "kb_vector_search",
+                    json!({"query":"must not", "kb_id":"kb-a"}),
+                    Some(claims),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("vector retrieval unavailable"));
+        });
+        match previous {
+            Some(value) => std::env::set_var("AGENTOS_DATA_DIR", value),
+            None => std::env::remove_var("AGENTOS_DATA_DIR"),
+        }
     }
 
     #[test]
