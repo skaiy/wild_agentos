@@ -693,39 +693,39 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
     let shapes: Vec<&ExcludeShape> = rules
         .iter()
         .flat_map(|rule| rule.excluded_shapes.iter())
-        .filter(|shape| {
-            matches!(shape.charset, ShapeCharset::Digits) && !shape.separators.is_empty()
-        })
+        .filter(|shape| !shape.separators.is_empty())
         .collect();
     if shapes.is_empty() {
         return HashSet::new();
     }
     let mut blocked = HashSet::new();
     for raw in question.split(|character: char| {
-        !character.is_ascii_digit()
+        !character.is_ascii_alphanumeric()
             && character != '+'
             && !shapes
                 .iter()
                 .any(|shape| shape.separators.contains(&character))
     }) {
-        let digits: String = raw
+        let normalized: String = raw
             .chars()
-            .filter(|character| character.is_ascii_digit())
+            .filter(|character| character.is_ascii_alphanumeric())
             .collect();
         for shape in &shapes {
             let matches_window = (shape.min_len as usize..=shape.max_len as usize).any(|length| {
-                digits.as_bytes().windows(length).any(|window| {
+                normalized.as_bytes().windows(length).any(|window| {
                     std::str::from_utf8(window).ok().is_some_and(|candidate| {
-                        candidate.bytes().all(|byte| byte.is_ascii_digit())
-                            && shape
-                                .leading
-                                .is_none_or(|leading| candidate.starts_with(leading))
+                        candidate.chars().all(|character| match shape.charset {
+                            ShapeCharset::Digits => character.is_ascii_digit(),
+                            ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
+                        }) && shape
+                            .leading
+                            .is_none_or(|leading| candidate.starts_with(leading))
                     })
                 })
             });
             if matches_window {
                 blocked.extend(
-                    raw.split(|character: char| !character.is_ascii_digit())
+                    raw.split(|character: char| !character.is_ascii_alphanumeric())
                         .filter(|fragment| !fragment.is_empty())
                         .map(|fragment| fragment.to_ascii_uppercase()),
                 );
@@ -1873,6 +1873,7 @@ mod tests {
                     "exclude_followed_by": ["年", "年份", "年款"],
                     "exclude_shapes": [
                         {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
+                        {"min_len": 17, "max_len": 17, "charset": "ascii_alnum", "separators": [" "]},
                         {"min_len": 11, "max_len": 11, "charset": "digits", "leading": "1", "separators": ["-", " "]}
                     ]
                 }, {
@@ -1896,6 +1897,8 @@ mod tests {
         assert_eq!(extract_pack_tokens("故障码 2033", &rules), vec!["2033"]);
         // fictional
         assert!(extract_pack_tokens("+86 199 0000 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
