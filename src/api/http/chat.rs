@@ -312,9 +312,11 @@ fn extract_fault_code_tokens(message: &str) -> Vec<String> {
 /// Extract literal diagnostic-code tokens for non-built-in pack RAG.
 ///
 /// Numeric diagnostic codes are limited to four or five digits and cannot
-/// start with zero. Calendar years, phone fragments, VINs and VIN-like
-/// truncated values are excluded. Alphanumeric codes may include underscores
-/// (for example `CP_A055` and `NIO_WL_021`).
+/// start with zero. Numbers in the calendar-year range are excluded only when
+/// immediately followed (optionally by limited whitespace) by a year marker;
+/// phone fragments, VINs and VIN-like truncated values are also excluded.
+/// Alphanumeric codes may include underscores (for example `CP_A055` and
+/// `NIO_WL_021`).
 fn extract_pack_fault_code_tokens(message: &str) -> Vec<String> {
     let message = message.nfkc().collect::<String>();
     let message = message.as_str();
@@ -322,11 +324,11 @@ fn extract_pack_fault_code_tokens(message: &str) -> Vec<String> {
     let lower_message = message.to_ascii_lowercase();
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let flush = |current: &mut String, tokens: &mut Vec<String>| {
+    let flush = |current: &mut String, following: &str, tokens: &mut Vec<String>| {
         let is_numeric_code = (4..=5).contains(&current.len())
             && current.chars().all(|character| character.is_ascii_digit())
             && !current.starts_with('0')
-            && !is_year_number(current, message)
+            && !is_year_number(current, following)
             && !phone_fragments.contains(current)
             && !is_mileage_number(current, &lower_message, message);
         let is_alphanumeric_code = current.len() >= 4
@@ -346,30 +348,37 @@ fn extract_pack_fault_code_tokens(message: &str) -> Vec<String> {
         }
         current.clear();
     };
-    for character in message.chars() {
+    for (index, character) in message.char_indices() {
         if character.is_ascii_alphanumeric() || character == '_' {
             current.push(character);
         } else {
-            flush(&mut current, &mut tokens);
+            flush(&mut current, &message[index..], &mut tokens);
         }
     }
-    flush(&mut current, &mut tokens);
+    flush(&mut current, "", &mut tokens);
     tokens.sort();
     tokens.dedup();
     tokens
 }
 
-fn is_year_number(number: &str, message: &str) -> bool {
+fn is_year_number(number: &str, following: &str) -> bool {
     let Ok(year) = number.parse::<u16>() else {
         return false;
     };
     if !(1990..=2035).contains(&year) {
         return false;
     }
-    message.match_indices(number).any(|(start, _)| {
-        let after = message[start + number.len()..].trim_start();
-        after.starts_with("年份") || after.starts_with("年款") || after.starts_with('年')
-    })
+    let mut after = following;
+    for _ in 0..3 {
+        let Some(character) = after.chars().next() else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        after = &after[character.len_utf8()..];
+    }
+    after.starts_with("年份") || after.starts_with("年款") || after.starts_with('年')
 }
 
 fn is_mileage_number(number: &str, lower_message: &str, message: &str) -> bool {
@@ -1852,10 +1861,10 @@ mod tests {
     }
 
     #[test]
-    fn pack_fault_code_tokens_keep_unqualified_four_digit_codes() {
+    fn pack_fault_code_tokens_keep_unqualified_four_digit_codes_and_exclude_marked_years() {
         assert_eq!(
-            extract_pack_fault_code_tokens("故障码 2033；单独的 2027"),
-            vec!["2027", "2033"]
+            extract_pack_fault_code_tokens("故障码 2033；2023年款；2021 年"),
+            vec!["2033"]
         );
     }
 
@@ -1869,13 +1878,11 @@ mod tests {
     }
 
     #[test]
-    fn pack_fault_code_tokens_reject_number_followed_by_year_marker() {
-        assert!(extract_pack_fault_code_tokens("2027年").is_empty());
-    }
-
-    #[test]
-    fn pack_fault_code_tokens_reject_model_year_context() {
-        assert!(extract_pack_fault_code_tokens("2024 年款").is_empty());
+    fn pack_fault_code_tokens_handle_year_range_boundaries_per_occurrence() {
+        assert_eq!(
+            extract_pack_fault_code_tokens("1990年；2035 年份；故障码 1990；故障码 2035"),
+            vec!["1990", "2035"]
+        );
     }
 
     #[tokio::test]
