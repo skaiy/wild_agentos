@@ -1,6 +1,6 @@
 //! Explicit, idempotent scope backfill for legacy KB catalog entries.
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -8,7 +8,24 @@ use std::{
 
 use serde_json::{json, Value};
 
-fn backfill(bases: &mut [Value], apply: bool) -> (usize, Vec<Value>) {
+fn parse_assignment(value: &str) -> Result<(String, (String, String)), String> {
+    let (id, scope) = value
+        .split_once('=')
+        .ok_or("assignment must be <kb_id>=<tenant>/<project>")?;
+    let (tenant, project) = scope
+        .split_once('/')
+        .ok_or("assignment must be <kb_id>=<tenant>/<project>")?;
+    if id.is_empty() || tenant.is_empty() || project.is_empty() || project.contains('/') {
+        return Err("assignment must be <kb_id>=<tenant>/<project>".into());
+    }
+    Ok((id.into(), (tenant.into(), project.into())))
+}
+
+fn backfill(
+    bases: &mut [Value],
+    apply: bool,
+    assigns: &BTreeMap<String, (String, String)>,
+) -> Result<(usize, Vec<Value>), String> {
     let mut report = Vec::new();
     let mut changed = 0usize;
     for base in bases {
@@ -36,6 +53,11 @@ fn backfill(bases: &mut [Value], apply: bool) -> (usize, Vec<Value>) {
             .and_then(Value::as_str)
             .unwrap_or("<missing>")
             .to_owned();
+        if evidence.is_empty() {
+            if let Some(scope) = assigns.get(&id) {
+                evidence.insert(scope.clone());
+            }
+        }
         if evidence.len() == 1 {
             let (tenant, project) = evidence.into_iter().next().unwrap();
             let tenant_conflict = base
@@ -49,7 +71,7 @@ fn backfill(bases: &mut [Value], apply: bool) -> (usize, Vec<Value>) {
             if tenant_conflict || project_conflict {
                 report.push(json!({"id": id, "status": "conflict"}));
             } else {
-                report.push(json!({"id": id, "status": "unambiguous", "tenant_id": tenant, "project_id": project}));
+                report.push(json!({"id": id, "status": if assigns.contains_key(&id) {"assigned"} else {"unambiguous"}, "tenant_id": tenant, "project_id": project}));
                 if apply {
                     if base.get("tenant_id").and_then(Value::as_str).is_none() {
                         base["tenant_id"] = json!(tenant);
@@ -64,7 +86,15 @@ fn backfill(bases: &mut [Value], apply: bool) -> (usize, Vec<Value>) {
             report.push(json!({"id": id, "status": if evidence.is_empty() {"no_evidence"} else {"ambiguous"}, "evidence": evidence}));
         }
     }
-    (changed, report)
+    for id in assigns.keys() {
+        if !bases
+            .iter()
+            .any(|base| base.get("id").and_then(Value::as_str) == Some(id))
+        {
+            return Err(format!("assigned KB id does not exist: {id}"));
+        }
+    }
+    Ok((changed, report))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -101,6 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut data_root = None;
     let mut apply = false;
+    let mut assigns = BTreeMap::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--data-root" => {
@@ -109,6 +140,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }
             "--apply" => apply = true,
+            "--assign" => {
+                let (id, scope) =
+                    parse_assignment(&args.next().ok_or("--assign requires a value")?)?;
+                if assigns.insert(id.clone(), scope).is_some() {
+                    return Err(format!("duplicate assignment for KB id: {id}").into());
+                }
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: kb-catalog-backfill --data-root <PATH> [--apply]\nDefault is dry-run."
@@ -121,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = data_root.ok_or("--data-root is required")?;
     let path = root.join("knowledge_bases.json");
     let mut bases: Vec<Value> = serde_json::from_slice(&fs::read(&path)?)?;
-    let (changed, report) = backfill(&mut bases, apply);
+    let (changed, report) = backfill(&mut bases, apply, &assigns)?;
     if apply && changed > 0 {
         atomic_write(&path, &serde_json::to_vec_pretty(&bases)?)?;
     }
@@ -143,11 +181,11 @@ mod tests {
             json!({"id":"missing","documents":[]}),
         ];
         let original = bases.clone();
-        assert_eq!(backfill(&mut bases, false).0, 0);
+        assert_eq!(backfill(&mut bases, false, &BTreeMap::new()).unwrap().0, 0);
         assert_eq!(bases, original);
-        assert_eq!(backfill(&mut bases, true).0, 1);
+        assert_eq!(backfill(&mut bases, true, &BTreeMap::new()).unwrap().0, 1);
         assert_eq!(bases[0]["tenant_id"], "t");
-        assert_eq!(backfill(&mut bases, true).0, 0);
+        assert_eq!(backfill(&mut bases, true, &BTreeMap::new()).unwrap().0, 0);
     }
 
     #[test]
@@ -157,7 +195,7 @@ mod tests {
             "tenant_id":"existing",
             "documents":[{"tenant_id":"evidence","project_id":"project"}]
         })];
-        let (changed, report) = backfill(&mut bases, true);
+        let (changed, report) = backfill(&mut bases, true, &BTreeMap::new()).unwrap();
         assert_eq!(changed, 0);
         assert_eq!(bases[0]["tenant_id"], "existing");
         assert!(bases[0].get("project_id").is_none());
