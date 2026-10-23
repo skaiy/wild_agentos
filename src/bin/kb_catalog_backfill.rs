@@ -29,9 +29,17 @@ fn backfill(
     let mut report = Vec::new();
     let mut changed = 0usize;
     for base in &mut *bases {
+        let id = base
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>")
+            .to_owned();
         if base.get("tenant_id").and_then(Value::as_str).is_some()
             && base.get("project_id").and_then(Value::as_str).is_some()
         {
+            if assigns.contains_key(&id) {
+                report.push(json!({"id": id, "status": "already_scoped"}));
+            }
             continue;
         }
         let mut evidence = BTreeSet::new();
@@ -48,14 +56,14 @@ fn backfill(
                 evidence.insert((tenant.to_owned(), project.to_owned()));
             }
         }
-        let id = base
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>")
-            .to_owned();
         if evidence.is_empty() {
             if let Some(scope) = assigns.get(&id) {
                 evidence.insert(scope.clone());
+            }
+        } else if let Some(scope) = assigns.get(&id) {
+            if !evidence.contains(scope) {
+                report.push(json!({"id": id, "status": "conflict"}));
+                continue;
             }
         }
         if evidence.len() == 1 {
@@ -268,6 +276,22 @@ mod tests {
         let mut unknown = BTreeMap::new();
         unknown.insert("missing".into(), ("tenant".into(), "project".into()));
         assert!(backfill(&mut bases, false, &unknown).is_err());
+    }
+
+    #[test]
+    fn conflicting_assignment_and_evidence_is_skipped_and_scoped_is_reported() {
+        let mut bases = vec![
+            json!({"id":"evidence","documents":[{"tenant_id":"t","project_id":"p"}]}),
+            json!({"id":"scoped","tenant_id":"t","project_id":"p"}),
+        ];
+        let mut assignments = BTreeMap::new();
+        assignments.insert("evidence".into(), ("other".into(), "p".into()));
+        assignments.insert("scoped".into(), ("t".into(), "p".into()));
+        let (changed, report) = backfill(&mut bases, true, &assignments).unwrap();
+        assert_eq!(changed, 0);
+        assert_eq!(report[0]["status"], "conflict");
+        assert_eq!(report[1]["status"], "already_scoped");
+        assert!(bases[0].get("tenant_id").is_none());
     }
 
     #[cfg(unix)]
