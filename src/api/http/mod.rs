@@ -368,8 +368,7 @@ pub fn open_vector_store(
     let root = data_dir();
     let vdir = root.join("vector_store");
     if let Err(error) = secure_vector_data_root(&root) {
-        tracing::warn!(error = %error, "Unable to secure vector data root; vector retrieval disabled");
-        return Arc::new(arc_swap::ArcSwapOption::empty());
+        panic!("Unable to secure vector data root; refusing startup: {error}");
     }
     match HyperspaceStore::open(&vdir, embed) {
         Ok(s) => Arc::new(arc_swap::ArcSwapOption::from_pointee(s)),
@@ -987,6 +986,24 @@ mod tests {
 
     use crate::gateway::unified_gateway::UnifiedGateway;
     use crate::tools::prompt_registry::PromptRegistry;
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_vector_data_root_corrects_existing_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        secure_vector_data_root(&root).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     /// 构造一个最小可用的 UnifiedGateway（不触网，仅满足 AppState 依赖）。
     fn test_gateway() -> UnifiedGateway {

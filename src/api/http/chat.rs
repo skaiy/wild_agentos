@@ -1334,11 +1334,47 @@ pub(crate) async fn openai_chat_completions_handler(
 mod tests {
     use super::*;
     use crate::core::core_types::{CoreConfig, SemanticCore};
+    use crate::memory::embedding_service::EmbeddingService;
+    use crate::memory::hyperspace_store::HyperspaceStore;
     use crate::tools::prompt_registry::PromptRegistry;
-    use axum::{body::Body, http::Request, routing::post, Router};
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        routing::post,
+        Router,
+    };
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use tower::ServiceExt;
 
     use super::super::api_gov::ApiUsageState;
+
+    struct UnavailableEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for UnavailableEmbeddingService {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Err("unavailable".into())
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
+
+    fn jwt(tenant_id: &str, project_id: &str) -> String {
+        encode(
+            &Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: "test-actor".into(),
+                tenant_id: tenant_id.into(),
+                project_id: Some(project_id.into()),
+                roles: vec!["DA".into()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
 
     fn make_state() -> Arc<AppState> {
         let l0 = std::env::temp_dir().join(format!("chat_rag_{}", uuid::Uuid::new_v4()));
@@ -2080,5 +2116,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_endpoint_fails_closed_when_embedding_provider_is_unavailable() {
+        let state = make_state();
+        state.knowledge_bases.write().await.push(json!({
+            "id": "chat-vector-kb",
+            "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "project-1"
+        }));
+        {
+            let mut packs = state.knowledge_packs.write().await;
+            packs
+                .iter_mut()
+                .find(|pack| pack["id"] == "attacker-pack")
+                .unwrap()["vector_kb_ids"] = json!(["chat-vector-kb"]);
+        }
+        let vector_dir =
+            std::env::temp_dir().join(format!("chat_unavailable_{}", uuid::Uuid::new_v4()));
+        let store =
+            HyperspaceStore::open(&vector_dir, Arc::new(UnavailableEmbeddingService)).unwrap();
+        state.vector_store.store(Some(Arc::new(store)));
+        let router = Router::new()
+            .route("/api/v1/agents/:id/chat", post(agent_chat_handler))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/agent-a/chat")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", jwt("tenant-a", "project-1")),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"retrieve context"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body, json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }));
     }
 }

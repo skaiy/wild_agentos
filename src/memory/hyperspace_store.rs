@@ -169,9 +169,11 @@ impl HyperspaceStore {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Embed text. An unavailable provider must fail retrieval rather than
-    /// silently searching with a placeholder vector.
-    async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+    /// Obtains the embedding used by every vector query and write.
+    ///
+    /// An unavailable provider must fail the operation rather than silently
+    /// substituting a placeholder vector.
+    async fn get_query_embedding(&self, text: &str) -> Result<Vec<f32>, CoreError> {
         self.embed.embed(text).await.map_err(|error| {
             warn!(error = %error, "Embedding service failed; vector operation rejected");
             CoreError::StorageError {
@@ -458,7 +460,7 @@ impl HyperspaceStore {
                 message: "vector text must not be empty".into(),
             });
         }
-        let vector = self.get_embedding(text).await?;
+        let vector = self.get_query_embedding(text).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -549,7 +551,7 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vector = self.get_embedding(query).await?;
+        let vector = self.get_query_embedding(query).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -629,7 +631,7 @@ impl HyperspaceStore {
                 message: "vector store integrity check failed; retrieval unavailable".into(),
             });
         }
-        let vector = self.get_embedding(query).await?;
+        let vector = self.get_query_embedding(query).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
