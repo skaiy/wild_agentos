@@ -417,6 +417,22 @@ struct ExcludeShape {
     leading: Option<char>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeywordRetrievalConfig {
+    rules: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct KeywordRetrievalRule {
+    prefixes: Vec<String>,
+    digit_count: u64,
+    exclude_followed_by: Vec<String>,
+    exclude_shapes: Vec<Value>,
+}
+
 async fn mounted_pack_vector_searches(
     state: &Arc<AppState>,
     agent: &Value,
@@ -474,12 +490,13 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
     if pack.get("keyword_retrieval").is_none_or(Value::is_null) {
         return Ok(());
     }
-    let rules = pack
+    let config = pack
         .get("keyword_retrieval")
-        .and_then(Value::as_object)
-        .and_then(|config| config.get("rules"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| "keyword_retrieval.rules must be an array".to_string())?;
+        .cloned()
+        .ok_or_else(|| "keyword_retrieval is required".to_string())?;
+    let config: KeywordRetrievalConfig = serde_json::from_value(config)
+        .map_err(|error| format!("invalid keyword_retrieval: {error}"))?;
+    let rules = &config.rules;
     if rules.is_empty() || rules.len() > MAX_PACK_TOKEN_RULES {
         return Err("keyword_retrieval.rules must contain 1..=16 entries".into());
     }
@@ -487,6 +504,8 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
         let object = rule
             .as_object()
             .ok_or_else(|| "keyword retrieval rule must be an object".to_string())?;
+        let _: KeywordRetrievalRule = serde_json::from_value(rule.clone())
+            .map_err(|error| format!("invalid keyword retrieval rule: {error}"))?;
         let digit_count = object
             .get("digit_count")
             .and_then(Value::as_u64)
@@ -1906,7 +1925,9 @@ mod tests {
     fn keyword_retrieval_configuration_rejects_invalid_rules() {
         let base = || json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
         for patch in [
+            json!({"keyword_retrieval":{"mode":"x","rules":[]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["unknown"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"mode":"x","prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["unknown"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":[],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["非"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":0,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),

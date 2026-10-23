@@ -258,6 +258,7 @@ pub(crate) async fn list_knowledge_packs_handler(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgePackCreateRequest {
     pub name: String,
     pub description: Option<String>,
