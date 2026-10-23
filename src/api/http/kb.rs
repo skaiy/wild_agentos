@@ -599,6 +599,7 @@ pub(crate) async fn vector_records_match_kb_ownership(
     if let Some(healthy) = store.cached_ownership_health(&cache_key) {
         return healthy;
     }
+    let generation = store.ownership_generation(&cache_key);
     let count = match store.count().await {
         Ok(count) => count,
         Err(error) => {
@@ -639,7 +640,7 @@ pub(crate) async fn vector_records_match_kb_ownership(
             }
             let Some((namespace, _)) = hit.iri.split_once('#') else {
                 tracing::error!(iri = %hit.iri, "Vector record has no claims namespace");
-                store.cache_ownership_health(cache_key, false);
+                store.cache_ownership_health_if_current(cache_key, generation, false);
                 return false;
             };
             if namespace
@@ -649,7 +650,7 @@ pub(crate) async fn vector_records_match_kb_ownership(
                     .as_deref()
                     .unwrap_or_default()
             {
-                store.cache_ownership_health(cache_key, false);
+                store.cache_ownership_health_if_current(cache_key, generation, false);
                 return false;
             }
             let tenant_tags: Vec<&str> = tags
@@ -663,7 +664,7 @@ pub(crate) async fn vector_records_match_kb_ownership(
                 || kb_tags.as_slice() != [expected_kb.as_str()]
             {
                 tracing::error!(iri = %hit.iri, "Vector record has inconsistent ownership tags");
-                store.cache_ownership_health(cache_key, false);
+                store.cache_ownership_health_if_current(cache_key, generation, false);
                 return false;
             }
             if !bases.iter().any(|kb| {
@@ -673,13 +674,13 @@ pub(crate) async fn vector_records_match_kb_ownership(
                     && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
             }) {
                 tracing::error!(iri = %hit.iri, "Vector record KB tag is not owned by its scope");
-                store.cache_ownership_health(cache_key, false);
+                store.cache_ownership_health_if_current(cache_key, generation, false);
                 return false;
             }
         }
         offset += hits.len();
     }
-    store.cache_ownership_health(cache_key, true);
+    store.cache_ownership_health_if_current(cache_key, generation, true);
     true
 }
 
@@ -888,6 +889,11 @@ pub(crate) async fn delete_knowledge_base_handler(
             && kb_belongs_to_claims(b, claims))
     });
     let _ = save_knowledge_bases(&guard);
+    if removed.get("kb_type").and_then(Value::as_str) == Some("vector") {
+        if let Some(store) = state.vector_store.load_full() {
+            store.invalidate_ownership_cache();
+        }
+    }
     (
         StatusCode::OK,
         Json(json!({ "status": "deleted", "id": id })),
@@ -981,6 +987,11 @@ pub(crate) async fn update_knowledge_base_handler(
         let _ = save_knowledge_bases(&guard);
         (updated, is_graph, graph_iri, name_changed)
     };
+    if updated.get("kb_type").and_then(Value::as_str) == Some("vector") {
+        if let Some(store) = state.vector_store.load_full() {
+            store.invalidate_ownership_cache();
+        }
+    }
 
     // 图类型改名：同步命名图 kbName 元三元组
     if is_graph && !graph_iri.is_empty() {

@@ -125,7 +125,8 @@ pub struct ScoredEntry {
 pub struct HyperspaceStore {
     engine: Arc<HyperspaceEngineImpl>,
     embed: Arc<dyn EmbeddingService>,
-    ownership_cache: RwLock<HashMap<String, bool>>,
+    ownership_cache: RwLock<HashMap<String, (u64, bool)>>,
+    ownership_generations: RwLock<HashMap<String, u64>>,
 }
 
 #[cfg(not(test))]
@@ -157,6 +158,7 @@ impl HyperspaceStore {
             engine: Arc::new(engine),
             embed,
             ownership_cache: RwLock::new(HashMap::new()),
+            ownership_generations: RwLock::new(HashMap::new()),
         })
     }
 
@@ -172,25 +174,48 @@ impl HyperspaceStore {
 
     /// Drops cached KB ownership-validation results after a vector mutation.
     pub fn invalidate_ownership_cache(&self) {
-        self.ownership_cache
+        let mut cache = self
+            .ownership_cache
             .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut generations = self
+            .ownership_generations
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        for key in cache.keys() {
+            *generations.entry(key.clone()).or_default() += 1;
+        }
+        cache.clear();
+    }
+
+    pub fn ownership_generation(&self, key: &str) -> u64 {
+        *self
+            .ownership_generations
+            .read()
             .unwrap_or_else(|error| error.into_inner())
-            .clear();
+            .get(key)
+            .unwrap_or(&0)
     }
 
     pub fn cached_ownership_health(&self, key: &str) -> Option<bool> {
+        let generation = self.ownership_generation(key);
         self.ownership_cache
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .get(key)
-            .copied()
+            .and_then(|(cached_generation, healthy)| {
+                (*cached_generation == generation).then_some(*healthy)
+            })
     }
 
-    pub fn cache_ownership_health(&self, key: String, healthy: bool) {
+    pub fn cache_ownership_health_if_current(&self, key: String, generation: u64, healthy: bool) {
+        if self.ownership_generation(&key) != generation {
+            return;
+        }
         self.ownership_cache
             .write()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(key, healthy);
+            .insert(key, (generation, healthy));
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -896,7 +921,8 @@ mod tests {
     #[tokio::test]
     async fn vector_writes_invalidate_cached_ownership_health() {
         let store = setup_store();
-        store.cache_ownership_health("vector://tenant/project#kb-a".into(), true);
+        let key = "vector://tenant/project#kb-a";
+        store.cache_ownership_health_if_current(key.into(), store.ownership_generation(key), true);
         store
             .upsert("cache:1", "invalidate ownership cache", &[])
             .await
@@ -1156,6 +1182,22 @@ mod tests {
         assert!(
             results[0].tags.contains(&"tenant:acme".to_string()),
             "Expected tenant tag in stored entry"
+        );
+    }
+
+    #[test]
+    fn stale_ownership_scan_cannot_restore_a_cache_entry_after_invalidation() {
+        let store = setup_store();
+        let key = "vector://tenant/project#kb-a";
+        let scan_generation = store.ownership_generation(key);
+        store.cache_ownership_health_if_current(key.into(), scan_generation, true);
+
+        store.invalidate_ownership_cache();
+        store.cache_ownership_health_if_current(key.into(), scan_generation, true);
+
+        assert!(
+            store.cached_ownership_health(key).is_none(),
+            "a scan that started before a write must not restore a stale healthy cache entry"
         );
     }
 
