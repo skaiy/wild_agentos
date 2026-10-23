@@ -1822,6 +1822,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pack_without_keyword_retrieval_mounts_without_exact_rules() {
+        let state = make_state();
+        *state.knowledge_packs.write().await = vec![json!({
+            "id": "pack-without-rules",
+            "builtin": false,
+            "vector_kb_ids": ["kb-without-rules"]
+        })];
+        let searches = mounted_pack_vector_searches(
+            &state,
+            &json!({ "knowledge_pack_ids": ["pack-without-rules"] }),
+        )
+        .await;
+        assert_eq!(searches.len(), 1);
+        assert!(searches[0].token_rules.is_empty());
+    }
+
+    #[tokio::test]
     async fn configured_pack_exact_retrieval_is_scoped_and_precedes_vectors() {
         let state = make_state();
         let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
