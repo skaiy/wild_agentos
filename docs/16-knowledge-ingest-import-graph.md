@@ -291,6 +291,8 @@ Stop Core before applying the backfill.
 Use `--assign <kb_id>=<tenant>/<project>` for an evidence-free record; repeat
 the option for multiple records. Existing scope fields are never overwritten:
 conflicting evidence or assignments are reported and skipped.
+If an interrupted operation leaves `.knowledge_bases.json.tmp`, review and
+remove it manually before retrying.
 
 `src/config/settings.rs` configures `embedding`: `ollama` by default, plus
 `oneapi` and `fallback`. Changing it hot-switches vector dimensions/model and

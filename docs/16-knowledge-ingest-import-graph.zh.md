@@ -439,6 +439,7 @@ scope 证据。审核后才传 `--apply`：仅当证据唯一指向一个 tenant
 应用 backfill 前须先停止 Core。
 对无证据记录可使用 `--assign <kb_id>=<tenant>/<project>`，多条记录可重复传入。
 已有 scope 字段绝不覆盖；证据或显式指定与现有值冲突时会报告并跳过。
+若中断后留下 `.knowledge_bases.json.tmp`，重试前须人工审核并删除。
 
 配置段 `embedding`（`src/config/settings.rs`）：`provider` 默认 `ollama`，另有 `oneapi`、`fallback`。HTTP 侧：
 
