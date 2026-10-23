@@ -154,15 +154,17 @@ fn append_audit(root: &Path, records: &[Value]) -> std::io::Result<()> {
         return Ok(());
     }
     let path = root.join("kb_catalog_backfill.audit.jsonl");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     for record in records {
         writeln!(file, "{}", serde_json::to_string(record)?)?;
     }

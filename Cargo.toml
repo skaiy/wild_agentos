@@ -159,6 +159,7 @@ ontologies = { path = "crates/ontologies" }
 csv = "1"
 rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rustls-tls"] }
 arc-swap = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
