@@ -305,6 +305,9 @@ impl Searcher {
         } else {
             evaluate_filters(&self.metadata, filters)
         };
+        if !filters.is_empty() && allowed.is_none() {
+            return Vec::new();
+        }
 
         let results = if let Some(ref ab) = allowed {
             self.index.search_with_filter(query, top_k, Some(ab))
@@ -811,6 +814,9 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         } else {
             evaluate_filters(&self.metadata, filters)
         };
+        if !filters.is_empty() && allowed.is_none() {
+            return Ok(Vec::new());
+        }
 
         let mut inner = self.inner.lock().unwrap();
         let results = if let Some(ref ab) = allowed {
@@ -851,6 +857,9 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         } else {
             evaluate_filters(&self.metadata, filters)
         };
+        if !filters.is_empty() && allowed.is_none() {
+            return Ok(Vec::new());
+        }
 
         let mut inner = self.inner.lock().unwrap();
 
@@ -1599,6 +1608,78 @@ mod tests {
         assert_eq!(
             tenant_b_results.first().map(|hit| hit.iri.as_str()),
             Some("tenant-b:23")
+        );
+
+        let contradictory_scope = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant-a"),
+            JsonLdFilter::tag("tags", "tenant-b"),
+        ]);
+        assert!(
+            eng.search(&query, 10, &[contradictory_scope])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a query with contradictory tenant scopes must not fall back to unfiltered results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tenant_and_kb_filters_prevent_cross_scope_results_in_hnsw_path() {
+        const FILTERED_HNSW_SIZE: usize = 5_001;
+        let config = HnswConfig {
+            m: 4,
+            m0: 8,
+            ef_search: 8,
+            ..HnswConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let eng = setup_engine_with_config(dir.path(), config);
+        let scope_a = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:scope-a"),
+            JsonLdFilter::tag("tags", "kb:scope-a"),
+        ]);
+        let scope_b = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:scope-b"),
+            JsonLdFilter::tag("tags", "kb:scope-b"),
+        ]);
+
+        eng.insert(
+            "synthetic:scope-a:0",
+            sequential_unit_vector(0, FILTERED_HNSW_SIZE + 1),
+            json!({"tags": ["tenant:scope-a", "kb:scope-a"]}),
+        )
+        .await
+        .unwrap();
+        for index in 0..FILTERED_HNSW_SIZE {
+            eng.insert(
+                &format!("synthetic:scope-b:{index}"),
+                sequential_unit_vector(index + 1, FILTERED_HNSW_SIZE + 1),
+                json!({"tags": ["tenant:scope-b", "kb:scope-b"]}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let b_query = sequential_unit_vector(24, FILTERED_HNSW_SIZE + 1);
+        let b_results = eng.search(&b_query, 10, &[scope_b]).await.unwrap();
+        assert!(
+            !b_results.is_empty(),
+            "the HNSW path should return entries for the authorized scope"
+        );
+        assert!(b_results
+            .iter()
+            .all(|hit| hit.iri.starts_with("synthetic:scope-b:")));
+
+        let contradictory_scope = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:scope-a"),
+            JsonLdFilter::tag("tags", "tenant:scope-b"),
+        ]);
+        assert!(
+            eng.search(&b_query, 10, &[scope_a, contradictory_scope])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a caller cannot widen a tenant and KB scope with an incompatible filter"
         );
     }
 

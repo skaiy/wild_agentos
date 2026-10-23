@@ -136,7 +136,7 @@ impl IncrementalHNSW {
     /// exactly than to recover from a global ANN candidate set. In particular,
     /// a tag with only a few vectors can otherwise be entirely absent from the
     /// first `ef_search` global candidates.
-    const EXACT_FILTERED_SEARCH_LIMIT: u64 = 512;
+    const EXACT_FILTERED_SEARCH_LIMIT: u64 = 5_000;
 
     pub fn new(metric: Box<dyn Metric>, config: HnswConfig) -> Self {
         Self {
@@ -493,12 +493,17 @@ impl IncrementalHNSW {
                     .map(|node| (id, self.metric.distance(query, &node.vector)))
             })
             .collect();
-        results.sort_by(|(left_id, left_distance), (right_id, right_distance)| {
-            left_distance
-                .total_cmp(right_distance)
-                .then_with(|| left_id.cmp(right_id))
-        });
-        results.truncate(top_k);
+        let compare_results =
+            |(left_id, left_distance): &(u32, f64), (right_id, right_distance): &(u32, f64)| {
+                left_distance
+                    .total_cmp(right_distance)
+                    .then_with(|| left_id.cmp(right_id))
+            };
+        if results.len() > top_k {
+            results.select_nth_unstable_by(top_k, compare_results);
+            results.truncate(top_k);
+        }
+        results.sort_by(compare_results);
         results
     }
 
