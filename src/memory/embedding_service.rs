@@ -130,6 +130,30 @@ pub struct FallbackEmbeddingService {
     dimension: usize,
 }
 
+/// Represents an invalid non-fallback provider configuration. It preserves the
+/// configured dimension but rejects every operation instead of silently
+/// returning local hash embeddings.
+pub struct UnavailableEmbeddingService {
+    dimension: usize,
+}
+
+impl UnavailableEmbeddingService {
+    pub fn new(dimension: usize) -> Self {
+        Self { dimension }
+    }
+}
+
+#[async_trait]
+impl EmbeddingService for UnavailableEmbeddingService {
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+        Err("embedding provider configuration unavailable".into())
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+}
+
 impl FallbackEmbeddingService {
     pub fn new() -> Self {
         Self {
@@ -273,8 +297,8 @@ pub fn create_embedding_service_from_config(
     config: &crate::config::settings::EmbeddingSettings,
     timeout_secs: u64,
 ) -> Arc<dyn EmbeddingService> {
-    if !config.enabled {
-        info!("Embedding disabled, using Fallback service");
+    if !config.enabled || config.provider == "fallback" {
+        info!("Using explicit Fallback Embedding service");
         return Arc::new(FallbackEmbeddingService::with_dimension(
             config.fallback.dimension,
         ));
@@ -297,10 +321,8 @@ pub fn create_embedding_service_from_config(
         }
         "oneapi" => {
             if config.oneapi.base_url.is_empty() || config.oneapi.api_key.is_empty() {
-                warn!("OneAPI Embedding config incomplete, falling back to Fallback");
-                return Arc::new(FallbackEmbeddingService::with_dimension(
-                    config.fallback.dimension,
-                ));
+                warn!("OneAPI Embedding config incomplete; rejecting embedding operations");
+                return Arc::new(UnavailableEmbeddingService::new(config.oneapi.dimension));
             }
             info!(
                 url = %config.oneapi.base_url,
@@ -315,20 +337,13 @@ pub fn create_embedding_service_from_config(
                 config.oneapi.dimension,
             ))
         }
-        "fallback" | "" => {
-            info!("Using Fallback Embedding service");
-            Arc::new(FallbackEmbeddingService::with_dimension(
-                config.fallback.dimension,
-            ))
-        }
+        "" => Arc::new(UnavailableEmbeddingService::new(config.fallback.dimension)),
         other => {
             warn!(
                 provider = other,
-                "Unknown Embedding provider, falling back to Fallback"
+                "Unknown Embedding provider; rejecting embedding operations"
             );
-            Arc::new(FallbackEmbeddingService::with_dimension(
-                config.fallback.dimension,
-            ))
+            Arc::new(UnavailableEmbeddingService::new(config.fallback.dimension))
         }
     }
 }
