@@ -1014,6 +1014,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_scan_metadata_scope_keeps_own_match_visible_after_foreign_cap() {
+        let store = setup_store();
+        let own = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let foreign = IsolationClaims::from_verified("tenant-b", "project-a", "actor-b").unwrap();
+        for index in 0..EXACT_SCAN_RECORD_LIMIT {
+            store
+                .upsert_with_claims(
+                    &foreign,
+                    &format!("foreign-{index}"),
+                    "foreign placeholder",
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_with_claims(&own, "own", "B2033", &["kb:local".into()])
+            .await
+            .unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &own,
+                &["kb:local".into()],
+                &["b2033".into()],
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(
+            result.entries.first().map(|entry| entry.text.as_str()),
+            Some("B2033")
+        );
+    }
+
+    #[tokio::test]
     async fn exact_matches_rank_equality_before_contains_stably() {
         let store = setup_store();
         let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
