@@ -969,6 +969,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_matches_report_when_scan_cap_is_exceeded() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        for index in 0..=EXACT_SCAN_RECORD_LIMIT {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("capped-{index}"),
+                    "placeholder",
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["missing".into()],
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(result.truncated);
+    }
+
+    #[tokio::test]
     async fn test_upsert_and_count() {
         let store = setup_store();
         store.upsert("v:1", "hello world", &[]).await.unwrap();
