@@ -33,11 +33,27 @@ fn backfill(bases: &mut [Value], apply: bool) -> (usize, Vec<Value>) {
             .to_owned();
         if evidence.len() == 1 {
             let (tenant, project) = evidence.into_iter().next().unwrap();
-            report.push(json!({"id": id, "status": "unambiguous", "tenant_id": tenant, "project_id": project}));
-            if apply {
-                base["tenant_id"] = json!(tenant);
-                base["project_id"] = json!(project);
-                changed += 1;
+            let tenant_conflict = base
+                .get("tenant_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value != tenant);
+            let project_conflict = base
+                .get("project_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value != project);
+            if tenant_conflict || project_conflict {
+                report.push(json!({"id": id, "status": "conflict"}));
+            } else {
+                report.push(json!({"id": id, "status": "unambiguous", "tenant_id": tenant, "project_id": project}));
+                if apply {
+                    if base.get("tenant_id").and_then(Value::as_str).is_none() {
+                        base["tenant_id"] = json!(tenant);
+                    }
+                    if base.get("project_id").and_then(Value::as_str).is_none() {
+                        base["project_id"] = json!(project);
+                    }
+                    changed += 1;
+                }
             }
         } else {
             report.push(json!({"id": id, "status": if evidence.is_empty() {"no_evidence"} else {"ambiguous"}, "evidence": evidence}));
@@ -97,5 +113,19 @@ mod tests {
         assert_eq!(backfill(&mut bases, true).0, 1);
         assert_eq!(bases[0]["tenant_id"], "t");
         assert_eq!(backfill(&mut bases, true).0, 0);
+    }
+
+    #[test]
+    fn conflicting_existing_scope_is_reported_without_overwrite() {
+        let mut bases = vec![json!({
+            "id":"conflict",
+            "tenant_id":"existing",
+            "documents":[{"tenant_id":"evidence","project_id":"project"}]
+        })];
+        let (changed, report) = backfill(&mut bases, true);
+        assert_eq!(changed, 0);
+        assert_eq!(bases[0]["tenant_id"], "existing");
+        assert!(bases[0].get("project_id").is_none());
+        assert_eq!(report[0]["status"], "conflict");
     }
 }
