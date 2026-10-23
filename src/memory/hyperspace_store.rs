@@ -1244,7 +1244,7 @@ mod tests {
         let store = setup_store();
         let key = "vector://tenant/project#kb-a";
         let scan_generation = store.ownership_generation(key);
-        store.invalidate_ownership_cache();
+        store.invalidate_ownership_cache_for(key);
         store.cache_ownership_health_if_current(key.into(), scan_generation, true);
 
         assert!(
