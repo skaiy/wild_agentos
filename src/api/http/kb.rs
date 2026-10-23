@@ -3658,6 +3658,51 @@ exit 2
     }
 
     #[tokio::test]
+    async fn cross_tenant_kb_id_routes_return_identical_not_found() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        state.knowledge_bases.write().await.push(json!({
+            "id": "foreign-kb",
+            "kb_type": "vector",
+            "tenant_id": "tenant-b",
+            "project_id": "default",
+        }));
+        let app = Router::new()
+            .route(
+                "/kb/:id",
+                put(update_knowledge_base_handler).delete(delete_knowledge_base_handler),
+            )
+            .route("/kb/:id/search", post(search_knowledge_base_handler))
+            .route("/kb/:id/reindex", post(reindex_knowledge_base_handler))
+            .route("/kb/:id/upload", post(upload_knowledge_base_handler))
+            .with_state(state);
+        let token = jwt("tenant-a");
+        let requests = [
+            ("POST", "/kb/foreign-kb/search", r#"{"query":"x"}"#),
+            ("POST", "/kb/foreign-kb/reindex", ""),
+            ("PUT", "/kb/foreign-kb", r#"{"name":"x"}"#),
+            ("DELETE", "/kb/foreign-kb", ""),
+            ("POST", "/kb/foreign-kb/upload", ""),
+        ];
+        for (method, uri, body) in requests {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let (status, body) = raw_response(&app, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            assert_eq!(
+                body,
+                br#"{"error":"knowledge base not found","id":"foreign-kb"}"#
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn foreign_namespace_same_kb_id_does_not_block_healthy_tenant() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
