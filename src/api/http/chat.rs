@@ -1359,7 +1359,6 @@ pub(crate) async fn openai_chat_completions_handler(
 mod tests {
     use super::*;
     use crate::core::core_types::{CoreConfig, SemanticCore};
-    use crate::memory::embedding_service::EmbeddingService;
     use crate::memory::hyperspace_store::HyperspaceStore;
     use crate::tools::prompt_registry::PromptRegistry;
     use axum::{
@@ -1372,19 +1371,6 @@ mod tests {
     use tower::ServiceExt;
 
     use super::super::api_gov::ApiUsageState;
-
-    struct UnavailableEmbeddingService;
-
-    #[async_trait::async_trait]
-    impl EmbeddingService for UnavailableEmbeddingService {
-        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
-            Err("unavailable".into())
-        }
-
-        fn dimension(&self) -> usize {
-            8
-        }
-    }
 
     fn jwt(tenant_id: &str, project_id: &str) -> String {
         encode(
@@ -2144,7 +2130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_endpoint_fails_closed_when_embedding_provider_is_unavailable() {
+    async fn chat_endpoint_fails_closed_when_kb_ownership_validation_fails() {
         let state = make_state();
         state.knowledge_bases.write().await.push(json!({
             "id": "chat-vector-kb",
@@ -2161,8 +2147,21 @@ mod tests {
         }
         let vector_dir =
             std::env::temp_dir().join(format!("chat_unavailable_{}", uuid::Uuid::new_v4()));
-        let store =
-            HyperspaceStore::open(&vector_dir, Arc::new(UnavailableEmbeddingService)).unwrap();
+        let store = HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "test-actor").unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "bad-ownership",
+                "must not be retrieved",
+                &["kb:chat-vector-kb".into(), "tenant:wrong".into()],
+            )
+            .await
+            .unwrap();
         state.vector_store.store(Some(Arc::new(store)));
         let router = Router::new()
             .route("/api/v1/agents/:id/chat", post(agent_chat_handler))
