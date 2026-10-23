@@ -312,11 +312,11 @@ fn extract_fault_code_tokens(message: &str) -> Vec<String> {
 /// Extract literal diagnostic-code tokens for non-built-in pack RAG.
 ///
 /// Numeric diagnostic codes are limited to four or five digits and cannot
-/// start with zero. Numbers in the calendar-year range are excluded only when
-/// immediately followed (optionally by limited whitespace) by a year marker;
+/// start with zero. Four-digit numbers are excluded only when immediately
+/// followed (optionally by limited whitespace) by a year marker;
 /// phone fragments, VINs and VIN-like truncated values are also excluded.
-/// Alphanumeric codes may include underscores (for example `CP_A055` and
-/// `NIO_WL_021`).
+/// Alphanumeric codes may include underscores (for example `ACME_CODE_055`
+/// and `ACME_WL_021`).
 fn extract_pack_fault_code_tokens(message: &str) -> Vec<String> {
     let message = message.nfkc().collect::<String>();
     let message = message.as_str();
@@ -362,10 +362,9 @@ fn extract_pack_fault_code_tokens(message: &str) -> Vec<String> {
 }
 
 fn is_year_number(number: &str, following: &str) -> bool {
-    let Ok(year) = number.parse::<u16>() else {
-        return false;
-    };
-    if !(1990..=2035).contains(&year) {
+    // Any four-digit token directly followed by a year marker (after at most
+    // three whitespace characters) is a year, even if it could be a code.
+    if number.len() != 4 || !number.bytes().all(|character| character.is_ascii_digit()) {
         return false;
     }
     let mut after = following;
@@ -1835,26 +1834,25 @@ mod tests {
     #[test]
     fn pack_fault_code_tokens_accept_codes_and_reject_dates_phone_and_vin() {
         // fictional
-        let phone = "19900000000";
-        let separated_phone = "+86 199-0000-0000";
+        let phone = "11111111111";
+        let separated_phone = "+00 111-1111-1111";
         // fictional
-        let vin = "LTEST000000000001";
+        let vin = "ACME0000000000001";
         let truncated_vin = &vin[..16];
         let vin_suffix = &vin[11..];
-        assert!(separated_phone_fragments(&separated_phone).contains("0000"));
+        assert!(separated_phone_fragments(&separated_phone).contains("1111"));
         assert!(contains_vin_like_run(&vin));
         assert_eq!(
             extract_pack_fault_code_tokens(&format!(
-                "Codes 1234 C1A10 CP_A055 NIO_WL_021; years 1999年 2024年 2099年; \
+                "Codes 1234 C1A10 ACME_CODE_055 ACME_WL_021; years 1999年 2024年 2099年; \
                  phones {phone} {separated_phone}; VIN pre{vin}suffix \
-                 {truncated_vin} {vin_suffix}; ES8 京A12345 120000km",
+                 {truncated_vin} {vin_suffix}; ACME-X8 测A00000 120000km",
             ),),
             vec![
                 "1234".to_string(),
-                "2099".to_string(),
+                "acme_code_055".to_string(),
+                "acme_wl_021".to_string(),
                 "c1a10".to_string(),
-                "cp_a055".to_string(),
-                "nio_wl_021".to_string(),
             ]
         );
         assert!(extract_pack_fault_code_tokens("odometer 12000 km; 里程 12345").is_empty());
@@ -1869,16 +1867,21 @@ mod tests {
     }
 
     #[test]
-    fn pack_fault_code_tokens_accept_supported_diagnostic_code_forms() {
-        assert_eq!(
-            extract_pack_fault_code_tokens("2033 P0A01 BYD_WL_002 AITO_WL_038 PCS_A053"),
-            vec!["2033", "aito_wl_038", "byd_wl_002", "p0a01", "pcs_a053"]
-        );
-        assert!(extract_pack_fault_code_tokens("USB3 京AD12345").is_empty());
+    fn pack_fault_code_tokens_treat_adjacent_year_marker_as_year() {
+        assert!(extract_pack_fault_code_tokens("故障码2033年").is_empty());
     }
 
     #[test]
-    fn pack_fault_code_tokens_handle_year_range_boundaries_per_occurrence() {
+    fn pack_fault_code_tokens_accept_supported_diagnostic_code_forms() {
+        assert_eq!(
+            extract_pack_fault_code_tokens("2033 P0A01 ACME_WL_002 ACME_WL_038 ACME_A053"),
+            vec!["2033", "acme_a053", "acme_wl_002", "acme_wl_038", "p0a01"]
+        );
+        assert!(extract_pack_fault_code_tokens("USB3 测A00000").is_empty());
+    }
+
+    #[test]
+    fn pack_fault_code_tokens_handle_marked_years_per_occurrence() {
         assert_eq!(
             extract_pack_fault_code_tokens("1990年；2035 年份；故障码 1990；故障码 2035"),
             vec!["1990", "2035"]
