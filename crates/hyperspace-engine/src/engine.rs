@@ -1567,21 +1567,27 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let eng = setup_engine_with_config(dir.path(), config);
-        let tenant_a_filter = JsonLdFilter::tag("tags", "tenant-a");
-        let tenant_b_filter = JsonLdFilter::tag("tags", "tenant-b");
+        let tenant_a_filter = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:exact-a"),
+            JsonLdFilter::tag("tags", "kb:exact-a"),
+        ]);
+        let tenant_b_filter = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:exact-b"),
+            JsonLdFilter::tag("tags", "kb:exact-b"),
+        ]);
 
         for index in 0..64 {
             eng.insert(
                 &format!("tenant-a:{index}"),
                 sequential_unit_vector(index * 2, 128),
-                json!({"tags": ["tenant-a"]}),
+                json!({"tags": ["tenant:exact-a", "kb:exact-a"]}),
             )
             .await
             .unwrap();
             eng.insert(
                 &format!("tenant-b:{index}"),
                 sequential_unit_vector(index * 2 + 1, 128),
-                json!({"tags": ["tenant-b"]}),
+                json!({"tags": ["tenant:exact-b", "kb:exact-b"]}),
             )
             .await
             .unwrap();
@@ -1610,17 +1616,22 @@ mod tests {
             Some("tenant-b:23")
         );
 
-        let contradictory_scope = JsonLdFilter::Must(vec![
-            JsonLdFilter::tag("tags", "tenant-a"),
-            JsonLdFilter::tag("tags", "tenant-b"),
-        ]);
-        assert!(
-            eng.search(&query, 10, &[contradictory_scope])
+        for missing_scope in [
+            vec![
+                JsonLdFilter::tag("tags", "tenant:absent"),
+                JsonLdFilter::tag("tags", "kb:exact-b"),
+            ],
+            vec![
+                JsonLdFilter::tag("tags", "tenant:exact-a"),
+                JsonLdFilter::tag("tags", "kb:absent"),
+            ],
+        ] {
+            assert!(eng
+                .search(&query, 10, &missing_scope)
                 .await
                 .unwrap()
-                .is_empty(),
-            "a query with contradictory tenant scopes must not fall back to unfiltered results"
-        );
+                .is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1634,10 +1645,6 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let eng = setup_engine_with_config(dir.path(), config);
-        let scope_a = JsonLdFilter::Must(vec![
-            JsonLdFilter::tag("tags", "tenant:scope-a"),
-            JsonLdFilter::tag("tags", "kb:scope-a"),
-        ]);
         let scope_b = JsonLdFilter::Must(vec![
             JsonLdFilter::tag("tags", "tenant:scope-b"),
             JsonLdFilter::tag("tags", "kb:scope-b"),
@@ -1670,17 +1677,22 @@ mod tests {
             .iter()
             .all(|hit| hit.iri.starts_with("synthetic:scope-b:")));
 
-        let contradictory_scope = JsonLdFilter::Must(vec![
-            JsonLdFilter::tag("tags", "tenant:scope-a"),
-            JsonLdFilter::tag("tags", "tenant:scope-b"),
-        ]);
-        assert!(
-            eng.search(&b_query, 10, &[scope_a, contradictory_scope])
+        for missing_scope in [
+            vec![
+                JsonLdFilter::tag("tags", "tenant:absent"),
+                JsonLdFilter::tag("tags", "kb:scope-b"),
+            ],
+            vec![
+                JsonLdFilter::tag("tags", "tenant:scope-a"),
+                JsonLdFilter::tag("tags", "kb:absent"),
+            ],
+        ] {
+            assert!(eng
+                .search(&b_query, 10, &missing_scope)
                 .await
                 .unwrap()
-                .is_empty(),
-            "a caller cannot widen a tenant and KB scope with an incompatible filter"
-        );
+                .is_empty());
+        }
     }
 
     #[tokio::test]

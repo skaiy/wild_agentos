@@ -50,18 +50,30 @@ pub enum CompiledFilter {
 
 impl CompiledFilter {
     /// Evaluate this filter against the metadata index, returning a RoaringBitmap
-    /// of matching IDs. Returns None if the filter would match nothing.
+    /// of matching IDs. `None` is reserved for callers that provide no filter;
+    /// every compiled filter evaluates to a bitmap, including an empty one.
     pub fn evaluate(&self, meta: &JsonLdMetadataIndex) -> Option<RoaringBitmap> {
         match self {
-            Self::MatchTag(key, val) => meta.ids_for_tag(key, val),
-            Self::MatchType(typ) => meta.ids_for_type(typ),
-            Self::MatchGraph(g) => meta.ids_for_graph(g),
-            Self::MatchContext(ctx) => meta.ids_for_context(ctx),
-            Self::Range { key, gte, lte } => meta.ids_for_numeric_range(key, *gte, *lte),
+            Self::MatchTag(key, val) => Some(meta.ids_for_tag(key, val).unwrap_or_default()),
+            Self::MatchType(typ) => Some(meta.ids_for_type(typ).unwrap_or_default()),
+            Self::MatchGraph(g) => Some(meta.ids_for_graph(g).unwrap_or_default()),
+            Self::MatchContext(ctx) => Some(meta.ids_for_context(ctx).unwrap_or_default()),
+            Self::Range { key, gte, lte } => Some(
+                meta.ids_for_numeric_range(key, *gte, *lte)
+                    .unwrap_or_default(),
+            ),
             Self::And(conds) => {
-                let mut iter = conds.iter().filter_map(|c| c.evaluate(meta));
-                let first = iter.next()?;
-                Some(iter.fold(first, |acc, bm| acc & bm))
+                let mut result: RoaringBitmap = meta.all_ids().iter().collect();
+                for cond in conds {
+                    let Some(matches) = cond.evaluate(meta) else {
+                        return Some(RoaringBitmap::new());
+                    };
+                    result &= matches;
+                    if result.is_empty() {
+                        break;
+                    }
+                }
+                Some(result)
             }
             Self::Or(conds) => {
                 let mut result = RoaringBitmap::new();
@@ -70,25 +82,15 @@ impl CompiledFilter {
                         result |= bm;
                     }
                 }
-                if result.is_empty() {
-                    None
-                } else {
-                    Some(result)
-                }
+                Some(result)
             }
             Self::Not(cond) => {
                 // Not is tricky: we need the universe of live IDs minus matching ones
                 let all: RoaringBitmap = meta.all_ids().iter().collect();
                 if let Some(matching) = cond.evaluate(meta) {
-                    let result = all - matching;
-                    if result.is_empty() {
-                        None
-                    } else {
-                        Some(result)
-                    }
+                    Some(all - matching)
                 } else {
-                    // Nothing matches the inner condition → everything passes
-                    Some(all)
+                    Some(RoaringBitmap::new())
                 }
             }
         }
@@ -158,9 +160,10 @@ pub fn compile_filter(f: &JsonLdFilter) -> CompiledFilter {
     }
 }
 
-/// Evaluate a set of JSON-LD filters against the metadata index and return
-/// a RoaringBitmap of matching IDs. This is the main entry point for
-/// filter-integrated search.
+/// Evaluate a set of JSON-LD filters against the metadata index.
+///
+/// An empty filter slice returns `None` (no restriction). A non-empty filter
+/// always returns `Some`, including `Some(empty)` when it matches nothing.
 pub fn evaluate_filters(
     meta: &JsonLdMetadataIndex,
     filters: &[JsonLdFilter],
@@ -358,6 +361,17 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_must_with_missing_child_is_empty() {
+        let meta = setup_test_index();
+        let filter = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "important"),
+            JsonLdFilter::tag("tags", "absent"),
+        ]);
+        let bm = compile_filter(&filter).evaluate(&meta).unwrap();
+        assert!(bm.is_empty());
+    }
+
+    #[test]
     fn test_evaluate_should() {
         let meta = setup_test_index();
         let filter = JsonLdFilter::Should(vec![
@@ -369,6 +383,23 @@ mod tests {
         assert!(!bm.contains(1));
         assert!(bm.contains(2));
         assert!(bm.contains(3));
+    }
+
+    #[test]
+    fn test_non_matching_compiled_filters_return_empty_bitmaps() {
+        let meta = setup_test_index();
+        let should = JsonLdFilter::Should(vec![JsonLdFilter::tag("tags", "absent")]);
+        let must_not = JsonLdFilter::MustNot(vec![JsonLdFilter::Should(vec![
+            JsonLdFilter::Type("Document".into()),
+            JsonLdFilter::Type("Note".into()),
+        ])]);
+
+        assert!(compile_filter(&should).evaluate(&meta).unwrap().is_empty());
+        assert!(compile_filter(&must_not)
+            .evaluate(&meta)
+            .unwrap()
+            .is_empty());
+        assert!(evaluate_filters(&meta, &[]).is_none());
     }
 
     #[test]
