@@ -633,7 +633,11 @@ fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
             if shape.separators.is_empty() {
                 return Err("grouped exclude shape requires separators".into());
             }
-            if max_groups == 0 || group_min_len == 0 || group_min_len > group_max_len {
+            if max_groups == 0
+                || group_min_len == 0
+                || group_min_len > group_max_len
+                || group_max_len > shape.max_len
+            {
                 return Err("exclude shape has invalid group bounds".into());
             }
         }
@@ -670,6 +674,36 @@ fn pack_rule_strings(value: Option<&Value>, prefixes: bool) -> Option<Vec<String
         .collect()
 }
 
+fn canonical_pack_token(token: &str, rules: &[PackTokenRule]) -> String {
+    rules
+        .iter()
+        .find_map(|rule| {
+            rule.prefixes.iter().find_map(|prefix| {
+                let separator = prefix.chars().last()?;
+                let stem = if matches!(separator, '-' | '_' | '/') {
+                    &prefix[..prefix.len() - separator.len_utf8()]
+                } else {
+                    prefix.as_str()
+                };
+                token
+                    .strip_prefix(prefix)
+                    .or_else(|| {
+                        if stem != prefix {
+                            token.strip_prefix(stem)
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|suffix| {
+                        suffix.len() == rule.digit_count
+                            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .map(|suffix| format!("{prefix}{suffix}"))
+            })
+        })
+        .unwrap_or_else(|| token.to_string())
+}
+
 fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
     if rules.is_empty() {
         return Vec::new();
@@ -687,25 +721,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
             .any(|rule| token_matches_rule(&upper, following, rule))
             && !blocked_fragments.contains(&upper)
         {
-            let canonical = rules
-                .iter()
-                .find_map(|rule| {
-                    rule.prefixes.iter().find_map(|prefix| {
-                        let separator = prefix.chars().last()?;
-                        if !matches!(separator, '-' | '_' | '/') {
-                            return None;
-                        }
-                        let stem = &prefix[..prefix.len() - separator.len_utf8()];
-                        upper
-                            .strip_prefix(stem)
-                            .filter(|suffix| {
-                                suffix.len() == rule.digit_count
-                                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                            })
-                            .map(|suffix| format!("{prefix}{suffix}"))
-                    })
-                })
-                .unwrap_or(upper);
+            let canonical = canonical_pack_token(&upper, rules);
             tokens.push(canonical.to_ascii_lowercase());
         }
         current.clear();
@@ -727,8 +743,13 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
                                 .chars()
                                 .take_while(|next| next.is_ascii_digit())
                                 .collect();
-                            if digits.len() == rule.digit_count {
-                                tokens.push(format!("{prefix}{digits}").to_ascii_lowercase());
+                            let following = &following[separator.len_utf8() + digits.len()..];
+                            let token = format!("{stem}{digits}").to_ascii_uppercase();
+                            if token_matches_rule(&token, following, rule)
+                                && !blocked_fragments.contains(&token)
+                            {
+                                tokens
+                                    .push(canonical_pack_token(&token, rules).to_ascii_lowercase());
                             }
                         }
                     }
@@ -760,29 +781,22 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
         return HashSet::new();
     }
     let mut blocked = HashSet::new();
-    for raw in question.split(|character: char| {
-        !character.is_ascii_alphanumeric()
-            && character != '+'
-            && !shapes
-                .iter()
-                .any(|shape| shape.separators.contains(&character))
-    }) {
-        let normalized: String = raw
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .collect();
-        for shape in &shapes {
-            let matches_window = if shape.max_groups.is_some() {
-                raw_matches_grouped_exclude_shape(raw, shape)
-            } else {
-                normalized_matches_exclude_shape_window(&normalized, shape)
-            };
-            if matches_window {
-                blocked.extend(
-                    raw.split(|character: char| !character.is_ascii_alphanumeric())
-                        .filter(|fragment| !fragment.is_empty())
-                        .map(|fragment| fragment.to_ascii_uppercase()),
-                );
+    let groups: Vec<&str> = question
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '+')
+        .filter(|group| !group.is_empty())
+        .collect();
+    for shape in &shapes {
+        if shape.max_groups.is_some() {
+            blocked.extend(grouped_exclude_shape_fragments(&groups, shape));
+        } else {
+            for group in &groups {
+                let normalized: String = group
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .collect();
+                if normalized_matches_exclude_shape_window(&normalized, shape) {
+                    blocked.insert(group.to_ascii_uppercase());
+                }
             }
         }
     }
@@ -799,30 +813,40 @@ fn normalized_matches_exclude_shape_window(normalized: &str, shape: &ExcludeShap
     })
 }
 
-fn raw_matches_grouped_exclude_shape(raw: &str, shape: &ExcludeShape) -> bool {
+fn grouped_exclude_shape_fragments(groups: &[&str], shape: &ExcludeShape) -> Vec<String> {
     let (Some(max_groups), Some(group_min_len), Some(group_max_len)) =
         (shape.max_groups, shape.group_min_len, shape.group_max_len)
     else {
-        return false;
+        return Vec::new();
     };
-    let groups: Vec<String> = raw
-        .split(|character| shape.separators.contains(&character))
-        .map(|group| {
-            group
-                .chars()
-                .filter(|character| character.is_ascii_alphanumeric())
-                .collect()
-        })
-        .collect();
-    !groups.is_empty()
-        && groups.len() <= max_groups as usize
-        && groups
-            .iter()
-            .all(|group| (group_min_len as usize..=group_max_len as usize).contains(&group.len()))
-        && (0..groups.len()).any(|start| {
-            let candidate: String = groups[start..].concat();
-            normalized_matches_exclude_shape(&candidate, shape)
-        })
+    let mut blocked = Vec::new();
+    for start in 0..groups.len() {
+        for group_count in 1..=max_groups as usize {
+            let Some(candidate_groups) = groups.get(start..start + group_count) else {
+                break;
+            };
+            let normalized_groups: Vec<String> = candidate_groups
+                .iter()
+                .map(|group| {
+                    group
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric())
+                        .collect()
+                })
+                .collect();
+            if normalized_groups.iter().all(|group| {
+                (group_min_len as usize..=group_max_len as usize).contains(&group.len())
+            }) && normalized_matches_exclude_shape(&normalized_groups.concat(), shape)
+            {
+                blocked.extend(
+                    candidate_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+        }
+    }
+    blocked
 }
 
 fn normalized_matches_exclude_shape(normalized: &str, shape: &ExcludeShape) -> bool {
@@ -1991,9 +2015,9 @@ mod tests {
                     "exclude_shapes": [
                         {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
                         {
-                            "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                            "min_len": 16, "max_len": 16, "charset": "ascii_alnum",
                             "separators": [" "], "max_groups": 4,
-                            "group_min_len": 4, "group_max_len": 5
+                            "group_min_len": 4, "group_max_len": 4
                         },
                         {
                             "min_len": 11, "max_len": 11, "charset": "digits",
@@ -2015,15 +2039,29 @@ mod tests {
             extract_pack_tokens("B2040 是什么故障", &rules),
             vec!["b2040"]
         );
+        assert_eq!(
+            extract_pack_tokens("What does B2033 mean", &rules),
+            vec!["b2033"]
+        );
         assert!(extract_pack_tokens("故障码2033年", &rules).is_empty());
         assert!(extract_pack_tokens("2023年", &rules).is_empty());
+        // fictional
         assert!(extract_pack_tokens("LTEST000000000001", &rules).is_empty());
+        // fictional
         assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
         assert_eq!(extract_pack_tokens("故障码 2033", &rules), vec!["2033"]);
         // fictional
         assert!(extract_pack_tokens("+86 199 0000 0000", &rules).is_empty());
         // fictional
-        assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
+        assert!(extract_pack_tokens("VINA 0000 0000 0001", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("B2033 VINA 0000 0000 0001", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert!(extract_pack_tokens("prefix VINA 0000 0000 0001 suffix", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("prefix 199 0000 0000 suffix", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
@@ -2040,6 +2078,7 @@ mod tests {
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":17,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","max_groups":2}]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":0,"group_min_len":4,"group_max_len":4}]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":2,"group_min_len":4,"group_max_len":9}]}]}}),
         ] {
             assert!(validate_keyword_retrieval_config(&patch).is_err());
         }
@@ -2055,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn grouped_exclude_shapes_do_not_match_extra_groups() {
+    fn grouped_exclude_shapes_match_sliding_group_windows() {
         let shape = ExcludeShape {
             min_len: 8,
             max_len: 8,
@@ -2066,8 +2105,11 @@ mod tests {
             group_min_len: Some(8),
             group_max_len: Some(8),
         };
-        assert!(raw_matches_grouped_exclude_shape("ABCDEFGH", &shape));
-        assert!(!raw_matches_grouped_exclude_shape("ABCD EFGH", &shape));
+        assert_eq!(
+            grouped_exclude_shape_fragments(&["ABCDEFGH"], &shape),
+            vec!["ABCDEFGH"]
+        );
+        assert!(grouped_exclude_shape_fragments(&["ABCD", "EFGH"], &shape).is_empty());
     }
 
     #[test]
@@ -2094,7 +2136,8 @@ mod tests {
         let rules = pack_token_rules(&pack);
         assert_eq!(extract_pack_tokens("TKT-0002", &rules), vec!["tkt-0002"]);
         assert_eq!(extract_pack_tokens("TKT0002", &rules), vec!["tkt-0002"]);
-        assert_eq!(extract_pack_tokens("TKT_0002", &rules), vec!["tkt_0002"]);
+        assert_eq!(extract_pack_tokens("TKT_0002", &rules), vec!["tkt-0002"]);
+        assert!(extract_pack_tokens("TKT-2033年", &rules).is_empty());
     }
 
     #[test]

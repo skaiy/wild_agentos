@@ -1001,21 +1001,30 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         let ids = if filters.is_empty() {
             self.metadata.all_ids()
         } else {
-            evaluate_filters(&self.metadata, filters)
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
+            match evaluate_filters(&self.metadata, filters) {
+                Some(ids) => ids.into_iter().collect(),
+                None => Vec::new(),
+            }
         };
-        Ok(ids
+        let mut hits = ids
             .into_iter()
-            .take(limit)
-            .map(|id| SearchHit {
-                id,
-                iri: reg.lookup(id).unwrap_or_default(),
-                score: 0.0,
-                payload: self.metadata.get_payload(id),
+            .map(|id| {
+                let iri = reg.lookup(id).ok_or_else(|| {
+                    EngineError::internal(format!(
+                        "missing IRI registry entry for filtered ID {id}"
+                    ))
+                })?;
+                Ok(SearchHit {
+                    id,
+                    iri,
+                    score: 0.0,
+                    payload: self.metadata.get_payload(id),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        hits.sort_by(|left, right| left.iri.cmp(&right.iri).then(left.id.cmp(&right.id)));
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     // ── Checkpoint ──────────────────────────────────────────────────────────
@@ -1423,6 +1432,44 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|h| h.iri == "doc:1"));
         assert!(results.iter().any(|h| h.iri == "note:1"));
+    }
+
+    #[tokio::test]
+    async fn list_filtered_sorts_before_limiting_and_propagates_missing_iris() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = setup_async_engine(dir.path());
+        eng.insert(
+            "z-last",
+            v(vec![1.0, 0.0, 0.0, 0.0]),
+            json!({"tags": ["sorted"]}),
+        )
+        .await
+        .unwrap();
+        eng.insert(
+            "a-first",
+            v(vec![0.0, 1.0, 0.0, 0.0]),
+            json!({"tags": ["sorted"]}),
+        )
+        .await
+        .unwrap();
+
+        let filter = JsonLdFilter::tag("tags", "sorted");
+        let results = eng.list_filtered(&[filter], 1).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].iri, "a-first");
+
+        let missing_id = eng.resolve_iri("z-last").await.unwrap().unwrap();
+        {
+            let mut registry = eng.iri_registry.lock().unwrap();
+            registry.iri_to_id.remove("z-last");
+            registry.id_to_iri.remove(&missing_id);
+        }
+
+        assert!(matches!(
+            eng.list_filtered(&[], 10).await,
+            Err(EngineError::Internal { message })
+                if message.contains("missing IRI registry entry")
+        ));
     }
 
     #[tokio::test]
