@@ -395,7 +395,26 @@ struct PackTokenRule {
     prefixes: Vec<String>,
     digit_count: usize,
     excluded_suffixes: Vec<String>,
-    excluded_shapes: HashSet<String>,
+    excluded_shapes: Vec<ExcludeShape>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShapeCharset {
+    Digits,
+    AsciiAlnum,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExcludeShape {
+    min_len: u8,
+    max_len: u8,
+    charset: ShapeCharset,
+    #[serde(default)]
+    separators: Vec<char>,
+    #[serde(default)]
+    leading: Option<char>,
 }
 
 async fn mounted_pack_vector_searches(
@@ -475,11 +494,7 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
         if !(1..=16).contains(&digit_count) {
             return Err("digit_count must be in 1..=16".into());
         }
-        for (field, prefixes) in [
-            ("prefixes", true),
-            ("exclude_followed_by", false),
-            ("exclude_shapes", false),
-        ] {
+        for (field, prefixes) in [("prefixes", true), ("exclude_followed_by", false)] {
             let values = object
                 .get(field)
                 .and_then(Value::as_array)
@@ -503,17 +518,21 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
                 {
                     return Err("prefixes must use configured ASCII separators".into());
                 }
-                if field == "exclude_shapes"
-                    && !matches!(
-                        value,
-                        "ascii_alphanumeric_run_16_17"
-                            | "eleven_digit_run"
-                            | "separated_eleven_digit_run"
-                    )
-                {
-                    return Err(format!("unknown exclude_shapes value: {value}"));
-                }
             }
+        }
+        let shapes = object
+            .get("exclude_shapes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "exclude_shapes is required".to_string())?;
+        if shapes.len() > MAX_PACK_TOKEN_RULE_VALUES {
+            return Err(format!(
+                "exclude_shapes exceeds {MAX_PACK_TOKEN_RULE_VALUES} values"
+            ));
+        }
+        for shape in shapes {
+            let shape: ExcludeShape = serde_json::from_value(shape.clone())
+                .map_err(|error| format!("invalid exclude_shapes value: {error}"))?;
+            validate_exclude_shape(&shape)?;
         }
     }
     Ok(())
@@ -542,17 +561,12 @@ fn pack_token_rules(pack: &Value) -> Vec<PackTokenRule> {
                 .filter(|count| (1..=16).contains(count))?;
             let prefixes = pack_rule_strings(object.get("prefixes"), true)?;
             let excluded_suffixes = pack_rule_strings(object.get("exclude_followed_by"), false)?;
-            let excluded_shapes = pack_rule_strings(object.get("exclude_shapes"), false)?
-                .into_iter()
-                .filter(|shape| {
-                    matches!(
-                        shape.as_str(),
-                        "ascii_alphanumeric_run_16_17"
-                            | "eleven_digit_run"
-                            | "separated_eleven_digit_run"
-                    )
-                })
-                .collect();
+            let excluded_shapes = object
+                .get("exclude_shapes")?
+                .as_array()?
+                .iter()
+                .map(|shape| serde_json::from_value::<ExcludeShape>(shape.clone()).ok())
+                .collect::<Option<Vec<_>>>()?;
             Some(PackTokenRule {
                 prefixes,
                 digit_count,
@@ -561,6 +575,29 @@ fn pack_token_rules(pack: &Value) -> Vec<PackTokenRule> {
             })
         })
         .collect()
+}
+
+fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
+    if shape.min_len == 0 || shape.min_len > shape.max_len || shape.max_len > 64 {
+        return Err("exclude shape length must be within 1..=64".into());
+    }
+    if shape
+        .separators
+        .iter()
+        .any(|separator| !matches!(separator, ' ' | '-' | '_' | '/'))
+    {
+        return Err("exclude shape has an invalid separator".into());
+    }
+    if let Some(leading) = shape.leading {
+        let valid = match shape.charset {
+            ShapeCharset::Digits => leading.is_ascii_digit(),
+            ShapeCharset::AsciiAlnum => leading.is_ascii_alphanumeric(),
+        };
+        if !valid {
+            return Err("exclude shape leading character conflicts with charset".into());
+        }
+    }
+    Ok(())
 }
 
 fn pack_rule_strings(value: Option<&Value>, prefixes: bool) -> Option<Vec<String>> {
@@ -595,7 +632,6 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
     if rules.is_empty() {
         return Vec::new();
     }
-    let separated_fragments = separated_eleven_digit_fragments(question);
     let mut tokens = Vec::new();
     let mut current = String::new();
     let flush = |current: &mut String, following: &str, tokens: &mut Vec<String>| {
@@ -605,7 +641,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         let upper = current.to_ascii_uppercase();
         if rules
             .iter()
-            .any(|rule| token_matches_rule(&upper, following, rule, &separated_fragments))
+            .any(|rule| token_matches_rule(&upper, following, rule))
         {
             tokens.push(upper.to_ascii_lowercase());
         }
@@ -631,12 +667,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
     tokens
 }
 
-fn token_matches_rule(
-    token: &str,
-    following: &str,
-    rule: &PackTokenRule,
-    separated_fragments: &HashSet<String>,
-) -> bool {
+fn token_matches_rule(token: &str, following: &str, rule: &PackTokenRule) -> bool {
     let prefix_matches = if rule.prefixes.is_empty() {
         token.len() == rule.digit_count && token.bytes().all(|byte| byte.is_ascii_digit())
     } else {
@@ -650,19 +681,30 @@ fn token_matches_rule(
         return false;
     }
     if excluded_by_suffix(following, &rule.excluded_suffixes)
-        || (rule
+        || rule
             .excluded_shapes
-            .contains("ascii_alphanumeric_run_16_17")
-            && (16..=17).contains(&token.len()))
-        || (rule.excluded_shapes.contains("eleven_digit_run")
-            && token.len() == 11
-            && token.bytes().all(|byte| byte.is_ascii_digit()))
-        || (rule.excluded_shapes.contains("separated_eleven_digit_run")
-            && separated_fragments.contains(token))
+            .iter()
+            .any(|shape| token_matches_exclude_shape(token, shape))
     {
         return false;
     }
     true
+}
+
+fn token_matches_exclude_shape(token: &str, shape: &ExcludeShape) -> bool {
+    let normalized: String = token
+        .chars()
+        .filter(|character| !shape.separators.contains(character))
+        .collect();
+    let length = normalized.len();
+    (shape.min_len as usize..=shape.max_len as usize).contains(&length)
+        && normalized.chars().all(|character| match shape.charset {
+            ShapeCharset::Digits => character.is_ascii_digit(),
+            ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
+        })
+        && shape
+            .leading
+            .is_none_or(|leading| normalized.starts_with(leading))
 }
 
 fn excluded_by_suffix(following: &str, suffixes: &[String]) -> bool {
@@ -677,29 +719,6 @@ fn excluded_by_suffix(following: &str, suffixes: &[String]) -> bool {
         remaining = &remaining[character.len_utf8()..];
     }
     suffixes.iter().any(|suffix| remaining.starts_with(suffix))
-}
-
-fn separated_eleven_digit_fragments(message: &str) -> HashSet<String> {
-    let groups: Vec<String> = message
-        .split(|character: char| !character.is_ascii_digit())
-        .filter(|group| !group.is_empty())
-        .map(str::to_string)
-        .collect();
-    let mut fragments = HashSet::new();
-    for start in 0..groups.len() {
-        let mut digits = String::new();
-        for end in start..groups.len().min(start + 4) {
-            digits.push_str(&groups[end]);
-            if digits.len() == 11 && digits.starts_with('1') {
-                fragments.extend(groups[start..=end].iter().cloned());
-                break;
-            }
-            if digits.len() >= 11 {
-                break;
-            }
-        }
-    }
-    fragments
 }
 
 async fn pack_scoped_vector_hits(
@@ -1786,9 +1805,8 @@ mod tests {
                     "digit_count": 4,
                     "exclude_followed_by": ["年", "年份", "年款"],
                     "exclude_shapes": [
-                        "ascii_alphanumeric_run_16_17",
-                        "eleven_digit_run",
-                        "separated_eleven_digit_run"
+                        {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
+                        {"min_len": 11, "max_len": 11, "charset": "digits", "leading": "1", "separators": ["-", " "]}
                     ]
                 }]
             }
@@ -1808,7 +1826,7 @@ mod tests {
 
     #[test]
     fn keyword_retrieval_configuration_rejects_invalid_rules() {
-        let base = || json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}});
+        let base = || json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
         for patch in [
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["unknown"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":[],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
@@ -1830,7 +1848,7 @@ mod tests {
 
     #[test]
     fn pack_token_rules_try_overlapping_prefixes() {
-        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["B", "BA"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}});
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["B", "BA"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
         assert_eq!(
             extract_pack_tokens("BA1234", &pack_token_rules(&pack)),
             vec!["ba1234"]
@@ -1839,7 +1857,7 @@ mod tests {
 
     #[test]
     fn pack_token_rules_support_separator_prefixes() {
-        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["TKT-"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}});
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["TKT-"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
         assert_eq!(
             extract_pack_tokens("TKT-0002", &pack_token_rules(&pack)),
             vec!["tkt-0002"]
@@ -1928,7 +1946,7 @@ mod tests {
                         "prefixes": ["B"],
                         "digit_count": 4,
                         "exclude_followed_by": ["年", "年份", "年款"],
-                    "exclude_shapes": ["ascii_alphanumeric_run_16_17"]
+                    "exclude_shapes": [{"min_len": 16, "max_len": 17, "charset": "ascii_alnum"}]
                     }]
                 }
             }),
@@ -1941,7 +1959,7 @@ mod tests {
                         "prefixes": ["B"],
                         "digit_count": 4,
                         "exclude_followed_by": ["年", "年份", "年款"],
-                    "exclude_shapes": ["ascii_alphanumeric_run_16_17"]
+                    "exclude_shapes": [{"min_len": 16, "max_len": 17, "charset": "ascii_alnum"}]
                     }]
                 }
             }),
