@@ -650,9 +650,29 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         current.clear();
     };
     for (index, character) in question.char_indices() {
-        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '/') {
+        if character.is_ascii_alphanumeric() {
             current.push(character);
         } else {
+            if matches!(character, '-' | '_' | '/') {
+                let following = &question[index..];
+                for rule in rules {
+                    for prefix in &rule.prefixes {
+                        let Some(separator) = prefix.chars().last() else {
+                            continue;
+                        };
+                        let stem = &prefix[..prefix.len() - separator.len_utf8()];
+                        if separator == character && current.eq_ignore_ascii_case(stem) {
+                            let digits: String = following[separator.len_utf8()..]
+                                .chars()
+                                .take_while(|next| next.is_ascii_digit())
+                                .collect();
+                            if digits.len() == rule.digit_count {
+                                tokens.push(format!("{prefix}{digits}").to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
             flush(&mut current, &question[index..], &mut tokens);
         }
     }
@@ -1917,6 +1937,19 @@ mod tests {
         assert_eq!(
             extract_pack_tokens("TKT-0002", &pack_token_rules(&pack)),
             vec!["tkt-0002"]
+        );
+    }
+
+    #[test]
+    fn pack_token_rules_do_not_globally_join_separators() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
+        assert_eq!(
+            extract_pack_tokens("B2033/B2034", &pack_token_rules(&pack)),
+            vec!["b2033", "b2034"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033-01", &pack_token_rules(&pack)),
+            vec!["b2033"]
         );
     }
 
