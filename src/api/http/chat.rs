@@ -629,17 +629,16 @@ fn token_matches_rule(
     rule: &PackTokenRule,
     separated_fragments: &HashSet<String>,
 ) -> bool {
-    let prefix_matches =
-        rule.prefixes.is_empty() || rule.prefixes.iter().any(|prefix| token.starts_with(prefix));
+    let prefix_matches = if rule.prefixes.is_empty() {
+        token.len() == rule.digit_count && token.bytes().all(|byte| byte.is_ascii_digit())
+    } else {
+        rule.prefixes.iter().any(|prefix| {
+            token.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.len() == rule.digit_count && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+    };
     if !prefix_matches {
-        return false;
-    }
-    let suffix = rule
-        .prefixes
-        .iter()
-        .find_map(|prefix| token.strip_prefix(prefix))
-        .unwrap_or(token);
-    if suffix.len() != rule.digit_count || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }
     if excluded_by_suffix(following, &rule.excluded_suffixes)
@@ -1807,6 +1806,15 @@ mod tests {
         );
         assert!(validate_keyword_retrieval_config(&too_many).is_err());
         assert!(validate_keyword_retrieval_config(&json!({"builtin": false})).is_ok());
+    }
+
+    #[test]
+    fn pack_token_rules_try_overlapping_prefixes() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["B", "BA"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}});
+        assert_eq!(
+            extract_pack_tokens("BA1234", &pack_token_rules(&pack)),
+            vec!["ba1234"]
+        );
     }
 
     #[tokio::test]
