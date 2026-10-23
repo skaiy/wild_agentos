@@ -1072,6 +1072,21 @@ mod tests {
             .unwrap()
     }
 
+    fn setup_engine_with_dimension(
+        dir: &Path,
+        dim: usize,
+        config: HnswConfig,
+    ) -> HyperspaceEngineImpl {
+        HyperspaceEngineImpl::open(
+            dir,
+            WalSyncMode::Strict,
+            dim,
+            Box::new(CosineMetric),
+            config,
+        )
+        .unwrap()
+    }
+
     fn v(coords: Vec<f64>) -> EmbeddingVector {
         EmbeddingVector::new_unchecked(coords, MetricKind::Cosine)
     }
@@ -1083,6 +1098,34 @@ mod tests {
     fn sequential_unit_vector(index: usize, total: usize) -> EmbeddingVector {
         let angle = (index + 1) as f64 * std::f64::consts::FRAC_PI_2 / (total + 1) as f64;
         v(vec![angle.cos(), angle.sin(), 0.0, 0.0])
+    }
+
+    fn synthetic_1024d_vector(index: usize, total: usize) -> EmbeddingVector {
+        let angle = (index + 1) as f64 * std::f64::consts::FRAC_PI_2 / (total + 1) as f64;
+        let mut coords = vec![0.0; 1024];
+        coords[0] = angle.cos();
+        coords[1] = angle.sin();
+        EmbeddingVector::new_unchecked(coords, MetricKind::Cosine)
+    }
+
+    async fn assert_filtered_self_recall(
+        engine: &HyperspaceEngineImpl,
+        entries: &[(String, String, usize)],
+    ) {
+        for (iri, tag, vector_index) in entries {
+            let query = synthetic_1024d_vector(*vector_index, entries.len());
+            let filter = JsonLdFilter::tag("tags", tag);
+            assert_eq!(
+                engine
+                    .search(&query, 1, std::slice::from_ref(&filter))
+                    .await
+                    .unwrap()
+                    .first()
+                    .map(|hit| hit.iri.as_str()),
+                Some(iri.as_str()),
+                "tag-filtered search should return {iri} as its own nearest neighbor"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1441,6 +1484,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_1024d_multi_collection_filtered_self_recall_survives_restart() {
+        const LARGE_COLLECTION_SIZE: usize = 3_000;
+        const SMALL_COLLECTION_SIZES: [usize; 3] = [3, 11, 50];
+        let total = LARGE_COLLECTION_SIZE + SMALL_COLLECTION_SIZES.iter().sum::<usize>();
+        let config = HnswConfig {
+            m: 16,
+            ef_search: 50,
+            ..HnswConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = Vec::with_capacity(total);
+
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            let mut vector_index = 0;
+            for (tag, collection_size) in
+                std::iter::once(("synthetic-large", LARGE_COLLECTION_SIZE)).chain(
+                    SMALL_COLLECTION_SIZES
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &size)| {
+                            (
+                                match index {
+                                    0 => "synthetic-small-a",
+                                    1 => "synthetic-small-b",
+                                    _ => "synthetic-small-c",
+                                },
+                                size,
+                            )
+                        }),
+                )
+            {
+                for local_index in 0..collection_size {
+                    let iri = format!("synthetic:{tag}:{local_index}");
+                    engine
+                        .insert(
+                            &iri,
+                            synthetic_1024d_vector(vector_index, total),
+                            json!({"tags": [tag]}),
+                        )
+                        .await
+                        .unwrap();
+                    entries.push((iri, tag.to_owned(), vector_index));
+                    vector_index += 1;
+                }
+            }
+            assert_filtered_self_recall(&engine, &entries).await;
+        }
+
+        // Reopening without a checkpoint exercises WAL replay.
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            assert_filtered_self_recall(&engine, &entries).await;
+            engine.checkpoint().await.unwrap();
+        }
+
+        // Reopening after a checkpoint exercises snapshot graph restoration.
+        let engine = setup_engine_with_dimension(dir.path(), 1024, config);
+        assert_filtered_self_recall(&engine, &entries).await;
     }
 
     #[tokio::test]
