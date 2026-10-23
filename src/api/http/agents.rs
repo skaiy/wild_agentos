@@ -1300,6 +1300,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_mounts_reject_invalid_pack_rules_before_persistence() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let state = test_state(temp.path());
+        *state.knowledge_packs.write().await = vec![json!({
+            "id": "invalid-pack",
+            "builtin": false,
+            "keyword_retrieval": {"rules": [{"mode": "x"}]}
+        })];
+        let router = Router::new()
+            .route("/api/v1/agents", post(create_agent_handler))
+            .route("/api/v1/agents/:id", put(update_agent_handler))
+            .with_state(state.clone());
+        let token = jwt("tenant-a", "project-a");
+        let (status, _) = request(
+            &router,
+            Request::builder().method("POST").uri("/api/v1/agents")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"id":"blocked-agent","name":"Blocked","knowledge_pack_ids":["invalid-pack"]}).to_string())).unwrap(),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!state
+            .user_agents
+            .read()
+            .await
+            .iter()
+            .any(|agent| agent["id"] == "blocked-agent"));
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/agents/agent-a")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"knowledge_pack_ids":["invalid-pack"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(state
+            .user_agents
+            .read()
+            .await
+            .iter()
+            .find(|agent| agent["id"] == "agent-a")
+            .unwrap()
+            .get("knowledge_pack_ids")
+            .is_none());
+        restore_env("AGENTOS_AUTH_MODE", previous_auth_mode);
+        restore_env("AGENTOS_JWT_SECRET", previous_jwt_secret);
+    }
+
+    #[tokio::test]
     async fn definition_validation_bounds_models_and_secrets() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(temp.path());
