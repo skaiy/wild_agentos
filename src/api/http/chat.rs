@@ -25,7 +25,7 @@ use crate::knowledge_graph::ontology_layer::{
     EV_REPAIR_RUNTIME_ASSET_ID,
 };
 use crate::knowledge_graph::store::KnowledgeGraphStore;
-use crate::memory::hyperspace_store::{HybridSearchFilter, ScoredEntry};
+use crate::memory::hyperspace_store::{HybridSearchFilter, MatchKind, ScoredEntry};
 
 use super::agents::resolve_definition_revision;
 use super::api_gov;
@@ -367,11 +367,18 @@ fn system_chat_message(content: impl Into<ChatContent>) -> ChatMessage {
 fn format_vector_hits_section(hits: &[ScoredEntry]) -> String {
     let mut section = String::from("【向量知识库检索结果】\n");
     for hit in hits {
-        section.push_str(&format!(
-            "- （相关度 {:.2}）{}\n",
-            hit.score,
-            truncate_retrieval_fact(&hit.text, 400)
-        ));
+        if hit.match_kind == MatchKind::Exact {
+            section.push_str(&format!(
+                "- （精确匹配）{}\n",
+                truncate_retrieval_fact(&hit.text, 400)
+            ));
+        } else {
+            section.push_str(&format!(
+                "- （相关度 {:.2}）{}\n",
+                hit.score,
+                truncate_retrieval_fact(&hit.text, 400)
+            ));
+        }
     }
     section
 }
@@ -645,7 +652,7 @@ async fn pack_scoped_vector_hits(
             {
                 Ok(mut batch) => {
                     for hit in &mut batch {
-                        hit.score = f32::NAN;
+                        hit.match_kind = MatchKind::Exact;
                     }
                     exact_hits.extend(batch);
                 }
@@ -693,7 +700,7 @@ async fn pack_scoped_vector_hits(
     exact_hits.append(&mut hits);
     let exact_count = exact_hits
         .iter()
-        .take_while(|hit| hit.score.is_nan())
+        .take_while(|hit| hit.match_kind == MatchKind::Exact)
         .count();
     exact_hits[exact_count..].sort_by(|left, right| {
         right
@@ -1782,7 +1789,9 @@ mod tests {
         assert!(hits
             .first()
             .is_some_and(|hit| hit.text.contains("exact-local")));
-        assert!(hits.first().is_some_and(|hit| hit.score.is_nan()));
+        assert!(hits
+            .first()
+            .is_some_and(|hit| hit.match_kind == MatchKind::Exact));
         assert!(hits.iter().all(|hit| !hit.text.contains("foreign")));
         let _ = std::fs::remove_dir_all(vector_dir);
     }

@@ -15,6 +15,7 @@ use crate::isolation::IsolationClaims;
 use crate::memory::embedding_service::EmbeddingService;
 use crate::CoreError;
 
+const EXACT_SCAN_RECORD_LIMIT: usize = 500;
 /// Search filter combining tag matching, type filtering, and importance range.
 ///
 /// Mirrors the original qdrant-based filter interface for backward compatibility
@@ -108,11 +109,18 @@ pub struct ScoredEntry {
     pub iri: String,
     pub text: String,
     pub score: f32,
+    pub match_kind: MatchKind,
     pub tags: Vec<String>,
     pub importance: Option<f32>,
     pub jsonld_types: Vec<String>,
     /// Unix timestamp (seconds) when this entry was stored
     pub stored_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Vector,
+    Exact,
 }
 
 /// In-memory vector store backed by HyperspaceEngine.
@@ -301,6 +309,7 @@ impl HyperspaceStore {
                     iri: hit.iri,
                     text,
                     score: hit.score,
+                    match_kind: MatchKind::Vector,
                     tags,
                     importance,
                     jsonld_types,
@@ -630,18 +639,36 @@ impl HyperspaceStore {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let candidate_limit = self.count().await?.min(usize::MAX as u64);
-        let query = tokens.join(" ");
-        let mut matches: Vec<ScoredEntry> = self
-            .search_with_claims_and_required_tags(claims, &query, required_tags, candidate_limit)
-            .await?
-            .into_iter()
-            .filter(|entry| {
-                tokens
-                    .iter()
-                    .any(|token| contains_ascii_token(&entry.text, token))
-            })
-            .collect();
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        let total = self.count().await? as usize;
+        if total > EXACT_SCAN_RECORD_LIMIT {
+            warn!(
+                total,
+                cap = EXACT_SCAN_RECORD_LIMIT,
+                "exact retrieval scan cap reached"
+            );
+        }
+        let mut matches: Vec<ScoredEntry> = Self::scored_hits_to_entries(
+            self.engine
+                .list(0, total.min(EXACT_SCAN_RECORD_LIMIT))
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("Hyperspace list: {e}"),
+                })?,
+        )
+        .into_iter()
+        .filter(|entry| {
+            entry.iri.starts_with(&format!("{namespace}#"))
+                && required_tags.iter().all(|tag| entry.tags.contains(tag))
+        })
+        .filter(|entry| {
+            tokens
+                .iter()
+                .any(|token| contains_ascii_token(&entry.text, token))
+        })
+        .collect();
         matches.sort_by(|left, right| left.iri.cmp(&right.iri));
         matches.truncate(limit as usize);
         Ok(matches)

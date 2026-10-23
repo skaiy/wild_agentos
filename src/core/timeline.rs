@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 
-use crate::memory::hyperspace_store::{HybridSearchFilter, HyperspaceStore, ScoredEntry};
+use crate::memory::hyperspace_store::{
+    HybridSearchFilter, HyperspaceStore, MatchKind, ScoredEntry,
+};
 use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::skill_graph::types::SkillGraphNode;
 
@@ -276,6 +278,7 @@ mod tests {
             iri: "x".into(),
             text: "".into(),
             score: 0.9,
+            match_kind: MatchKind::Vector,
             tags: vec![],
             importance: None,
             jsonld_types: vec![],
@@ -293,6 +296,7 @@ mod tests {
                 iri: "old".into(),
                 text: "".into(),
                 score: 0.9,
+                match_kind: MatchKind::Vector,
                 tags: vec![],
                 importance: None,
                 jsonld_types: vec![],
@@ -302,6 +306,7 @@ mod tests {
                 iri: "new".into(),
                 text: "".into(),
                 score: 0.5,
+                match_kind: MatchKind::Vector,
                 tags: vec![],
                 importance: None,
                 jsonld_types: vec![],
