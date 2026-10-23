@@ -368,7 +368,13 @@ pub fn open_vector_store(
     let root = data_dir();
     let vdir = root.join("vector_store");
     if let Err(error) = secure_vector_data_root(&root) {
-        panic!("Unable to secure vector data root; refusing startup: {error}");
+        tracing::error!(
+            expected_mode = "0700",
+            error = %error,
+            "Unable to secure vector data root; refusing startup"
+        );
+        eprintln!("Unable to secure vector data root (expected owner-writable mode 0700); exiting");
+        std::process::exit(1);
     }
     match HyperspaceStore::open(&vdir, embed) {
         Ok(s) => Arc::new(arc_swap::ArcSwapOption::from_pointee(s)),
