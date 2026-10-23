@@ -499,7 +499,7 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
                 .get(field)
                 .and_then(Value::as_array)
                 .ok_or_else(|| format!("{field} is required"))?;
-            if values.is_empty() || values.len() > MAX_PACK_TOKEN_RULE_VALUES {
+            if (values.is_empty() && !prefixes) || values.len() > MAX_PACK_TOKEN_RULE_VALUES {
                 return Err(format!(
                     "{field} exceeds {MAX_PACK_TOKEN_RULE_VALUES} values"
                 ));
@@ -632,6 +632,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
     if rules.is_empty() {
         return Vec::new();
     }
+    let blocked_fragments = excluded_raw_run_fragments(question, rules);
     let mut tokens = Vec::new();
     let mut current = String::new();
     let flush = |current: &mut String, following: &str, tokens: &mut Vec<String>| {
@@ -642,6 +643,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         if rules
             .iter()
             .any(|rule| token_matches_rule(&upper, following, rule))
+            && !blocked_fragments.contains(&upper)
         {
             tokens.push(upper.to_ascii_lowercase());
         }
@@ -665,6 +667,52 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         tokens.truncate(MAX_PACK_EXTRACTED_TOKENS);
     }
     tokens
+}
+
+fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSet<String> {
+    let shapes: Vec<&ExcludeShape> = rules
+        .iter()
+        .flat_map(|rule| rule.excluded_shapes.iter())
+        .filter(|shape| {
+            matches!(shape.charset, ShapeCharset::Digits) && !shape.separators.is_empty()
+        })
+        .collect();
+    if shapes.is_empty() {
+        return HashSet::new();
+    }
+    let mut blocked = HashSet::new();
+    for raw in question.split(|character: char| {
+        !character.is_ascii_digit()
+            && character != '+'
+            && !shapes
+                .iter()
+                .any(|shape| shape.separators.contains(&character))
+    }) {
+        let digits: String = raw
+            .chars()
+            .filter(|character| character.is_ascii_digit())
+            .collect();
+        for shape in &shapes {
+            let matches_window = (shape.min_len as usize..=shape.max_len as usize).any(|length| {
+                digits.as_bytes().windows(length).any(|window| {
+                    std::str::from_utf8(window).ok().is_some_and(|candidate| {
+                        candidate.bytes().all(|byte| byte.is_ascii_digit())
+                            && shape
+                                .leading
+                                .is_none_or(|leading| candidate.starts_with(leading))
+                    })
+                })
+            });
+            if matches_window {
+                blocked.extend(
+                    raw.split(|character: char| !character.is_ascii_digit())
+                        .filter(|fragment| !fragment.is_empty())
+                        .map(|fragment| fragment.to_ascii_uppercase()),
+                );
+            }
+        }
+    }
+    blocked
 }
 
 fn token_matches_rule(token: &str, following: &str, rule: &PackTokenRule) -> bool {
@@ -1808,6 +1856,11 @@ mod tests {
                         {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
                         {"min_len": 11, "max_len": 11, "charset": "digits", "leading": "1", "separators": ["-", " "]}
                     ]
+                }, {
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年", "年份", "年款"],
+                    "exclude_shapes": []
                 }]
             }
         });
@@ -1821,6 +1874,9 @@ mod tests {
         assert!(extract_pack_tokens("2023年", &rules).is_empty());
         assert!(extract_pack_tokens("LTEST000000000001", &rules).is_empty());
         assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
+        assert_eq!(extract_pack_tokens("故障码 2033", &rules), vec!["2033"]);
+        // fictional
+        assert!(extract_pack_tokens("+86 199 0000 0000", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
@@ -1829,7 +1885,7 @@ mod tests {
         let base = || json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
         for patch in [
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["unknown"]}]}}),
-            json!({"keyword_retrieval":{"rules":[{"prefixes":[],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":[],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["非"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":0,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":17,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
