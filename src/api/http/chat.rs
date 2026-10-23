@@ -781,21 +781,29 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
         return HashSet::new();
     }
     let mut blocked = HashSet::new();
-    let groups: Vec<&str> = question
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '+')
-        .filter(|group| !group.is_empty())
-        .collect();
     for shape in &shapes {
         if shape.max_groups.is_some() {
+            let groups: Vec<&str> = question
+                .split(|character| shape.separators.contains(&character))
+                .filter(|group| !group.is_empty())
+                .collect();
             blocked.extend(grouped_exclude_shape_fragments(&groups, shape));
         } else {
-            for group in &groups {
-                let normalized: String = group
+            for raw in question.split(|character: char| {
+                !character.is_ascii_alphanumeric()
+                    && character != '+'
+                    && !shape.separators.contains(&character)
+            }) {
+                let normalized: String = raw
                     .chars()
                     .filter(|character| character.is_ascii_alphanumeric())
                     .collect();
                 if normalized_matches_exclude_shape_window(&normalized, shape) {
-                    blocked.insert(group.to_ascii_uppercase());
+                    blocked.extend(
+                        raw.split(|character: char| !character.is_ascii_alphanumeric())
+                            .filter(|fragment| !fragment.is_empty())
+                            .map(|fragment| fragment.to_ascii_uppercase()),
+                    );
                 }
             }
         }
@@ -834,7 +842,11 @@ fn grouped_exclude_shape_fragments(groups: &[&str], shape: &ExcludeShape) -> Vec
                         .collect()
                 })
                 .collect();
-            if normalized_groups.iter().all(|group| {
+            if candidate_groups.iter().all(|group| {
+                group
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '+')
+            }) && normalized_groups.iter().all(|group| {
                 (group_min_len as usize..=group_max_len as usize).contains(&group.len())
             }) && normalized_matches_exclude_shape(&normalized_groups.concat(), shape)
             {
@@ -2015,9 +2027,10 @@ mod tests {
                     "exclude_shapes": [
                         {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
                         {
-                            "min_len": 16, "max_len": 16, "charset": "ascii_alnum",
+                            "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                            "leading": "L",
                             "separators": [" "], "max_groups": 4,
-                            "group_min_len": 4, "group_max_len": 4
+                            "group_min_len": 4, "group_max_len": 5
                         },
                         {
                             "min_len": 11, "max_len": 11, "charset": "digits",
@@ -2053,15 +2066,17 @@ mod tests {
         // fictional
         assert!(extract_pack_tokens("+86 199 0000 0000", &rules).is_empty());
         // fictional
-        assert!(extract_pack_tokens("VINA 0000 0000 0001", &rules).is_empty());
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
         assert_eq!(
-            extract_pack_tokens("B2033 VINA 0000 0000 0001", &rules),
+            extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules),
             vec!["b2033"]
         );
         // fictional
-        assert!(extract_pack_tokens("prefix VINA 0000 0000 0001 suffix", &rules).is_empty());
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001 trailing words", &rules).is_empty());
         // fictional
-        assert!(extract_pack_tokens("prefix 199 0000 0000 suffix", &rules).is_empty());
+        assert!(extract_pack_tokens("199 0000 0000 trailing words", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("leading words 199 0000 0000", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
@@ -2110,6 +2125,25 @@ mod tests {
             vec!["ABCDEFGH"]
         );
         assert!(grouped_exclude_shape_fragments(&["ABCD", "EFGH"], &shape).is_empty());
+    }
+
+    #[test]
+    fn legacy_separator_exclude_shapes_still_match_across_configured_separators() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": [],
+                    "exclude_shapes": [{
+                        "min_len": 8, "max_len": 8, "charset": "digits",
+                        "separators": ["-"]
+                    }]
+                }]
+            }
+        });
+        // fictional
+        assert!(extract_pack_tokens("1111-2222", &pack_token_rules(&pack)).is_empty());
     }
 
     #[test]

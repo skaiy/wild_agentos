@@ -889,7 +889,7 @@ impl HyperspaceStore {
 fn contains_ascii_token(text: &str, token: &str) -> bool {
     let text = text.to_ascii_lowercase();
     let token = token.to_ascii_lowercase();
-    text.match_indices(&token).any(|(index, _)| {
+    if text.match_indices(&token).any(|(index, _)| {
         let before_is_word = text[..index]
             .chars()
             .next_back()
@@ -900,7 +900,26 @@ fn contains_ascii_token(text: &str, token: &str) -> bool {
             .next()
             .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
         !before_is_word && !after_is_word
-    })
+    }) {
+        return true;
+    }
+
+    let normalized_token = normalize_separator_token(&token);
+    token
+        .chars()
+        .any(|character| matches!(character, '-' | '_' | '/'))
+        && text
+            .split(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '/')
+            })
+            .any(|candidate| normalize_separator_token(candidate) == normalized_token)
+}
+
+fn normalize_separator_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | '/'))
+        .collect()
 }
 
 fn entry_matches_claims_and_tags(
@@ -1151,6 +1170,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.entries[0].text, "B2033");
+    }
+
+    #[tokio::test]
+    async fn exact_matches_normalize_separator_tokens_in_document_text() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        // fictional
+        store
+            .upsert_with_claims(&claims, "separator", "TKT_0002", &["kb:local".into()])
+            .await
+            .unwrap();
+        // fictional
+        store
+            .upsert_with_claims(&claims, "unseparated", "TKT0002", &["kb:local".into()])
+            .await
+            .unwrap();
+
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["tkt-0002".into()],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries.len(), 2);
     }
 
     #[tokio::test]
