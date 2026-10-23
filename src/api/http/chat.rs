@@ -1478,7 +1478,13 @@ mod tests {
                     "builtin": false,
                 }),
             ])),
-            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::from_pointee(
+                HyperspaceStore::open(
+                    &l0.join("vectors"),
+                    Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+                )
+                .unwrap(),
+            )),
             blob_store: None,
             task_executor: None,
             batch_manager: None,
