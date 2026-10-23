@@ -3397,7 +3397,7 @@ mod isolation_contract {
             .header("authorization", format!("Bearer {}", jwt("tenant-b")))
             .body(Body::empty())
             .unwrap();
-        assert_eq!(response_json(&app, b_stats).await.1["triples"], json!(0));
+        assert_eq!(response_json(&app, b_stats).await.0, StatusCode::NOT_FOUND);
 
         let legacy = state
             .kg_store
@@ -3681,7 +3681,7 @@ exit 2
             .route("/kb/:id/reindex", post(reindex_knowledge_base_handler))
             .route("/kb/:id/upload", post(upload_knowledge_base_handler))
             .with_state(state);
-        let token = jwt("tenant-a");
+        let token = jwt_for_scope("tenant-a", Some("default"));
         let requests = [
             ("POST", "/kb/foreign-kb/search", r#"{"query":"x"}"#),
             ("POST", "/kb/foreign-kb/reindex", ""),
