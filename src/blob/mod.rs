@@ -153,12 +153,31 @@ impl BlobStore for LocalFsBlobStore {
                 .map_err(|e| CoreError::Internal {
                     message: format!("blob mkdir: {e}"),
                 })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    .await
+                    .map_err(|e| CoreError::Internal {
+                        message: format!("blob chmod directory: {e}"),
+                    })?;
+            }
         }
         tokio::fs::write(&path, bytes)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("blob write: {e}"),
-            })
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("blob chmod file: {e}"),
+                })?;
+        }
+        Ok(())
     }
     async fn get(&self, claims: &IsolationClaims, key: &str) -> Result<Vec<u8>, CoreError> {
         let path = self.safe_path(&scoped_key(claims, key)?)?;

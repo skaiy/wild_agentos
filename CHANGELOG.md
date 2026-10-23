@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+- Hardened claims-scoped KB retrieval: foreign KB ids now use a uniform
+  not-found response, and KB ownership validation is cached and invalidated on
+  vector mutations.
+- Data-root startup now enforces owner-only (`0700`) permissions and exits
+  cleanly when that requirement cannot be established.
+- Empty embedding provider configuration no longer implicitly selects local
+  fallback embeddings; deployments that require fallback must configure it
+  explicitly.
 - Added the fictional `ev-repair-fault-kb` filesystem example pack (ontology
   anchors, SHACL, Skill, golden I/O, audit samples) with a `knowledge-pack-gate`
   CI job. (#417)
