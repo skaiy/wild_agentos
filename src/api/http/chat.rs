@@ -29,7 +29,7 @@ use crate::memory::hyperspace_store::{HybridSearchFilter, ScoredEntry};
 use super::agents::resolve_definition_revision;
 use super::api_gov;
 use super::iam::UserIdentity;
-use super::kb::kb_vector_tag;
+use super::kb::{kb_vector_tag, VECTOR_RETRIEVAL_UNAVAILABLE};
 use super::AppState;
 
 const PACK_VECTOR_RAG_PER_KB_LIMIT: u64 = 5;
@@ -421,7 +421,7 @@ async fn pack_scoped_vector_hits(
     let Some(store) = state.vector_store.load_full() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": "chat vector retrieval unavailable" }),
+            json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
         ));
     };
     let mut hits = Vec::new();
@@ -445,7 +445,7 @@ async fn pack_scoped_vector_hits(
                 );
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    json!({ "error": "chat vector retrieval unavailable" }),
+                    json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
                 ));
             }
         }
@@ -513,9 +513,10 @@ async fn ev_repair_legacy_vector_section(
         .search_with_claims(claims, question, &HybridSearchFilter::new(), 5)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "chat vector retrieval failed");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": format!("chat vector retrieval failed: {e}") }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
             )
         })?;
     if hits.is_empty() {

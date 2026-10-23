@@ -169,15 +169,15 @@ impl HyperspaceStore {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Embed text, falling back to a zero vector on failure.
-    async fn get_embedding(&self, text: &str) -> Vec<f32> {
-        match self.embed.embed(text).await {
-            Ok(vec) => vec,
-            Err(e) => {
-                warn!(error = %e, "Embedding service failed, using zero vector");
-                vec![0.0f32; self.embed.dimension()]
+    /// Embed text. An unavailable provider must fail retrieval rather than
+    /// silently searching with a placeholder vector.
+    async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+        self.embed.embed(text).await.map_err(|error| {
+            warn!(error = %error, "Embedding service failed; vector operation rejected");
+            CoreError::StorageError {
+                message: "embedding provider unavailable".into(),
             }
-        }
+        })
     }
 
     /// Convert a `HybridSearchFilter` to a `Vec<JsonLdFilter>` for the engine.
@@ -458,7 +458,7 @@ impl HyperspaceStore {
                 message: "vector text must not be empty".into(),
             });
         }
-        let vector = self.get_embedding(text).await;
+        let vector = self.get_embedding(text).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -549,7 +549,7 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vector = self.get_embedding(query).await;
+        let vector = self.get_embedding(query).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -629,7 +629,7 @@ impl HyperspaceStore {
                 message: "vector store integrity check failed; retrieval unavailable".into(),
             });
         }
-        let vector = self.get_embedding(query).await;
+        let vector = self.get_embedding(query).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -766,6 +766,16 @@ impl HyperspaceStore {
         })
     }
 
+    /// Lists persisted records for startup and ownership-integrity validation.
+    pub async fn list(&self, offset: usize, limit: usize) -> Result<Vec<SearchHit>, CoreError> {
+        self.engine
+            .list(offset, limit)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace list: {e}"),
+            })
+    }
+
     /// Resolve an IRI to its numeric point ID (if indexed).
     pub async fn resolve_iri(&self, iri: &str) -> Result<Option<u32>, CoreError> {
         self.engine
@@ -791,7 +801,20 @@ impl HyperspaceStore {
 mod tests {
     use super::*;
     use crate::isolation::IsolationClaims;
-    use crate::memory::embedding_service::FallbackEmbeddingService;
+    use crate::memory::embedding_service::{EmbeddingService, FallbackEmbeddingService};
+
+    struct UnavailableEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for UnavailableEmbeddingService {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Err("unavailable".into())
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
 
     fn setup_store() -> HyperspaceStore {
         let dir = tempfile::tempdir().unwrap();
@@ -828,6 +851,16 @@ mod tests {
         let store = setup_store();
         let results = store.search("nothing", 10).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedding_failure_does_not_search_with_a_placeholder_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            HyperspaceStore::open(dir.path(), Arc::new(UnavailableEmbeddingService)).unwrap();
+        let result = store.search("unavailable provider", 10).await;
+        assert!(result.is_err());
+        assert_eq!(store.count().await.unwrap(), 0);
     }
 
     #[tokio::test]

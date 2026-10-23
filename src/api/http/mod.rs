@@ -332,6 +332,21 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("data"))
 }
 
+/// Creates the persistent vector-store root with owner-only permissions.
+///
+/// Container volumes and bind mounts can create the top-level data directory
+/// after the image is built, so this is deliberately enforced by the process
+/// before the vector engine opens its files.
+fn secure_vector_data_root(root: &std::path::Path) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// 序列化所有依赖进程级环境变量（AGENTOS_DATA_DIR / AGENTOS_AUTH_STRICT）的测试——
 /// 避免并行执行时 env 被相互覆盖导致落盘/读取或鉴权模式错乱。各测试在函数入口取锁并持有到结束。
 #[cfg(test)]
@@ -350,7 +365,12 @@ pub fn open_vector_store(
 ) -> SharedVectorStore {
     let embed =
         crate::memory::embedding_service::create_embedding_service_from_config(embedding, 30);
-    let vdir = data_dir().join("vector_store");
+    let root = data_dir();
+    let vdir = root.join("vector_store");
+    if let Err(error) = secure_vector_data_root(&root) {
+        tracing::warn!(error = %error, "Unable to secure vector data root; vector retrieval disabled");
+        return Arc::new(arc_swap::ArcSwapOption::empty());
+    }
     match HyperspaceStore::open(&vdir, embed) {
         Ok(s) => Arc::new(arc_swap::ArcSwapOption::from_pointee(s)),
         Err(e) => {
@@ -466,6 +486,16 @@ pub fn build_router(
         invocations: invocations_runtime,
         shutdown: shutdown.clone(),
     });
+    if let Some(store) = state.vector_store.load_full() {
+        let state_for_validation = state.clone();
+        tokio::spawn(async move {
+            if !kb::vector_records_match_kb_ownership(&state_for_validation, &store).await {
+                tracing::error!(
+                    "Vector ownership validation failed at startup; KB retrieval will fail closed"
+                );
+            }
+        });
+    }
     tokio::spawn(run_online_corpus_watcher_scheduler(
         state.online_corpus_jobs.clone(),
         online_corpus_watchers,
