@@ -415,7 +415,7 @@ impl IncrementalHNSW {
         allowed: Option<&RoaringBitmap>,
     ) -> Vec<(u32, f64)> {
         if let Some(allowed) = allowed {
-            if allowed.len() <= Self::EXACT_FILTERED_SEARCH_LIMIT {
+            if Self::should_use_exact_filtered_search(allowed) {
                 return self.exact_filtered_search(query, top_k, allowed);
             }
         }
@@ -452,6 +452,10 @@ impl IncrementalHNSW {
         }
         results.truncate(top_k);
         results
+    }
+
+    fn should_use_exact_filtered_search(allowed: &RoaringBitmap) -> bool {
+        allowed.len() <= Self::EXACT_FILTERED_SEARCH_LIMIT
     }
 
     /// Increase the global beam width for a selective filter. This keeps the
@@ -805,6 +809,18 @@ mod tests {
         for (id, _) in &results {
             assert!(allowed.contains(*id), "ID {id} should be in allowed set");
         }
+    }
+
+    #[test]
+    fn test_filtered_exact_search_threshold_includes_5000() {
+        let mut at_limit = RoaringBitmap::new();
+        at_limit.insert_range(0..=4_999);
+        assert!(IncrementalHNSW::should_use_exact_filtered_search(&at_limit));
+
+        at_limit.insert(5_000);
+        assert!(!IncrementalHNSW::should_use_exact_filtered_search(
+            &at_limit
+        ));
     }
 
     fn sequential_unit_vector(index: usize, total: usize) -> EmbeddingVector {

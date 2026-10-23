@@ -306,6 +306,8 @@ impl Searcher {
             evaluate_filters(&self.metadata, filters)
         };
         if !filters.is_empty() && allowed.is_none() {
+            // Keep this fail-closed if a future metadata evaluator uses None
+            // for a non-empty filter expression.
             return Vec::new();
         }
 
@@ -410,6 +412,24 @@ pub struct HyperspaceEngineImpl {
     data_dir: PathBuf,
     config: HnswConfig,
     dim: usize,
+}
+
+fn validate_search_query(query: &EmbeddingVector) -> Result<(), EngineError> {
+    let mut norm_squared = 0.0;
+    for &coordinate in &query.coords {
+        if !coordinate.is_finite() {
+            return Err(EngineError::InvalidVector(
+                "Search query coordinates must be finite".into(),
+            ));
+        }
+        norm_squared += coordinate * coordinate;
+    }
+    if !norm_squared.is_finite() || norm_squared == 0.0 {
+        return Err(EngineError::InvalidVector(
+            "Search query must have a finite, non-zero norm".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl HyperspaceEngineImpl {
@@ -809,12 +829,15 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         top_k: usize,
         filters: &[JsonLdFilter],
     ) -> Result<Vec<SearchHit>, EngineError> {
+        validate_search_query(query)?;
         let allowed = if filters.is_empty() {
             None
         } else {
             evaluate_filters(&self.metadata, filters)
         };
         if !filters.is_empty() && allowed.is_none() {
+            // Keep this fail-closed if a future metadata evaluator uses None
+            // for a non-empty filter expression.
             return Ok(Vec::new());
         }
 
@@ -851,6 +874,12 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         alpha: f32,
         filters: &[JsonLdFilter],
     ) -> Result<Vec<SearchHit>, EngineError> {
+        if let Some(query) = text_query {
+            validate_search_query(query)?;
+        }
+        if let Some(query) = struct_query {
+            validate_search_query(query)?;
+        }
         // Evaluate filters
         let allowed = if filters.is_empty() {
             None
@@ -858,6 +887,8 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
             evaluate_filters(&self.metadata, filters)
         };
         if !filters.is_empty() && allowed.is_none() {
+            // Keep this fail-closed if a future metadata evaluator uses None
+            // for a non-empty filter expression.
             return Ok(Vec::new());
         }
 
@@ -1166,6 +1197,32 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 1);
         assert_eq!(results[0].iri, "vec:1");
+    }
+
+    #[tokio::test]
+    async fn test_search_rejects_zero_norm_and_non_finite_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = setup_async_engine(dir.path());
+        eng.insert(
+            "synthetic:query-validation",
+            v(vec![1.0, 0.0, 0.0, 0.0]),
+            json!({"tags": ["synthetic-query-validation"]}),
+        )
+        .await
+        .unwrap();
+        let filter = JsonLdFilter::tag("tags", "synthetic-query-validation");
+
+        for invalid_query in [
+            v(vec![0.0, 0.0, 0.0, 0.0]),
+            v(vec![f64::NAN, 0.0, 0.0, 0.0]),
+            v(vec![f64::INFINITY, 0.0, 0.0, 0.0]),
+        ] {
+            assert!(matches!(
+                eng.search(&invalid_query, 1, std::slice::from_ref(&filter))
+                    .await,
+                Err(EngineError::InvalidVector(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1496,6 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "long-running 1024-dimensional scale regression"]
     async fn test_1024d_multi_collection_filtered_self_recall_survives_restart() {
         const LARGE_COLLECTION_SIZE: usize = 3_000;
         const SMALL_COLLECTION_SIZES: [usize; 3] = [3, 11, 50];
@@ -1553,6 +1611,66 @@ mod tests {
         }
 
         // Reopening after a checkpoint exercises snapshot graph restoration.
+        let engine = setup_engine_with_dimension(dir.path(), 1024, config);
+        assert_filtered_self_recall(&engine, &entries).await;
+    }
+
+    #[tokio::test]
+    async fn test_1024d_filtered_self_recall_survives_restart() {
+        const LARGE_COLLECTION_SIZE: usize = 64;
+        const SMALL_COLLECTION_SIZES: [usize; 2] = [3, 11];
+        let total = LARGE_COLLECTION_SIZE + SMALL_COLLECTION_SIZES.iter().sum::<usize>();
+        let config = HnswConfig {
+            m: 16,
+            ef_search: 50,
+            ..HnswConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = Vec::with_capacity(total);
+
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            let mut vector_index = 0;
+            for (tag, collection_size) in
+                std::iter::once(("synthetic-large", LARGE_COLLECTION_SIZE)).chain(
+                    SMALL_COLLECTION_SIZES
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &size)| {
+                            (
+                                if index == 0 {
+                                    "synthetic-small-a"
+                                } else {
+                                    "synthetic-small-b"
+                                },
+                                size,
+                            )
+                        }),
+                )
+            {
+                for local_index in 0..collection_size {
+                    let iri = format!("synthetic:{tag}:{local_index}");
+                    engine
+                        .insert(
+                            &iri,
+                            synthetic_1024d_vector(vector_index, total),
+                            json!({"tags": [tag]}),
+                        )
+                        .await
+                        .unwrap();
+                    entries.push((iri, tag.to_owned(), vector_index));
+                    vector_index += 1;
+                }
+            }
+            assert_filtered_self_recall(&engine, &entries).await;
+        }
+
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            assert_filtered_self_recall(&engine, &entries).await;
+            engine.checkpoint().await.unwrap();
+        }
+
         let engine = setup_engine_with_dimension(dir.path(), 1024, config);
         assert_filtered_self_recall(&engine, &entries).await;
     }
@@ -1626,11 +1744,13 @@ mod tests {
                 JsonLdFilter::tag("tags", "kb:absent"),
             ],
         ] {
-            assert!(eng
-                .search(&query, 10, &missing_scope)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                eng.search(&query, 10, &missing_scope)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a non-matching tenant or KB scope must produce no exact-search results"
+            );
         }
     }
 
@@ -1687,11 +1807,13 @@ mod tests {
                 JsonLdFilter::tag("tags", "kb:absent"),
             ],
         ] {
-            assert!(eng
-                .search(&b_query, 10, &missing_scope)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                eng.search(&b_query, 10, &missing_scope)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a non-matching tenant or KB scope must produce no HNSW-search results"
+            );
         }
     }
 

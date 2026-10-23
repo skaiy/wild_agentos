@@ -63,6 +63,7 @@ impl CompiledFilter {
                     .unwrap_or_default(),
             ),
             Self::And(conds) => {
+                // The empty conjunction is the identity: it matches every live ID.
                 let mut result: RoaringBitmap = meta.all_ids().iter().collect();
                 for cond in conds {
                     let Some(matches) = cond.evaluate(meta) else {
@@ -369,6 +370,16 @@ mod tests {
         ]);
         let bm = compile_filter(&filter).evaluate(&meta).unwrap();
         assert!(bm.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_empty_must_matches_all_ids() {
+        let meta = setup_test_index();
+        let bm = compile_filter(&JsonLdFilter::Must(vec![]))
+            .evaluate(&meta)
+            .unwrap();
+        let all_ids: RoaringBitmap = meta.all_ids().iter().collect();
+        assert_eq!(bm, all_ids);
     }
 
     #[test]
