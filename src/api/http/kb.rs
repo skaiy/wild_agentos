@@ -1295,7 +1295,7 @@ pub(crate) async fn search_knowledge_base_handler(
             Json(json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE })),
         );
     }
-    if !vector_records_match_kb_ownership(&store, &[kb.clone()], claims, &id).await {
+    if !vector_records_match_kb_ownership(&store, std::slice::from_ref(&kb), claims, &id).await {
         tracing::error!("KB search rejected because vector ownership validation failed");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
