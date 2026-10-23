@@ -865,7 +865,6 @@ async fn pack_scoped_vector_hits(
             }
         }
     }
-    exact_hits.sort_by(|left, right| left.iri.cmp(&right.iri));
     exact_hits.dedup_by(|left, right| left.iri == right.iri);
     let mut seen_iris = HashSet::new();
     exact_hits.retain(|hit| seen_iris.insert(hit.iri.clone()));

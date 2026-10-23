@@ -1042,6 +1042,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_token_text_ranks_before_containing_text() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "contains",
+                "prefix B2033 suffix",
+                &["kb:local".into()],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(&claims, "exact", "B2033", &["kb:local".into()])
+            .await
+            .unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["b2033".into()],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].text, "B2033");
+    }
+
+    #[tokio::test]
     async fn test_upsert_and_count() {
         let store = setup_store();
         store.upsert("v:1", "hello world", &[]).await.unwrap();
