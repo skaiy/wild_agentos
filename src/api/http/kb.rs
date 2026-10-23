@@ -3683,18 +3683,33 @@ exit 2
             .with_state(state);
         let token = jwt_for_scope("tenant-a", Some("default"));
         let requests = [
-            ("POST", "/kb/foreign-kb/search", r#"{"query":"x"}"#),
-            ("POST", "/kb/foreign-kb/reindex", ""),
-            ("PUT", "/kb/foreign-kb", r#"{"name":"x"}"#),
-            ("DELETE", "/kb/foreign-kb", ""),
-            ("POST", "/kb/foreign-kb/upload", ""),
+            (
+                "POST",
+                "/kb/foreign-kb/search",
+                r#"{"query":"x"}"#,
+                "application/json",
+            ),
+            ("POST", "/kb/foreign-kb/reindex", "", "application/json"),
+            (
+                "PUT",
+                "/kb/foreign-kb",
+                r#"{"name":"x"}"#,
+                "application/json",
+            ),
+            ("DELETE", "/kb/foreign-kb", "", "application/json"),
+            (
+                "POST",
+                "/kb/foreign-kb/upload",
+                "--test--\r\n",
+                "multipart/form-data; boundary=test",
+            ),
         ];
-        for (method, uri, body) in requests {
+        for (method, uri, body, content_type) in requests {
             let request = Request::builder()
                 .method(method)
                 .uri(uri)
                 .header("authorization", format!("Bearer {token}"))
-                .header("content-type", "application/json")
+                .header("content-type", content_type)
                 .body(Body::from(body))
                 .unwrap();
             let (status, body) = raw_response(&app, request).await;
