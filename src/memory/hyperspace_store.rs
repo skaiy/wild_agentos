@@ -648,31 +648,38 @@ impl HyperspaceStore {
                 truncated: false,
             });
         }
-        let total = self.count().await? as usize;
-        let truncated = total > EXACT_SCAN_RECORD_LIMIT;
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        let filter = HybridSearchFilter::new()
+            .with_must_tags(required_tags.to_vec())
+            .with_named_graph(namespace);
+        let filters = self.to_jsonld_filters(&filter);
+        let candidates = self
+            .engine
+            .list_filtered(&filters, EXACT_SCAN_RECORD_LIMIT + 1)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace filtered list: {e}"),
+            })?;
+        let truncated = candidates.len() > EXACT_SCAN_RECORD_LIMIT;
         if truncated {
             warn!(
-                total,
+                scanned = EXACT_SCAN_RECORD_LIMIT,
                 cap = EXACT_SCAN_RECORD_LIMIT,
                 "exact retrieval scan cap reached"
             );
         }
-        let mut matches: Vec<ScoredEntry> = Self::scored_hits_to_entries(
-            self.engine
-                .list(0, total.min(EXACT_SCAN_RECORD_LIMIT))
-                .await
-                .map_err(|e| CoreError::Internal {
-                    message: format!("Hyperspace list: {e}"),
-                })?,
-        )
-        .into_iter()
-        .filter(|entry| entry_matches_claims_and_tags(entry, claims, required_tags))
-        .filter(|entry| {
-            tokens
-                .iter()
-                .any(|token| contains_ascii_token(&entry.text, token))
-        })
-        .collect();
+        let mut matches: Vec<ScoredEntry> = Self::scored_hits_to_entries(candidates)
+            .into_iter()
+            .take(EXACT_SCAN_RECORD_LIMIT)
+            .filter(|entry| entry_matches_claims_and_tags(entry, claims, required_tags))
+            .filter(|entry| {
+                tokens
+                    .iter()
+                    .any(|token| contains_ascii_token(&entry.text, token))
+            })
+            .collect();
         // Stable tiers: an entire chunk equal to a requested token precedes a
         // token merely contained within longer chunk text.
         matches.sort_by_key(|entry| {

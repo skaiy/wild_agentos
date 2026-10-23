@@ -389,6 +389,11 @@ pub trait HyperspaceEngine: Send + Sync {
     async fn get_payload(&self, iri: &str) -> Result<Option<Value>, EngineError>;
     async fn get_vector(&self, iri: &str) -> Result<Option<EmbeddingVector>, EngineError>;
     async fn list(&self, offset: usize, limit: usize) -> Result<Vec<SearchHit>, EngineError>;
+    async fn list_filtered(
+        &self,
+        filters: &[JsonLdFilter],
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, EngineError>;
 
     // ── Maintenance ──
     async fn checkpoint(&self) -> Result<(), EngineError>;
@@ -983,6 +988,32 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
                     score: 0.0,
                     payload,
                 }
+            })
+            .collect())
+    }
+
+    async fn list_filtered(
+        &self,
+        filters: &[JsonLdFilter],
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, EngineError> {
+        let reg = self.iri_registry.lock().unwrap();
+        let ids = if filters.is_empty() {
+            self.metadata.all_ids()
+        } else {
+            evaluate_filters(&self.metadata, filters)
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
+        Ok(ids
+            .into_iter()
+            .take(limit)
+            .map(|id| SearchHit {
+                id,
+                iri: reg.lookup(id).unwrap_or_default(),
+                score: 0.0,
+                payload: self.metadata.get_payload(id),
             })
             .collect())
     }
