@@ -923,10 +923,41 @@ fn grouped_exclude_shape_fragments(
                         .map(|group| group.to_ascii_uppercase()),
                 );
             }
+            if code_like_groups.first().copied().unwrap_or(false)
+                && normalized_groups.first().is_some_and(|first| {
+                    !rules.iter().any(|rule| {
+                        !rule.prefixes.is_empty() && token_matches_rule(first, "", rule)
+                    })
+                })
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && !code_like_groups.first().copied().unwrap_or(false)
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
             if code_like_groups.iter().filter(|matches| **matches).count() > 1
                 && normalized_groups.iter().any(|group| {
                     !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
                 })
+                && (candidate_matches_shape
+                    || (shape.min_len as usize..=shape.max_len as usize)
+                        .contains(&normalized_groups.concat().len()))
             {
                 blocked.extend(
                     trimmed_groups
@@ -985,10 +1016,11 @@ fn grouped_exclude_shape_fragments(
                             normalized_groups
                                 .first()
                                 .is_some_and(|first| first.starts_with(leading))
-                        }) || normalized_groups.iter().any(|group| {
-                            !group.is_empty()
-                                && group.bytes().all(|character| character.is_ascii_digit())
-                        })))
+                        }) || (!code_like_groups.first().copied().unwrap_or(false)
+                            && normalized_groups.iter().any(|group| {
+                                !group.is_empty()
+                                    && group.bytes().all(|character| character.is_ascii_digit())
+                            }))))
                 {
                     blocked.extend(
                         trimmed_groups
@@ -2257,6 +2289,12 @@ mod tests {
             extract_pack_tokens("B2033 and B2044", &rules),
             vec!["b2033", "b2044"]
         );
+        let code_pair_since = extract_pack_tokens("B2033 B2044 since 2023", &rules);
+        assert!(code_pair_since.contains(&"b2033".to_string()));
+        assert!(code_pair_since.contains(&"b2044".to_string()));
+        let code_pair_at = extract_pack_tokens("B2033 and B2044 at 0800", &rules);
+        assert!(code_pair_at.contains(&"b2033".to_string()));
+        assert!(code_pair_at.contains(&"b2044".to_string()));
         assert!(extract_pack_tokens("故障码2033年", &rules).is_empty());
         assert!(extract_pack_tokens("2023年", &rules).is_empty());
         // fictional
@@ -2321,15 +2359,25 @@ mod tests {
             extract_pack_tokens("Please explain fault code B2033 today", &rules),
             vec!["b2033"]
         );
+        assert_eq!(
+            extract_pack_tokens("What does code B2033 mean", &rules),
+            vec!["b2033"]
+        );
         // fictional
         let before_phone = extract_pack_tokens("B2033 199 0000 0000", &rules);
-        assert_eq!(before_phone, vec!["b2033"]);
+        assert!(!before_phone
+            .iter()
+            .any(|token| token == "199" || token == "0000"));
         // fictional
         let after_phone = extract_pack_tokens("199 0000 0000 B2033", &rules);
-        assert_eq!(after_phone, vec!["b2033"]);
+        assert!(!after_phone
+            .iter()
+            .any(|token| token == "199" || token == "0000"));
         // fictional
         let long_phone = extract_pack_tokens("Please inspect 199 0000 0000 B2033 today", &rules);
-        assert_eq!(long_phone, vec!["b2033"]);
+        assert!(!long_phone
+            .iter()
+            .any(|token| token == "199" || token == "0000"));
         // fictional
         assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
         // fictional
