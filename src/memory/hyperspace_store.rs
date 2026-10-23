@@ -642,6 +642,24 @@ impl HyperspaceStore {
         tokens: &[String],
         limit: u64,
     ) -> Result<ExactMatchResult, CoreError> {
+        self.exact_matches_with_claims_and_required_tags_capped(
+            claims,
+            required_tags,
+            tokens,
+            limit,
+            EXACT_SCAN_RECORD_LIMIT,
+        )
+        .await
+    }
+
+    async fn exact_matches_with_claims_and_required_tags_capped(
+        &self,
+        claims: &IsolationClaims,
+        required_tags: &[String],
+        tokens: &[String],
+        limit: u64,
+        scan_cap: usize,
+    ) -> Result<ExactMatchResult, CoreError> {
         if tokens.is_empty() {
             return Ok(ExactMatchResult {
                 entries: Vec::new(),
@@ -657,22 +675,22 @@ impl HyperspaceStore {
         let filters = self.to_jsonld_filters(&filter);
         let candidates = self
             .engine
-            .list_filtered(&filters, EXACT_SCAN_RECORD_LIMIT + 1)
+            .list_filtered(&filters, scan_cap + 1)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("Hyperspace filtered list: {e}"),
             })?;
-        let truncated = candidates.len() > EXACT_SCAN_RECORD_LIMIT;
+        let truncated = candidates.len() > scan_cap;
         if truncated {
             warn!(
-                scanned = EXACT_SCAN_RECORD_LIMIT,
-                cap = EXACT_SCAN_RECORD_LIMIT,
+                scanned = scan_cap,
+                cap = scan_cap,
                 "exact retrieval scan cap reached"
             );
         }
         let mut matches: Vec<ScoredEntry> = Self::scored_hits_to_entries(candidates)
             .into_iter()
-            .take(EXACT_SCAN_RECORD_LIMIT)
+            .take(scan_cap)
             .filter(|entry| entry_matches_claims_and_tags(entry, claims, required_tags))
             .filter(|entry| {
                 tokens
@@ -1011,6 +1029,35 @@ mod tests {
             .await
             .unwrap();
         assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn exact_matches_report_truncation_without_exact_hits() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        for index in 0..3 {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("entry-{index}"),
+                    "placeholder",
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        let result = store
+            .exact_matches_with_claims_and_required_tags_capped(
+                &claims,
+                &["kb:local".into()],
+                &["absent".into()],
+                1,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(result.truncated);
+        assert!(result.entries.is_empty());
     }
 
     #[tokio::test]
