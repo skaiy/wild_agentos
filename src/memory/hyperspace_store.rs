@@ -883,11 +883,51 @@ mod tests {
     use super::*;
     use crate::isolation::IsolationClaims;
     use crate::memory::embedding_service::FallbackEmbeddingService;
+    use async_trait::async_trait;
 
     fn setup_store() -> HyperspaceStore {
         let dir = tempfile::tempdir().unwrap();
         let embed = Arc::new(FallbackEmbeddingService::new());
         HyperspaceStore::open(dir.path(), embed).unwrap()
+    }
+
+    struct UnavailableEmbedding;
+
+    #[async_trait]
+    impl EmbeddingService for UnavailableEmbedding {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Err("unavailable".into())
+        }
+
+        fn dimension(&self) -> usize {
+            128
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_matches_do_not_require_embedding_availability() {
+        let directory = tempfile::tempdir().unwrap();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let seeded =
+            HyperspaceStore::open(directory.path(), Arc::new(FallbackEmbeddingService::new()))
+                .unwrap();
+        seeded
+            .upsert_with_claims(&claims, "entry", "B2033 placeholder", &["kb:local".into()])
+            .await
+            .unwrap();
+        drop(seeded);
+        let store =
+            HyperspaceStore::open(directory.path(), Arc::new(UnavailableEmbedding)).unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["b2033".into()],
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries.len(), 1);
     }
 
     #[tokio::test]
