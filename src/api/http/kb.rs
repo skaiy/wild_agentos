@@ -3658,30 +3658,35 @@ exit 2
     }
 
     #[tokio::test]
-    async fn unhealthy_kb_does_not_block_other_kbs_or_tenants() {
+    async fn foreign_namespace_same_kb_id_does_not_block_healthy_tenant() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path());
         let a = IsolationClaims::from_verified("tenant-a", "default", "a").unwrap();
         let b = IsolationClaims::from_verified("tenant-b", "default", "b").unwrap();
         state.knowledge_bases.write().await.extend([
-            json!({"id":"kb-a","kb_type":"vector","tenant_id":"tenant-a","project_id":"default"}),
-            json!({"id":"kb-b","kb_type":"vector","tenant_id":"tenant-b","project_id":"default"}),
+            json!({"id":"shared-kb","kb_type":"vector","tenant_id":"tenant-a","project_id":"default"}),
+            json!({"id":"shared-kb","kb_type":"vector","tenant_id":"tenant-b","project_id":"default"}),
         ]);
         let store = state.vector_store.load_full().unwrap();
         store
-            .upsert_with_claims(&a, "bad", "bad", &["kb:kb-a".into(), "tenant:wrong".into()])
+            .upsert_with_claims(
+                &a,
+                "bad",
+                "bad",
+                &["kb:shared-kb".into(), "tenant:wrong".into()],
+            )
             .await
             .unwrap();
         store
-            .upsert_with_claims(&b, "good", "good", &["kb:kb-b".into()])
+            .upsert_with_claims(&b, "good", "good", &["kb:shared-kb".into()])
             .await
             .unwrap();
         let bases = state.knowledge_bases.read().await.clone();
-        assert!(!vector_records_match_kb_ownership(&store, &bases, &a, "kb-a").await);
-        assert!(vector_records_match_kb_ownership(&store, &bases, &b, "kb-b").await);
+        assert!(!vector_records_match_kb_ownership(&store, &bases, &a, "shared-kb").await);
+        assert!(vector_records_match_kb_ownership(&store, &bases, &b, "shared-kb").await);
         assert_eq!(
             store
-                .search_with_claims_and_required_tags(&b, "good", &["kb:kb-b".into()], 5)
+                .search_with_claims_and_required_tags(&b, "good", &["kb:shared-kb".into()], 5)
                 .await
                 .unwrap()
                 .len(),
