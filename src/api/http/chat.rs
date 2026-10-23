@@ -894,16 +894,39 @@ fn grouped_exclude_shape_fragments(
             }
             if code_like_groups.iter().filter(|matches| **matches).count() > 1
                 && (candidate_matches_shape
-                    || group_count == max_groups as usize + 1
-                    || normalized_groups.iter().any(|group| {
-                        !group.is_empty()
-                            && group.bytes().all(|character| character.is_ascii_digit())
+                    || (shape.min_len as usize..=shape.max_len as usize)
+                        .contains(&normalized_groups.concat().len()))
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            let starts_with_embedded_leading_code = shape.leading.is_some_and(|leading| {
+                normalized_groups.first().is_some_and(|first| {
+                    first.strip_prefix(leading).is_some_and(|suffix| {
+                        rules.iter().any(|rule| {
+                            !rule.prefixes.is_empty() && token_matches_rule(suffix, "", rule)
+                        })
                     })
-                    || shape.leading.is_some_and(|leading| {
-                        normalized_groups
-                            .first()
-                            .is_some_and(|first| first.starts_with(leading))
-                    }))
+                })
+            });
+            if starts_with_embedded_leading_code
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
             {
                 blocked.extend(
                     trimmed_groups
@@ -956,7 +979,17 @@ fn grouped_exclude_shape_fragments(
                             (other_index != index).then_some(group.to_ascii_uppercase())
                         },
                     ));
-                } else if candidate_matches_shape || group_count == max_groups as usize + 1 {
+                } else if candidate_matches_shape
+                    || (group_count == max_groups as usize + 1
+                        && (shape.leading.is_some_and(|leading| {
+                            normalized_groups
+                                .first()
+                                .is_some_and(|first| first.starts_with(leading))
+                        }) || normalized_groups.iter().any(|group| {
+                            !group.is_empty()
+                                && group.bytes().all(|character| character.is_ascii_digit())
+                        })))
+                {
                     blocked.extend(
                         trimmed_groups
                             .iter()
@@ -2209,7 +2242,8 @@ mod tests {
             extract_pack_tokens("Lamp shows B2033 when cold", &rules),
             vec!["b2033"]
         );
-        // Intentional safety tradeoff: this is a complete leading-shaped window.
+        // Intentional safety tradeoff: indistinguishable from a complete
+        // leading-shaped identifier under configured ASCII-only constraints.
         assert!(extract_pack_tokens("Look into B2033 code", &rules).is_empty());
         assert_eq!(
             extract_pack_tokens("Let me check B2033", &rules),
@@ -2218,6 +2252,10 @@ mod tests {
         assert_eq!(
             extract_pack_tokens("LED fault B2033", &rules),
             vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 and B2044", &rules),
+            vec!["b2033", "b2044"]
         );
         assert!(extract_pack_tokens("故障码2033年", &rules).is_empty());
         assert!(extract_pack_tokens("2023年", &rules).is_empty());
@@ -2279,6 +2317,19 @@ mod tests {
             extract_pack_tokens("B2033 and B2044", &rules),
             vec!["b2033", "b2044"]
         );
+        assert_eq!(
+            extract_pack_tokens("Please explain fault code B2033 today", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        let before_phone = extract_pack_tokens("B2033 199 0000 0000", &rules);
+        assert_eq!(before_phone, vec!["b2033"]);
+        // fictional
+        let after_phone = extract_pack_tokens("199 0000 0000 B2033", &rules);
+        assert_eq!(after_phone, vec!["b2033"]);
+        // fictional
+        let long_phone = extract_pack_tokens("Please inspect 199 0000 0000 B2033 today", &rules);
+        assert_eq!(long_phone, vec!["b2033"]);
         // fictional
         assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
         // fictional
