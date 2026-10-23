@@ -1417,7 +1417,10 @@ pub(crate) async fn upload_knowledge_base_handler(
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
             .cloned()
     };
     let kb = match kb {

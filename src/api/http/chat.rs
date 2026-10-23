@@ -427,6 +427,17 @@ async fn pack_scoped_vector_hits(
     let bases = state.knowledge_bases.read().await.clone();
     let mut hits = Vec::new();
     for kb_id in kb_ids {
+        if !bases.iter().any(|kb| {
+            kb.get("id").and_then(Value::as_str) == Some(kb_id.as_str())
+                && kb.get("kb_type").and_then(Value::as_str) == Some("vector")
+                && kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+                && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+        }) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                json!({ "error": "knowledge base not found", "id": kb_id }),
+            ));
+        }
         if !vector_records_match_kb_ownership(&store, &bases, claims, kb_id).await {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
