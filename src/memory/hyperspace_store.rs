@@ -15,7 +15,13 @@ use crate::isolation::IsolationClaims;
 use crate::memory::embedding_service::EmbeddingService;
 use crate::CoreError;
 
-const EXACT_SCAN_RECORD_LIMIT: usize = 500;
+pub const EXACT_SCAN_RECORD_LIMIT: usize = 20_000;
+
+#[derive(Debug, Clone)]
+pub struct ExactMatchResult {
+    pub entries: Vec<ScoredEntry>,
+    pub truncated: bool,
+}
 /// Search filter combining tag matching, type filtering, and importance range.
 ///
 /// Mirrors the original qdrant-based filter interface for backward compatibility
@@ -622,7 +628,7 @@ impl HyperspaceStore {
             .search_with_claims(claims, query, &filter, candidate_limit)
             .await?
             .into_iter()
-            .filter(|entry| required_tags.iter().all(|tag| entry.tags.contains(tag)))
+            .filter(|entry| entry_matches_claims_and_tags(entry, claims, required_tags))
             .take(limit as usize)
             .collect())
     }
@@ -635,15 +641,16 @@ impl HyperspaceStore {
         required_tags: &[String],
         tokens: &[String],
         limit: u64,
-    ) -> Result<Vec<ScoredEntry>, CoreError> {
+    ) -> Result<ExactMatchResult, CoreError> {
         if tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ExactMatchResult {
+                entries: Vec::new(),
+                truncated: false,
+            });
         }
-        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
-            message: format!("invalid verified vector namespace: {e}"),
-        })?;
         let total = self.count().await? as usize;
-        if total > EXACT_SCAN_RECORD_LIMIT {
+        let truncated = total > EXACT_SCAN_RECORD_LIMIT;
+        if truncated {
             warn!(
                 total,
                 cap = EXACT_SCAN_RECORD_LIMIT,
@@ -659,10 +666,7 @@ impl HyperspaceStore {
                 })?,
         )
         .into_iter()
-        .filter(|entry| {
-            entry.iri.starts_with(&format!("{namespace}#"))
-                && required_tags.iter().all(|tag| entry.tags.contains(tag))
-        })
+        .filter(|entry| entry_matches_claims_and_tags(entry, claims, required_tags))
         .filter(|entry| {
             tokens
                 .iter()
@@ -671,7 +675,10 @@ impl HyperspaceStore {
         .collect();
         matches.sort_by(|left, right| left.iri.cmp(&right.iri));
         matches.truncate(limit as usize);
-        Ok(matches)
+        Ok(ExactMatchResult {
+            entries: matches,
+            truncated,
+        })
     }
 
     async fn search_with_filter_inner(
@@ -858,6 +865,17 @@ fn contains_ascii_token(text: &str, token: &str) -> bool {
             .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
         !before_is_word && !after_is_word
     })
+}
+
+fn entry_matches_claims_and_tags(
+    entry: &ScoredEntry,
+    claims: &IsolationClaims,
+    required_tags: &[String],
+) -> bool {
+    claims
+        .vector_namespace()
+        .is_ok_and(|namespace| entry.iri.starts_with(&format!("{namespace}#")))
+        && required_tags.iter().all(|tag| entry.tags.contains(tag))
 }
 
 #[cfg(test)]

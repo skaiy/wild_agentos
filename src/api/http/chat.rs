@@ -724,7 +724,11 @@ async fn pack_scoped_vector_hits(
                 )
                 .await
             {
-                Ok(mut batch) => {
+                Ok(result) => {
+                    if result.truncated {
+                        tracing::warn!(kb_id = %search.kb_id, "pack exact retrieval scan was truncated");
+                    }
+                    let mut batch = result.entries;
                     for hit in &mut batch {
                         hit.match_kind = MatchKind::Exact;
                     }
