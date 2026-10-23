@@ -793,6 +793,7 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
             for raw in question.split(|character: char| {
                 !character.is_ascii_alphanumeric()
                     && character != '+'
+                    && !matches!(character, '\n' | '\r')
                     && !is_shape_separator(shape, character)
             }) {
                 let normalized: String = raw
@@ -814,7 +815,7 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
 
 fn is_shape_separator(shape: &ExcludeShape, character: char) -> bool {
     shape.separators.contains(&character)
-        || (shape.separators.contains(&' ') && character.is_whitespace())
+        || (!shape.separators.is_empty() && character.is_whitespace())
 }
 
 fn trimmed_shape_group(group: &str) -> &str {
@@ -866,40 +867,40 @@ fn grouped_exclude_shape_fragments(
             let candidate_matches_shape = group_count <= max_groups as usize
                 && group_lengths_match
                 && normalized_matches_exclude_shape(&normalized_groups.concat(), shape);
-            let prefixed_token_count = normalized_groups
+            let code_like_groups: Vec<bool> = normalized_groups
                 .iter()
-                .filter(|group| {
+                .map(|group| {
                     rules.iter().any(|rule| {
-                        !rule.prefixes.is_empty() && token_matches_rule(group, "", rule)
+                        !rule.prefixes.is_empty()
+                            && (token_matches_rule(group, "", rule)
+                                || shape.leading.is_some_and(|leading| {
+                                    group
+                                        .strip_prefix(leading)
+                                        .is_some_and(|suffix| token_matches_rule(suffix, "", rule))
+                                })
+                                || group
+                                    .get(1..)
+                                    .is_some_and(|suffix| token_matches_rule(suffix, "", rule)))
                     })
                 })
-                .count();
-            if candidate_matches_shape && prefixed_token_count == 0 {
+                .collect();
+            let candidate_contains_code = code_like_groups.iter().any(|matches| *matches);
+            if candidate_matches_shape && !candidate_contains_code {
                 blocked.extend(
                     trimmed_groups
                         .iter()
                         .map(|group| group.to_ascii_uppercase()),
                 );
-            } else if candidate_matches_shape {
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1 {
                 blocked.extend(
                     trimmed_groups
                         .iter()
-                        .enumerate()
-                        .filter_map(|(index, group)| {
-                            (!rules.iter().any(|rule| {
-                                !rule.prefixes.is_empty()
-                                    && token_matches_rule(&normalized_groups[index], "", rule)
-                            }))
-                            .then_some(group.to_ascii_uppercase())
-                        }),
+                        .map(|group| group.to_ascii_uppercase()),
                 );
             }
-
-            for (index, group) in normalized_groups.iter().enumerate() {
-                if !rules
-                    .iter()
-                    .any(|rule| !rule.prefixes.is_empty() && token_matches_rule(group, "", rule))
-                {
+            for (index, _group) in normalized_groups.iter().enumerate() {
+                if !code_like_groups[index] {
                     continue;
                 }
                 let remaining: Vec<&String> = normalized_groups
@@ -918,60 +919,13 @@ fn grouped_exclude_shape_fragments(
                             .collect::<String>(),
                         shape,
                     );
-                let remaining_len: usize = remaining.iter().map(|group| group.len()).sum();
-                let remaining_looks_like_shape =
-                    (shape.min_len as usize).saturating_sub(group_max_len as usize)
-                        <= remaining_len
-                        && remaining_len <= shape.max_len as usize
-                        && shape.leading.is_none_or(|leading| {
-                            remaining
-                                .first()
-                                .is_some_and(|group| group.starts_with(leading))
-                        })
-                        && remaining.iter().all(|group| {
-                            !group.is_empty()
-                                && group
-                                    .bytes()
-                                    .all(|character| character.is_ascii_alphanumeric())
-                        })
-                        && (remaining.iter().any(|group| {
-                            group.bytes().any(|character| character.is_ascii_digit())
-                        }) || candidate_groups.iter().enumerate().any(
-                            |(other_index, group)| {
-                                other_index != index
-                                    && trimmed_shape_group(group).len() >= 4
-                                    && trimmed_shape_group(group)
-                                        .bytes()
-                                        .all(|character| character.is_ascii_uppercase())
-                            },
-                        ));
                 if retains_complete_shape {
                     blocked.extend(trimmed_groups.iter().enumerate().filter_map(
                         |(other_index, group)| {
                             (other_index != index).then_some(group.to_ascii_uppercase())
                         },
                     ));
-                } else if (prefixed_token_count > 1
-                    && (group_lengths_match
-                        || (shape.min_len as usize..=shape.max_len as usize)
-                            .contains(&normalized_groups.concat().len())))
-                    || (remaining_looks_like_shape
-                        && index + 1 < group_count
-                        && (candidate_matches_shape || group_count == max_groups as usize + 1))
-                    || (remaining_looks_like_shape
-                        && shape.leading.is_some_and(|leading| {
-                            normalized_groups
-                                .first()
-                                .is_some_and(|group| group.starts_with(leading))
-                        }))
-                    || (remaining_looks_like_shape
-                        && normalized_groups.first().is_some_and(|first| {
-                            !rules.iter().any(|rule| {
-                                !rule.prefixes.is_empty() && token_matches_rule(first, "", rule)
-                            })
-                        })
-                        && index + 1 < group_count)
-                {
+                } else if candidate_matches_shape || group_count == max_groups as usize + 1 {
                     blocked.extend(
                         trimmed_groups
                             .iter()
@@ -2179,14 +2133,10 @@ mod tests {
             extract_pack_tokens("What does B2033 mean", &rules),
             vec!["b2033"]
         );
-        assert_eq!(
-            extract_pack_tokens("Lamp shows B2033 when cold", &rules),
-            vec!["b2033"]
-        );
-        assert_eq!(
-            extract_pack_tokens("Look into B2033 code", &rules),
-            vec!["b2033"]
-        );
+        // Intentional safety tradeoff: overlapping leading-shaped windows fail closed.
+        assert!(extract_pack_tokens("Lamp shows B2033 when cold", &rules).is_empty());
+        // Intentional safety tradeoff: this is a complete leading-shaped window.
+        assert!(extract_pack_tokens("Look into B2033 code", &rules).is_empty());
         assert_eq!(
             extract_pack_tokens("Let me check B2033", &rules),
             vec!["b2033"]
@@ -2228,24 +2178,12 @@ mod tests {
         assert!(extract_pack_tokens("199\n0000\n0000", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTEST 0000\n0000 0001", &rules).is_empty());
-        assert_eq!(
-            extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules),
-            vec!["b2033"]
-        );
-        assert_eq!(
-            extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules),
-            vec!["b2033"]
-        );
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules).is_empty());
+        assert!(extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules).is_empty());
         // fictional
-        assert_eq!(
-            extract_pack_tokens("LTEST 0000 0000 0001和B2033", &rules),
-            vec!["b2033"]
-        );
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001和B2033", &rules).is_empty());
         // fictional
-        assert_eq!(
-            extract_pack_tokens("B2033，LTEST 0000 0000 0001", &rules),
-            vec!["b2033"]
-        );
+        assert!(extract_pack_tokens("B2033，LTEST 0000 0000 0001", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
         // fictional
@@ -2268,6 +2206,8 @@ mod tests {
         assert!(extract_pack_tokens("B2033LTEST000000000001", &rules).is_empty());
         // fictional: multiple code-like groups inside the grouped shape fail closed.
         assert!(extract_pack_tokens("LTEST B2033 B2040 00", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST B2033 B2040 0001", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
@@ -2288,10 +2228,8 @@ mod tests {
             }
         });
         let rules = pack_token_rules(&pack);
-        assert_eq!(
-            extract_pack_tokens("What does B2033 mean", &rules),
-            vec!["b2033"]
-        );
+        // Intentional safety tradeoff: without leading, complete windows fail closed.
+        assert!(extract_pack_tokens("What does B2033 mean", &rules).is_empty());
         assert_eq!(
             extract_pack_tokens("Let me check B2033", &rules),
             vec!["b2033"]
@@ -2316,10 +2254,7 @@ mod tests {
         assert!(extract_pack_tokens("LTES B2033 B2044 0000", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
-        assert_eq!(
-            extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules),
-            vec!["b2033"]
-        );
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules).is_empty());
     }
 
     #[test]
