@@ -420,6 +420,12 @@ struct ExcludeShape {
     separators: Vec<char>,
     #[serde(default)]
     leading: Option<char>,
+    #[serde(default)]
+    max_groups: Option<u8>,
+    #[serde(default)]
+    group_min_len: Option<u8>,
+    #[serde(default)]
+    group_max_len: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -621,6 +627,18 @@ fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
             return Err("exclude shape leading character conflicts with charset".into());
         }
     }
+    match (shape.max_groups, shape.group_min_len, shape.group_max_len) {
+        (None, None, None) => {}
+        (Some(max_groups), Some(group_min_len), Some(group_max_len)) => {
+            if shape.separators.is_empty() {
+                return Err("grouped exclude shape requires separators".into());
+            }
+            if max_groups == 0 || group_min_len == 0 || group_min_len > group_max_len {
+                return Err("exclude shape has invalid group bounds".into());
+            }
+        }
+        _ => return Err("exclude shape group bounds must be configured together".into()),
+    }
     Ok(())
 }
 
@@ -754,18 +772,11 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
             .filter(|character| character.is_ascii_alphanumeric())
             .collect();
         for shape in &shapes {
-            let matches_window = (shape.min_len as usize..=shape.max_len as usize).any(|length| {
-                normalized.as_bytes().windows(length).any(|window| {
-                    std::str::from_utf8(window).ok().is_some_and(|candidate| {
-                        candidate.chars().all(|character| match shape.charset {
-                            ShapeCharset::Digits => character.is_ascii_digit(),
-                            ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
-                        }) && shape
-                            .leading
-                            .is_none_or(|leading| candidate.starts_with(leading))
-                    })
-                })
-            });
+            let matches_window = if shape.max_groups.is_some() {
+                raw_matches_grouped_exclude_shape(raw, shape)
+            } else {
+                normalized_matches_exclude_shape_window(&normalized, shape)
+            };
             if matches_window {
                 blocked.extend(
                     raw.split(|character: char| !character.is_ascii_alphanumeric())
@@ -776,6 +787,53 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
         }
     }
     blocked
+}
+
+fn normalized_matches_exclude_shape_window(normalized: &str, shape: &ExcludeShape) -> bool {
+    (shape.min_len as usize..=shape.max_len as usize).any(|length| {
+        normalized.as_bytes().windows(length).any(|window| {
+            std::str::from_utf8(window)
+                .ok()
+                .is_some_and(|candidate| normalized_matches_exclude_shape(candidate, shape))
+        })
+    })
+}
+
+fn raw_matches_grouped_exclude_shape(raw: &str, shape: &ExcludeShape) -> bool {
+    let (Some(max_groups), Some(group_min_len), Some(group_max_len)) =
+        (shape.max_groups, shape.group_min_len, shape.group_max_len)
+    else {
+        return false;
+    };
+    let groups: Vec<String> = raw
+        .split(|character| shape.separators.contains(&character))
+        .map(|group| {
+            group
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .collect()
+        })
+        .collect();
+    !groups.is_empty()
+        && groups.len() <= max_groups as usize
+        && groups
+            .iter()
+            .all(|group| (group_min_len as usize..=group_max_len as usize).contains(&group.len()))
+        && (0..groups.len()).any(|start| {
+            let candidate: String = groups[start..].concat();
+            normalized_matches_exclude_shape(&candidate, shape)
+        })
+}
+
+fn normalized_matches_exclude_shape(normalized: &str, shape: &ExcludeShape) -> bool {
+    (shape.min_len as usize..=shape.max_len as usize).contains(&normalized.len())
+        && normalized.chars().all(|character| match shape.charset {
+            ShapeCharset::Digits => character.is_ascii_digit(),
+            ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
+        })
+        && shape
+            .leading
+            .is_none_or(|leading| normalized.starts_with(leading))
 }
 
 fn token_matches_rule(token: &str, following: &str, rule: &PackTokenRule) -> bool {
@@ -818,15 +876,7 @@ fn token_matches_exclude_shape(token: &str, shape: &ExcludeShape) -> bool {
         .chars()
         .filter(|character| !shape.separators.contains(character))
         .collect();
-    let length = normalized.len();
-    (shape.min_len as usize..=shape.max_len as usize).contains(&length)
-        && normalized.chars().all(|character| match shape.charset {
-            ShapeCharset::Digits => character.is_ascii_digit(),
-            ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
-        })
-        && shape
-            .leading
-            .is_none_or(|leading| normalized.starts_with(leading))
+    normalized_matches_exclude_shape(&normalized, shape)
 }
 
 fn excluded_by_suffix(following: &str, suffixes: &[String]) -> bool {
@@ -1940,8 +1990,16 @@ mod tests {
                     "exclude_followed_by": ["年", "年份", "年款"],
                     "exclude_shapes": [
                         {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
-                        {"min_len": 17, "max_len": 17, "charset": "ascii_alnum", "separators": [" "]},
-                        {"min_len": 11, "max_len": 11, "charset": "digits", "leading": "1", "separators": ["-", " "]}
+                        {
+                            "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                            "separators": [" "], "max_groups": 4,
+                            "group_min_len": 4, "group_max_len": 5
+                        },
+                        {
+                            "min_len": 11, "max_len": 11, "charset": "digits",
+                            "leading": "1", "separators": ["-", " "], "max_groups": 4,
+                            "group_min_len": 2, "group_max_len": 4
+                        }
                     ]
                 }, {
                     "prefixes": [],
@@ -1980,6 +2038,8 @@ mod tests {
             json!({"keyword_retrieval":{"rules":[{"prefixes":["非"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":0,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":17,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","max_groups":2}]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":0,"group_min_len":4,"group_max_len":4}]}]}}),
         ] {
             assert!(validate_keyword_retrieval_config(&patch).is_err());
         }
@@ -1992,6 +2052,22 @@ mod tests {
         assert!(validate_keyword_retrieval_config(&too_many).is_err());
         assert!(validate_keyword_retrieval_config(&json!({"builtin": false})).is_ok());
         assert!(validate_keyword_retrieval_config(&json!({"keyword_retrieval": null})).is_ok());
+    }
+
+    #[test]
+    fn grouped_exclude_shapes_do_not_match_extra_groups() {
+        let shape = ExcludeShape {
+            min_len: 8,
+            max_len: 8,
+            charset: ShapeCharset::AsciiAlnum,
+            separators: vec![' '],
+            leading: None,
+            max_groups: Some(1),
+            group_min_len: Some(8),
+            group_max_len: Some(8),
+        };
+        assert!(raw_matches_grouped_exclude_shape("ABCDEFGH", &shape));
+        assert!(!raw_matches_grouped_exclude_shape("ABCD EFGH", &shape));
     }
 
     #[test]
