@@ -673,7 +673,18 @@ impl HyperspaceStore {
                 .any(|token| contains_ascii_token(&entry.text, token))
         })
         .collect();
-        matches.sort_by(|left, right| left.iri.cmp(&right.iri));
+        // Stable tiers: an entire chunk equal to a requested token precedes a
+        // token merely contained within longer chunk text.
+        matches.sort_by_key(|entry| {
+            if tokens
+                .iter()
+                .any(|token| entry.text.eq_ignore_ascii_case(token))
+            {
+                0
+            } else {
+                1
+            }
+        });
         matches.truncate(limit as usize);
         Ok(ExactMatchResult {
             entries: matches,
@@ -993,6 +1004,34 @@ mod tests {
             .await
             .unwrap();
         assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn exact_matches_rank_equality_before_contains_stably() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        for (id, text) in [
+            ("contains-first", "prefix fault code 2033 suffix"),
+            ("exact-target", "fault code 2033"),
+            ("contains-second", "more fault code 2033 text"),
+        ] {
+            store
+                .upsert_with_claims(&claims, id, text, &["kb:local".into()])
+                .await
+                .unwrap();
+        }
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["fault code 2033".into()],
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].text, "fault code 2033");
+        assert_eq!(result.entries[1].text, "prefix fault code 2033 suffix");
+        assert_eq!(result.entries[2].text, "more fault code 2033 text");
     }
 
     #[tokio::test]
