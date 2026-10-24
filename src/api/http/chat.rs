@@ -611,10 +611,13 @@ fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
     if shape.min_len == 0 || shape.min_len > shape.max_len || shape.max_len > 64 {
         return Err("exclude shape length must be within 1..=64".into());
     }
+    if shape.max_groups.is_some() && shape.separators.is_empty() {
+        return Err("grouped exclude shape requires separators".into());
+    }
     if shape
         .separators
         .iter()
-        .any(|separator| separator.is_ascii_alphanumeric())
+        .any(|separator| !matches!(separator, ' ' | '-' | '_' | '/' | '.' | '\u{3000}'))
     {
         return Err("exclude shape has an invalid separator".into());
     }
@@ -785,7 +788,7 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
         if shape.max_groups.is_some() {
             let groups: Vec<&str> = question
                 .split(|character| is_shape_separator(shape, character))
-                .flat_map(|group| group.split(|character: char| !character.is_ascii_alphanumeric()))
+                .flat_map(|group| group.split(|character: char| !is_shape_alphanumeric(character)))
                 .filter(|group| !group.is_empty())
                 .collect();
             blocked.extend(grouped_exclude_shape_fragments(&groups, shape, rules));
@@ -820,7 +823,27 @@ fn is_shape_separator(shape: &ExcludeShape, character: char) -> bool {
 }
 
 fn trimmed_shape_group(group: &str) -> &str {
-    group.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+    group.trim_matches(|character: char| !is_shape_alphanumeric(character))
+}
+
+fn is_shape_alphanumeric(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '\u{FF10}'..='\u{FF19}' | '\u{FF21}'..='\u{FF3A}' | '\u{FF41}'..='\u{FF5A}'
+        )
+}
+
+fn narrow_compatibility_fold(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\u{FF01}'..='\u{FF5E}' => {
+                char::from_u32(character as u32 - 0xFEE0).unwrap_or(character)
+            }
+            _ => character,
+        })
+        .collect()
 }
 
 fn normalized_matches_exclude_shape_window(normalized: &str, shape: &ExcludeShape) -> bool {
@@ -855,16 +878,18 @@ fn grouped_exclude_shape_fragments(
                 .collect();
             let normalized_groups: Vec<String> = trimmed_groups
                 .iter()
-                .map(|group| group.to_ascii_uppercase())
+                .map(|group| narrow_compatibility_fold(group).to_ascii_uppercase())
                 .collect();
-            let group_lengths_match = trimmed_groups.iter().all(|group| {
+            let group_lengths_match = normalized_groups.iter().all(|group| {
                 !group.is_empty()
                     && group
                         .chars()
                         .all(|character| character.is_ascii_alphanumeric())
-            }) && normalized_groups.iter().all(|group| {
-                (group_min_len as usize..=group_max_len as usize).contains(&group.len())
             });
+            let group_lengths_match = group_lengths_match
+                && normalized_groups.iter().all(|group| {
+                    (group_min_len as usize..=group_max_len as usize).contains(&group.len())
+                });
             let candidate_matches_shape = group_count <= max_groups as usize
                 && group_lengths_match
                 && normalized_matches_exclude_shape(&normalized_groups.concat(), shape);
@@ -885,98 +910,7 @@ fn grouped_exclude_shape_fragments(
                     })
                 })
                 .collect();
-            let candidate_contains_code = code_like_groups.iter().any(|matches| *matches);
-            if candidate_matches_shape && !candidate_contains_code {
-                blocked.extend(
-                    trimmed_groups
-                        .iter()
-                        .map(|group| group.to_ascii_uppercase()),
-                );
-            }
-            if code_like_groups.iter().filter(|matches| **matches).count() > 1
-                && (candidate_matches_shape
-                    || (shape.min_len as usize..=shape.max_len as usize)
-                        .contains(&normalized_groups.concat().len())
-                    || shape.leading.is_some_and(|leading| {
-                        normalized_groups
-                            .first()
-                            .is_some_and(|first| first.starts_with(leading))
-                    }))
-            {
-                blocked.extend(
-                    trimmed_groups
-                        .iter()
-                        .map(|group| group.to_ascii_uppercase()),
-                );
-            }
-            if code_like_groups.first().copied().unwrap_or(false)
-                && normalized_groups.first().is_some_and(|first| {
-                    !rules.iter().any(|rule| {
-                        !rule.prefixes.is_empty() && token_matches_rule(first, "", rule)
-                    })
-                })
-                && normalized_groups.iter().any(|group| {
-                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
-                })
-            {
-                blocked.extend(
-                    trimmed_groups
-                        .iter()
-                        .map(|group| group.to_ascii_uppercase()),
-                );
-            }
-            if code_like_groups.iter().filter(|matches| **matches).count() > 1
-                && !code_like_groups.first().copied().unwrap_or(false)
-                && normalized_groups.iter().any(|group| {
-                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
-                })
-                && normalized_groups
-                    .first()
-                    .is_some_and(|first| first.len() == group_min_len as usize)
-                && normalized_groups.concat().len()
-                    <= shape.max_len as usize + group_max_len as usize
-            {
-                blocked.extend(
-                    trimmed_groups
-                        .iter()
-                        .map(|group| group.to_ascii_uppercase()),
-                );
-            }
-            if shape.leading.is_none()
-                && code_like_groups.iter().filter(|matches| **matches).count() > 1
-            {
-                blocked.extend(
-                    trimmed_groups
-                        .iter()
-                        .map(|group| group.to_ascii_uppercase()),
-                );
-            }
-            if code_like_groups.iter().filter(|matches| **matches).count() > 1
-                && group_count <= max_groups as usize
-                && !code_like_groups.first().copied().unwrap_or(false)
-                && normalized_groups.iter().any(|group| {
-                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
-                })
-                && normalized_groups.first().is_some_and(|first| {
-                    (group_min_len as usize..=group_max_len as usize).contains(&first.len())
-                })
-                && (shape.min_len as usize..=shape.max_len as usize)
-                    .contains(&normalized_groups.concat().len())
-            {
-                blocked.extend(
-                    trimmed_groups
-                        .iter()
-                        .map(|group| group.to_ascii_uppercase()),
-                );
-            }
-            if code_like_groups.iter().filter(|matches| **matches).count() > 1
-                && normalized_groups.iter().any(|group| {
-                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
-                })
-                && (candidate_matches_shape
-                    || (shape.min_len as usize..=shape.max_len as usize)
-                        .contains(&normalized_groups.concat().len()))
-            {
+            if candidate_matches_shape {
                 blocked.extend(
                     trimmed_groups
                         .iter()
@@ -1013,49 +947,20 @@ fn grouped_exclude_shape_fragments(
                         shape,
                     );
                 if retains_complete_shape
-                    || shape.leading.is_some()
-                        && code_removal_forms_complete_shape(
-                            groups,
-                            start + index,
-                            shape,
-                            max_groups,
-                            group_min_len,
-                            group_max_len,
-                        )
+                    || code_removal_forms_complete_shape(
+                        groups,
+                        start + index,
+                        shape,
+                        max_groups,
+                        group_min_len,
+                        group_max_len,
+                    )
                 {
                     blocked.extend(trimmed_groups.iter().enumerate().filter_map(
                         |(other_index, group)| {
                             (other_index != index).then_some(group.to_ascii_uppercase())
                         },
                     ));
-                } else if candidate_matches_shape
-                    || (group_count == max_groups as usize + 1
-                        && normalized_groups.first().is_some_and(|first| {
-                            (group_min_len as usize..=group_max_len as usize).contains(&first.len())
-                        })
-                        && (shape.min_len as usize..=shape.max_len as usize)
-                            .contains(&normalized_groups.concat().len()))
-                    || (group_count == max_groups as usize + 1
-                        && shape.leading.is_some_and(|leading| {
-                            normalized_groups
-                                .first()
-                                .is_some_and(|first| first.starts_with(leading))
-                        }))
-                    || (group_count == max_groups as usize + 1
-                        && code_like_groups.iter().filter(|matches| **matches).count() == 1
-                        && normalized_groups.first().is_some_and(|first| {
-                            (group_min_len as usize..=group_max_len as usize).contains(&first.len())
-                        })
-                        && normalized_groups.iter().any(|group| {
-                            !group.is_empty()
-                                && group.bytes().all(|character| character.is_ascii_digit())
-                        }))
-                {
-                    blocked.extend(
-                        trimmed_groups
-                            .iter()
-                            .map(|group| group.to_ascii_uppercase()),
-                    );
                 }
             }
         }
@@ -2406,6 +2311,10 @@ mod tests {
             extract_pack_tokens("What does code B2033 mean", &rules),
             vec!["b2033"]
         );
+        assert_eq!(
+            extract_pack_tokens("Code B2033 in v1.2 manual", &rules),
+            vec!["b2033"]
+        );
         // fictional
         let before_phone = extract_pack_tokens("B2033 199 0000 0000", &rules);
         assert_eq!(before_phone, vec!["b2033"]);
@@ -2415,30 +2324,19 @@ mod tests {
         // fictional
         let long_phone = extract_pack_tokens("Please inspect 199 0000 0000 B2033 today", &rules);
         assert_eq!(long_phone, vec!["b2033"]);
-        // fictional
-        assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
+        // Embedded code-like fragments outside a complete shape are not suppressed.
         // fictional
         assert!(extract_pack_tokens("LSVA B2033 KX1P 9QZ7", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTST B2033 ABCD EFGH", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("ABCD B2033 B2044 0000", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("LTES B2033 B2044 0000", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTEST 0000 0000 0001 trailing words", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("199 0000 0000 trailing words", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("leading words 199 0000 0000", &rules).is_empty());
-        // fictional: the code interrupts the configured grouped shape, so fail closed.
-        assert!(extract_pack_tokens("LTEST B2033 0000 0000 01", &rules).is_empty());
         // fictional: concatenated values are not tokenized and therefore do not retrieve.
         assert!(extract_pack_tokens("B2033LTEST000000000001", &rules).is_empty());
-        // fictional: multiple code-like groups inside the grouped shape fail closed.
-        assert!(extract_pack_tokens("LTEST B2033 B2040 00", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("LTEST B2033 B2040 0001", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
     }
 
@@ -2471,23 +2369,20 @@ mod tests {
         );
         // fictional
         assert!(extract_pack_tokens("ABCD B2033 0000 0000", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("LTEST B2033 0000 0000 01", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("LTEST B2033 B2044 0001", &rules).is_empty());
+        // The following probes do not form a complete configured shape.
         // fictional
         assert!(extract_pack_tokens("LSVA B2033 KX1P 9QZ7", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTST B2033 ABCD EFGH", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("ABCD B2033 B2044 0000", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("LTES B2033 B2044 0000", &rules).is_empty());
-        // fictional
-        assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("B2033 B2044", &rules),
+            vec!["b2033", "b2044"]
+        );
         assert!(extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules).is_empty());
-        // Intentional safety tradeoff: this contains an ambiguous complete window.
-        assert!(extract_pack_tokens("Please check B2033 B2044 0800", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("Please check B2033 B2044 0800", &rules),
+            vec!["b2033", "b2044"]
+        );
     }
 
     #[test]
@@ -2593,6 +2488,8 @@ mod tests {
             "199，0000，0000",
             "199。0000。0000",
             "199\n0000\n0000",
+            "１９９　００００　００００",
+            "LTEST　００００　００００　０００１",
         ] {
             // fictional
             assert_eq!(extract_pack_tokens(value, &rules), Vec::<String>::new());
@@ -2613,6 +2510,8 @@ mod tests {
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","max_groups":2}]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":0,"group_min_len":4,"group_max_len":4}]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":2,"group_min_len":4,"group_max_len":9}]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":["·"]}]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[],"max_groups":2,"group_min_len":4,"group_max_len":4}]}]}}),
         ] {
             assert!(validate_keyword_retrieval_config(&patch).is_err());
         }
@@ -2625,6 +2524,22 @@ mod tests {
         assert!(validate_keyword_retrieval_config(&too_many).is_err());
         assert!(validate_keyword_retrieval_config(&json!({"builtin": false})).is_ok());
         assert!(validate_keyword_retrieval_config(&json!({"keyword_retrieval": null})).is_ok());
+        assert!(validate_keyword_retrieval_config(&json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 8,
+                        "max_len": 8,
+                        "charset": "ascii_alnum",
+                        "separators": [".", "　"]
+                    }]
+                }]
+            }
+        }))
+        .is_ok());
     }
 
     #[test]
