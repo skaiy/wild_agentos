@@ -563,6 +563,7 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
             let shape: ExcludeShape = serde_json::from_value(shape.clone())
                 .map_err(|error| format!("invalid exclude_shapes value: {error}"))?;
             validate_exclude_shape(&shape)?;
+            validate_rule_shape_token_capacity(object, digit_count as usize, &shape)?;
         }
     }
     Ok(())
@@ -645,6 +646,71 @@ fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
             }
         }
         _ => return Err("exclude shape group bounds must be configured together".into()),
+    }
+    Ok(())
+}
+
+fn validate_rule_shape_token_capacity(
+    rule: &serde_json::Map<String, Value>,
+    digit_count: usize,
+    shape: &ExcludeShape,
+) -> Result<(), String> {
+    let prefixes = rule
+        .get("prefixes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "prefixes is required".to_string())?;
+    let token_is_compatible = match shape.charset {
+        ShapeCharset::Digits => prefixes.is_empty(),
+        ShapeCharset::AsciiAlnum => true,
+    };
+    if !token_is_compatible {
+        return Ok(());
+    };
+    let Some(max_groups) = shape.max_groups else {
+        return Err(
+            "exclude shape must define group bounds to prove two rule tokens cannot share a window"
+                .into(),
+        );
+    };
+    let token_len = if prefixes.is_empty() {
+        digit_count
+    } else {
+        prefixes
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|prefix| {
+                let optional_separator = prefix
+                    .chars()
+                    .last()
+                    .filter(|character| matches!(character, '-' | '_' | '/'))
+                    .map(char::len_utf8)
+                    .unwrap_or_default();
+                prefix.len() - optional_separator + digit_count
+            })
+            .min()
+            .ok_or_else(|| "prefixes is required".to_string())?
+    };
+    let (Some(group_min_len), Some(group_max_len)) = (shape.group_min_len, shape.group_max_len)
+    else {
+        return Err(
+            "exclude shape must define group bounds to prove two rule tokens cannot share a window"
+                .into(),
+        );
+    };
+    if token_len < group_min_len as usize || token_len > group_max_len as usize {
+        return Ok(());
+    }
+    let minimum_group_count = (shape.min_len as usize).div_ceil(group_max_len as usize);
+    if minimum_group_count > max_groups as usize {
+        return Err("exclude shape cannot satisfy its configured group bounds".into());
+    }
+    let minimum_window_len =
+        token_len * 2 + minimum_group_count.saturating_sub(2) * group_min_len as usize;
+    if minimum_window_len <= shape.max_len as usize {
+        return Err(
+            "exclude shape can contain two tokens matched by the same rule; tighten its length or group bounds"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -913,6 +979,22 @@ fn grouped_exclude_shape_fragments(
                     })
                 })
                 .collect();
+            if code_like_groups.iter().any(|matches| *matches) {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, group)| {
+                            rules
+                                .iter()
+                                .any(|rule| {
+                                    rule.prefixes.is_empty()
+                                        && token_matches_rule(&normalized_groups[index], "", rule)
+                                })
+                                .then_some(group.to_ascii_uppercase())
+                        }),
+                );
+            }
             if candidate_matches_shape {
                 blocked.extend(
                     trimmed_groups
@@ -2176,7 +2258,6 @@ mod tests {
                     "digit_count": 4,
                     "exclude_followed_by": ["年", "年份", "年款"],
                     "exclude_shapes": [
-                        {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
                         {
                             "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
                             "leading": "L",
@@ -2226,18 +2307,22 @@ mod tests {
             extract_pack_tokens("B2033 and B2044", &rules),
             vec!["b2033", "b2044"]
         );
-        let plain_pair_since = extract_pack_tokens("Codes B2033 B2044 since 2023", &rules);
-        assert!(plain_pair_since.contains(&"b2033".to_string()));
-        assert!(plain_pair_since.contains(&"b2044".to_string()));
-        let plain_pair_time = extract_pack_tokens("Please check B2033 B2044 0800", &rules);
-        assert!(plain_pair_time.contains(&"b2033".to_string()));
-        assert!(plain_pair_time.contains(&"b2044".to_string()));
-        let code_pair_since = extract_pack_tokens("B2033 B2044 since 2023", &rules);
-        assert!(code_pair_since.contains(&"b2033".to_string()));
-        assert!(code_pair_since.contains(&"b2044".to_string()));
-        let code_pair_at = extract_pack_tokens("B2033 and B2044 at 0800", &rules);
-        assert!(code_pair_at.contains(&"b2033".to_string()));
-        assert!(code_pair_at.contains(&"b2044".to_string()));
+        assert_eq!(
+            extract_pack_tokens("Codes B2033 B2044 since 2023", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Please check B2033 B2044 0800", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 B2044 since 2023", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 and B2044 at 0800", &rules),
+            vec!["b2033", "b2044"]
+        );
         assert!(extract_pack_tokens("故障码2033年", &rules).is_empty());
         assert!(extract_pack_tokens("2023年", &rules).is_empty());
         // fictional
@@ -2356,6 +2441,11 @@ mod tests {
                         "separators": [" "], "max_groups": 4,
                         "group_min_len": 4, "group_max_len": 5
                     }]
+                }, {
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": []
                 }]
             }
         });
@@ -2387,34 +2477,52 @@ mod tests {
             vec!["b2033", "b2044"]
         );
         // These do not fully match the configured 17-character, 4–5-group shape.
+        // fictional
         assert_eq!(
             extract_pack_tokens("LB2033 B2044 0000 0001", &rules),
             vec!["b2044"]
         );
+        // fictional
         assert_eq!(
             extract_pack_tokens("ABCD B2033 B2044 0000", &rules),
             vec!["b2033", "b2044"]
         );
+        // fictional
         assert_eq!(
             extract_pack_tokens("LTES B2033 B2044 0000", &rules),
             vec!["b2033", "b2044"]
         );
+        // fictional
         assert_eq!(
             extract_pack_tokens("LTEST B2033 0000 0000 01", &rules),
             vec!["b2033"]
         );
+        // fictional
         assert_eq!(
             extract_pack_tokens("LTEST B2033 B2040 00", &rules),
             vec!["b2033", "b2040"]
         );
+        // fictional
         assert_eq!(
             extract_pack_tokens("LTEST B2033 B2040 0001", &rules),
             vec!["b2033", "b2040"]
         );
+        // fictional
         assert_eq!(
             extract_pack_tokens("LTEST B2033 B2044 0001", &rules),
             vec!["b2033", "b2044"]
         );
+        for value in [
+            "LB2033 B2044 0000 0001",
+            "ABCD B2033 B2044 0000",
+            "LTES B2033 B2044 0000",
+            "LTEST B2033 0000 0000 01",
+            "LTEST B2033 B2040 00",
+            "LTEST B2033 B2040 0001",
+            "LTEST B2033 B2044 0001",
+        ] {
+            println!("bare {value}: {:?}", extract_pack_tokens(value, &rules));
+        }
     }
 
     #[test]
@@ -2522,6 +2630,9 @@ mod tests {
             "199\n0000\n0000",
             "１９９　００００　００００",
             "LTEST　００００　００００　０００１",
+            "Ｌ ＴＥＳＴ ００００",
+            "Ｌ ＴＥＳＴ 0000",
+            "ＬＴＥＳＴ００００００００００１",
         ] {
             // fictional
             assert_eq!(extract_pack_tokens(value, &rules), Vec::<String>::new());
@@ -2544,6 +2655,7 @@ mod tests {
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":2,"group_min_len":4,"group_max_len":9}]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":["·"]}]}]}}),
             json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[],"max_groups":2,"group_min_len":4,"group_max_len":4}]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":18,"max_len":18,"charset":"ascii_alnum","separators":[" "],"max_groups":4,"group_min_len":4,"group_max_len":5}]}]}}),
         ] {
             assert!(validate_keyword_retrieval_config(&patch).is_err());
         }
@@ -2566,7 +2678,30 @@ mod tests {
                         "min_len": 8,
                         "max_len": 8,
                         "charset": "ascii_alnum",
-                        "separators": [".", "　"]
+                        "separators": [".", "　"],
+                        "max_groups": 2,
+                        "group_min_len": 5,
+                        "group_max_len": 5
+                    }]
+                }]
+            }
+        }))
+        .is_ok());
+        assert!(validate_keyword_retrieval_config(&json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B", "C", "P", "U"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 17,
+                        "max_len": 17,
+                        "charset": "ascii_alnum",
+                        "leading": "L",
+                        "separators": [" ", "-", "_", "/", ".", "　"],
+                        "max_groups": 4,
+                        "group_min_len": 4,
+                        "group_max_len": 5
                     }]
                 }]
             }
