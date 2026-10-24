@@ -815,7 +815,8 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
 
 fn is_shape_separator(shape: &ExcludeShape, character: char) -> bool {
     shape.separators.contains(&character)
-        || (!shape.separators.is_empty() && character.is_whitespace())
+        || character.is_whitespace()
+        || matches!(character, '.' | '·' | '，' | '。')
 }
 
 fn trimmed_shape_group(group: &str) -> &str {
@@ -2548,6 +2549,54 @@ mod tests {
             extract_pack_tokens("Please check B2033 B2044 0800", &rules),
             vec!["b2033", "b2044"]
         );
+    }
+
+    #[test]
+    fn generic_text_separators_block_identifier_and_mobile_fragments() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [
+                    {
+                        "prefixes": ["B"],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年"],
+                        "exclude_shapes": [{
+                            "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                            "leading": "L", "separators": [" ", "-"], "max_groups": 4,
+                            "group_min_len": 4, "group_max_len": 5
+                        }]
+                    },
+                    {
+                        "prefixes": [],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年"],
+                        "exclude_shapes": [{
+                            "min_len": 11, "max_len": 11, "charset": "digits",
+                            "leading": "1", "separators": [" ", "-"], "max_groups": 4,
+                            "group_min_len": 2, "group_max_len": 4
+                        }]
+                    }
+                ]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        for value in [
+            "LTEST　0000　0000　0001",
+            "LTEST.0000.0000.0001",
+            "LTEST·0000·0000·0001",
+            "LTEST，0000，0000，0001",
+            "LTEST。0000。0000。0001",
+            "LTEST\n0000\n0000\n0001",
+            "199　0000　0000",
+            "199.0000.0000",
+            "199·0000·0000",
+            "199，0000，0000",
+            "199。0000。0000",
+            "199\n0000\n0000",
+        ] {
+            // fictional
+            assert_eq!(extract_pack_tokens(value, &rules), Vec::<String>::new());
+        }
     }
 
     #[test]
