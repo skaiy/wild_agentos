@@ -799,7 +799,7 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
                     && !matches!(character, '\n' | '\r')
                     && !is_shape_separator(shape, character)
             }) {
-                let normalized: String = raw
+                let normalized: String = narrow_compatibility_fold(raw)
                     .chars()
                     .filter(|character| character.is_ascii_alphanumeric())
                     .collect();
@@ -893,6 +893,9 @@ fn grouped_exclude_shape_fragments(
             let candidate_matches_shape = group_count <= max_groups as usize
                 && group_lengths_match
                 && normalized_matches_exclude_shape(&normalized_groups.concat(), shape);
+            // Under the deployed 17-character shape with at most four 4–5 character
+            // groups, two five-character fault codes cannot both fit a full shape.
+            // Masking therefore depends on the shape match itself, never code count.
             let code_like_groups: Vec<bool> = normalized_groups
                 .iter()
                 .map(|group| {
@@ -2383,6 +2386,35 @@ mod tests {
             extract_pack_tokens("Please check B2033 B2044 0800", &rules),
             vec!["b2033", "b2044"]
         );
+        // These do not fully match the configured 17-character, 4–5-group shape.
+        assert_eq!(
+            extract_pack_tokens("LB2033 B2044 0000 0001", &rules),
+            vec!["b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("ABCD B2033 B2044 0000", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LTES B2033 B2044 0000", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LTEST B2033 0000 0000 01", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LTEST B2033 B2040 00", &rules),
+            vec!["b2033", "b2040"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LTEST B2033 B2040 0001", &rules),
+            vec!["b2033", "b2040"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LTEST B2033 B2044 0001", &rules),
+            vec!["b2033", "b2044"]
+        );
     }
 
     #[test]
@@ -2606,6 +2638,11 @@ mod tests {
         let rules = pack_token_rules(&legacy_pack);
         // fictional
         assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("１９９００００００００", &rules),
+            Vec::<String>::new()
+        );
         // fictional
         assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
     }
