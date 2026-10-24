@@ -614,7 +614,7 @@ fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
     if shape
         .separators
         .iter()
-        .any(|separator| !matches!(separator, ' ' | '-' | '_' | '/'))
+        .any(|separator| separator.is_ascii_alphanumeric())
     {
         return Err("exclude shape has an invalid separator".into());
     }
@@ -900,30 +900,7 @@ fn grouped_exclude_shape_fragments(
                         normalized_groups
                             .first()
                             .is_some_and(|first| first.starts_with(leading))
-                    })
-                    || normalized_groups
-                        .first()
-                        .is_some_and(|first| first.starts_with('L')))
-            {
-                blocked.extend(
-                    trimmed_groups
-                        .iter()
-                        .map(|group| group.to_ascii_uppercase()),
-                );
-            }
-            let starts_with_embedded_leading_code = shape.leading.is_some_and(|leading| {
-                normalized_groups.first().is_some_and(|first| {
-                    first.strip_prefix(leading).is_some_and(|suffix| {
-                        rules.iter().any(|rule| {
-                            !rule.prefixes.is_empty() && token_matches_rule(suffix, "", rule)
-                        })
-                    })
-                })
-            });
-            if starts_with_embedded_leading_code
-                && normalized_groups.iter().any(|group| {
-                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
-                })
+                    }))
             {
                 blocked.extend(
                     trimmed_groups
@@ -948,16 +925,42 @@ fn grouped_exclude_shape_fragments(
                 );
             }
             if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && !code_like_groups.first().copied().unwrap_or(false)
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+                && normalized_groups
+                    .first()
+                    .is_some_and(|first| first.len() == group_min_len as usize)
+                && normalized_groups.concat().len()
+                    <= shape.max_len as usize + group_max_len as usize
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if shape.leading.is_none()
+                && code_like_groups.iter().filter(|matches| **matches).count() > 1
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
                 && group_count <= max_groups as usize
                 && !code_like_groups.first().copied().unwrap_or(false)
                 && normalized_groups.iter().any(|group| {
                     !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
                 })
-                && ((shape.min_len as usize..=shape.max_len as usize)
+                && normalized_groups.first().is_some_and(|first| {
+                    (group_min_len as usize..=group_max_len as usize).contains(&first.len())
+                })
+                && (shape.min_len as usize..=shape.max_len as usize)
                     .contains(&normalized_groups.concat().len())
-                    || normalized_groups
-                        .first()
-                        .is_some_and(|first| first.len() == 4))
             {
                 blocked.extend(
                     trimmed_groups
@@ -1026,17 +1029,26 @@ fn grouped_exclude_shape_fragments(
                     ));
                 } else if candidate_matches_shape
                     || (group_count == max_groups as usize + 1
-                        && (shape.leading.is_some_and(|leading| {
+                        && normalized_groups.first().is_some_and(|first| {
+                            (group_min_len as usize..=group_max_len as usize).contains(&first.len())
+                        })
+                        && (shape.min_len as usize..=shape.max_len as usize)
+                            .contains(&normalized_groups.concat().len()))
+                    || (group_count == max_groups as usize + 1
+                        && shape.leading.is_some_and(|leading| {
                             normalized_groups
                                 .first()
                                 .is_some_and(|first| first.starts_with(leading))
-                        }) || (normalized_groups
-                            .first()
-                            .is_some_and(|first| first.starts_with('L') || first.len() == 4)
-                            && normalized_groups.iter().any(|group| {
-                                !group.is_empty()
-                                    && group.bytes().all(|character| character.is_ascii_digit())
-                            }))))
+                        }))
+                    || (group_count == max_groups as usize + 1
+                        && code_like_groups.iter().filter(|matches| **matches).count() == 1
+                        && normalized_groups.first().is_some_and(|first| {
+                            (group_min_len as usize..=group_max_len as usize).contains(&first.len())
+                        })
+                        && normalized_groups.iter().any(|group| {
+                            !group.is_empty()
+                                && group.bytes().all(|character| character.is_ascii_digit())
+                        }))
                 {
                     blocked.extend(
                         trimmed_groups
@@ -2259,12 +2271,12 @@ mod tests {
                         {
                             "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
                             "leading": "L",
-                            "separators": [" "], "max_groups": 4,
+                            "separators": [" ", "-", ".", "　"], "max_groups": 4,
                             "group_min_len": 4, "group_max_len": 5
                         },
                         {
                             "min_len": 11, "max_len": 11, "charset": "digits",
-                            "leading": "1", "separators": ["-", " "], "max_groups": 4,
+                            "leading": "1", "separators": ["-", " ", ".", "　"], "max_groups": 4,
                             "group_min_len": 2, "group_max_len": 4
                         }
                     ]
@@ -2330,6 +2342,14 @@ mod tests {
         assert!(extract_pack_tokens("+86 199 0000 0000", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST　0000　0000　0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST.0000.0000.0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199.0000.0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199　0000　0000", &rules).is_empty());
         // fictional
         assert!(extract_pack_tokens("LTEST 0000 0000 0001.", &rules).is_empty());
         // fictional
@@ -2465,6 +2485,69 @@ mod tests {
         // fictional
         assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
         assert!(extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules).is_empty());
+        // Intentional safety tradeoff: this contains an ambiguous complete window.
+        assert!(extract_pack_tokens("Please check B2033 B2044 0800", &rules).is_empty());
+    }
+
+    #[test]
+    fn grouped_exclude_shapes_use_configured_leading_marker() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                        "leading": "W", "separators": [" "], "max_groups": 4,
+                        "group_min_len": 4, "group_max_len": 5
+                    }]
+                }]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        // fictional
+        assert!(extract_pack_tokens("WTEST 0000 0000 0001", &rules).is_empty());
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("WTEST 0000 0000 0001 B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Codes B2033 B2044 since 2023", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Please check B2033 B2044 0800", &rules),
+            vec!["b2033", "b2044"]
+        );
+    }
+
+    #[test]
+    fn grouped_exclude_shapes_with_leading_l_recall_plain_code_pairs() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                        "leading": "L", "separators": [" "], "max_groups": 4,
+                        "group_min_len": 4, "group_max_len": 5
+                    }]
+                }]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        assert_eq!(
+            extract_pack_tokens("Codes B2033 B2044 since 2023", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Please check B2033 B2044 0800", &rules),
+            vec!["b2033", "b2044"]
+        );
     }
 
     #[test]
