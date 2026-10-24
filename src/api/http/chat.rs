@@ -29,7 +29,10 @@ use crate::memory::hyperspace_store::{HybridSearchFilter, ScoredEntry};
 use super::agents::resolve_definition_revision;
 use super::api_gov;
 use super::iam::UserIdentity;
-use super::kb::{kb_vector_tag, vector_records_match_kb_ownership, VECTOR_RETRIEVAL_UNAVAILABLE};
+use super::kb::{
+    kb_vector_tag, ownership_ids_match, vector_records_match_kb_ownership,
+    VECTOR_RETRIEVAL_UNAVAILABLE,
+};
 use super::AppState;
 
 const PACK_VECTOR_RAG_PER_KB_LIMIT: u64 = 5;
@@ -223,8 +226,12 @@ fn resource_supports_vision(resource: &Value) -> bool {
 /// tenant/project. Missing scope is denied rather than treated as a shared
 /// agent, so a legacy record cannot accidentally expose its model.
 fn agent_matches_claims(agent: &Value, claims: &IsolationClaims) -> bool {
-    agent.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
-        && agent.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    ownership_ids_match(
+        agent.get("tenant_id").and_then(Value::as_str),
+        agent.get("project_id").and_then(Value::as_str),
+        claims.tenant_id(),
+        claims.project_id(),
+    )
 }
 
 /// Built-in runtime capabilities are allowlisted in code. Pack JSON remains

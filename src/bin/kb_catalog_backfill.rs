@@ -8,6 +8,10 @@ use std::{
 
 use serde_json::{json, Value};
 
+fn present_id(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 fn parse_assignment(value: &str) -> Result<(String, (String, String)), String> {
     let (id, scope) = value
         .split_once('=')
@@ -36,17 +40,17 @@ fn backfill(
             .and_then(Value::as_str)
             .unwrap_or("<missing>")
             .to_owned();
-        if base.get("tenant_id").and_then(Value::as_str).is_some()
-            && base.get("project_id").and_then(Value::as_str).is_some()
-        {
+        let current_tenant = present_id(base.get("tenant_id").and_then(Value::as_str));
+        let current_project = present_id(base.get("project_id").and_then(Value::as_str));
+        if let (Some(current_tenant), Some(current_project)) = (current_tenant, current_project) {
             if let Some((tenant, project)) = assigns.get(&id) {
-                if base.get("tenant_id").and_then(Value::as_str) == Some(tenant)
-                    && base.get("project_id").and_then(Value::as_str) == Some(project)
-                {
+                if current_tenant == tenant && current_project == project {
                     report.push(json!({"id": id, "status": "already_scoped"}));
                 } else {
                     report.push(json!({"id": id, "status": "conflict"}));
                 }
+            } else {
+                report.push(json!({"id": id, "status": "present"}));
             }
             continue;
         }
@@ -58,8 +62,8 @@ fn backfill(
             .flatten()
         {
             if let (Some(tenant), Some(project)) = (
-                document.get("tenant_id").and_then(Value::as_str),
-                document.get("project_id").and_then(Value::as_str),
+                present_id(document.get("tenant_id").and_then(Value::as_str)),
+                present_id(document.get("project_id").and_then(Value::as_str)),
             ) {
                 evidence.insert((tenant.to_owned(), project.to_owned()));
             }
@@ -76,13 +80,9 @@ fn backfill(
         }
         if evidence.len() == 1 {
             let (tenant, project) = evidence.into_iter().next().unwrap();
-            let tenant_conflict = base
-                .get("tenant_id")
-                .and_then(Value::as_str)
+            let tenant_conflict = present_id(base.get("tenant_id").and_then(Value::as_str))
                 .is_some_and(|value| value != tenant);
-            let project_conflict = base
-                .get("project_id")
-                .and_then(Value::as_str)
+            let project_conflict = present_id(base.get("project_id").and_then(Value::as_str))
                 .is_some_and(|value| value != project);
             if tenant_conflict || project_conflict {
                 report.push(json!({"id": id, "status": "conflict"}));
@@ -93,10 +93,10 @@ fn backfill(
                         "tenant_id": base.get("tenant_id").cloned().unwrap_or(Value::Null),
                         "project_id": base.get("project_id").cloned().unwrap_or(Value::Null),
                     });
-                    if base.get("tenant_id").and_then(Value::as_str).is_none() {
+                    if present_id(base.get("tenant_id").and_then(Value::as_str)).is_none() {
                         base["tenant_id"] = json!(tenant);
                     }
-                    if base.get("project_id").and_then(Value::as_str).is_none() {
+                    if present_id(base.get("project_id").and_then(Value::as_str)).is_none() {
                         base["project_id"] = json!(project);
                     }
                     report.last_mut().unwrap()["before"] = before;
@@ -257,6 +257,38 @@ mod tests {
         assert_eq!(backfill(&mut bases, true, &BTreeMap::new()).unwrap().0, 1);
         assert_eq!(bases[0]["tenant_id"], "t");
         assert_eq!(backfill(&mut bases, true, &BTreeMap::new()).unwrap().0, 0);
+    }
+
+    #[test]
+    fn blank_and_missing_scope_ids_are_backfilled_or_reported() {
+        let mut bases = vec![
+            json!({
+                "id":"empty",
+                "tenant_id":"",
+                "project_id":" ",
+                "documents":[{"tenant_id":"tenant","project_id":"project"}]
+            }),
+            json!({
+                "id":"missing",
+                "documents":[{"tenant_id":" ","project_id":"project"}]
+            }),
+            json!({
+                "id":"different",
+                "tenant_id":"other",
+                "documents":[{"tenant_id":"tenant","project_id":"project"}]
+            }),
+            json!({"id":"present","tenant_id":"tenant","project_id":"project"}),
+        ];
+
+        let (changed, report) = backfill(&mut bases, true, &BTreeMap::new()).unwrap();
+
+        assert_eq!(changed, 1);
+        assert_eq!(bases[0]["tenant_id"], "tenant");
+        assert_eq!(bases[0]["project_id"], "project");
+        assert_eq!(report[0]["status"], "unambiguous");
+        assert_eq!(report[1]["status"], "no_evidence");
+        assert_eq!(report[2]["status"], "conflict");
+        assert_eq!(report[3]["status"], "present");
     }
 
     #[test]

@@ -444,10 +444,9 @@ pub(crate) fn claims_identity(claims: JwtClaims) -> Option<UserIdentity> {
         return None;
     }
     let (project_id, provenance, missing_scope_field) = match claims.project_id.as_deref() {
-        Some(project_id) if !project_id.trim().is_empty() => {
-            (project_id, IsolationScopeProvenance::VerifiedExplicit, None)
-        }
-        _ => (
+        Some(project_id) if project_id.trim().is_empty() => return None,
+        Some(project_id) => (project_id, IsolationScopeProvenance::VerifiedExplicit, None),
+        None => (
             "default",
             IsolationScopeProvenance::VerifiedDefaulted,
             Some(IsolationScopeField::ProjectId),
@@ -683,11 +682,14 @@ pub(crate) mod tests {
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::set(&[(PLATFORM_ADMIN_TENANT_ENV, "platform".into())]);
         assert_platform_denied(&platform_identity("platform", None, &[PLATFORM_ADMIN_ROLE]));
-        assert_platform_denied(&platform_identity(
-            "platform",
-            Some("  "),
-            &[PLATFORM_ADMIN_ROLE],
-        ));
+        assert!(claims_identity(JwtClaims {
+            sub: "test-actor".into(),
+            tenant_id: "platform".into(),
+            project_id: Some("  ".into()),
+            roles: vec![PLATFORM_ADMIN_ROLE.into()],
+            exp: 0,
+        })
+        .is_none());
         let mut identity = platform_identity("platform", Some("project-a"), &[PLATFORM_ADMIN_ROLE]);
         identity.isolation_claims = Some(
             crate::isolation::IsolationClaims::from_verified("platform", "project-a", "test-actor")
@@ -726,6 +728,29 @@ pub(crate) mod tests {
         }
         std::env::remove_var(PLATFORM_ADMIN_TENANT_ENV);
         assert_platform_denied(&identity);
+    }
+
+    #[test]
+    fn blank_platform_admin_tenant_never_matches_a_blank_token_tenant() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[(PLATFORM_ADMIN_TENANT_ENV, "platform".into())]);
+
+        for configured_tenant in ["", " \t "] {
+            std::env::set_var(PLATFORM_ADMIN_TENANT_ENV, configured_tenant);
+            assert_platform_denied(&platform_identity(
+                "platform",
+                Some("project-a"),
+                &[PLATFORM_ADMIN_ROLE],
+            ));
+            assert!(claims_identity(JwtClaims {
+                sub: "service".to_string(),
+                tenant_id: "".to_string(),
+                project_id: Some("project-a".to_string()),
+                roles: vec![PLATFORM_ADMIN_ROLE.to_string()],
+                exp: 0,
+            })
+            .is_none());
+        }
     }
 
     #[test]
@@ -1029,30 +1054,39 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn jwt_with_empty_project_claim_uses_default_project() {
+    async fn jwt_with_blank_scope_claims_is_unauthorized() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous_mode = std::env::var_os("AGENTOS_AUTH_MODE");
         std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
-        let token = encode(
-            &Header::default(),
-            &JwtClaims {
-                sub: "service".to_string(),
-                tenant_id: "acme".to_string(),
-                project_id: Some(String::new()),
-                roles: vec![],
-                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
-            },
-            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
-        )
-        .unwrap();
+        for (tenant_id, project_id) in [
+            ("", Some("project")),
+            (" \t ", Some("project")),
+            ("acme", Some("")),
+            ("acme", Some(" \n ")),
+        ] {
+            let token = encode(
+                &Header::default(),
+                &JwtClaims {
+                    sub: "service".to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    project_id: project_id.map(str::to_owned),
+                    roles: vec![],
+                    exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                },
+                &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+            )
+            .unwrap();
+            let (mut parts, _) = Request::builder()
+                .header("authorization", format!("Bearer {token}"))
+                .body(())
+                .unwrap()
+                .into_parts();
 
-        let claims = verify_jwt(&token)
-            .await
-            .unwrap()
-            .isolation_claims()
-            .unwrap()
-            .clone();
-        assert_eq!(claims.project_id(), "default");
+            let rejection = UserIdentity::from_request_parts(&mut parts, &())
+                .await
+                .unwrap_err();
+            assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+        }
         restore_env("AGENTOS_AUTH_MODE", previous_mode);
     }
 
