@@ -567,9 +567,28 @@ pub struct KnowledgeBaseCreateRequest {
 ///
 /// Records without this scope are historical and deliberately remain outside
 /// the claims-scoped catalog rather than being migrated on read.
+pub(crate) fn ownership_ids_match(
+    record_tenant_id: Option<&str>,
+    record_project_id: Option<&str>,
+    request_tenant_id: &str,
+    request_project_id: &str,
+) -> bool {
+    let is_present = |id: &str| !id.trim().is_empty();
+    record_tenant_id.is_some_and(is_present)
+        && record_project_id.is_some_and(is_present)
+        && is_present(request_tenant_id)
+        && is_present(request_project_id)
+        && record_tenant_id == Some(request_tenant_id)
+        && record_project_id == Some(request_project_id)
+}
+
 fn kb_belongs_to_claims(kb: &Value, claims: &IsolationClaims) -> bool {
-    kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
-        && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+    ownership_ids_match(
+        kb.get("tenant_id").and_then(Value::as_str),
+        kb.get("project_id").and_then(Value::as_str),
+        claims.tenant_id(),
+        claims.project_id(),
+    )
 }
 
 /// Server-derived filter tag that separates KBs sharing a claims namespace.
@@ -670,12 +689,7 @@ pub(crate) async fn vector_records_match_kb_ownership(
             if !bases.iter().any(|kb| {
                 kb.get("id").and_then(Value::as_str) == Some(kb_id)
                     && kb.get("kb_type").and_then(Value::as_str) == Some("vector")
-                    // Historical catalog entries may predate ownership fields.
-                    // Their record namespace is still claims-minted and must
-                    // match above; this compatibility path never grants a
-                    // caller access to a different namespace.
-                    && kb.get("tenant_id").and_then(Value::as_str).is_none_or(|tenant| tenant == claims.tenant_id())
-                    && kb.get("project_id").and_then(Value::as_str).is_none_or(|project| project == claims.project_id())
+                    && kb_belongs_to_claims(kb, claims)
             }) {
                 tracing::error!(iri = %hit.iri, "Vector record KB tag is not owned by its scope");
                 store.cache_ownership_health_if_current(cache_key, generation, false);
@@ -2969,7 +2983,7 @@ mod isolation_contract {
     use axum::{
         body::{to_bytes, Body},
         http::Request,
-        routing::{get, post, put},
+        routing::{delete, get, post, put},
         Router,
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
@@ -3065,6 +3079,67 @@ mod isolation_contract {
             &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn blank_ownership_ids_are_not_matched() {
+        assert!(!ownership_ids_match(
+            Some(""),
+            Some("project"),
+            "",
+            "project"
+        ));
+        assert!(!ownership_ids_match(
+            Some(" \t "),
+            Some("project"),
+            " \n ",
+            "project"
+        ));
+        assert!(!ownership_ids_match(Some("tenant"), Some(""), "tenant", ""));
+        assert!(ownership_ids_match(
+            Some("tenant"),
+            Some("project"),
+            "tenant",
+            "project"
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_or_blank_catalog_tenant_is_not_found_for_normal_tenants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        state.knowledge_bases.write().await.extend([
+            json!({
+                "id": "blank-owned",
+                "kb_type": "vector",
+                "tenant_id": "",
+                "project_id": "default"
+            }),
+            json!({
+                "id": "missing-owned",
+                "kb_type": "vector",
+                "project_id": "default"
+            }),
+        ]);
+        let app = Router::new()
+            .route("/kb/bases/:id", delete(delete_knowledge_base_handler))
+            .with_state(state);
+
+        for tenant_id in ["tenant-a", "tenant-b"] {
+            for kb_id in ["blank-owned", "missing-owned"] {
+                let request = Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kb/bases/{kb_id}"))
+                    .header("authorization", format!("Bearer {}", jwt(tenant_id)))
+                    .body(Body::empty())
+                    .unwrap();
+                assert_eq!(
+                    response_json(&app, request).await.0,
+                    StatusCode::NOT_FOUND,
+                    "{tenant_id} must not resolve {kb_id}"
+                );
+            }
+        }
     }
 
     async fn response_json(router: &Router, request: Request<Body>) -> (StatusCode, Value) {

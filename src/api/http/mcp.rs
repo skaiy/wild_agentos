@@ -2787,16 +2787,7 @@ mod tests {
             "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
         }));
         let response = invoke(empty_project).await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            serde_json::from_slice::<Value>(
-                &axum::body::to_bytes(response.into_body(), 1024)
-                    .await
-                    .unwrap()
-            )
-            .unwrap(),
-            json!({"error": "mcp_claims_incomplete", "missing_field": "project_id"})
-        );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         let explicit_default = raw_inbound_identity_token(json!({
@@ -4453,13 +4444,12 @@ mod tests {
             ))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
-        assert!(body.contains("mcp_claims_incomplete"));
-        assert!(body.contains("project_id"));
+        assert!(body.contains("Bearer token verification failed"));
         assert!(!body.contains(&token));
         assert!(!body.contains("test-tenant"));
         assert!(!body.contains("default"));

@@ -242,12 +242,16 @@ async fn isolation_contract_platform_config_platform_tenant_and_scope_fail_close
             None,
         )
         .await;
-        assert_denied(
-            status,
-            &body,
-            "configuration updates",
-            &[SUBJECT, tenant, PROJECT, PLATFORM_ADMIN_ROLE, BASE_URL],
-        );
+        if project.is_some_and(|project| project.trim().is_empty()) {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        } else {
+            assert_denied(
+                status,
+                &body,
+                "configuration updates",
+                &[SUBJECT, tenant, PROJECT, PLATFORM_ADMIN_ROLE, BASE_URL],
+            );
+        }
         assert_unchanged(&state, &before, &path, None, &model, &mapping).await;
     }
 }
