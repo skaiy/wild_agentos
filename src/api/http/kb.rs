@@ -258,6 +258,7 @@ pub(crate) async fn list_knowledge_packs_handler(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgePackCreateRequest {
     pub name: String,
     pub description: Option<String>,
@@ -270,6 +271,8 @@ pub struct KnowledgePackCreateRequest {
     pub graph_kb_ids: Vec<String>,
     #[serde(default)]
     pub vector_kb_ids: Vec<String>,
+    #[serde(default)]
+    pub keyword_retrieval: Option<Value>,
 }
 
 /// 校验知识包关联的分类/图库/向量库 id 均存在且类型匹配；返回 Err(错误消息)。
@@ -327,6 +330,14 @@ pub(crate) async fn create_knowledge_pack_handler(
             Json(json!({ "error": "name 不能为空" })),
         );
     }
+    let keyword_pack = req
+        .keyword_retrieval
+        .as_ref()
+        .map(|config| json!({ "keyword_retrieval": config }))
+        .unwrap_or_else(|| json!({}));
+    if let Err(error) = crate::api::http::chat::validate_keyword_retrieval_config(&keyword_pack) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(e) = validate_pack_refs(
         &state,
         &req.category_ids,
@@ -352,6 +363,7 @@ pub(crate) async fn create_knowledge_pack_handler(
         "category_ids": req.category_ids,
         "graph_kb_ids": req.graph_kb_ids,
         "vector_kb_ids": req.vector_kb_ids,
+        "keyword_retrieval": req.keyword_retrieval,
         "builtin": false,
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
@@ -390,6 +402,15 @@ pub(crate) async fn update_knowledge_pack_handler(
     let vks = extract_ids("vector_kb_ids");
     if let Err(e) = validate_pack_refs(&state, &cat, &gks, &vks).await {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+    }
+    if patch.get("keyword_retrieval").is_some() {
+        let validation_pack =
+            json!({ "keyword_retrieval": patch.get("keyword_retrieval").cloned() });
+        if let Err(error) =
+            crate::api::http::chat::validate_keyword_retrieval_config(&validation_pack)
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+        }
     }
     let mut guard = state.knowledge_packs.write().await;
     let found = guard
@@ -2865,6 +2886,21 @@ mod isolation_contract {
         jwt_for_scope(tenant_id, None)
     }
 
+    fn platform_jwt(tenant_id: &str) -> String {
+        encode(
+            &Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: format!("{tenant_id}-admin"),
+                tenant_id: tenant_id.to_string(),
+                project_id: Some("project-a".into()),
+                roles: vec!["PLATFORM_ADMIN".into()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
+
     fn jwt_for_scope(tenant_id: &str, project_id: Option<&str>) -> String {
         encode(
             &Header::default(),
@@ -2888,6 +2924,72 @@ mod isolation_contract {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn knowledge_pack_unknown_rule_fields_are_rejected_without_persistence() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        let previous_platform_tenant =
+            std::env::var_os(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
+        std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, "tenant-a");
+        let state = test_state(tmp.path());
+        state.knowledge_packs.write().await.push(json!({
+            "id": "existing-pack",
+            "builtin": false,
+            "vector_kb_ids": []
+        }));
+        let app = Router::new()
+            .route("/packs", post(create_knowledge_pack_handler))
+            .route("/packs/:id", put(update_knowledge_pack_handler))
+            .with_state(state.clone());
+        let token = platform_jwt("tenant-a");
+        let invalid = json!({
+            "name": "invalid",
+            "keyword_retrieval": {"mode":"x","rules":[]}
+        });
+        let (status, _) = response_json(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/packs")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(invalid.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.knowledge_packs.read().await.len(), 1);
+        let (status, _) = response_json(
+            &app,
+            Request::builder()
+                .method("PUT")
+                .uri("/packs/existing-pack")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"keyword_retrieval":{"mode":"x","rules":[]}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state.knowledge_packs.read().await[0]
+            .get("keyword_retrieval")
+            .is_none());
+        if let Some(previous) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", previous);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
+        if let Some(previous) = previous_platform_tenant {
+            std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, previous);
+        } else {
+            std::env::remove_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        }
     }
 
     #[tokio::test]

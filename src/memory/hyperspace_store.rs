@@ -15,6 +15,13 @@ use crate::isolation::IsolationClaims;
 use crate::memory::embedding_service::EmbeddingService;
 use crate::CoreError;
 
+pub const EXACT_SCAN_RECORD_LIMIT: usize = 20_000;
+
+#[derive(Debug, Clone)]
+pub struct ExactMatchResult {
+    pub entries: Vec<ScoredEntry>,
+    pub truncated: bool,
+}
 /// Search filter combining tag matching, type filtering, and importance range.
 ///
 /// Mirrors the original qdrant-based filter interface for backward compatibility
@@ -108,11 +115,18 @@ pub struct ScoredEntry {
     pub iri: String,
     pub text: String,
     pub score: f32,
+    pub match_kind: MatchKind,
     pub tags: Vec<String>,
     pub importance: Option<f32>,
     pub jsonld_types: Vec<String>,
     /// Unix timestamp (seconds) when this entry was stored
     pub stored_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Vector,
+    Exact,
 }
 
 /// In-memory vector store backed by HyperspaceEngine.
@@ -301,6 +315,7 @@ impl HyperspaceStore {
                     iri: hit.iri,
                     text,
                     score: hit.score,
+                    match_kind: MatchKind::Vector,
                     tags,
                     importance,
                     jsonld_types,
@@ -613,9 +628,93 @@ impl HyperspaceStore {
             .search_with_claims(claims, query, &filter, candidate_limit)
             .await?
             .into_iter()
-            .filter(|entry| required_tags.iter().all(|tag| entry.tags.contains(tag)))
+            .filter(|entry| entry_matches_claims_and_tags(entry, claims, required_tags))
             .take(limit as usize)
             .collect())
+    }
+
+    /// Finds literal ASCII token matches only after applying the same verified
+    /// namespace and required-tag filters used for semantic retrieval.
+    pub async fn exact_matches_with_claims_and_required_tags(
+        &self,
+        claims: &IsolationClaims,
+        required_tags: &[String],
+        tokens: &[String],
+        limit: u64,
+    ) -> Result<ExactMatchResult, CoreError> {
+        self.exact_matches_with_claims_and_required_tags_capped(
+            claims,
+            required_tags,
+            tokens,
+            limit,
+            EXACT_SCAN_RECORD_LIMIT,
+        )
+        .await
+    }
+
+    async fn exact_matches_with_claims_and_required_tags_capped(
+        &self,
+        claims: &IsolationClaims,
+        required_tags: &[String],
+        tokens: &[String],
+        limit: u64,
+        scan_cap: usize,
+    ) -> Result<ExactMatchResult, CoreError> {
+        if tokens.is_empty() {
+            return Ok(ExactMatchResult {
+                entries: Vec::new(),
+                truncated: false,
+            });
+        }
+        let namespace = claims.vector_namespace().map_err(|e| CoreError::Internal {
+            message: format!("invalid verified vector namespace: {e}"),
+        })?;
+        let filter = HybridSearchFilter::new()
+            .with_must_tags(required_tags.to_vec())
+            .with_named_graph(namespace);
+        let filters = self.to_jsonld_filters(&filter);
+        let candidates = self
+            .engine
+            .list_filtered(&filters, scan_cap + 1)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace filtered list: {e}"),
+            })?;
+        let truncated = candidates.len() > scan_cap;
+        if truncated {
+            warn!(
+                scanned = scan_cap,
+                cap = scan_cap,
+                "exact retrieval scan cap reached"
+            );
+        }
+        let mut matches: Vec<ScoredEntry> = Self::scored_hits_to_entries(candidates)
+            .into_iter()
+            .take(scan_cap)
+            .filter(|entry| entry_matches_claims_and_tags(entry, claims, required_tags))
+            .filter(|entry| {
+                tokens
+                    .iter()
+                    .any(|token| contains_ascii_token(&entry.text, token))
+            })
+            .collect();
+        // Stable tiers: an entire chunk equal to a requested token precedes a
+        // token merely contained within longer chunk text.
+        matches.sort_by_key(|entry| {
+            if tokens
+                .iter()
+                .any(|token| entry.text.eq_ignore_ascii_case(token))
+            {
+                0
+            } else {
+                1
+            }
+        });
+        matches.truncate(limit as usize);
+        Ok(ExactMatchResult {
+            entries: matches,
+            truncated,
+        })
     }
 
     async fn search_with_filter_inner(
@@ -787,16 +886,317 @@ impl HyperspaceStore {
     }
 }
 
+fn contains_ascii_token(text: &str, token: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let token = token.to_ascii_lowercase();
+    if text.match_indices(&token).any(|(index, _)| {
+        let before_is_word = text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        let after_index = index + token.len();
+        let after_is_word = text[after_index..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        !before_is_word && !after_is_word
+    }) {
+        return true;
+    }
+
+    let normalized_token = normalize_separator_token(&token);
+    token
+        .chars()
+        .any(|character| matches!(character, '-' | '_' | '/'))
+        && text
+            .split(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '/')
+            })
+            .any(|candidate| normalize_separator_token(candidate) == normalized_token)
+}
+
+fn normalize_separator_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | '/'))
+        .collect()
+}
+
+fn entry_matches_claims_and_tags(
+    entry: &ScoredEntry,
+    claims: &IsolationClaims,
+    required_tags: &[String],
+) -> bool {
+    claims
+        .vector_namespace()
+        .is_ok_and(|namespace| entry.iri.starts_with(&format!("{namespace}#")))
+        && required_tags.iter().all(|tag| entry.tags.contains(tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::isolation::IsolationClaims;
     use crate::memory::embedding_service::FallbackEmbeddingService;
+    use async_trait::async_trait;
 
     fn setup_store() -> HyperspaceStore {
         let dir = tempfile::tempdir().unwrap();
         let embed = Arc::new(FallbackEmbeddingService::new());
         HyperspaceStore::open(dir.path(), embed).unwrap()
+    }
+
+    struct UnavailableEmbedding;
+
+    #[async_trait]
+    impl EmbeddingService for UnavailableEmbedding {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Err("unavailable".into())
+        }
+
+        fn dimension(&self) -> usize {
+            128
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_matches_do_not_require_embedding_availability() {
+        let directory = tempfile::tempdir().unwrap();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let seeded =
+            HyperspaceStore::open(directory.path(), Arc::new(FallbackEmbeddingService::new()))
+                .unwrap();
+        seeded
+            .upsert_with_claims(&claims, "entry", "B2033 placeholder", &["kb:local".into()])
+            .await
+            .unwrap();
+        drop(seeded);
+        let store =
+            HyperspaceStore::open(directory.path(), Arc::new(UnavailableEmbedding)).unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["b2033".into()],
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_matches_scan_large_scoped_library_without_embeddings() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let foreign = IsolationClaims::from_verified("tenant-b", "project-a", "actor-b").unwrap();
+        for index in 0..5_001 {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("entry-{index}"),
+                    if index == 5_000 {
+                        "B2033 marker"
+                    } else {
+                        "placeholder"
+                    },
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_with_claims(&foreign, "foreign", "B2033 foreign", &["kb:local".into()])
+            .await
+            .unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["b2033".into()],
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.entries[0].text.contains("marker"));
+    }
+
+    #[tokio::test]
+    async fn exact_matches_report_when_scan_cap_is_exceeded() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        for index in 0..=EXACT_SCAN_RECORD_LIMIT {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("capped-{index}"),
+                    "placeholder",
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["missing".into()],
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn exact_matches_report_truncation_without_exact_hits() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        for index in 0..3 {
+            store
+                .upsert_with_claims(
+                    &claims,
+                    &format!("entry-{index}"),
+                    "placeholder",
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        let result = store
+            .exact_matches_with_claims_and_required_tags_capped(
+                &claims,
+                &["kb:local".into()],
+                &["absent".into()],
+                1,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(result.truncated);
+        assert!(result.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_scan_metadata_scope_keeps_own_match_visible_after_foreign_cap() {
+        let store = setup_store();
+        let own = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        let foreign = IsolationClaims::from_verified("tenant-b", "project-a", "actor-b").unwrap();
+        for index in 0..EXACT_SCAN_RECORD_LIMIT {
+            store
+                .upsert_with_claims(
+                    &foreign,
+                    &format!("foreign-{index}"),
+                    "foreign placeholder",
+                    &["kb:local".into()],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_with_claims(&own, "own", "B2033", &["kb:local".into()])
+            .await
+            .unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &own,
+                &["kb:local".into()],
+                &["b2033".into()],
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(
+            result.entries.first().map(|entry| entry.text.as_str()),
+            Some("B2033")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_matches_rank_equality_before_contains_stably() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        for (id, text) in [
+            ("contains-first", "prefix fault code 2033 suffix"),
+            ("exact-target", "fault code 2033"),
+            ("contains-second", "more fault code 2033 text"),
+        ] {
+            store
+                .upsert_with_claims(&claims, id, text, &["kb:local".into()])
+                .await
+                .unwrap();
+        }
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["fault code 2033".into()],
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].text, "fault code 2033");
+        assert_eq!(result.entries[1].text, "prefix fault code 2033 suffix");
+        assert_eq!(result.entries[2].text, "more fault code 2033 text");
+    }
+
+    #[tokio::test]
+    async fn exact_token_text_ranks_before_containing_text() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "contains",
+                "prefix B2033 suffix",
+                &["kb:local".into()],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(&claims, "exact", "B2033", &["kb:local".into()])
+            .await
+            .unwrap();
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["b2033".into()],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries[0].text, "B2033");
+    }
+
+    #[tokio::test]
+    async fn exact_matches_normalize_separator_tokens_in_document_text() {
+        let store = setup_store();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-a", "actor-a").unwrap();
+        // fictional
+        store
+            .upsert_with_claims(&claims, "separator", "TKT_0002", &["kb:local".into()])
+            .await
+            .unwrap();
+        // fictional
+        store
+            .upsert_with_claims(&claims, "unseparated", "TKT0002", &["kb:local".into()])
+            .await
+            .unwrap();
+
+        let result = store
+            .exact_matches_with_claims_and_required_tags(
+                &claims,
+                &["kb:local".into()],
+                &["tkt-0002".into()],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.entries.len(), 2);
     }
 
     #[tokio::test]

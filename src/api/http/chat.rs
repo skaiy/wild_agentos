@@ -2,6 +2,7 @@
 //!
 //! 路由仍由 `mod.rs` 的 `build_router` 组装。
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use crate::knowledge_graph::ontology_layer::{
     EV_REPAIR_RUNTIME_ASSET_ID,
 };
 use crate::knowledge_graph::store::KnowledgeGraphStore;
-use crate::memory::hyperspace_store::{HybridSearchFilter, ScoredEntry};
+use crate::memory::hyperspace_store::{HybridSearchFilter, MatchKind, ScoredEntry};
 
 use super::agents::resolve_definition_revision;
 use super::api_gov;
@@ -34,6 +35,10 @@ use super::AppState;
 
 const PACK_VECTOR_RAG_PER_KB_LIMIT: u64 = 5;
 const PACK_VECTOR_RAG_TOTAL_LIMIT: usize = 8;
+const MAX_PACK_TOKEN_RULES: usize = 16;
+const MAX_PACK_TOKEN_RULE_VALUES: usize = 16;
+const MAX_PACK_TOKEN_RULE_VALUE_LENGTH: usize = 32;
+const MAX_PACK_EXTRACTED_TOKENS: usize = 16;
 
 #[derive(Deserialize)]
 pub struct AgentChatRequest {
@@ -363,16 +368,86 @@ fn system_chat_message(content: impl Into<ChatContent>) -> ChatMessage {
 fn format_vector_hits_section(hits: &[ScoredEntry]) -> String {
     let mut section = String::from("【向量知识库检索结果】\n");
     for hit in hits {
-        section.push_str(&format!(
-            "- （相关度 {:.2}）{}\n",
-            hit.score,
-            truncate_retrieval_fact(&hit.text, 400)
-        ));
+        if hit.match_kind == MatchKind::Exact {
+            section.push_str(&format!(
+                "- （精确匹配）{}\n",
+                truncate_retrieval_fact(&hit.text, 400)
+            ));
+        } else {
+            section.push_str(&format!(
+                "- （相关度 {:.2}）{}\n",
+                hit.score,
+                truncate_retrieval_fact(&hit.text, 400)
+            ));
+        }
     }
     section
 }
 
-async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec<String> {
+#[derive(Clone, Debug)]
+struct PackVectorSearch {
+    kb_id: String,
+    token_rules: Vec<PackTokenRule>,
+}
+
+struct PackVectorHits {
+    hits: Vec<ScoredEntry>,
+    exact_truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PackTokenRule {
+    prefixes: Vec<String>,
+    digit_count: usize,
+    excluded_suffixes: Vec<String>,
+    excluded_shapes: Vec<ExcludeShape>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShapeCharset {
+    Digits,
+    AsciiAlnum,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExcludeShape {
+    min_len: u8,
+    max_len: u8,
+    charset: ShapeCharset,
+    #[serde(default)]
+    separators: Vec<char>,
+    #[serde(default)]
+    leading: Option<char>,
+    #[serde(default)]
+    max_groups: Option<u8>,
+    #[serde(default)]
+    group_min_len: Option<u8>,
+    #[serde(default)]
+    group_max_len: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeywordRetrievalConfig {
+    rules: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct KeywordRetrievalRule {
+    prefixes: Vec<String>,
+    digit_count: u64,
+    exclude_followed_by: Vec<String>,
+    exclude_shapes: Vec<Value>,
+}
+
+async fn mounted_pack_vector_searches(
+    state: &Arc<AppState>,
+    agent: &Value,
+) -> Result<Vec<PackVectorSearch>, String> {
     let pack_ids: Vec<&str> = agent
         .get("knowledge_pack_ids")
         .and_then(Value::as_array)
@@ -385,10 +460,10 @@ async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec
         })
         .unwrap_or_default();
     if pack_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let packs = state.knowledge_packs.read().await;
-    let mut kb_ids = Vec::new();
+    let mut searches = Vec::new();
     for pack_id in pack_ids {
         let Some(pack) = packs
             .iter()
@@ -396,27 +471,717 @@ async fn mounted_pack_vector_kb_ids(state: &Arc<AppState>, agent: &Value) -> Vec
         else {
             continue;
         };
+        let token_rules = if pack.get("builtin").and_then(Value::as_bool) == Some(false) {
+            validate_keyword_retrieval_config(pack)?;
+            pack_token_rules(pack)
+        } else {
+            Vec::new()
+        };
         if let Some(ids) = pack.get("vector_kb_ids").and_then(Value::as_array) {
             for id in ids {
                 if let Some(kb_id) = id.as_str() {
-                    if !kb_id.is_empty() && !kb_ids.iter().any(|existing| existing == kb_id) {
-                        kb_ids.push(kb_id.to_string());
+                    if !kb_id.is_empty()
+                        && !searches
+                            .iter()
+                            .any(|search: &PackVectorSearch| search.kb_id == kb_id)
+                    {
+                        searches.push(PackVectorSearch {
+                            kb_id: kb_id.to_string(),
+                            token_rules: token_rules.clone(),
+                        });
                     }
                 }
             }
         }
     }
-    kb_ids
+    Ok(searches)
+}
+
+pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), String> {
+    if pack.get("keyword_retrieval").is_none_or(Value::is_null) {
+        return Ok(());
+    }
+    let config = pack
+        .get("keyword_retrieval")
+        .cloned()
+        .ok_or_else(|| "keyword_retrieval is required".to_string())?;
+    let config: KeywordRetrievalConfig = serde_json::from_value(config)
+        .map_err(|error| format!("invalid keyword_retrieval: {error}"))?;
+    let rules = &config.rules;
+    if rules.is_empty() || rules.len() > MAX_PACK_TOKEN_RULES {
+        return Err("keyword_retrieval.rules must contain 1..=16 entries".into());
+    }
+    for rule in rules {
+        let object = rule
+            .as_object()
+            .ok_or_else(|| "keyword retrieval rule must be an object".to_string())?;
+        let _: KeywordRetrievalRule = serde_json::from_value(rule.clone())
+            .map_err(|error| format!("invalid keyword retrieval rule: {error}"))?;
+        let digit_count = object
+            .get("digit_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "digit_count is required".to_string())?;
+        if !(1..=16).contains(&digit_count) {
+            return Err("digit_count must be in 1..=16".into());
+        }
+        for (field, prefixes) in [("prefixes", true), ("exclude_followed_by", false)] {
+            let values = object
+                .get(field)
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{field} is required"))?;
+            if (values.is_empty() && !prefixes) || values.len() > MAX_PACK_TOKEN_RULE_VALUES {
+                return Err(format!(
+                    "{field} exceeds {MAX_PACK_TOKEN_RULE_VALUES} values"
+                ));
+            }
+            for value in values {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| format!("{field} values must be strings"))?;
+                if value.is_empty() || value.len() > MAX_PACK_TOKEN_RULE_VALUE_LENGTH {
+                    return Err(format!("{field} contains an invalid value"));
+                }
+                if prefixes
+                    && !value.bytes().all(|byte| {
+                        byte.is_ascii_alphabetic() || matches!(byte, b'-' | b'_' | b'/')
+                    })
+                {
+                    return Err("prefixes must use configured ASCII separators".into());
+                }
+            }
+        }
+        let shapes = object
+            .get("exclude_shapes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "exclude_shapes is required".to_string())?;
+        if shapes.len() > MAX_PACK_TOKEN_RULE_VALUES {
+            return Err(format!(
+                "exclude_shapes exceeds {MAX_PACK_TOKEN_RULE_VALUES} values"
+            ));
+        }
+        for shape in shapes {
+            let shape: ExcludeShape = serde_json::from_value(shape.clone())
+                .map_err(|error| format!("invalid exclude_shapes value: {error}"))?;
+            validate_exclude_shape(&shape)?;
+        }
+    }
+    Ok(())
+}
+
+fn pack_token_rules(pack: &Value) -> Vec<PackTokenRule> {
+    if validate_keyword_retrieval_config(pack).is_err() {
+        return Vec::new();
+    }
+    let Some(rules) = pack
+        .get("keyword_retrieval")
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("rules"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    rules
+        .iter()
+        .take(MAX_PACK_TOKEN_RULES)
+        .filter_map(|rule| {
+            let object = rule.as_object()?;
+            let digit_count = object.get("digit_count")?.as_u64()?;
+            let digit_count = usize::try_from(digit_count)
+                .ok()
+                .filter(|count| (1..=16).contains(count))?;
+            let prefixes = pack_rule_strings(object.get("prefixes"), true)?;
+            let excluded_suffixes = pack_rule_strings(object.get("exclude_followed_by"), false)?;
+            let excluded_shapes = object
+                .get("exclude_shapes")?
+                .as_array()?
+                .iter()
+                .map(|shape| serde_json::from_value::<ExcludeShape>(shape.clone()).ok())
+                .collect::<Option<Vec<_>>>()?;
+            Some(PackTokenRule {
+                prefixes,
+                digit_count,
+                excluded_suffixes,
+                excluded_shapes,
+            })
+        })
+        .collect()
+}
+
+fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
+    if shape.min_len == 0 || shape.min_len > shape.max_len || shape.max_len > 64 {
+        return Err("exclude shape length must be within 1..=64".into());
+    }
+    if shape
+        .separators
+        .iter()
+        .any(|separator| separator.is_ascii_alphanumeric())
+    {
+        return Err("exclude shape has an invalid separator".into());
+    }
+    if let Some(leading) = shape.leading {
+        let valid = match shape.charset {
+            ShapeCharset::Digits => leading.is_ascii_digit(),
+            ShapeCharset::AsciiAlnum => leading.is_ascii_alphanumeric(),
+        };
+        if !valid {
+            return Err("exclude shape leading character conflicts with charset".into());
+        }
+    }
+    match (shape.max_groups, shape.group_min_len, shape.group_max_len) {
+        (None, None, None) => {}
+        (Some(max_groups), Some(group_min_len), Some(group_max_len)) => {
+            if shape.separators.is_empty() {
+                return Err("grouped exclude shape requires separators".into());
+            }
+            if max_groups == 0
+                || group_min_len == 0
+                || group_min_len > group_max_len
+                || group_max_len > shape.max_len
+            {
+                return Err("exclude shape has invalid group bounds".into());
+            }
+        }
+        _ => return Err("exclude shape group bounds must be configured together".into()),
+    }
+    Ok(())
+}
+
+fn pack_rule_strings(value: Option<&Value>, prefixes: bool) -> Option<Vec<String>> {
+    let values = value?.as_array()?;
+    if values.len() > MAX_PACK_TOKEN_RULE_VALUES {
+        return None;
+    }
+    values
+        .iter()
+        .map(Value::as_str)
+        .map(|value| {
+            let value = value?;
+            if value.is_empty()
+                || value.len() > MAX_PACK_TOKEN_RULE_VALUE_LENGTH
+                || (prefixes
+                    && !value.bytes().all(|byte| {
+                        byte.is_ascii_alphabetic() || matches!(byte, b'-' | b'_' | b'/')
+                    }))
+            {
+                return None;
+            }
+            Some(if prefixes {
+                value.to_ascii_uppercase()
+            } else {
+                value.to_string()
+            })
+        })
+        .collect()
+}
+
+fn canonical_pack_token(token: &str, rules: &[PackTokenRule]) -> String {
+    rules
+        .iter()
+        .find_map(|rule| {
+            rule.prefixes.iter().find_map(|prefix| {
+                let separator = prefix.chars().last()?;
+                let stem = if matches!(separator, '-' | '_' | '/') {
+                    &prefix[..prefix.len() - separator.len_utf8()]
+                } else {
+                    prefix.as_str()
+                };
+                token
+                    .strip_prefix(prefix)
+                    .or_else(|| {
+                        if stem != prefix {
+                            token.strip_prefix(stem)
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|suffix| {
+                        suffix.len() == rule.digit_count
+                            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .map(|suffix| format!("{prefix}{suffix}"))
+            })
+        })
+        .unwrap_or_else(|| token.to_string())
+}
+
+fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
+    if rules.is_empty() {
+        return Vec::new();
+    }
+    let blocked_fragments = excluded_raw_run_fragments(question, rules);
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let flush = |current: &mut String, following: &str, tokens: &mut Vec<String>| {
+        if current.is_empty() {
+            return;
+        }
+        let upper = current.to_ascii_uppercase();
+        if rules
+            .iter()
+            .any(|rule| token_matches_rule(&upper, following, rule))
+            && !blocked_fragments.contains(&upper)
+        {
+            let canonical = canonical_pack_token(&upper, rules);
+            tokens.push(canonical.to_ascii_lowercase());
+        }
+        current.clear();
+    };
+    for (index, character) in question.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            current.push(character);
+        } else {
+            if matches!(character, '-' | '_' | '/') {
+                let following = &question[index..];
+                for rule in rules {
+                    for prefix in &rule.prefixes {
+                        let Some(separator) = prefix.chars().last() else {
+                            continue;
+                        };
+                        let stem = &prefix[..prefix.len() - separator.len_utf8()];
+                        if separator == character && current.eq_ignore_ascii_case(stem) {
+                            let digits: String = following[separator.len_utf8()..]
+                                .chars()
+                                .take_while(|next| next.is_ascii_digit())
+                                .collect();
+                            let following = &following[separator.len_utf8() + digits.len()..];
+                            let token = format!("{stem}{digits}").to_ascii_uppercase();
+                            if token_matches_rule(&token, following, rule)
+                                && !blocked_fragments.contains(&token)
+                            {
+                                tokens
+                                    .push(canonical_pack_token(&token, rules).to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+            flush(&mut current, &question[index..], &mut tokens);
+        }
+    }
+    flush(&mut current, "", &mut tokens);
+    tokens.sort();
+    tokens.dedup();
+    if tokens.len() > MAX_PACK_EXTRACTED_TOKENS {
+        tracing::warn!(
+            cap = MAX_PACK_EXTRACTED_TOKENS,
+            "pack exact token cap reached"
+        );
+        tokens.truncate(MAX_PACK_EXTRACTED_TOKENS);
+    }
+    tokens
+}
+
+fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSet<String> {
+    let shapes: Vec<&ExcludeShape> = rules
+        .iter()
+        .flat_map(|rule| rule.excluded_shapes.iter())
+        .filter(|shape| !shape.separators.is_empty())
+        .collect();
+    if shapes.is_empty() {
+        return HashSet::new();
+    }
+    let mut blocked = HashSet::new();
+    for shape in &shapes {
+        if shape.max_groups.is_some() {
+            let groups: Vec<&str> = question
+                .split(|character| is_shape_separator(shape, character))
+                .flat_map(|group| group.split(|character: char| !character.is_ascii_alphanumeric()))
+                .filter(|group| !group.is_empty())
+                .collect();
+            blocked.extend(grouped_exclude_shape_fragments(&groups, shape, rules));
+        } else {
+            for raw in question.split(|character: char| {
+                !character.is_ascii_alphanumeric()
+                    && character != '+'
+                    && !matches!(character, '\n' | '\r')
+                    && !is_shape_separator(shape, character)
+            }) {
+                let normalized: String = raw
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .collect();
+                if normalized_matches_exclude_shape_window(&normalized, shape) {
+                    blocked.extend(
+                        raw.split(|character: char| !character.is_ascii_alphanumeric())
+                            .filter(|fragment| !fragment.is_empty())
+                            .map(|fragment| fragment.to_ascii_uppercase()),
+                    );
+                }
+            }
+        }
+    }
+    blocked
+}
+
+fn is_shape_separator(shape: &ExcludeShape, character: char) -> bool {
+    shape.separators.contains(&character)
+        || (!shape.separators.is_empty() && character.is_whitespace())
+}
+
+fn trimmed_shape_group(group: &str) -> &str {
+    group.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+}
+
+fn normalized_matches_exclude_shape_window(normalized: &str, shape: &ExcludeShape) -> bool {
+    (shape.min_len as usize..=shape.max_len as usize).any(|length| {
+        normalized.as_bytes().windows(length).any(|window| {
+            std::str::from_utf8(window)
+                .ok()
+                .is_some_and(|candidate| normalized_matches_exclude_shape(candidate, shape))
+        })
+    })
+}
+
+fn grouped_exclude_shape_fragments(
+    groups: &[&str],
+    shape: &ExcludeShape,
+    rules: &[PackTokenRule],
+) -> Vec<String> {
+    let (Some(max_groups), Some(group_min_len), Some(group_max_len)) =
+        (shape.max_groups, shape.group_min_len, shape.group_max_len)
+    else {
+        return Vec::new();
+    };
+    let mut blocked = Vec::new();
+    for start in 0..groups.len() {
+        for group_count in 1..=max_groups as usize + 1 {
+            let Some(candidate_groups) = groups.get(start..start + group_count) else {
+                break;
+            };
+            let trimmed_groups: Vec<&str> = candidate_groups
+                .iter()
+                .map(|group| trimmed_shape_group(group))
+                .collect();
+            let normalized_groups: Vec<String> = trimmed_groups
+                .iter()
+                .map(|group| group.to_ascii_uppercase())
+                .collect();
+            let group_lengths_match = trimmed_groups.iter().all(|group| {
+                !group.is_empty()
+                    && group
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+            }) && normalized_groups.iter().all(|group| {
+                (group_min_len as usize..=group_max_len as usize).contains(&group.len())
+            });
+            let candidate_matches_shape = group_count <= max_groups as usize
+                && group_lengths_match
+                && normalized_matches_exclude_shape(&normalized_groups.concat(), shape);
+            let code_like_groups: Vec<bool> = normalized_groups
+                .iter()
+                .map(|group| {
+                    rules.iter().any(|rule| {
+                        !rule.prefixes.is_empty()
+                            && (token_matches_rule(group, "", rule)
+                                || shape.leading.is_some_and(|leading| {
+                                    group
+                                        .strip_prefix(leading)
+                                        .is_some_and(|suffix| token_matches_rule(suffix, "", rule))
+                                })
+                                || group
+                                    .get(1..)
+                                    .is_some_and(|suffix| token_matches_rule(suffix, "", rule)))
+                    })
+                })
+                .collect();
+            let candidate_contains_code = code_like_groups.iter().any(|matches| *matches);
+            if candidate_matches_shape && !candidate_contains_code {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && (candidate_matches_shape
+                    || (shape.min_len as usize..=shape.max_len as usize)
+                        .contains(&normalized_groups.concat().len())
+                    || shape.leading.is_some_and(|leading| {
+                        normalized_groups
+                            .first()
+                            .is_some_and(|first| first.starts_with(leading))
+                    }))
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.first().copied().unwrap_or(false)
+                && normalized_groups.first().is_some_and(|first| {
+                    !rules.iter().any(|rule| {
+                        !rule.prefixes.is_empty() && token_matches_rule(first, "", rule)
+                    })
+                })
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && !code_like_groups.first().copied().unwrap_or(false)
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+                && normalized_groups
+                    .first()
+                    .is_some_and(|first| first.len() == group_min_len as usize)
+                && normalized_groups.concat().len()
+                    <= shape.max_len as usize + group_max_len as usize
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if shape.leading.is_none()
+                && code_like_groups.iter().filter(|matches| **matches).count() > 1
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && group_count <= max_groups as usize
+                && !code_like_groups.first().copied().unwrap_or(false)
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+                && normalized_groups.first().is_some_and(|first| {
+                    (group_min_len as usize..=group_max_len as usize).contains(&first.len())
+                })
+                && (shape.min_len as usize..=shape.max_len as usize)
+                    .contains(&normalized_groups.concat().len())
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            if code_like_groups.iter().filter(|matches| **matches).count() > 1
+                && normalized_groups.iter().any(|group| {
+                    !group.is_empty() && group.bytes().all(|character| character.is_ascii_digit())
+                })
+                && (candidate_matches_shape
+                    || (shape.min_len as usize..=shape.max_len as usize)
+                        .contains(&normalized_groups.concat().len()))
+            {
+                blocked.extend(
+                    trimmed_groups
+                        .iter()
+                        .map(|group| group.to_ascii_uppercase()),
+                );
+            }
+            let candidate_charset_matches = normalized_groups.iter().all(|group| {
+                group.chars().all(|character| match shape.charset {
+                    ShapeCharset::Digits => character.is_ascii_digit(),
+                    ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
+                })
+            });
+            if !candidate_charset_matches {
+                continue;
+            }
+            for (index, _group) in normalized_groups.iter().enumerate() {
+                if !code_like_groups[index] {
+                    continue;
+                }
+                let remaining: Vec<&String> = normalized_groups
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(other_index, group)| (other_index != index).then_some(group))
+                    .collect();
+                let retains_complete_shape = remaining.len() <= max_groups as usize
+                    && remaining.iter().all(|group| {
+                        (group_min_len as usize..=group_max_len as usize).contains(&group.len())
+                    })
+                    && normalized_matches_exclude_shape(
+                        &remaining
+                            .iter()
+                            .map(|group| group.as_str())
+                            .collect::<String>(),
+                        shape,
+                    );
+                if retains_complete_shape
+                    || shape.leading.is_some()
+                        && code_removal_forms_complete_shape(
+                            groups,
+                            start + index,
+                            shape,
+                            max_groups,
+                            group_min_len,
+                            group_max_len,
+                        )
+                {
+                    blocked.extend(trimmed_groups.iter().enumerate().filter_map(
+                        |(other_index, group)| {
+                            (other_index != index).then_some(group.to_ascii_uppercase())
+                        },
+                    ));
+                } else if candidate_matches_shape
+                    || (group_count == max_groups as usize + 1
+                        && normalized_groups.first().is_some_and(|first| {
+                            (group_min_len as usize..=group_max_len as usize).contains(&first.len())
+                        })
+                        && (shape.min_len as usize..=shape.max_len as usize)
+                            .contains(&normalized_groups.concat().len()))
+                    || (group_count == max_groups as usize + 1
+                        && shape.leading.is_some_and(|leading| {
+                            normalized_groups
+                                .first()
+                                .is_some_and(|first| first.starts_with(leading))
+                        }))
+                    || (group_count == max_groups as usize + 1
+                        && code_like_groups.iter().filter(|matches| **matches).count() == 1
+                        && normalized_groups.first().is_some_and(|first| {
+                            (group_min_len as usize..=group_max_len as usize).contains(&first.len())
+                        })
+                        && normalized_groups.iter().any(|group| {
+                            !group.is_empty()
+                                && group.bytes().all(|character| character.is_ascii_digit())
+                        }))
+                {
+                    blocked.extend(
+                        trimmed_groups
+                            .iter()
+                            .map(|group| group.to_ascii_uppercase()),
+                    );
+                }
+            }
+        }
+    }
+    blocked
+}
+
+fn code_removal_forms_complete_shape(
+    groups: &[&str],
+    code_position: usize,
+    shape: &ExcludeShape,
+    max_groups: u8,
+    group_min_len: u8,
+    group_max_len: u8,
+) -> bool {
+    for start in 0..=code_position {
+        for group_count in 1..=max_groups as usize + 1 {
+            let end = start + group_count;
+            let Some(window) = groups.get(start..end) else {
+                break;
+            };
+            if !(start..end).contains(&code_position) {
+                continue;
+            }
+            let remaining: Vec<&str> = window
+                .iter()
+                .enumerate()
+                .filter_map(|(index, group)| {
+                    (start + index != code_position).then_some(trimmed_shape_group(group))
+                })
+                .collect();
+            if remaining.len() <= max_groups as usize
+                && remaining.iter().all(|group| {
+                    !group.is_empty()
+                        && group
+                            .bytes()
+                            .all(|character| character.is_ascii_alphanumeric())
+                        && (group_min_len as usize..=group_max_len as usize).contains(&group.len())
+                })
+                && normalized_matches_exclude_shape(&remaining.concat().to_ascii_uppercase(), shape)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn normalized_matches_exclude_shape(normalized: &str, shape: &ExcludeShape) -> bool {
+    (shape.min_len as usize..=shape.max_len as usize).contains(&normalized.len())
+        && normalized.chars().all(|character| match shape.charset {
+            ShapeCharset::Digits => character.is_ascii_digit(),
+            ShapeCharset::AsciiAlnum => character.is_ascii_alphanumeric(),
+        })
+        && shape
+            .leading
+            .is_none_or(|leading| normalized.starts_with(leading))
+}
+
+fn token_matches_rule(token: &str, following: &str, rule: &PackTokenRule) -> bool {
+    let prefix_matches = if rule.prefixes.is_empty() {
+        token.len() == rule.digit_count && token.bytes().all(|byte| byte.is_ascii_digit())
+    } else {
+        rule.prefixes.iter().any(|prefix| {
+            token
+                .strip_prefix(prefix)
+                .or_else(|| {
+                    let separator = prefix.chars().last()?;
+                    if matches!(separator, '-' | '_' | '/') {
+                        token.strip_prefix(&prefix[..prefix.len() - separator.len_utf8()])
+                    } else {
+                        None
+                    }
+                })
+                .is_some_and(|suffix| {
+                    suffix.len() == rule.digit_count
+                        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+    };
+    if !prefix_matches {
+        return false;
+    }
+    if excluded_by_suffix(following, &rule.excluded_suffixes)
+        || rule
+            .excluded_shapes
+            .iter()
+            .any(|shape| token_matches_exclude_shape(token, shape))
+    {
+        return false;
+    }
+    true
+}
+
+fn token_matches_exclude_shape(token: &str, shape: &ExcludeShape) -> bool {
+    let normalized: String = token
+        .chars()
+        .filter(|character| !shape.separators.contains(character))
+        .collect();
+    normalized_matches_exclude_shape(&normalized, shape)
+}
+
+fn excluded_by_suffix(following: &str, suffixes: &[String]) -> bool {
+    let mut remaining = following;
+    for _ in 0..3 {
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        remaining = &remaining[character.len_utf8()..];
+    }
+    suffixes.iter().any(|suffix| remaining.starts_with(suffix))
 }
 
 async fn pack_scoped_vector_hits(
     state: &Arc<AppState>,
     claims: &IsolationClaims,
     question: &str,
-    kb_ids: &[String],
-) -> Result<Vec<ScoredEntry>, (StatusCode, Value)> {
-    if kb_ids.is_empty() {
-        return Ok(Vec::new());
+    searches: &[PackVectorSearch],
+) -> Result<PackVectorHits, (StatusCode, Value)> {
+    if searches.is_empty() {
+        return Ok(PackVectorHits {
+            hits: Vec::new(),
+            exact_truncated: false,
+        });
     }
     let Some(store) = state.vector_store.load_full() else {
         return Err((
@@ -424,9 +1189,46 @@ async fn pack_scoped_vector_hits(
             json!({ "error": "chat vector retrieval unavailable" }),
         ));
     };
+    let mut exact_hits = Vec::new();
+    let mut exact_truncated = false;
     let mut hits = Vec::new();
-    for kb_id in kb_ids {
-        let tag = kb_vector_tag(kb_id);
+    for search in searches {
+        let tag = kb_vector_tag(&search.kb_id);
+        let tokens = extract_pack_tokens(question, &search.token_rules);
+        if !tokens.is_empty() {
+            match store
+                .exact_matches_with_claims_and_required_tags(
+                    claims,
+                    std::slice::from_ref(&tag),
+                    &tokens,
+                    PACK_VECTOR_RAG_PER_KB_LIMIT,
+                )
+                .await
+            {
+                Ok(result) => {
+                    if result.truncated {
+                        exact_truncated = true;
+                        tracing::warn!(kb_id = %search.kb_id, "pack exact retrieval scan was truncated");
+                    }
+                    let mut batch = result.entries;
+                    for hit in &mut batch {
+                        hit.match_kind = MatchKind::Exact;
+                    }
+                    exact_hits.extend(batch);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        kb_id = %search.kb_id,
+                        error = %error,
+                        "pack-scoped exact retrieval failed"
+                    );
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({ "error": "chat vector retrieval unavailable" }),
+                    ));
+                }
+            }
+        }
         match store
             .search_with_claims_and_required_tags(
                 claims,
@@ -439,7 +1241,7 @@ async fn pack_scoped_vector_hits(
             Ok(batch) => hits.extend(batch),
             Err(error) => {
                 tracing::error!(
-                    kb_id = %kb_id,
+                    kb_id = %search.kb_id,
                     error = %error,
                     "pack-scoped chat vector retrieval failed"
                 );
@@ -450,14 +1252,26 @@ async fn pack_scoped_vector_hits(
             }
         }
     }
-    hits.sort_by(|left, right| {
+    exact_hits.dedup_by(|left, right| left.iri == right.iri);
+    let mut seen_iris = HashSet::new();
+    exact_hits.retain(|hit| seen_iris.insert(hit.iri.clone()));
+    hits.retain(|hit| seen_iris.insert(hit.iri.clone()));
+    exact_hits.append(&mut hits);
+    let exact_count = exact_hits
+        .iter()
+        .take_while(|hit| hit.match_kind == MatchKind::Exact)
+        .count();
+    exact_hits[exact_count..].sort_by(|left, right| {
         right
             .score
             .partial_cmp(&left.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
-    Ok(hits)
+    exact_hits.truncate(PACK_VECTOR_RAG_TOTAL_LIMIT);
+    Ok(PackVectorHits {
+        hits: exact_hits,
+        exact_truncated,
+    })
 }
 
 async fn ev_repair_graph_retrieval(
@@ -570,19 +1384,32 @@ async fn build_claims_scoped_prefix_messages(
         ));
     }
 
-    let pack_kb_ids = mounted_pack_vector_kb_ids(state, agent).await;
+    let pack_vector_searches =
+        mounted_pack_vector_searches(state, agent)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    json!({ "error": format!("invalid mounted pack configuration: {error}") }),
+                )
+            })?;
     let graph_retrieval = if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
         Some(ev_repair_graph_retrieval(state, claims, &question).await?)
     } else {
         None
     };
 
-    let vector_section = if !pack_kb_ids.is_empty() {
-        let hits = pack_scoped_vector_hits(state, claims, &question, &pack_kb_ids).await?;
-        if hits.is_empty() {
+    let vector_section = if !pack_vector_searches.is_empty() {
+        let retrieval =
+            pack_scoped_vector_hits(state, claims, &question, &pack_vector_searches).await?;
+        if retrieval.hits.is_empty() {
             None
         } else {
-            Some(format_vector_hits_section(&hits))
+            let mut section = format_vector_hits_section(&retrieval.hits);
+            if retrieval.exact_truncated {
+                section.push_str("[exact retrieval truncated]\n");
+            }
+            Some(section)
         }
     } else if builtin_asset == Some(BuiltinRuntimeAsset::EvRepair) {
         ev_repair_legacy_vector_section(state, claims, &question).await?
@@ -1428,6 +2255,562 @@ mod tests {
             invocations: crate::api::http::invocations::InvocationsRuntime::unavailable(),
             shutdown: tokio_util::sync::CancellationToken::new(),
         })
+    }
+
+    #[test]
+    fn configured_pack_token_rules_are_opt_in_and_exclude_marked_values() {
+        let pack = json!({
+            "builtin": false,
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年", "年份", "年款"],
+                    "exclude_shapes": [
+                        {"min_len": 16, "max_len": 17, "charset": "ascii_alnum"},
+                        {
+                            "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                            "leading": "L",
+                            "separators": [" ", "-", ".", "　"], "max_groups": 4,
+                            "group_min_len": 4, "group_max_len": 5
+                        },
+                        {
+                            "min_len": 11, "max_len": 11, "charset": "digits",
+                            "leading": "1", "separators": ["-", " ", ".", "　"], "max_groups": 4,
+                            "group_min_len": 2, "group_max_len": 4
+                        }
+                    ]
+                }, {
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年", "年份", "年款"],
+                    "exclude_shapes": []
+                }]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        assert_eq!(extract_pack_tokens("报B2033", &rules), vec!["b2033"]);
+        assert_eq!(
+            extract_pack_tokens("B2040 是什么故障", &rules),
+            vec!["b2040"]
+        );
+        assert_eq!(
+            extract_pack_tokens("What does B2033 mean", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Lamp shows B2033 when cold", &rules),
+            vec!["b2033"]
+        );
+        // Intentional safety tradeoff: indistinguishable from a complete
+        // leading-shaped identifier under configured ASCII-only constraints.
+        assert!(extract_pack_tokens("Look into B2033 code", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("Let me check B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LED fault B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 and B2044", &rules),
+            vec!["b2033", "b2044"]
+        );
+        let plain_pair_since = extract_pack_tokens("Codes B2033 B2044 since 2023", &rules);
+        assert!(plain_pair_since.contains(&"b2033".to_string()));
+        assert!(plain_pair_since.contains(&"b2044".to_string()));
+        let plain_pair_time = extract_pack_tokens("Please check B2033 B2044 0800", &rules);
+        assert!(plain_pair_time.contains(&"b2033".to_string()));
+        assert!(plain_pair_time.contains(&"b2044".to_string()));
+        let code_pair_since = extract_pack_tokens("B2033 B2044 since 2023", &rules);
+        assert!(code_pair_since.contains(&"b2033".to_string()));
+        assert!(code_pair_since.contains(&"b2044".to_string()));
+        let code_pair_at = extract_pack_tokens("B2033 and B2044 at 0800", &rules);
+        assert!(code_pair_at.contains(&"b2033".to_string()));
+        assert!(code_pair_at.contains(&"b2044".to_string()));
+        assert!(extract_pack_tokens("故障码2033年", &rules).is_empty());
+        assert!(extract_pack_tokens("2023年", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST000000000001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("19900000000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
+        assert_eq!(extract_pack_tokens("故障码 2033", &rules), vec!["2033"]);
+        // fictional
+        assert!(extract_pack_tokens("+86 199 0000 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST　0000　0000　0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST.0000.0000.0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199.0000.0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199　0000　0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001.", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001，", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("(LTEST 0000 0000 0001)", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199 0000 0000。", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199-0000 0000,", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("车架号LTEST 0000 0000 0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("电话199 0000 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST\t0000\u{00a0}0000\u{3000}0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199\n0000\n0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST 0000\n0000 0001", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 LTEST 0000 0000 0001", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("LTEST 0000 0000 0001和B2033", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("车架号LTEST 0000 0000 0001，故障B2033。", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("B2033，LTEST 0000 0000 0001", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033 and B2044", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Please explain fault code B2033 today", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("What does code B2033 mean", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        let before_phone = extract_pack_tokens("B2033 199 0000 0000", &rules);
+        assert_eq!(before_phone, vec!["b2033"]);
+        // fictional
+        let after_phone = extract_pack_tokens("199 0000 0000 B2033", &rules);
+        assert_eq!(after_phone, vec!["b2033"]);
+        // fictional
+        let long_phone = extract_pack_tokens("Please inspect 199 0000 0000 B2033 today", &rules);
+        assert_eq!(long_phone, vec!["b2033"]);
+        // fictional
+        assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LSVA B2033 KX1P 9QZ7", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTST B2033 ABCD EFGH", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("ABCD B2033 B2044 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTES B2033 B2044 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001 trailing words", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("199 0000 0000 trailing words", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("leading words 199 0000 0000", &rules).is_empty());
+        // fictional: the code interrupts the configured grouped shape, so fail closed.
+        assert!(extract_pack_tokens("LTEST B2033 0000 0000 01", &rules).is_empty());
+        // fictional: concatenated values are not tokenized and therefore do not retrieve.
+        assert!(extract_pack_tokens("B2033LTEST000000000001", &rules).is_empty());
+        // fictional: multiple code-like groups inside the grouped shape fail closed.
+        assert!(extract_pack_tokens("LTEST B2033 B2040 00", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST B2033 B2040 0001", &rules).is_empty());
+        assert!(extract_pack_tokens("B2033", &[]).is_empty());
+    }
+
+    #[test]
+    fn grouped_exclude_shapes_without_leading_do_not_block_fault_codes_in_prose() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                        "separators": [" "], "max_groups": 4,
+                        "group_min_len": 4, "group_max_len": 5
+                    }]
+                }]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        // Intentional safety tradeoff: without leading, complete windows fail closed.
+        assert!(extract_pack_tokens("What does B2033 mean", &rules).is_empty());
+        assert_eq!(
+            extract_pack_tokens("Let me check B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("LED fault B2033", &rules),
+            vec!["b2033"]
+        );
+        // fictional
+        assert!(extract_pack_tokens("ABCD B2033 0000 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST B2033 0000 0000 01", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST B2033 B2044 0001", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LSVA B2033 KX1P 9QZ7", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTST B2033 ABCD EFGH", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("ABCD B2033 B2044 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTES B2033 B2044 0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LB2033 B2044 0000 0001", &rules).is_empty());
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001 B2033", &rules).is_empty());
+        // Intentional safety tradeoff: this contains an ambiguous complete window.
+        assert!(extract_pack_tokens("Please check B2033 B2044 0800", &rules).is_empty());
+    }
+
+    #[test]
+    fn grouped_exclude_shapes_use_configured_leading_marker() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                        "leading": "W", "separators": [" "], "max_groups": 4,
+                        "group_min_len": 4, "group_max_len": 5
+                    }]
+                }]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        // fictional
+        assert!(extract_pack_tokens("WTEST 0000 0000 0001", &rules).is_empty());
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("WTEST 0000 0000 0001 B2033", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Codes B2033 B2044 since 2023", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Please check B2033 B2044 0800", &rules),
+            vec!["b2033", "b2044"]
+        );
+    }
+
+    #[test]
+    fn grouped_exclude_shapes_with_leading_l_recall_plain_code_pairs() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                        "leading": "L", "separators": [" "], "max_groups": 4,
+                        "group_min_len": 4, "group_max_len": 5
+                    }]
+                }]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        assert_eq!(
+            extract_pack_tokens("Codes B2033 B2044 since 2023", &rules),
+            vec!["b2033", "b2044"]
+        );
+        assert_eq!(
+            extract_pack_tokens("Please check B2033 B2044 0800", &rules),
+            vec!["b2033", "b2044"]
+        );
+    }
+
+    #[test]
+    fn keyword_retrieval_configuration_rejects_invalid_rules() {
+        let base = || json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
+        for patch in [
+            json!({"keyword_retrieval":{"mode":"x","rules":[]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["unknown"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"mode":"x","prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["unknown"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":[],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["非"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":0,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":17,"exclude_followed_by":["年"],"exclude_shapes":["ascii_alphanumeric_run_16_17"]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","max_groups":2}]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":0,"group_min_len":4,"group_max_len":4}]}]}}),
+            json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":8,"max_len":8,"charset":"ascii_alnum","separators":[" "],"max_groups":2,"group_min_len":4,"group_max_len":9}]}]}}),
+        ] {
+            assert!(validate_keyword_retrieval_config(&patch).is_err());
+        }
+        let mut too_many = base();
+        too_many["keyword_retrieval"]["rules"] = Value::Array(
+            (0..17)
+                .map(|_| base()["keyword_retrieval"]["rules"][0].clone())
+                .collect(),
+        );
+        assert!(validate_keyword_retrieval_config(&too_many).is_err());
+        assert!(validate_keyword_retrieval_config(&json!({"builtin": false})).is_ok());
+        assert!(validate_keyword_retrieval_config(&json!({"keyword_retrieval": null})).is_ok());
+    }
+
+    #[test]
+    fn grouped_exclude_shapes_match_sliding_group_windows() {
+        let shape = ExcludeShape {
+            min_len: 8,
+            max_len: 8,
+            charset: ShapeCharset::AsciiAlnum,
+            separators: vec![' '],
+            leading: None,
+            max_groups: Some(1),
+            group_min_len: Some(8),
+            group_max_len: Some(8),
+        };
+        assert_eq!(
+            grouped_exclude_shape_fragments(&["ABCDEFGH"], &shape, &[]),
+            vec!["ABCDEFGH"]
+        );
+        assert!(grouped_exclude_shape_fragments(&["ABCD", "EFGH"], &shape, &[]).is_empty());
+    }
+
+    #[test]
+    fn legacy_separator_exclude_shapes_still_match_across_configured_separators() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 8, "max_len": 8, "charset": "digits",
+                        "separators": ["-"]
+                    }]
+                }]
+            }
+        });
+        // fictional
+        assert!(extract_pack_tokens("1111-2222", &pack_token_rules(&pack)).is_empty());
+
+        let legacy_pack = json!({
+            "keyword_retrieval": {
+                "rules": [
+                    {
+                        "prefixes": [],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年"],
+                        "exclude_shapes": [{
+                            "min_len": 11, "max_len": 11, "charset": "digits",
+                            "leading": "1", "separators": ["-"]
+                        }]
+                    },
+                    {
+                        "prefixes": [],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年"],
+                        "exclude_shapes": [{
+                            "min_len": 17, "max_len": 17, "charset": "ascii_alnum",
+                            "separators": [" "]
+                        }]
+                    }
+                ]
+            }
+        });
+        let rules = pack_token_rules(&legacy_pack);
+        // fictional
+        assert!(extract_pack_tokens("199-0000-0000", &rules).is_empty());
+        // fictional
+        assert!(extract_pack_tokens("LTEST 0000 0000 0001", &rules).is_empty());
+    }
+
+    #[test]
+    fn pack_token_rules_try_overlapping_prefixes() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["B", "BA"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
+        assert_eq!(
+            extract_pack_tokens("BA1234", &pack_token_rules(&pack)),
+            vec!["ba1234"]
+        );
+    }
+
+    #[test]
+    fn pack_token_rules_support_separator_prefixes() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["TKT-"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
+        assert_eq!(
+            extract_pack_tokens("TKT-0002", &pack_token_rules(&pack)),
+            vec!["tkt-0002"]
+        );
+    }
+
+    #[test]
+    fn pack_token_rules_normalize_optional_prefix_separators() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["TKT-", "TKT_"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
+        let rules = pack_token_rules(&pack);
+        assert_eq!(extract_pack_tokens("TKT-0002", &rules), vec!["tkt-0002"]);
+        assert_eq!(extract_pack_tokens("TKT0002", &rules), vec!["tkt-0002"]);
+        assert_eq!(extract_pack_tokens("TKT_0002", &rules), vec!["tkt-0002"]);
+        assert!(extract_pack_tokens("TKT-2033年", &rules).is_empty());
+    }
+
+    #[test]
+    fn pack_token_rules_do_not_globally_join_separators() {
+        let pack = json!({"keyword_retrieval":{"rules":[{"prefixes":["B"],"digit_count":4,"exclude_followed_by":["年"],"exclude_shapes":[{"min_len":16,"max_len":17,"charset":"ascii_alnum"}]}]}});
+        assert_eq!(
+            extract_pack_tokens("B2033/B2034", &pack_token_rules(&pack)),
+            vec!["b2033", "b2034"]
+        );
+        assert_eq!(
+            extract_pack_tokens("B2033-01", &pack_token_rules(&pack)),
+            vec!["b2033"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_without_keyword_retrieval_mounts_without_exact_rules() {
+        let state = make_state();
+        *state.knowledge_packs.write().await = vec![json!({
+            "id": "pack-without-rules",
+            "builtin": false,
+            "vector_kb_ids": ["kb-without-rules"]
+        })];
+        let searches = mounted_pack_vector_searches(
+            &state,
+            &json!({ "knowledge_pack_ids": ["pack-without-rules"] }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(searches.len(), 1);
+        assert!(searches[0].token_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_mounted_pack_configuration_is_rejected() {
+        let state = make_state();
+        *state.knowledge_packs.write().await = vec![json!({
+            "id": "invalid-pack",
+            "builtin": false,
+            "vector_kb_ids": ["kb-invalid"],
+            "keyword_retrieval": {"rules": [{
+                "prefixes": ["B"],
+                "digit_count": 4,
+                "exclude_followed_by": ["年"],
+                "exclude_shapes": ["unknown"]
+            }]}
+        })];
+        let result = mounted_pack_vector_searches(
+            &state,
+            &json!({ "knowledge_pack_ids": ["invalid-pack"] }),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn configured_pack_exact_retrieval_is_scoped_and_precedes_vectors() {
+        let state = make_state();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let foreign_claims =
+            IsolationClaims::from_verified("tenant-b", "project-1", "actor-b").unwrap();
+        let vector_dir = std::env::temp_dir().join(format!("chat_pack_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vector_dir).unwrap();
+        let store = crate::memory::hyperspace_store::HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "contains-local",
+                "prefix B2033 suffix",
+                &[kb_vector_tag("kb-local")],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "exact-local",
+                "B2033",
+                &[kb_vector_tag("kb-local")],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(
+                &foreign_claims,
+                "exact-foreign",
+                "B2033 foreign placeholder entry",
+                &[kb_vector_tag("kb-local")],
+            )
+            .await
+            .unwrap();
+        state.vector_store.store(Some(Arc::new(store)));
+        *state.knowledge_packs.write().await = vec![
+            json!({
+                "id": "pack-config-a",
+                "builtin": false,
+                "vector_kb_ids": ["kb-local"],
+                "keyword_retrieval": {
+                    "rules": [{
+                        "prefixes": ["B"],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年", "年份", "年款"],
+                    "exclude_shapes": [{"min_len": 16, "max_len": 17, "charset": "ascii_alnum"}]
+                    }]
+                }
+            }),
+            json!({
+                "id": "pack-config-b",
+                "builtin": false,
+                "vector_kb_ids": ["kb-local"],
+                "keyword_retrieval": {
+                    "rules": [{
+                        "prefixes": ["B"],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年", "年份", "年款"],
+                    "exclude_shapes": [{"min_len": 16, "max_len": 17, "charset": "ascii_alnum"}]
+                    }]
+                }
+            }),
+        ];
+        let agent = json!({ "knowledge_pack_ids": ["pack-config-b"] });
+        let searches = mounted_pack_vector_searches(&state, &agent).await.unwrap();
+        let hits = pack_scoped_vector_hits(&state, &claims, "报B2033", &searches)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.hits.first().map(|hit| hit.text.as_str()),
+            Some("B2033")
+        );
+        assert!(hits
+            .hits
+            .first()
+            .is_some_and(|hit| hit.match_kind == MatchKind::Exact));
+        assert!(hits.hits.iter().all(|hit| !hit.text.contains("foreign")));
+        let _ = std::fs::remove_dir_all(vector_dir);
     }
 
     #[tokio::test]

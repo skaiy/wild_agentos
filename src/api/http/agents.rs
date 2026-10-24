@@ -430,6 +430,26 @@ pub(crate) async fn create_agent_handler(
     if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
         return error.into_response();
     }
+    {
+        let packs = state.knowledge_packs.read().await;
+        for pack_id in &req.knowledge_pack_ids {
+            let Some(pack) = packs
+                .iter()
+                .find(|pack| pack.get("id").and_then(Value::as_str) == Some(pack_id.as_str()))
+            else {
+                continue;
+            };
+            if let Err(error) = crate::api::http::chat::validate_keyword_retrieval_config(pack) {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(
+                        json!({ "error": format!("invalid mounted pack configuration: {error}") }),
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    }
     let is_definition = req.id.is_some()
         || req.system_prompt.is_some()
         || req.model.is_some()
@@ -735,6 +755,24 @@ pub(crate) async fn update_agent_handler(
     };
     if let Err(error) = identity.require_control_plane_da_or_platform_admin("agent writes") {
         return error.into_response();
+    }
+    if let Some(pack_ids) = patch.get("knowledge_pack_ids").and_then(Value::as_array) {
+        let packs = state.knowledge_packs.read().await;
+        for pack_id in pack_ids.iter().filter_map(Value::as_str) {
+            if let Some(pack) = packs
+                .iter()
+                .find(|pack| pack.get("id").and_then(Value::as_str) == Some(pack_id))
+            {
+                if let Err(error) = crate::api::http::chat::validate_keyword_retrieval_config(pack)
+                {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({ "error": format!("invalid mounted pack configuration: {error}") })),
+                    )
+                        .into_response();
+                }
+            }
+        }
     }
     let mut guard = state.user_agents.write().await;
     let found = guard.iter().position(|agent| {
@@ -1259,6 +1297,71 @@ mod tests {
         restore_env("AGENTOS_AUTH_MODE", previous_auth_mode);
         restore_env("AGENTOS_JWT_SECRET", previous_jwt_secret);
         restore_env("AGENTOS_DATA_DIR", previous_data_dir);
+    }
+
+    #[tokio::test]
+    async fn agent_mounts_reject_invalid_pack_rules_before_persistence() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_auth_mode = std::env::var_os("AGENTOS_AUTH_MODE");
+        let previous_jwt_secret = std::env::var_os("AGENTOS_JWT_SECRET");
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTOS_AUTH_MODE", "hs256");
+        std::env::set_var(
+            "AGENTOS_JWT_SECRET",
+            "test-hs256-secret-at-least-32-bytes-long",
+        );
+        let state = test_state(temp.path());
+        *state.knowledge_packs.write().await = vec![json!({
+            "id": "invalid-pack",
+            "builtin": false,
+            "keyword_retrieval": {"rules": [{"mode": "x"}]}
+        })];
+        let router = Router::new()
+            .route("/api/v1/agents", post(create_agent_handler))
+            .route("/api/v1/agents/:id", put(update_agent_handler))
+            .with_state(state.clone());
+        let token = jwt("tenant-a", "project-a");
+        let (status, _) = request(
+            &router,
+            Request::builder().method("POST").uri("/api/v1/agents")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"id":"blocked-agent","name":"Blocked","knowledge_pack_ids":["invalid-pack"]}).to_string())).unwrap(),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!state
+            .user_agents
+            .read()
+            .await
+            .iter()
+            .any(|agent| agent["id"] == "blocked-agent"));
+        let (status, _) = request(
+            &router,
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/agents/agent-a")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"knowledge_pack_ids":["invalid-pack"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(state
+            .user_agents
+            .read()
+            .await
+            .iter()
+            .find(|agent| agent["id"] == "agent-a")
+            .unwrap()
+            .get("knowledge_pack_ids")
+            .is_none());
+        restore_env("AGENTOS_AUTH_MODE", previous_auth_mode);
+        restore_env("AGENTOS_JWT_SECRET", previous_jwt_secret);
     }
 
     #[tokio::test]
