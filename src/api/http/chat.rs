@@ -2512,17 +2512,6 @@ mod tests {
             extract_pack_tokens("LTEST B2033 B2044 0001", &rules),
             vec!["b2033", "b2044"]
         );
-        for value in [
-            "LB2033 B2044 0000 0001",
-            "ABCD B2033 B2044 0000",
-            "LTES B2033 B2044 0000",
-            "LTEST B2033 0000 0000 01",
-            "LTEST B2033 B2040 00",
-            "LTEST B2033 B2040 0001",
-            "LTEST B2033 B2044 0001",
-        ] {
-            println!("bare {value}: {:?}", extract_pack_tokens(value, &rules));
-        }
     }
 
     #[test]
