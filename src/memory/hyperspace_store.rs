@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use hyperspace_engine::engine::{HyperspaceEngine, HyperspaceEngineImpl, SearchHit};
@@ -124,6 +126,13 @@ pub struct ScoredEntry {
 pub struct HyperspaceStore {
     engine: Arc<HyperspaceEngineImpl>,
     embed: Arc<dyn EmbeddingService>,
+    ownership_cache: RwLock<OwnershipCacheState>,
+    ownership_generation: AtomicU64,
+}
+
+#[derive(Default)]
+struct OwnershipCacheState {
+    entries: HashMap<String, (u64, bool)>,
 }
 
 #[cfg(not(test))]
@@ -154,6 +163,8 @@ impl HyperspaceStore {
         Ok(Self {
             engine: Arc::new(engine),
             embed,
+            ownership_cache: RwLock::new(OwnershipCacheState::default()),
+            ownership_generation: AtomicU64::new(0),
         })
     }
 
@@ -167,17 +178,66 @@ impl HyperspaceStore {
         self.engine.is_retrieval_ready()
     }
 
+    /// Drops cached KB ownership-validation results after a vector mutation.
+    pub fn invalidate_ownership_cache(&self) {
+        let mut cache = self
+            .ownership_cache
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        self.ownership_generation.fetch_add(1, Ordering::AcqRel);
+        cache.entries.clear();
+    }
+
+    pub fn ownership_generation(&self, _key: &str) -> u64 {
+        self.ownership_generation.load(Ordering::Acquire)
+    }
+
+    pub fn cached_ownership_health(&self, key: &str) -> Option<bool> {
+        let cache = self
+            .ownership_cache
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = self.ownership_generation.load(Ordering::Acquire);
+        cache
+            .entries
+            .get(key)
+            .and_then(|(cached_generation, healthy)| {
+                (*cached_generation == generation).then_some(*healthy)
+            })
+    }
+
+    pub fn cache_ownership_health_if_current(&self, key: String, generation: u64, healthy: bool) {
+        let mut cache = self
+            .ownership_cache
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.ownership_generation.load(Ordering::Acquire) == generation {
+            cache.entries.insert(key, (generation, healthy));
+        }
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Embed text, falling back to a zero vector on failure.
-    async fn get_embedding(&self, text: &str) -> Vec<f32> {
-        match self.embed.embed(text).await {
-            Ok(vec) => vec,
-            Err(e) => {
-                warn!(error = %e, "Embedding service failed, using zero vector");
-                vec![0.0f32; self.embed.dimension()]
+    /// Obtains the embedding used by every vector query and write.
+    ///
+    /// An unavailable provider must fail the operation rather than silently
+    /// substituting a placeholder vector.
+    async fn get_query_embedding(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+        let embedding = self.embed.embed(text).await.map_err(|error| {
+            warn!(error = %error, "Embedding service failed; vector operation rejected");
+            CoreError::StorageError {
+                message: "embedding provider unavailable".into(),
             }
+        })?;
+        if embedding.len() != self.embed.dimension()
+            || embedding.iter().any(|value| !value.is_finite())
+            || embedding.iter().all(|value| *value == 0.0)
+        {
+            return Err(CoreError::StorageError {
+                message: "embedding provider returned an invalid vector".into(),
+            });
         }
+        Ok(embedding)
     }
 
     /// Convert a `HybridSearchFilter` to a `Vec<JsonLdFilter>` for the engine.
@@ -458,7 +518,7 @@ impl HyperspaceStore {
                 message: "vector text must not be empty".into(),
             });
         }
-        let vector = self.get_embedding(text).await;
+        let vector = self.get_query_embedding(text).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -510,6 +570,7 @@ impl HyperspaceStore {
             .map_err(|e| CoreError::Internal {
                 message: format!("Hyperspace upsert: {e}"),
             })?;
+        self.invalidate_ownership_cache();
 
         debug!(iri = %iri, point_id = point_id, "Vector stored via HyperspaceEngine");
         Ok(point_id)
@@ -549,7 +610,7 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vector = self.get_embedding(query).await;
+        let vector = self.get_query_embedding(query).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -629,7 +690,7 @@ impl HyperspaceStore {
                 message: "vector store integrity check failed; retrieval unavailable".into(),
             });
         }
-        let vector = self.get_embedding(query).await;
+        let vector = self.get_query_embedding(query).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -756,6 +817,7 @@ impl HyperspaceStore {
             .map_err(|e| CoreError::Internal {
                 message: format!("Hyperspace delete: {e}"),
             })?;
+        self.invalidate_ownership_cache();
         Ok(())
     }
 
@@ -764,6 +826,16 @@ impl HyperspaceStore {
         self.engine.count().await.map_err(|e| CoreError::Internal {
             message: format!("Hyperspace count: {e}"),
         })
+    }
+
+    /// Lists persisted records for startup and ownership-integrity validation.
+    pub async fn list(&self, offset: usize, limit: usize) -> Result<Vec<SearchHit>, CoreError> {
+        self.engine
+            .list(offset, limit)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace list: {e}"),
+            })
     }
 
     /// Resolve an IRI to its numeric point ID (if indexed).
@@ -791,7 +863,36 @@ impl HyperspaceStore {
 mod tests {
     use super::*;
     use crate::isolation::IsolationClaims;
-    use crate::memory::embedding_service::FallbackEmbeddingService;
+    use crate::memory::embedding_service::{EmbeddingService, FallbackEmbeddingService};
+
+    struct UnavailableEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for UnavailableEmbeddingService {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Err("unavailable".into())
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
+
+    struct InvalidEmbeddingService {
+        vector: Vec<f32>,
+        dimension: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for InvalidEmbeddingService {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Ok(self.vector.clone())
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+    }
 
     fn setup_store() -> HyperspaceStore {
         let dir = tempfile::tempdir().unwrap();
@@ -828,6 +929,43 @@ mod tests {
         let store = setup_store();
         let results = store.search("nothing", 10).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedding_failure_does_not_search_with_a_placeholder_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            HyperspaceStore::open(dir.path(), Arc::new(UnavailableEmbeddingService)).unwrap();
+        let result = store.search("unavailable provider", 10).await;
+        assert!(result.is_err());
+        assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_query_embeddings_are_rejected() {
+        for (vector, dimension) in [(vec![0.0; 3], 3), (vec![f32::NAN; 3], 3), (vec![1.0; 2], 3)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = HyperspaceStore::open(
+                dir.path(),
+                Arc::new(InvalidEmbeddingService { vector, dimension }),
+            )
+            .unwrap();
+            assert!(store.search("query", 1).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_writes_invalidate_cached_ownership_health() {
+        let store = setup_store();
+        let key = "vector://tenant/project#kb-a";
+        store.cache_ownership_health_if_current(key.into(), store.ownership_generation(key), true);
+        store
+            .upsert("cache:1", "invalidate ownership cache", &[])
+            .await
+            .unwrap();
+        assert!(store
+            .cached_ownership_health("vector://tenant/project#kb-a")
+            .is_none());
     }
 
     #[tokio::test]
@@ -1080,6 +1218,20 @@ mod tests {
         assert!(
             results[0].tags.contains(&"tenant:acme".to_string()),
             "Expected tenant tag in stored entry"
+        );
+    }
+
+    #[test]
+    fn stale_ownership_scan_cannot_restore_a_cache_entry_after_invalidation() {
+        let store = setup_store();
+        let key = "vector://tenant/project#kb-a";
+        let scan_generation = store.ownership_generation(key);
+        store.invalidate_ownership_cache();
+        store.cache_ownership_health_if_current(key.into(), scan_generation, true);
+
+        assert!(
+            store.cached_ownership_health(key).is_none(),
+            "a scan that started before a write must not restore a stale healthy cache entry"
         );
     }
 

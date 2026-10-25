@@ -332,6 +332,21 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("data"))
 }
 
+/// Creates the persistent vector-store root with owner-only permissions.
+///
+/// Container volumes and bind mounts can create the top-level data directory
+/// after the image is built, so this is deliberately enforced by the process
+/// before the vector engine opens its files.
+fn secure_vector_data_root(root: &std::path::Path) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// 序列化所有依赖进程级环境变量（AGENTOS_DATA_DIR / AGENTOS_AUTH_STRICT）的测试——
 /// 避免并行执行时 env 被相互覆盖导致落盘/读取或鉴权模式错乱。各测试在函数入口取锁并持有到结束。
 #[cfg(test)]
@@ -350,7 +365,17 @@ pub fn open_vector_store(
 ) -> SharedVectorStore {
     let embed =
         crate::memory::embedding_service::create_embedding_service_from_config(embedding, 30);
-    let vdir = data_dir().join("vector_store");
+    let root = data_dir();
+    let vdir = root.join("vector_store");
+    if let Err(error) = secure_vector_data_root(&root) {
+        tracing::error!(
+            expected_mode = "0700",
+            error = %error,
+            "Unable to secure vector data root; refusing startup"
+        );
+        eprintln!("Unable to secure vector data root (expected owner-writable mode 0700); exiting");
+        std::process::exit(1);
+    }
     match HyperspaceStore::open(&vdir, embed) {
         Ok(s) => Arc::new(arc_swap::ArcSwapOption::from_pointee(s)),
         Err(e) => {
@@ -466,6 +491,35 @@ pub fn build_router(
         invocations: invocations_runtime,
         shutdown: shutdown.clone(),
     });
+    if let Some(store) = state.vector_store.load_full() {
+        let state_for_validation = state.clone();
+        tokio::spawn(async move {
+            let bases = state_for_validation.knowledge_bases.read().await.clone();
+            for base in bases.iter().filter(|base| {
+                base.get("kb_type").and_then(serde_json::Value::as_str) == Some("vector")
+            }) {
+                let Some(kb_id) = base.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let (Some(tenant), Some(project)) = (
+                    base.get("tenant_id").and_then(serde_json::Value::as_str),
+                    base.get("project_id").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                let Ok(claims) = crate::isolation::IsolationClaims::from_verified(
+                    tenant,
+                    project,
+                    "startup-validation",
+                ) else {
+                    continue;
+                };
+                if !kb::vector_records_match_kb_ownership(&store, &bases, &claims, kb_id).await {
+                    tracing::error!(kb_id, "Vector ownership validation failed at startup");
+                }
+            }
+        });
+    }
     tokio::spawn(run_online_corpus_watcher_scheduler(
         state.online_corpus_jobs.clone(),
         online_corpus_watchers,
@@ -957,6 +1011,39 @@ mod tests {
 
     use crate::gateway::unified_gateway::UnifiedGateway;
     use crate::tools::prompt_registry::PromptRegistry;
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_vector_data_root_corrects_existing_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        secure_vector_data_root(&root).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn secure_vector_data_root_returns_a_clear_error_for_an_invalid_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data-file");
+        std::fs::write(&root, "not a directory").unwrap();
+        let error = secure_vector_data_root(&root).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ),
+            "unexpected startup filesystem error: {error}"
+        );
+    }
 
     /// 构造一个最小可用的 UnifiedGateway（不触网，仅满足 AppState 依赖）。
     fn test_gateway() -> UnifiedGateway {

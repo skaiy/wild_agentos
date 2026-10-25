@@ -159,6 +159,7 @@ ontologies = { path = "crates/ontologies" }
 csv = "1"
 rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rustls-tls"] }
 arc-swap = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -186,6 +187,10 @@ path = "src/bin/private_deploy_bench.rs"
 [[bin]]
 name = "vector-store-check"
 path = "src/bin/vector_store_check.rs"
+
+[[bin]]
+name = "kb-catalog-backfill"
+path = "src/bin/kb_catalog_backfill.rs"
 
 [[bench]]
 name = "bench_graph_backend"
