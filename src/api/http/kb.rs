@@ -2980,6 +2980,41 @@ mod isolation_contract {
         assert!(state.knowledge_packs.read().await[0]
             .get("keyword_retrieval")
             .is_none());
+        let collision = json!({
+            "name": "collision",
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 3,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 16,
+                        "max_len": 16,
+                        "charset": "ascii_alnum",
+                        "separators": [" "],
+                        "max_groups": 4,
+                        "group_min_len": 4,
+                        "group_max_len": 4
+                    }]
+                }]
+            }
+        });
+        let (status, body) = response_json(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/packs")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(collision.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "exclude shape can contain two tokens matched by configured rules; tighten its length or group bounds"
+        );
         if let Some(previous) = previous_data_dir {
             std::env::set_var("AGENTOS_DATA_DIR", previous);
         } else {

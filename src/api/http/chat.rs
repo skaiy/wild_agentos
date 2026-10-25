@@ -824,8 +824,10 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
     if rules.is_empty() {
         return Vec::new();
     }
-    let blocked_fragments = excluded_raw_run_fragments(question, rules);
     let normalized_question = narrow_compatibility_fold(question);
+    let blocked_fragments = excluded_raw_run_fragments(&normalized_question, rules);
+    // Full-width identifier characters make no-prefix extraction fail-closed;
+    // prefixed code rules still match the folded token stream.
     let has_fullwidth_identifier_chars = question.chars().any(|character| {
         matches!(
             character,
@@ -840,7 +842,8 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         }
         let upper = current.to_ascii_uppercase();
         if rules.iter().any(|rule| {
-            (!has_fullwidth_identifier_chars || !rule.prefixes.is_empty())
+            (!has_fullwidth_identifier_chars
+                || blocked_fragments.is_empty() && !rule.prefixes.is_empty())
                 && token_matches_rule(&upper, following, rule)
         }) && !blocked_fragments.contains(&upper)
         {
@@ -927,7 +930,9 @@ fn excluded_raw_run_fragments(question: &str, rules: &[PackTokenRule]) -> HashSe
                     blocked.extend(
                         raw.split(|character: char| !character.is_ascii_alphanumeric())
                             .filter(|fragment| !fragment.is_empty())
-                            .map(|fragment| fragment.to_ascii_uppercase()),
+                            .map(|fragment| {
+                                narrow_compatibility_fold(fragment).to_ascii_uppercase()
+                            }),
                     );
                 }
             }
@@ -1045,7 +1050,7 @@ fn grouped_exclude_shape_fragments(
                                     rule.prefixes.is_empty()
                                         && token_matches_rule(&normalized_groups[index], "", rule)
                                 })
-                                .then_some(group.to_ascii_uppercase())
+                                .then_some(narrow_compatibility_fold(group).to_ascii_uppercase())
                         }),
                 );
             }
@@ -1053,7 +1058,7 @@ fn grouped_exclude_shape_fragments(
                 blocked.extend(
                     trimmed_groups
                         .iter()
-                        .map(|group| group.to_ascii_uppercase()),
+                        .map(|group| narrow_compatibility_fold(group).to_ascii_uppercase()),
                 );
             }
             let candidate_charset_matches = normalized_groups.iter().all(|group| {
@@ -1097,7 +1102,8 @@ fn grouped_exclude_shape_fragments(
                 {
                     blocked.extend(trimmed_groups.iter().enumerate().filter_map(
                         |(other_index, group)| {
-                            (other_index != index).then_some(group.to_ascii_uppercase())
+                            (other_index != index)
+                                .then_some(narrow_compatibility_fold(group).to_ascii_uppercase())
                         },
                     ));
                 }
@@ -2654,6 +2660,9 @@ mod tests {
             extract_pack_tokens("2024年，B2033？", &rules),
             vec!["b2033"]
         );
+        // The full-width code run folds for prefixed matching; the earlier
+        // year token remains excluded by its configured Chinese suffix.
+        assert_eq!(extract_pack_tokens("2024年 Ｂ2033", &rules), vec!["b2033"]);
         assert_eq!(extract_pack_tokens("2468？", &rules), vec!["2468"]);
     }
 
@@ -2704,6 +2713,9 @@ mod tests {
             "Ｌ ＴＥＳＴ ００００",
             "Ｌ ＴＥＳＴ 0000",
             "ＬＴＥＳＴ００００００００００１",
+            "ＬＴＥＳＴ ００００ ００００ ０００１ Ｂ２０３３",
+            "LTES Ｂ２０３３ 0000 0001",
+            "ＬＴＥＳ Ｂ２０３３ ００００ ０００１",
         ] {
             // fictional
             assert_eq!(extract_pack_tokens(value, &rules), Vec::<String>::new());
@@ -2854,6 +2866,12 @@ mod tests {
             }
         });
         assert_eq!(validate_keyword_retrieval_config(&pack), Ok(()));
+        let rules = pack_token_rules(&pack);
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("199 0000 0000", &rules),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
