@@ -660,6 +660,7 @@ fn validate_rule_pair_token_capacity(rules: &[Value]) -> Result<(), String> {
             .and_then(Value::as_u64)
             .ok_or_else(|| "digit_count is required".to_string())?
             as usize;
+        let (token_len_a, prefixes_a) = rule_token_minimum_length(object_a, digit_count_a)?;
         let shapes = object_a
             .get("exclude_shapes")
             .and_then(Value::as_array)
@@ -685,7 +686,6 @@ fn validate_rule_pair_token_capacity(rules: &[Value]) -> Result<(), String> {
                     .and_then(Value::as_u64)
                     .ok_or_else(|| "digit_count is required".to_string())?
                     as usize;
-                let (token_len_a, prefixes_a) = rule_token_minimum_length(object_a, digit_count_a)?;
                 let (token_len_b, prefixes_b) = rule_token_minimum_length(object_b, digit_count_b)?;
                 let token_compatible = match shape.charset {
                     ShapeCharset::Digits => prefixes_a == 0 && prefixes_b == 0,
@@ -694,9 +694,18 @@ fn validate_rule_pair_token_capacity(rules: &[Value]) -> Result<(), String> {
                 if !token_compatible {
                     continue;
                 }
-                // Runtime grouped matching suppresses no-prefix digit groups
-                // before emission when they occur alongside a prefixed code.
-                if prefixes_a == 0 || prefixes_b == 0 {
+                // Mixed prefixed/no-prefix pairs are handled by runtime
+                // digit-fragment suppression before a code can be emitted.
+                if (prefixes_a == 0) != (prefixes_b == 0) {
+                    continue;
+                }
+                // Two no-prefix digit tokens are runtime-suppressed inside a
+                // digit shape; phone_shaped_no_prefix_rule_passes_capacity_validation
+                // covers this exemption end to end.
+                if prefixes_a == 0
+                    && prefixes_b == 0
+                    && matches!(shape.charset, ShapeCharset::Digits)
+                {
                     continue;
                 }
                 if token_len_a < group_min_len as usize
@@ -816,9 +825,13 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         return Vec::new();
     }
     let blocked_fragments = excluded_raw_run_fragments(question, rules);
-    let has_fullwidth_compat_chars = question
-        .chars()
-        .any(|character| matches!(character, '\u{FF01}'..='\u{FF5E}'));
+    let normalized_question = narrow_compatibility_fold(question);
+    let has_fullwidth_identifier_chars = question.chars().any(|character| {
+        matches!(
+            character,
+            '\u{FF10}'..='\u{FF19}' | '\u{FF21}'..='\u{FF3A}' | '\u{FF41}'..='\u{FF5A}'
+        )
+    });
     let mut tokens = Vec::new();
     let mut current = String::new();
     let flush = |current: &mut String, following: &str, tokens: &mut Vec<String>| {
@@ -827,7 +840,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         }
         let upper = current.to_ascii_uppercase();
         if rules.iter().any(|rule| {
-            (!has_fullwidth_compat_chars || !rule.prefixes.is_empty())
+            (!has_fullwidth_identifier_chars || !rule.prefixes.is_empty())
                 && token_matches_rule(&upper, following, rule)
         }) && !blocked_fragments.contains(&upper)
         {
@@ -836,12 +849,12 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         }
         current.clear();
     };
-    for (index, character) in question.char_indices() {
+    for (index, character) in normalized_question.char_indices() {
         if character.is_ascii_alphanumeric() {
             current.push(character);
         } else {
             if matches!(character, '-' | '_' | '/') {
-                let following = &question[index..];
+                let following = &normalized_question[index..];
                 for rule in rules {
                     for prefix in &rule.prefixes {
                         let Some(separator) = prefix.chars().last() else {
@@ -865,7 +878,7 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
                     }
                 }
             }
-            flush(&mut current, &question[index..], &mut tokens);
+            flush(&mut current, &normalized_question[index..], &mut tokens);
         }
     }
     flush(&mut current, "", &mut tokens);
@@ -2617,6 +2630,34 @@ mod tests {
     }
 
     #[test]
+    fn fullwidth_punctuation_does_not_disable_no_prefix_rules() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [
+                    {
+                        "prefixes": ["B"],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年"],
+                        "exclude_shapes": []
+                    },
+                    {
+                        "prefixes": [],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年"],
+                        "exclude_shapes": []
+                    }
+                ]
+            }
+        });
+        let rules = pack_token_rules(&pack);
+        assert_eq!(
+            extract_pack_tokens("2024年，B2033？", &rules),
+            vec!["b2033"]
+        );
+        assert_eq!(extract_pack_tokens("2468？", &rules), vec!["2468"]);
+    }
+
+    #[test]
     fn generic_text_separators_block_identifier_and_mobile_fragments() {
         let pack = json!({
             "keyword_retrieval": {
@@ -2760,7 +2801,13 @@ mod tests {
                 }]
             }
         });
-        assert!(validate_keyword_retrieval_config(&same_rule).is_err());
+        assert_eq!(
+            validate_keyword_retrieval_config(&same_rule),
+            Err(
+                "exclude shape can contain two tokens matched by configured rules; tighten its length or group bounds"
+                    .to_string()
+            )
+        );
         let cross_rule = json!({
             "keyword_retrieval": {
                 "rules": [{
@@ -2776,7 +2823,13 @@ mod tests {
                 }]
             }
         });
-        assert!(validate_keyword_retrieval_config(&cross_rule).is_err());
+        assert_eq!(
+            validate_keyword_retrieval_config(&cross_rule),
+            Err(
+                "exclude shape can contain two tokens matched by configured rules; tighten its length or group bounds"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -2798,6 +2851,54 @@ mod tests {
                         "group_max_len": 4
                     }]
                 }]
+            }
+        });
+        assert_eq!(validate_keyword_retrieval_config(&pack), Ok(()));
+    }
+
+    #[test]
+    fn full_baseline_pack_passes_capacity_validation() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [
+                    {
+                        "prefixes": ["B", "C", "P", "U"],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年", "年份", "年款"],
+                        "exclude_shapes": [
+                            {
+                                "min_len": 17,
+                                "max_len": 17,
+                                "charset": "ascii_alnum",
+                                "leading": "L",
+                                "separators": [" ", "-", "_", "/", ".", "　"],
+                                "max_groups": 4,
+                                "group_min_len": 4,
+                                "group_max_len": 5
+                            },
+                            {
+                                "min_len": 16,
+                                "max_len": 17,
+                                "charset": "ascii_alnum"
+                            }
+                        ]
+                    },
+                    {
+                        "prefixes": [],
+                        "digit_count": 4,
+                        "exclude_followed_by": ["年", "年份", "年款"],
+                        "exclude_shapes": [{
+                            "min_len": 11,
+                            "max_len": 11,
+                            "charset": "digits",
+                            "leading": "1",
+                            "separators": [" ", "-"],
+                            "max_groups": 4,
+                            "group_min_len": 2,
+                            "group_max_len": 4
+                        }]
+                    }
+                ]
             }
         });
         assert_eq!(validate_keyword_retrieval_config(&pack), Ok(()));
