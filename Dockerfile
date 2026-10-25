@@ -63,8 +63,9 @@ RUN cargo auditable build --locked --release --bin wild-agent-os-core \
     && strip target/release/wild-agent-os-core
 
 # 运行镜像没有 shell，不能 RUN mkdir；在这里建好数据/日志目录，带属主一起 COPY。
+# 数据根仅运行用户可访问；部署时程序也会重新收紧可能由卷挂载创建的目录。
 # 沿用 uid/gid 10001：已有数据卷的属主不变，升级无需 chown。
-RUN mkdir -p /out/app/data /out/app/logs
+RUN install -d -m 0700 /out/app/data && mkdir -p /out/app/logs
 
 # ─────────────────────────────────────────────────────────────
 FROM ${DISTROLESS}cc-debian12:nonroot@${DISTROLESS_DIGEST} AS runtime
