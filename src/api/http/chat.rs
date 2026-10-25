@@ -563,9 +563,9 @@ pub(crate) fn validate_keyword_retrieval_config(pack: &Value) -> Result<(), Stri
             let shape: ExcludeShape = serde_json::from_value(shape.clone())
                 .map_err(|error| format!("invalid exclude_shapes value: {error}"))?;
             validate_exclude_shape(&shape)?;
-            validate_rule_shape_token_capacity(object, digit_count as usize, &shape)?;
         }
     }
+    validate_rule_pair_token_capacity(rules)?;
     Ok(())
 }
 
@@ -650,69 +650,107 @@ fn validate_exclude_shape(shape: &ExcludeShape) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_rule_shape_token_capacity(
+fn validate_rule_pair_token_capacity(rules: &[Value]) -> Result<(), String> {
+    for rule_a in rules {
+        let object_a = rule_a
+            .as_object()
+            .ok_or_else(|| "keyword retrieval rule must be an object".to_string())?;
+        let digit_count_a = object_a
+            .get("digit_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "digit_count is required".to_string())?
+            as usize;
+        let shapes = object_a
+            .get("exclude_shapes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "exclude_shapes is required".to_string())?;
+        for shape_value in shapes {
+            let shape: ExcludeShape = serde_json::from_value(shape_value.clone())
+                .map_err(|error| format!("invalid exclude_shapes value: {error}"))?;
+            // Legacy non-grouped shapes only inspect contiguous normalized text.
+            let Some(max_groups) = shape.max_groups else {
+                continue;
+            };
+            let (Some(group_min_len), Some(group_max_len)) =
+                (shape.group_min_len, shape.group_max_len)
+            else {
+                continue;
+            };
+            for rule_b in rules {
+                let object_b = rule_b
+                    .as_object()
+                    .ok_or_else(|| "keyword retrieval rule must be an object".to_string())?;
+                let digit_count_b = object_b
+                    .get("digit_count")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "digit_count is required".to_string())?
+                    as usize;
+                let (token_len_a, prefixes_a) = rule_token_minimum_length(object_a, digit_count_a)?;
+                let (token_len_b, prefixes_b) = rule_token_minimum_length(object_b, digit_count_b)?;
+                let token_compatible = match shape.charset {
+                    ShapeCharset::Digits => prefixes_a == 0 && prefixes_b == 0,
+                    ShapeCharset::AsciiAlnum => true,
+                };
+                if !token_compatible {
+                    continue;
+                }
+                // Runtime grouped matching suppresses no-prefix digit groups
+                // before emission when they occur alongside a prefixed code.
+                if prefixes_a == 0 || prefixes_b == 0 {
+                    continue;
+                }
+                if token_len_a < group_min_len as usize
+                    || token_len_a > group_max_len as usize
+                    || token_len_b < group_min_len as usize
+                    || token_len_b > group_max_len as usize
+                {
+                    continue;
+                }
+                let minimum_group_count = (shape.min_len as usize).div_ceil(group_max_len as usize);
+                if minimum_group_count > max_groups as usize {
+                    return Err("exclude shape cannot satisfy its configured group bounds".into());
+                }
+                let minimum_window_len = token_len_a
+                    + token_len_b
+                    + minimum_group_count.saturating_sub(2) * group_min_len as usize;
+                if minimum_window_len <= shape.max_len as usize {
+                    return Err(
+                        "exclude shape can contain two tokens matched by configured rules; tighten its length or group bounds"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rule_token_minimum_length(
     rule: &serde_json::Map<String, Value>,
     digit_count: usize,
-    shape: &ExcludeShape,
-) -> Result<(), String> {
+) -> Result<(usize, usize), String> {
     let prefixes = rule
         .get("prefixes")
         .and_then(Value::as_array)
         .ok_or_else(|| "prefixes is required".to_string())?;
-    let token_is_compatible = match shape.charset {
-        ShapeCharset::Digits => prefixes.is_empty(),
-        ShapeCharset::AsciiAlnum => true,
-    };
-    if !token_is_compatible {
-        return Ok(());
-    };
-    let Some(max_groups) = shape.max_groups else {
-        return Err(
-            "exclude shape must define group bounds to prove two rule tokens cannot share a window"
-                .into(),
-        );
-    };
-    let token_len = if prefixes.is_empty() {
-        digit_count
-    } else {
-        prefixes
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|prefix| {
-                let optional_separator = prefix
-                    .chars()
-                    .last()
-                    .filter(|character| matches!(character, '-' | '_' | '/'))
-                    .map(char::len_utf8)
-                    .unwrap_or_default();
-                prefix.len() - optional_separator + digit_count
-            })
-            .min()
-            .ok_or_else(|| "prefixes is required".to_string())?
-    };
-    let (Some(group_min_len), Some(group_max_len)) = (shape.group_min_len, shape.group_max_len)
-    else {
-        return Err(
-            "exclude shape must define group bounds to prove two rule tokens cannot share a window"
-                .into(),
-        );
-    };
-    if token_len < group_min_len as usize || token_len > group_max_len as usize {
-        return Ok(());
+    if prefixes.is_empty() {
+        return Ok((digit_count, 0));
     }
-    let minimum_group_count = (shape.min_len as usize).div_ceil(group_max_len as usize);
-    if minimum_group_count > max_groups as usize {
-        return Err("exclude shape cannot satisfy its configured group bounds".into());
-    }
-    let minimum_window_len =
-        token_len * 2 + minimum_group_count.saturating_sub(2) * group_min_len as usize;
-    if minimum_window_len <= shape.max_len as usize {
-        return Err(
-            "exclude shape can contain two tokens matched by the same rule; tighten its length or group bounds"
-                .into(),
-        );
-    }
-    Ok(())
+    let token_len = prefixes
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|prefix| {
+            let optional_separator = prefix
+                .chars()
+                .last()
+                .filter(|character| matches!(character, '-' | '_' | '/'))
+                .map(char::len_utf8)
+                .unwrap_or_default();
+            prefix.len() - optional_separator + digit_count
+        })
+        .min()
+        .ok_or_else(|| "prefixes is required".to_string())?;
+    Ok((token_len, prefixes.len()))
 }
 
 fn pack_rule_strings(value: Option<&Value>, prefixes: bool) -> Option<Vec<String>> {
@@ -778,6 +816,9 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
         return Vec::new();
     }
     let blocked_fragments = excluded_raw_run_fragments(question, rules);
+    let has_fullwidth_compat_chars = question
+        .chars()
+        .any(|character| matches!(character, '\u{FF01}'..='\u{FF5E}'));
     let mut tokens = Vec::new();
     let mut current = String::new();
     let flush = |current: &mut String, following: &str, tokens: &mut Vec<String>| {
@@ -785,10 +826,10 @@ fn extract_pack_tokens(question: &str, rules: &[PackTokenRule]) -> Vec<String> {
             return;
         }
         let upper = current.to_ascii_uppercase();
-        if rules
-            .iter()
-            .any(|rule| token_matches_rule(&upper, following, rule))
-            && !blocked_fragments.contains(&upper)
+        if rules.iter().any(|rule| {
+            (!has_fullwidth_compat_chars || !rule.prefixes.is_empty())
+                && token_matches_rule(&upper, following, rule)
+        }) && !blocked_fragments.contains(&upper)
         {
             let canonical = canonical_pack_token(&upper, rules);
             tokens.push(canonical.to_ascii_lowercase());
@@ -2696,6 +2737,70 @@ mod tests {
             }
         }))
         .is_ok());
+    }
+
+    #[test]
+    fn keyword_retrieval_rejects_same_and_cross_rule_shape_collisions() {
+        let collision_shape = json!({
+            "min_len": 16,
+            "max_len": 16,
+            "charset": "ascii_alnum",
+            "separators": [" "],
+            "max_groups": 4,
+            "group_min_len": 4,
+            "group_max_len": 4
+        });
+        let same_rule = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 3,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [collision_shape.clone()]
+                }]
+            }
+        });
+        assert!(validate_keyword_retrieval_config(&same_rule).is_err());
+        let cross_rule = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": ["B"],
+                    "digit_count": 3,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [collision_shape]
+                }, {
+                    "prefixes": ["C"],
+                    "digit_count": 3,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": []
+                }]
+            }
+        });
+        assert!(validate_keyword_retrieval_config(&cross_rule).is_err());
+    }
+
+    #[test]
+    fn phone_shaped_no_prefix_rule_passes_capacity_validation() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 11,
+                        "max_len": 11,
+                        "charset": "digits",
+                        "leading": "1",
+                        "separators": [" ", "-"],
+                        "max_groups": 4,
+                        "group_min_len": 2,
+                        "group_max_len": 4
+                    }]
+                }]
+            }
+        });
+        assert_eq!(validate_keyword_retrieval_config(&pack), Ok(()));
     }
 
     #[test]
