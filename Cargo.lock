@@ -6460,6 +6460,7 @@ dependencies = [
  "json-syntax 0.12.5",
  "jsonschema",
  "jsonwebtoken",
+ "libc",
  "lru 0.16.4",
  "md5 0.7.0",
  "mockall",

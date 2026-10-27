@@ -598,6 +598,117 @@ pub(crate) fn kb_vector_tag(kb_id: &str) -> String {
     format!("kb:{kb_id}")
 }
 
+pub(crate) const VECTOR_RETRIEVAL_UNAVAILABLE: &str = "vector retrieval unavailable";
+
+/// Validates the requested KB's records and caches the result by
+/// claims-minted namespace and KB id. A bad record therefore disables only
+/// its KB, not retrieval for unrelated tenants or KBs.
+pub(crate) async fn vector_records_match_kb_ownership(
+    store: &crate::memory::hyperspace_store::HyperspaceStore,
+    bases: &[Value],
+    claims: &IsolationClaims,
+    kb_id: &str,
+) -> bool {
+    if !store.is_retrieval_ready() {
+        return false;
+    }
+    let namespace = match claims.vector_namespace() {
+        Ok(namespace) => namespace,
+        Err(_) => return false,
+    };
+    let cache_key = format!("{namespace}#{kb_id}");
+    if let Some(healthy) = store.cached_ownership_health(&cache_key) {
+        return healthy;
+    }
+    let generation = store.ownership_generation(&cache_key);
+    let count = match store.count().await {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(error = %error, "Unable to count vectors during ownership validation");
+            return false;
+        }
+    };
+    let mut offset = 0usize;
+    while offset < count as usize {
+        let hits = match store.list(offset, 256).await {
+            Ok(hits) => hits,
+            Err(error) => {
+                tracing::error!(error = %error, "Unable to list vectors during ownership validation");
+                return false;
+            }
+        };
+        if hits.is_empty() {
+            break;
+        }
+        for hit in &hits {
+            // This check is scoped to the requested KB. Records for other KBs
+            // cannot make this KB unhealthy.
+            let tags = hit
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("tags"))
+                .and_then(Value::as_array);
+            let Some(tags) = tags else {
+                continue;
+            };
+            let kb_tags: Vec<&str> = tags
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|tag| tag.starts_with("kb:"))
+                .collect();
+            if !kb_tags.iter().any(|tag| *tag == kb_vector_tag(kb_id)) {
+                continue;
+            }
+            let Some((namespace, _)) = hit.iri.split_once('#') else {
+                tracing::error!(iri = %hit.iri, "Vector record has no claims namespace");
+                store.cache_ownership_health_if_current(cache_key, generation, false);
+                return false;
+            };
+            if namespace
+                != claims
+                    .vector_namespace()
+                    .ok()
+                    .as_deref()
+                    .unwrap_or_default()
+            {
+                tracing::warn!(iri = %hit.iri, "Ignoring foreign-namespace record with matching KB tag during ownership validation");
+                continue;
+            }
+            let tenant_tags: Vec<&str> = tags
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|tag| tag.starts_with("tenant:"))
+                .collect();
+            let expected_tenant = format!("tenant:{}", claims.tenant_id());
+            let expected_kb = kb_vector_tag(kb_id);
+            if tenant_tags.as_slice() != [expected_tenant.as_str()]
+                || kb_tags.as_slice() != [expected_kb.as_str()]
+            {
+                tracing::error!(iri = %hit.iri, "Vector record has inconsistent ownership tags");
+                store.cache_ownership_health_if_current(cache_key, generation, false);
+                return false;
+            }
+            if !bases.iter().any(|kb| {
+                kb.get("id").and_then(Value::as_str) == Some(kb_id)
+                    && kb.get("kb_type").and_then(Value::as_str) == Some("vector")
+                    // Historical catalog entries may predate ownership fields.
+                    // Their record namespace is still claims-minted and must
+                    // match above; this compatibility path never grants a
+                    // caller access to a different namespace.
+                    && kb.get("tenant_id").and_then(Value::as_str).is_none_or(|tenant| tenant == claims.tenant_id())
+                    && kb.get("project_id").and_then(Value::as_str).is_none_or(|project| project == claims.project_id())
+            }) {
+                tracing::error!(iri = %hit.iri, "Vector record KB tag is not owned by its scope");
+                store.cache_ownership_health_if_current(cache_key, generation, false);
+                return false;
+            }
+        }
+        offset += hits.len();
+    }
+    store.cache_ownership_health_if_current(cache_key, generation, true);
+    true
+}
+
 /// GET /api/v1/kb/bases — 返回全部知识库
 pub(crate) async fn list_knowledge_bases_handler(
     State(state): State<Arc<AppState>>,
@@ -803,6 +914,9 @@ pub(crate) async fn delete_knowledge_base_handler(
             && kb_belongs_to_claims(b, claims))
     });
     let _ = save_knowledge_bases(&guard);
+    if let Some(store) = state.vector_store.load_full() {
+        store.invalidate_ownership_cache();
+    }
     (
         StatusCode::OK,
         Json(json!({ "status": "deleted", "id": id })),
@@ -896,6 +1010,9 @@ pub(crate) async fn update_knowledge_base_handler(
         let _ = save_knowledge_bases(&guard);
         (updated, is_graph, graph_iri, name_changed)
     };
+    if let Some(store) = state.vector_store.load_full() {
+        store.invalidate_ownership_cache();
+    }
 
     // 图类型改名：同步命名图 kbName 元三元组
     if is_graph && !graph_iri.is_empty() {
@@ -948,7 +1065,10 @@ pub(crate) async fn knowledge_base_stats_handler(
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
             .cloned()
     };
     let kb = match kb {
@@ -1061,7 +1181,10 @@ pub(crate) async fn ingest_knowledge_base_handler(
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
             .cloned()
     };
     let kb = match kb {
@@ -1166,7 +1289,10 @@ pub(crate) async fn search_knowledge_base_handler(
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
             .cloned()
     };
     let kb = match kb {
@@ -1207,7 +1333,14 @@ pub(crate) async fn search_knowledge_base_handler(
         tracing::error!("KB search rejected because vector store integrity validation failed");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "vector store integrity check failed; retrieval unavailable" })),
+            Json(json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE })),
+        );
+    }
+    if !vector_records_match_kb_ownership(&store, std::slice::from_ref(&kb), claims, &id).await {
+        tracing::error!("KB search rejected because vector ownership validation failed");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE })),
         );
     }
     let limit = req.limit.unwrap_or(5).clamp(1, 20);
@@ -1225,10 +1358,13 @@ pub(crate) async fn search_knowledge_base_handler(
                 Json(json!({ "count": results.len(), "namespace": namespace, "results": results })),
             )
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("检索失败: {e}") })),
-        ),
+        Err(error) => {
+            tracing::error!(error = %error, "KB vector retrieval failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE })),
+            )
+        }
     }
 }
 
@@ -1302,7 +1438,10 @@ pub(crate) async fn upload_knowledge_base_handler(
         let guard = state.knowledge_bases.read().await;
         guard
             .iter()
-            .find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .find(|b| {
+                b.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && kb_belongs_to_claims(b, claims)
+            })
             .cloned()
     };
     let kb = match kb {
@@ -1449,7 +1588,8 @@ pub(crate) async fn upload_knowledge_base_handler(
                         chunk_iris.push(iri);
                     }
                     Err(e) => {
-                        file_err = Some(format!("写入失败: {e}"));
+                        tracing::error!(error = %e, "KB upload vector write failed");
+                        file_err = Some("向量写入失败".to_string());
                         break;
                     }
                 }
@@ -1863,20 +2003,51 @@ async fn run_kb_reindex(
             updated.push(doc);
             continue;
         }
-        let key = format!("kb/{id}/{doc_id}");
+        let key = doc
+            .get("blob_ref")
+            .and_then(|reference| reference.get("key"))
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .unwrap_or_else(|| {
+                tracing::warn!(doc_id = %doc_id, "KB ledger blob key missing; using derived key");
+                ""
+            });
+        let key = if key.is_empty() {
+            format!("kb/{id}/{doc_id}")
+        } else {
+            key.to_string()
+        };
+        if !key.starts_with(&format!("kb/{id}/")) {
+            any_failed = true;
+            if let Some(o) = doc.as_object_mut() {
+                o.insert("status".into(), json!("failed"));
+                o.insert("skipped_reason".into(), json!("invalid ledger blob key"));
+                o.insert("chunks".into(), json!(0));
+                o.insert("chunk_iris".into(), json!([]));
+            }
+            updated.push(doc);
+            continue;
+        }
         let bytes = match blob.get(&claims, &key).await {
             Ok(b) => b,
-            Err(e) => {
-                any_failed = true;
-                if let Some(o) = doc.as_object_mut() {
-                    o.insert("status".into(), json!("failed"));
-                    o.insert("skipped_reason".into(), json!(format!("原文读取失败: {e}")));
-                    o.insert("chunks".into(), json!(0));
-                    o.insert("chunk_iris".into(), json!([]));
+            // The selected document ledger has already been scope-checked
+            // before this background task was started. Preserve that
+            // authorization boundary while reading the prior tenant-only key.
+            Err(_current_error) => match blob.get_legacy(&claims, &key).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(error = %e, key = %key, "KB reindex blob reads failed");
+                    any_failed = true;
+                    if let Some(o) = doc.as_object_mut() {
+                        o.insert("status".into(), json!("failed"));
+                        o.insert("skipped_reason".into(), json!("原文读取失败"));
+                        o.insert("chunks".into(), json!(0));
+                        o.insert("chunk_iris".into(), json!([]));
+                    }
+                    updated.push(doc);
+                    continue;
                 }
-                updated.push(doc);
-                continue;
-            }
+            },
         };
         // ③ 重新分块 embedding 写入。
         let text = String::from_utf8_lossy(&bytes).to_string();
@@ -1888,7 +2059,8 @@ async fn run_kb_reindex(
             match store.upsert_with_claims(&claims, &iri, &chunk, &tags).await {
                 Ok(_) => new_iris.push(iri),
                 Err(e) => {
-                    err = Some(format!("写入失败: {e}"));
+                    tracing::error!(error = %e, "KB reindex vector write failed");
+                    err = Some("向量写入失败".to_string());
                     break;
                 }
             }
@@ -2812,7 +2984,7 @@ mod isolation_contract {
     use crate::api::http::{api_gov::ApiUsageState, AppState, TEST_ENV_LOCK};
     use crate::core::core_types::{CoreConfig, SemanticCore};
     use crate::gateway::UnifiedGateway;
-    use crate::memory::embedding_service::FallbackEmbeddingService;
+    use crate::memory::embedding_service::{EmbeddingService, FallbackEmbeddingService};
     use crate::memory::hyperspace_store::HyperspaceStore;
     use crate::tools::prompt_registry::PromptRegistry;
     use axum::{
@@ -2823,6 +2995,19 @@ mod isolation_contract {
     };
     use jsonwebtoken::{encode, EncodingKey, Header};
     use tower::ServiceExt;
+
+    struct UnavailableEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for UnavailableEmbeddingService {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+            Err("unavailable".into())
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
 
     fn test_state(tmp: &std::path::Path) -> Arc<AppState> {
         let l0 = tmp.join("l0");
@@ -2869,7 +3054,9 @@ mod isolation_contract {
             knowledge_bases: Arc::new(tokio::sync::RwLock::new(vec![])),
             knowledge_packs: Arc::new(tokio::sync::RwLock::new(vec![])),
             vector_store: Arc::new(arc_swap::ArcSwapOption::from_pointee(vector_store)),
-            blob_store: None,
+            blob_store: Some(Arc::new(crate::blob::LocalFsBlobStore::new(
+                tmp.join("blobs"),
+            ))),
             task_executor: None,
             batch_manager: None,
             api_clients: Arc::new(tokio::sync::RwLock::new(vec![])),
@@ -3289,6 +3476,8 @@ mod isolation_contract {
         state.knowledge_bases.write().await.push(json!({
             "id": "graph-kb",
             "kb_type": "graph",
+            "tenant_id": "tenant-a",
+            "project_id": "default",
             "graph": "graph:world"
         }));
         let app = Router::new()
@@ -3347,7 +3536,7 @@ mod isolation_contract {
             .header("authorization", format!("Bearer {}", jwt("tenant-b")))
             .body(Body::empty())
             .unwrap();
-        assert_eq!(response_json(&app, b_stats).await.1["triples"], json!(0));
+        assert_eq!(response_json(&app, b_stats).await.0, StatusCode::NOT_FOUND);
 
         let legacy = state
             .kg_store
@@ -3389,6 +3578,8 @@ exit 2
         state.knowledge_bases.write().await.push(json!({
             "id": "graph-kb",
             "kb_type": "graph",
+            "tenant_id": "tenant-a",
+            "project_id": "default",
             "graph": "client:ignored"
         }));
         let app = Router::new()
@@ -3465,11 +3656,15 @@ exit 2
         state.knowledge_bases.write().await.push(json!({
             "id": "vector-kb-a",
             "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "default",
             "vector_namespace": "tenant:legacy"
         }));
         state.knowledge_bases.write().await.push(json!({
             "id": "vector-kb-b",
             "kb_type": "vector",
+            "tenant_id": "tenant-b",
+            "project_id": "default",
             "vector_namespace": "tenant:legacy"
         }));
         let app = Router::new()
@@ -3506,6 +3701,19 @@ exit 2
             .body(Body::from(r#"{"text":"private battery instructions"}"#))
             .unwrap();
         assert_eq!(response_json(&app, ingested).await.0, StatusCode::OK);
+        let tenant_b_ingested = Request::builder()
+            .method("POST")
+            .uri("/kb/vector-kb-b/ingest")
+            .header("authorization", format!("Bearer {}", jwt("tenant-b")))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"text":"tenant B private repair instructions"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            response_json(&app, tenant_b_ingested).await.0,
+            StatusCode::OK
+        );
 
         let search = |tenant_id, kb_id| {
             Request::builder()
@@ -3516,24 +3724,258 @@ exit 2
                 .body(Body::from(r#"{"query":"battery instructions"}"#))
                 .unwrap()
         };
+        let (_, tenant_a_result) = response_json(&app, search("tenant-a", "vector-kb-a")).await;
+        assert_eq!(tenant_a_result["count"], json!(1));
         assert_eq!(
-            response_json(&app, search("tenant-a", "vector-kb-a"))
-                .await
-                .1["count"],
-            json!(1)
+            tenant_a_result["results"][0]["text"],
+            json!("private battery instructions")
         );
+        assert!(tenant_a_result["results"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tenant:tenant-a")));
+        assert!(tenant_a_result["results"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("kb:vector-kb-a")));
+        let (_, tenant_b_result) = response_json(&app, search("tenant-b", "vector-kb-b")).await;
+        assert_eq!(tenant_b_result["count"], json!(1));
+        assert_eq!(
+            tenant_b_result["results"][0]["text"],
+            json!("tenant B private repair instructions")
+        );
+        assert!(tenant_b_result["results"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tenant:tenant-b")));
+        assert!(tenant_b_result["results"][0]["tags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("kb:vector-kb-b")));
         assert_eq!(
             response_json(&app, search("tenant-a", "vector-kb-b"))
                 .await
-                .1["count"],
-            json!(0),
-            "KB B must not retrieve entries ingested into KB A in the same claims namespace"
+                .0,
+            StatusCode::NOT_FOUND
         );
         assert_eq!(
             response_json(&app, search("tenant-b", "vector-kb-a"))
                 .await
-                .1["count"],
-            json!(0)
+                .0,
+            StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn kb_search_fails_closed_when_embedding_provider_is_unavailable() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        state.knowledge_bases.write().await.push(json!({
+            "id": "unavailable-embedding-kb",
+            "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "default"
+        }));
+        let unavailable = HyperspaceStore::open(
+            &tmp.path().join("unavailable-vectors"),
+            Arc::new(UnavailableEmbeddingService),
+        )
+        .unwrap();
+        state.vector_store.store(Some(Arc::new(unavailable)));
+        let app = Router::new()
+            .route("/kb/:id/search", post(search_knowledge_base_handler))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/kb/unavailable-embedding-kb/search")
+            .header("authorization", format!("Bearer {}", jwt("tenant-a")))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"query":"must not use a placeholder vector"}"#,
+            ))
+            .unwrap();
+        let (status, body) = response_json(&app, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }));
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_kb_id_routes_return_identical_not_found() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        state.knowledge_bases.write().await.push(json!({
+            "id": "foreign-kb",
+            "kb_type": "vector",
+            "tenant_id": "tenant-b",
+            "project_id": "default",
+        }));
+        let app = Router::new()
+            .route(
+                "/kb/:id",
+                put(update_knowledge_base_handler).delete(delete_knowledge_base_handler),
+            )
+            .route("/kb/:id/search", post(search_knowledge_base_handler))
+            .route("/kb/:id/reindex", post(reindex_knowledge_base_handler))
+            .route("/kb/:id/upload", post(upload_knowledge_base_handler))
+            .with_state(state);
+        let token = jwt_for_scope("tenant-a", Some("default"));
+        let requests = [
+            (
+                "POST",
+                "/kb/foreign-kb/search",
+                r#"{"query":"x"}"#,
+                "application/json",
+            ),
+            ("POST", "/kb/foreign-kb/reindex", "", "application/json"),
+            (
+                "PUT",
+                "/kb/foreign-kb",
+                r#"{"name":"x"}"#,
+                "application/json",
+            ),
+            ("DELETE", "/kb/foreign-kb", "", "application/json"),
+            (
+                "POST",
+                "/kb/foreign-kb/upload",
+                "--test--\r\n",
+                "multipart/form-data; boundary=test",
+            ),
+        ];
+        for (method, uri, body, content_type) in requests {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap();
+            let (status, body) = raw_response(&app, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            assert_eq!(
+                body,
+                br#"{"error":"knowledge base not found","id":"foreign-kb"}"#
+            );
+        }
+        let foreign = raw_response(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/kb/foreign-kb/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"x"}"#))
+                .unwrap(),
+        )
+        .await;
+        let missing = raw_response(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/kb/missing-kb/search")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"x"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(foreign.0, missing.0);
+        assert_eq!(
+            String::from_utf8(foreign.1)
+                .unwrap()
+                .replace("foreign-kb", "<id>"),
+            String::from_utf8(missing.1)
+                .unwrap()
+                .replace("missing-kb", "<id>")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_namespace_same_kb_id_does_not_block_healthy_tenant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path());
+        let a = IsolationClaims::from_verified("tenant-a", "default", "a").unwrap();
+        let b = IsolationClaims::from_verified("tenant-b", "default", "b").unwrap();
+        state.knowledge_bases.write().await.extend([
+            json!({"id":"shared-kb","kb_type":"vector","tenant_id":"tenant-a","project_id":"default"}),
+            json!({"id":"shared-kb","kb_type":"vector","tenant_id":"tenant-b","project_id":"default"}),
+        ]);
+        let store = state.vector_store.load_full().unwrap();
+        store
+            .upsert_with_claims(
+                &a,
+                "bad",
+                "bad",
+                &["kb:shared-kb".into(), "tenant:wrong".into()],
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_with_claims(&b, "good", "good", &["kb:shared-kb".into()])
+            .await
+            .unwrap();
+        let bases = state.knowledge_bases.read().await.clone();
+        assert!(!vector_records_match_kb_ownership(&store, &bases, &a, "shared-kb").await);
+        assert!(vector_records_match_kb_ownership(&store, &bases, &b, "shared-kb").await);
+        assert_eq!(
+            store
+                .search_with_claims_and_required_tags(&b, "good", &["kb:shared-kb".into()], 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_reads_owned_legacy_blob_key_without_widening_scope() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
+        let state = test_state(tmp.path());
+        let claims =
+            IsolationClaims::from_verified("tenant-a", "default", "reindex-actor").unwrap();
+        let kb_id = "reindex-kb";
+        let doc_id = "legacy-document";
+        state.knowledge_bases.write().await.push(json!({
+            "id": kb_id,
+            "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "default",
+            "documents": [{
+                "doc_id": doc_id,
+                "filename": "source.md",
+                "blob_ref": {"backend": "local", "key": format!("kb/{kb_id}/{doc_id}")},
+                "chunk_size": 100,
+                "chunk_iris": []
+            }]
+        }));
+        let legacy_path = tmp
+            .path()
+            .join("blobs")
+            .join("tenant-a")
+            .join("kb")
+            .join(kb_id)
+            .join(doc_id);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, "owned historical source text").unwrap();
+
+        let docs = state.knowledge_bases.read().await[0]["documents"]
+            .as_array()
+            .unwrap()
+            .clone();
+        run_kb_reindex(state.clone(), claims, kb_id.to_string(), docs).await;
+
+        let kb = state.knowledge_bases.read().await[0].clone();
+        assert_eq!(kb["reindex_status"], json!("ready"));
+        assert_eq!(kb["documents"][0]["status"], json!("ready"));
+        assert_eq!(kb["documents"][0]["chunks"], json!(1));
+        if let Some(value) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", value);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
     }
 }

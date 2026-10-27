@@ -429,6 +429,18 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/kb/bases/${VEC_ID}/search" \
 
 ## 10. Embedding 可换，底座不可换
 
+### 旧目录 scope 回填
+
+`kb-catalog-backfill --data-root <PATH>` 是显式 dry-run 命令，用于缺少
+`tenant_id` 或 `project_id` 的目录记录。它会列出所有未 scoped KB 及文档级
+scope 证据。审核后才传 `--apply`：仅当证据唯一指向一个 tenant/project
+组合时写入；证据歧义或缺失的记录保持不变并报告；重复执行幂等。运行时读取
+不会从未 scoped 记录推断 scope。
+应用 backfill 前须先停止 Core。
+对无证据记录可使用 `--assign <kb_id>=<tenant>/<project>`，多条记录可重复传入。
+已有 scope 字段绝不覆盖；证据或显式指定与现有值冲突时会报告并跳过。
+若中断后留下 `.knowledge_bases.json.tmp`，重试前须人工审核并删除。
+
 配置段 `embedding`（`src/config/settings.rs`）：`provider` 默认 `ollama`，另有 `oneapi`、`fallback`。HTTP 侧：
 
 - 改系统配置中的 `embedding` → 热切换向量库维度/模型，并排队 `reindex`

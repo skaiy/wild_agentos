@@ -8,6 +8,9 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::api::http::kb::{
+    kb_vector_tag, load_knowledge_bases, vector_records_match_kb_ownership,
+};
 use crate::knowledge_graph::code_ast::CodeAstExtractor;
 use crate::knowledge_graph::extractor::KnowledgeExtractor;
 use crate::knowledge_graph::ontology::OntologyManager;
@@ -41,6 +44,11 @@ pub(super) async fn execute_kb_vector_search(
     if query.is_empty() {
         return Err("query 不能为空".to_string());
     }
+    let kb_id = input
+        .get("kb_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "kb_id is required".to_string())?;
     let limit = input
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -59,7 +67,11 @@ pub(super) async fn execute_kb_vector_search(
 
     // `namespace` is intentionally ignored. Claims mint the only searchable
     // namespace, so an LLM cannot select another tenant's vectors.
-    let filter = HybridSearchFilter::new();
+    let bases = load_knowledge_bases();
+    if !vector_records_match_kb_ownership(&store, &bases, &claims, kb_id).await {
+        return Err("vector retrieval unavailable".to_string());
+    }
+    let filter = HybridSearchFilter::new().with_must_tags(vec![kb_vector_tag(kb_id)]);
     let hits = store
         .search_with_claims(&claims, &query, &filter, limit)
         .await

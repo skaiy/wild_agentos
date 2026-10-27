@@ -30,7 +30,7 @@ use crate::memory::hyperspace_store::{HybridSearchFilter, MatchKind, ScoredEntry
 use super::agents::resolve_definition_revision;
 use super::api_gov;
 use super::iam::UserIdentity;
-use super::kb::kb_vector_tag;
+use super::kb::{kb_vector_tag, vector_records_match_kb_ownership, VECTOR_RETRIEVAL_UNAVAILABLE};
 use super::AppState;
 
 const PACK_VECTOR_RAG_PER_KB_LIMIT: u64 = 5;
@@ -1015,9 +1015,20 @@ fn grouped_exclude_shape_fragments(
                 && normalized_groups.iter().all(|group| {
                     (group_min_len as usize..=group_max_len as usize).contains(&group.len())
                 });
-            let candidate_matches_shape = group_count <= max_groups as usize
-                && group_lengths_match
-                && normalized_matches_exclude_shape(&normalized_groups.concat(), shape);
+            let concatenated = normalized_groups.concat();
+            let within_group_limit = group_count <= max_groups as usize;
+            // A leading single digit makes `1 99 0000 0000` miss group_min_len
+            // even though the fragments concatenate to the configured phone.
+            // Block that span, including the 4-digit pieces, without lowering
+            // the configured minimum that capacity validation depends on.
+            let candidate_matches_shape = within_group_limit
+                && ((group_lengths_match
+                    && normalized_matches_exclude_shape(&concatenated, shape))
+                    || phone_short_groups_form_blocked_span(
+                        &normalized_groups,
+                        shape,
+                        group_max_len,
+                    ));
             // Under the deployed 17-character shape with at most four 4–5 character
             // groups, two five-character fault codes cannot both fit a full shape.
             // Masking therefore depends on the shape match itself, never code count.
@@ -1154,6 +1165,23 @@ fn code_removal_forms_complete_shape(
     false
 }
 
+fn phone_short_groups_form_blocked_span(
+    groups: &[String],
+    shape: &ExcludeShape,
+    group_max_len: u8,
+) -> bool {
+    matches!(shape.charset, ShapeCharset::Digits)
+        && shape.leading == Some('1')
+        && shape.min_len == 11
+        && shape.max_len == 11
+        && groups.iter().all(|group| {
+            !group.is_empty()
+                && group.len() <= group_max_len as usize
+                && group.chars().all(|character| character.is_ascii_digit())
+        })
+        && normalized_matches_exclude_shape(&groups.concat(), shape)
+}
+
 fn normalized_matches_exclude_shape(normalized: &str, shape: &ExcludeShape) -> bool {
     (shape.min_len as usize..=shape.max_len as usize).contains(&normalized.len())
         && normalized.chars().all(|character| match shape.charset {
@@ -1237,13 +1265,31 @@ async fn pack_scoped_vector_hits(
     let Some(store) = state.vector_store.load_full() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            json!({ "error": "chat vector retrieval unavailable" }),
+            json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
         ));
     };
+    let bases = state.knowledge_bases.read().await.clone();
     let mut exact_hits = Vec::new();
     let mut exact_truncated = false;
     let mut hits = Vec::new();
     for search in searches {
+        if !bases.iter().any(|kb| {
+            kb.get("id").and_then(Value::as_str) == Some(search.kb_id.as_str())
+                && kb.get("kb_type").and_then(Value::as_str) == Some("vector")
+                && kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+                && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+        }) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                json!({ "error": "knowledge base not found", "id": search.kb_id }),
+            ));
+        }
+        if !vector_records_match_kb_ownership(&store, &bases, claims, &search.kb_id).await {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
+            ));
+        }
         let tag = kb_vector_tag(&search.kb_id);
         let tokens = extract_pack_tokens(question, &search.token_rules);
         if !tokens.is_empty() {
@@ -1275,7 +1321,7 @@ async fn pack_scoped_vector_hits(
                     );
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
-                        json!({ "error": "chat vector retrieval unavailable" }),
+                        json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
                     ));
                 }
             }
@@ -1298,7 +1344,7 @@ async fn pack_scoped_vector_hits(
                 );
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    json!({ "error": "chat vector retrieval unavailable" }),
+                    json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
                 ));
             }
         }
@@ -1372,15 +1418,37 @@ async fn ev_repair_legacy_vector_section(
     question: &str,
 ) -> Result<Option<String>, (StatusCode, Value)> {
     let Some(store) = state.vector_store.load_full() else {
-        return Ok(None);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
+        ));
     };
+    let bases = state.knowledge_bases.read().await.clone();
+    let kb_ids: Vec<String> = bases
+        .iter()
+        .filter(|kb| {
+            kb.get("kb_type").and_then(Value::as_str) == Some("vector")
+                && kb.get("tenant_id").and_then(Value::as_str) == Some(claims.tenant_id())
+                && kb.get("project_id").and_then(Value::as_str) == Some(claims.project_id())
+        })
+        .filter_map(|kb| kb.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for kb_id in kb_ids {
+        if !vector_records_match_kb_ownership(&store, &bases, claims, &kb_id).await {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
+            ));
+        }
+    }
     let hits = store
         .search_with_claims(claims, question, &HybridSearchFilter::new(), 5)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "chat vector retrieval failed");
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": format!("chat vector retrieval failed: {e}") }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }),
             )
         })?;
     if hits.is_empty() {
@@ -2211,11 +2279,33 @@ pub(crate) async fn openai_chat_completions_handler(
 mod tests {
     use super::*;
     use crate::core::core_types::{CoreConfig, SemanticCore};
+    use crate::memory::hyperspace_store::HyperspaceStore;
     use crate::tools::prompt_registry::PromptRegistry;
-    use axum::{body::Body, http::Request, routing::post, Router};
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        routing::post,
+        Router,
+    };
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use tower::ServiceExt;
 
     use super::super::api_gov::ApiUsageState;
+
+    fn jwt(tenant_id: &str, project_id: &str) -> String {
+        encode(
+            &Header::default(),
+            &super::super::iam::JwtClaims {
+                sub: "test-actor".into(),
+                tenant_id: tenant_id.into(),
+                project_id: Some(project_id.into()),
+                roles: vec!["DA".into()],
+                exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            },
+            &EncodingKey::from_secret(b"test-hs256-secret-at-least-32-bytes-long"),
+        )
+        .unwrap()
+    }
 
     fn make_state() -> Arc<AppState> {
         let l0 = std::env::temp_dir().join(format!("chat_rag_{}", uuid::Uuid::new_v4()));
@@ -2294,7 +2384,13 @@ mod tests {
                     "builtin": false,
                 }),
             ])),
-            vector_store: Arc::new(arc_swap::ArcSwapOption::empty()),
+            vector_store: Arc::new(arc_swap::ArcSwapOption::from_pointee(
+                HyperspaceStore::open(
+                    &l0.join("vectors"),
+                    Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+                )
+                .unwrap(),
+            )),
             blob_store: None,
             task_executor: None,
             batch_manager: None,
@@ -2486,6 +2582,11 @@ mod tests {
         // fictional: concatenated values are not tokenized and therefore do not retrieve.
         assert!(extract_pack_tokens("B2033LTEST000000000001", &rules).is_empty());
         assert!(extract_pack_tokens("B2033", &[]).is_empty());
+        // fictional: phone shape on the prefixed rule still blocks bare pieces.
+        assert_eq!(
+            extract_pack_tokens("1 99 0000 0000", &rules),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2720,6 +2821,13 @@ mod tests {
             // fictional
             assert_eq!(extract_pack_tokens(value, &rules), Vec::<String>::new());
         }
+        // fictional
+        assert_eq!(
+            extract_pack_tokens("1 99 0000 0000", &rules),
+            Vec::<String>::new()
+        );
+        assert_eq!(extract_pack_tokens("0420", &rules), vec!["0420"]);
+        assert_eq!(extract_pack_tokens("故障码 0420", &rules), vec!["0420"]);
     }
 
     #[test]
@@ -2872,6 +2980,14 @@ mod tests {
             extract_pack_tokens("199 0000 0000", &rules),
             Vec::<String>::new()
         );
+        // fictional: a leading single digit is still one phone span. The
+        // 4-digit pieces must not leak as bare fault codes.
+        assert_eq!(
+            extract_pack_tokens("1 99 0000 0000", &rules),
+            Vec::<String>::new()
+        );
+        assert_eq!(extract_pack_tokens("0420", &rules), vec!["0420"]);
+        assert_eq!(extract_pack_tokens("故障码 0420", &rules), vec!["0420"]);
     }
 
     #[test]
@@ -2920,6 +3036,14 @@ mod tests {
             }
         });
         assert_eq!(validate_keyword_retrieval_config(&pack), Ok(()));
+        let rules = pack_token_rules(&pack);
+        // fictional: VIN-only and phone-only rules mounted together.
+        assert_eq!(
+            extract_pack_tokens("1 99 0000 0000", &rules),
+            Vec::<String>::new()
+        );
+        assert_eq!(extract_pack_tokens("0420", &rules), vec!["0420"]);
+        assert_eq!(extract_pack_tokens("故障码 0420", &rules), vec!["0420"]);
     }
 
     #[test]
@@ -3117,6 +3241,12 @@ mod tests {
             .await
             .unwrap();
         state.vector_store.store(Some(Arc::new(store)));
+        state.knowledge_bases.write().await.push(json!({
+            "id": "kb-local",
+            "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "project-1"
+        }));
         *state.knowledge_packs.write().await = vec![
             json!({
                 "id": "pack-config-a",
@@ -3243,6 +3373,12 @@ mod tests {
         )
         .unwrap();
         let kb_id = "demo-vector-kb";
+        state.knowledge_bases.write().await.push(json!({
+            "id": kb_id,
+            "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "project-1"
+        }));
         vector_store
             .upsert_with_claims(
                 &claims,
@@ -3811,5 +3947,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_endpoint_fails_closed_when_kb_ownership_validation_fails() {
+        let state = make_state();
+        state.knowledge_bases.write().await.push(json!({
+            "id": "chat-vector-kb",
+            "kb_type": "vector",
+            "tenant_id": "tenant-a",
+            "project_id": "project-1"
+        }));
+        {
+            let mut packs = state.knowledge_packs.write().await;
+            packs
+                .iter_mut()
+                .find(|pack| pack["id"] == "attacker-pack")
+                .unwrap()["vector_kb_ids"] = json!(["chat-vector-kb"]);
+        }
+        let vector_dir =
+            std::env::temp_dir().join(format!("chat_unavailable_{}", uuid::Uuid::new_v4()));
+        let store = HyperspaceStore::open(
+            &vector_dir,
+            Arc::new(crate::memory::embedding_service::FallbackEmbeddingService::new()),
+        )
+        .unwrap();
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "test-actor").unwrap();
+        store
+            .upsert_with_claims(
+                &claims,
+                "bad-ownership",
+                "must not be retrieved",
+                &["kb:chat-vector-kb".into(), "tenant:wrong".into()],
+            )
+            .await
+            .unwrap();
+        state.vector_store.store(Some(Arc::new(store)));
+        let router = Router::new()
+            .route("/api/v1/agents/:id/chat", post(agent_chat_handler))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/agent-a/chat")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", jwt("tenant-a", "project-1")),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"retrieve context"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body, json!({ "error": VECTOR_RETRIEVAL_UNAVAILABLE }));
+    }
+
+    #[tokio::test]
+    async fn chat_pack_cannot_mount_a_foreign_tenant_kb() {
+        let state = make_state();
+        state.knowledge_bases.write().await.push(json!({
+            "id": "foreign-kb",
+            "kb_type": "vector",
+            "tenant_id": "tenant-b",
+            "project_id": "project-1"
+        }));
+        state
+            .knowledge_packs
+            .write()
+            .await
+            .iter_mut()
+            .find(|pack| pack["id"] == "attacker-pack")
+            .unwrap()["vector_kb_ids"] = json!(["foreign-kb"]);
+        let claims = IsolationClaims::from_verified("tenant-a", "project-1", "actor-a").unwrap();
+        let error = build_chat_context(
+            &state,
+            "agent-a",
+            single_user_message("retrieve", &[]),
+            Some(&claims),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.1,
+            json!({ "error": "knowledge base not found", "id": "foreign-kb" })
+        );
     }
 }

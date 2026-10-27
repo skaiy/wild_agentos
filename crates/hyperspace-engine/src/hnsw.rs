@@ -132,6 +132,12 @@ pub struct IncrementalHNSW {
 }
 
 impl IncrementalHNSW {
+    /// Small filtered collections are cheaper and more reliable to search
+    /// exactly than to recover from a global ANN candidate set. In particular,
+    /// a tag with only a few vectors can otherwise be entirely absent from the
+    /// first `ef_search` global candidates.
+    const EXACT_FILTERED_SEARCH_LIMIT: u64 = 5_000;
+
     pub fn new(metric: Box<dyn Metric>, config: HnswConfig) -> Self {
         Self {
             nodes: Vec::new(),
@@ -408,6 +414,12 @@ impl IncrementalHNSW {
         top_k: usize,
         allowed: Option<&RoaringBitmap>,
     ) -> Vec<(u32, f64)> {
+        if let Some(allowed) = allowed {
+            if Self::should_use_exact_filtered_search(allowed) {
+                return self.exact_filtered_search(query, top_k, allowed);
+            }
+        }
+
         let mut ep = self.entry_point.load(Ordering::Relaxed);
         if ep != u32::MAX && !self.contains(ep) {
             self.fix_entry_point();
@@ -418,7 +430,7 @@ impl IncrementalHNSW {
         }
 
         let max_layer = self.max_layer.load(Ordering::Relaxed);
-        let ef = self.config.ef_search.max(top_k);
+        let ef = self.filter_aware_ef(top_k, allowed);
 
         // Multi-layer descent
         let mut curr_ep = ep;
@@ -439,6 +451,63 @@ impl IncrementalHNSW {
             results.retain(|(id, _)| ab.contains(*id));
         }
         results.truncate(top_k);
+        results
+    }
+
+    fn should_use_exact_filtered_search(allowed: &RoaringBitmap) -> bool {
+        allowed.len() <= Self::EXACT_FILTERED_SEARCH_LIMIT
+    }
+
+    /// Increase the global beam width for a selective filter. This keeps the
+    /// expected number of allowed candidates proportional to `top_k` instead
+    /// of allowing a much larger collection to consume a fixed global budget.
+    fn filter_aware_ef(&self, top_k: usize, allowed: Option<&RoaringBitmap>) -> usize {
+        let base_ef = self.config.ef_search.max(top_k);
+        let Some(allowed) = allowed else {
+            return base_ef;
+        };
+
+        let total = self.len();
+        let allowed_count = allowed.len() as usize;
+        if total == 0 || allowed_count == 0 {
+            return base_ef;
+        }
+
+        let scaled_ef = top_k
+            .saturating_mul(total)
+            .div_ceil(allowed_count)
+            .saturating_mul(2);
+        base_ef.max(scaled_ef).min(total)
+    }
+
+    /// Brute-force the small allowed set. This is the correctness backstop for
+    /// sparse tag filters and is independent of graph reachability.
+    fn exact_filtered_search(
+        &self,
+        query: &EmbeddingVector,
+        top_k: usize,
+        allowed: &RoaringBitmap,
+    ) -> Vec<(u32, f64)> {
+        let mut results: Vec<(u32, f64)> = allowed
+            .iter()
+            .filter_map(|id| {
+                self.nodes
+                    .get(id as usize)
+                    .and_then(|node| node.as_ref())
+                    .map(|node| (id, self.metric.distance(query, &node.vector)))
+            })
+            .collect();
+        let compare_results =
+            |(left_id, left_distance): &(u32, f64), (right_id, right_distance): &(u32, f64)| {
+                left_distance
+                    .total_cmp(right_distance)
+                    .then_with(|| left_id.cmp(right_id))
+            };
+        if results.len() > top_k {
+            results.select_nth_unstable_by(top_k, compare_results);
+            results.truncate(top_k);
+        }
+        results.sort_by(compare_results);
         results
     }
 
@@ -740,6 +809,18 @@ mod tests {
         for (id, _) in &results {
             assert!(allowed.contains(*id), "ID {id} should be in allowed set");
         }
+    }
+
+    #[test]
+    fn test_filtered_exact_search_threshold_includes_5000() {
+        let mut at_limit = RoaringBitmap::new();
+        at_limit.insert_range(0..=4_999);
+        assert!(IncrementalHNSW::should_use_exact_filtered_search(&at_limit));
+
+        at_limit.insert(5_000);
+        assert!(!IncrementalHNSW::should_use_exact_filtered_search(
+            &at_limit
+        ));
     }
 
     fn sequential_unit_vector(index: usize, total: usize) -> EmbeddingVector {

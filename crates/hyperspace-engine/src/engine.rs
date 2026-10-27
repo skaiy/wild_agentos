@@ -305,6 +305,11 @@ impl Searcher {
         } else {
             evaluate_filters(&self.metadata, filters)
         };
+        if !filters.is_empty() && allowed.is_none() {
+            // Keep this fail-closed if a future metadata evaluator uses None
+            // for a non-empty filter expression.
+            return Vec::new();
+        }
 
         let results = if let Some(ref ab) = allowed {
             self.index.search_with_filter(query, top_k, Some(ab))
@@ -412,6 +417,24 @@ pub struct HyperspaceEngineImpl {
     data_dir: PathBuf,
     config: HnswConfig,
     dim: usize,
+}
+
+fn validate_search_query(query: &EmbeddingVector) -> Result<(), EngineError> {
+    let mut norm_squared = 0.0;
+    for &coordinate in &query.coords {
+        if !coordinate.is_finite() {
+            return Err(EngineError::InvalidVector(
+                "Search query coordinates must be finite".into(),
+            ));
+        }
+        norm_squared += coordinate * coordinate;
+    }
+    if !norm_squared.is_finite() || norm_squared == 0.0 {
+        return Err(EngineError::InvalidVector(
+            "Search query must have a finite, non-zero norm".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl HyperspaceEngineImpl {
@@ -811,11 +834,17 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         top_k: usize,
         filters: &[JsonLdFilter],
     ) -> Result<Vec<SearchHit>, EngineError> {
+        validate_search_query(query)?;
         let allowed = if filters.is_empty() {
             None
         } else {
             evaluate_filters(&self.metadata, filters)
         };
+        if !filters.is_empty() && allowed.is_none() {
+            // Keep this fail-closed if a future metadata evaluator uses None
+            // for a non-empty filter expression.
+            return Ok(Vec::new());
+        }
 
         let mut inner = self.inner.lock().unwrap();
         let results = if let Some(ref ab) = allowed {
@@ -850,12 +879,23 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         alpha: f32,
         filters: &[JsonLdFilter],
     ) -> Result<Vec<SearchHit>, EngineError> {
+        if let Some(query) = text_query {
+            validate_search_query(query)?;
+        }
+        if let Some(query) = struct_query {
+            validate_search_query(query)?;
+        }
         // Evaluate filters
         let allowed = if filters.is_empty() {
             None
         } else {
             evaluate_filters(&self.metadata, filters)
         };
+        if !filters.is_empty() && allowed.is_none() {
+            // Keep this fail-closed if a future metadata evaluator uses None
+            // for a non-empty filter expression.
+            return Ok(Vec::new());
+        }
 
         let mut inner = self.inner.lock().unwrap();
 
@@ -1112,6 +1152,21 @@ mod tests {
             .unwrap()
     }
 
+    fn setup_engine_with_dimension(
+        dir: &Path,
+        dim: usize,
+        config: HnswConfig,
+    ) -> HyperspaceEngineImpl {
+        HyperspaceEngineImpl::open(
+            dir,
+            WalSyncMode::Strict,
+            dim,
+            Box::new(CosineMetric),
+            config,
+        )
+        .unwrap()
+    }
+
     fn v(coords: Vec<f64>) -> EmbeddingVector {
         EmbeddingVector::new_unchecked(coords, MetricKind::Cosine)
     }
@@ -1123,6 +1178,34 @@ mod tests {
     fn sequential_unit_vector(index: usize, total: usize) -> EmbeddingVector {
         let angle = (index + 1) as f64 * std::f64::consts::FRAC_PI_2 / (total + 1) as f64;
         v(vec![angle.cos(), angle.sin(), 0.0, 0.0])
+    }
+
+    fn synthetic_1024d_vector(index: usize, total: usize) -> EmbeddingVector {
+        let angle = (index + 1) as f64 * std::f64::consts::FRAC_PI_2 / (total + 1) as f64;
+        let mut coords = vec![0.0; 1024];
+        coords[0] = angle.cos();
+        coords[1] = angle.sin();
+        EmbeddingVector::new_unchecked(coords, MetricKind::Cosine)
+    }
+
+    async fn assert_filtered_self_recall(
+        engine: &HyperspaceEngineImpl,
+        entries: &[(String, String, usize)],
+    ) {
+        for (iri, tag, vector_index) in entries {
+            let query = synthetic_1024d_vector(*vector_index, entries.len());
+            let filter = JsonLdFilter::tag("tags", tag);
+            assert_eq!(
+                engine
+                    .search(&query, 1, std::slice::from_ref(&filter))
+                    .await
+                    .unwrap()
+                    .first()
+                    .map(|hit| hit.iri.as_str()),
+                Some(iri.as_str()),
+                "tag-filtered search should return {iri} as its own nearest neighbor"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1154,6 +1237,32 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 1);
         assert_eq!(results[0].iri, "vec:1");
+    }
+
+    #[tokio::test]
+    async fn test_search_rejects_zero_norm_and_non_finite_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = setup_async_engine(dir.path());
+        eng.insert(
+            "synthetic:query-validation",
+            v(vec![1.0, 0.0, 0.0, 0.0]),
+            json!({"tags": ["synthetic-query-validation"]}),
+        )
+        .await
+        .unwrap();
+        let filter = JsonLdFilter::tag("tags", "synthetic-query-validation");
+
+        for invalid_query in [
+            v(vec![0.0, 0.0, 0.0, 0.0]),
+            v(vec![f64::NAN, 0.0, 0.0, 0.0]),
+            v(vec![f64::INFINITY, 0.0, 0.0, 0.0]),
+        ] {
+            assert!(matches!(
+                eng.search(&invalid_query, 1, std::slice::from_ref(&filter))
+                    .await,
+                Err(EngineError::InvalidVector(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1522,6 +1631,129 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "long-running 1024-dimensional scale regression"]
+    async fn test_1024d_multi_collection_filtered_self_recall_survives_restart() {
+        const LARGE_COLLECTION_SIZE: usize = 3_000;
+        const SMALL_COLLECTION_SIZES: [usize; 3] = [3, 11, 50];
+        let total = LARGE_COLLECTION_SIZE + SMALL_COLLECTION_SIZES.iter().sum::<usize>();
+        let config = HnswConfig {
+            m: 16,
+            ef_search: 50,
+            ..HnswConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = Vec::with_capacity(total);
+
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            let mut vector_index = 0;
+            for (tag, collection_size) in
+                std::iter::once(("synthetic-large", LARGE_COLLECTION_SIZE)).chain(
+                    SMALL_COLLECTION_SIZES
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &size)| {
+                            (
+                                match index {
+                                    0 => "synthetic-small-a",
+                                    1 => "synthetic-small-b",
+                                    _ => "synthetic-small-c",
+                                },
+                                size,
+                            )
+                        }),
+                )
+            {
+                for local_index in 0..collection_size {
+                    let iri = format!("synthetic:{tag}:{local_index}");
+                    engine
+                        .insert(
+                            &iri,
+                            synthetic_1024d_vector(vector_index, total),
+                            json!({"tags": [tag]}),
+                        )
+                        .await
+                        .unwrap();
+                    entries.push((iri, tag.to_owned(), vector_index));
+                    vector_index += 1;
+                }
+            }
+            assert_filtered_self_recall(&engine, &entries).await;
+        }
+
+        // Reopening without a checkpoint exercises WAL replay.
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            assert_filtered_self_recall(&engine, &entries).await;
+            engine.checkpoint().await.unwrap();
+        }
+
+        // Reopening after a checkpoint exercises snapshot graph restoration.
+        let engine = setup_engine_with_dimension(dir.path(), 1024, config);
+        assert_filtered_self_recall(&engine, &entries).await;
+    }
+
+    #[tokio::test]
+    async fn test_1024d_filtered_self_recall_survives_restart() {
+        const LARGE_COLLECTION_SIZE: usize = 64;
+        const SMALL_COLLECTION_SIZES: [usize; 2] = [3, 11];
+        let total = LARGE_COLLECTION_SIZE + SMALL_COLLECTION_SIZES.iter().sum::<usize>();
+        let config = HnswConfig {
+            m: 16,
+            ef_search: 50,
+            ..HnswConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = Vec::with_capacity(total);
+
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            let mut vector_index = 0;
+            for (tag, collection_size) in
+                std::iter::once(("synthetic-large", LARGE_COLLECTION_SIZE)).chain(
+                    SMALL_COLLECTION_SIZES
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &size)| {
+                            (
+                                if index == 0 {
+                                    "synthetic-small-a"
+                                } else {
+                                    "synthetic-small-b"
+                                },
+                                size,
+                            )
+                        }),
+                )
+            {
+                for local_index in 0..collection_size {
+                    let iri = format!("synthetic:{tag}:{local_index}");
+                    engine
+                        .insert(
+                            &iri,
+                            synthetic_1024d_vector(vector_index, total),
+                            json!({"tags": [tag]}),
+                        )
+                        .await
+                        .unwrap();
+                    entries.push((iri, tag.to_owned(), vector_index));
+                    vector_index += 1;
+                }
+            }
+            assert_filtered_self_recall(&engine, &entries).await;
+        }
+
+        {
+            let engine = setup_engine_with_dimension(dir.path(), 1024, config.clone());
+            assert_filtered_self_recall(&engine, &entries).await;
+            engine.checkpoint().await.unwrap();
+        }
+
+        let engine = setup_engine_with_dimension(dir.path(), 1024, config);
+        assert_filtered_self_recall(&engine, &entries).await;
+    }
+
+    #[tokio::test]
     async fn test_tag_filtering_does_not_return_other_tenant_vectors() {
         let config = HnswConfig {
             m: 16,
@@ -1531,21 +1763,27 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let eng = setup_engine_with_config(dir.path(), config);
-        let tenant_a_filter = JsonLdFilter::tag("tags", "tenant-a");
-        let tenant_b_filter = JsonLdFilter::tag("tags", "tenant-b");
+        let tenant_a_filter = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:exact-a"),
+            JsonLdFilter::tag("tags", "kb:exact-a"),
+        ]);
+        let tenant_b_filter = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:exact-b"),
+            JsonLdFilter::tag("tags", "kb:exact-b"),
+        ]);
 
         for index in 0..64 {
             eng.insert(
                 &format!("tenant-a:{index}"),
                 sequential_unit_vector(index * 2, 128),
-                json!({"tags": ["tenant-a"]}),
+                json!({"tags": ["tenant:exact-a", "kb:exact-a"]}),
             )
             .await
             .unwrap();
             eng.insert(
                 &format!("tenant-b:{index}"),
                 sequential_unit_vector(index * 2 + 1, 128),
-                json!({"tags": ["tenant-b"]}),
+                json!({"tags": ["tenant:exact-b", "kb:exact-b"]}),
             )
             .await
             .unwrap();
@@ -1573,6 +1811,88 @@ mod tests {
             tenant_b_results.first().map(|hit| hit.iri.as_str()),
             Some("tenant-b:23")
         );
+
+        for missing_scope in [
+            vec![
+                JsonLdFilter::tag("tags", "tenant:absent"),
+                JsonLdFilter::tag("tags", "kb:exact-b"),
+            ],
+            vec![
+                JsonLdFilter::tag("tags", "tenant:exact-a"),
+                JsonLdFilter::tag("tags", "kb:absent"),
+            ],
+        ] {
+            assert!(
+                eng.search(&query, 10, &missing_scope)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a non-matching tenant or KB scope must produce no exact-search results"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tenant_and_kb_filters_prevent_cross_scope_results_in_hnsw_path() {
+        const FILTERED_HNSW_SIZE: usize = 5_001;
+        let config = HnswConfig {
+            m: 4,
+            m0: 8,
+            ef_search: 8,
+            ..HnswConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let eng = setup_engine_with_config(dir.path(), config);
+        let scope_b = JsonLdFilter::Must(vec![
+            JsonLdFilter::tag("tags", "tenant:scope-b"),
+            JsonLdFilter::tag("tags", "kb:scope-b"),
+        ]);
+
+        eng.insert(
+            "synthetic:scope-a:0",
+            sequential_unit_vector(0, FILTERED_HNSW_SIZE + 1),
+            json!({"tags": ["tenant:scope-a", "kb:scope-a"]}),
+        )
+        .await
+        .unwrap();
+        for index in 0..FILTERED_HNSW_SIZE {
+            eng.insert(
+                &format!("synthetic:scope-b:{index}"),
+                sequential_unit_vector(index + 1, FILTERED_HNSW_SIZE + 1),
+                json!({"tags": ["tenant:scope-b", "kb:scope-b"]}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let b_query = sequential_unit_vector(24, FILTERED_HNSW_SIZE + 1);
+        let b_results = eng.search(&b_query, 10, &[scope_b]).await.unwrap();
+        assert!(
+            !b_results.is_empty(),
+            "the HNSW path should return entries for the authorized scope"
+        );
+        assert!(b_results
+            .iter()
+            .all(|hit| hit.iri.starts_with("synthetic:scope-b:")));
+
+        for missing_scope in [
+            vec![
+                JsonLdFilter::tag("tags", "tenant:absent"),
+                JsonLdFilter::tag("tags", "kb:scope-b"),
+            ],
+            vec![
+                JsonLdFilter::tag("tags", "tenant:scope-a"),
+                JsonLdFilter::tag("tags", "kb:absent"),
+            ],
+        ] {
+            assert!(
+                eng.search(&b_query, 10, &missing_scope)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a non-matching tenant or KB scope must produce no HNSW-search results"
+            );
+        }
     }
 
     #[tokio::test]
