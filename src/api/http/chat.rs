@@ -1017,18 +1017,13 @@ fn grouped_exclude_shape_fragments(
                 });
             let concatenated = normalized_groups.concat();
             let within_group_limit = group_count <= max_groups as usize;
-            // A leading single digit makes `1 99 0000 0000` miss group_min_len
-            // even though the fragments concatenate to the configured phone.
-            // Block that span, including the 4-digit pieces, without lowering
-            // the configured minimum that capacity validation depends on.
+            // Digit fragments shorter than group_min_len can still form the
+            // configured shape. Length, leading, and charset come from that
+            // shape; each fragment stays within group_max_len.
             let candidate_matches_shape = within_group_limit
                 && ((group_lengths_match
                     && normalized_matches_exclude_shape(&concatenated, shape))
-                    || phone_short_groups_form_blocked_span(
-                        &normalized_groups,
-                        shape,
-                        group_max_len,
-                    ));
+                    || short_groups_match_exclude_shape(&normalized_groups, shape, group_max_len));
             // Under the deployed 17-character shape with at most four 4–5 character
             // groups, two five-character fault codes cannot both fit a full shape.
             // Masking therefore depends on the shape match itself, never code count.
@@ -1165,15 +1160,19 @@ fn code_removal_forms_complete_shape(
     false
 }
 
-fn phone_short_groups_form_blocked_span(
+fn short_groups_match_exclude_shape(
     groups: &[String],
     shape: &ExcludeShape,
     group_max_len: u8,
 ) -> bool {
+    let Some(max_groups) = shape.max_groups else {
+        return false;
+    };
+    // Alphanumeric shapes keep group_min_len. This fallback is only for digit
+    // groups, and the span still has to satisfy the shape itself.
     matches!(shape.charset, ShapeCharset::Digits)
-        && shape.leading == Some('1')
-        && shape.min_len == 11
-        && shape.max_len == 11
+        && !groups.is_empty()
+        && groups.len() <= max_groups as usize
         && groups.iter().all(|group| {
             !group.is_empty()
                 && group.len() <= group_max_len as usize
@@ -2986,6 +2985,40 @@ mod tests {
             extract_pack_tokens("1 99 0000 0000", &rules),
             Vec::<String>::new()
         );
+        assert_eq!(extract_pack_tokens("0420", &rules), vec!["0420"]);
+        assert_eq!(extract_pack_tokens("故障码 0420", &rules), vec!["0420"]);
+    }
+
+    #[test]
+    fn short_digit_groups_follow_the_configured_exclude_shape() {
+        let pack = json!({
+            "keyword_retrieval": {
+                "rules": [{
+                    "prefixes": [],
+                    "digit_count": 4,
+                    "exclude_followed_by": ["年"],
+                    "exclude_shapes": [{
+                        "min_len": 8,
+                        "max_len": 8,
+                        "charset": "digits",
+                        "leading": "7",
+                        "separators": [" ", "-"],
+                        "max_groups": 3,
+                        "group_min_len": 3,
+                        "group_max_len": 4
+                    }]
+                }]
+            }
+        });
+        assert_eq!(validate_keyword_retrieval_config(&pack), Ok(()));
+        let rules = pack_token_rules(&pack);
+        // fictional: the leading group is shorter than group_min_len, and the
+        // blocked span is this shape rather than a fixed length or leading digit.
+        assert_eq!(
+            extract_pack_tokens("7 000 0000", &rules),
+            Vec::<String>::new()
+        );
+        assert_eq!(extract_pack_tokens("8 000 0000", &rules), vec!["0000"]);
         assert_eq!(extract_pack_tokens("0420", &rules), vec!["0420"]);
         assert_eq!(extract_pack_tokens("故障码 0420", &rules), vec!["0420"]);
     }
