@@ -167,6 +167,7 @@ const MUST_BE_PROTECTED: &[(&str, &str)] = &[
     ("POST", "/api/v1/tasks"),
     ("POST", "/api/v1/tasks/stream"),
     ("GET", "/api/v1/kb/bases/:id/documents"),
+    ("GET", "/api/v1/knowledge-packs/:id"),
     ("GET", "/api/v1/batch/events"),
     ("POST", "/v1/invocations"),
     ("GET", "/v1/invocations"),
@@ -583,6 +584,7 @@ fn isolation_contract_anonymous_route_sweep_parses_kb_documents_route() {
     for expected in [
         ("GET", "/api/v1/kb/bases/:id/documents"),
         ("GET", "/api/v1/knowledge-packs"),
+        ("GET", "/api/v1/knowledge-packs/:id"),
         ("DELETE", "/api/v1/kb/categories/:id"),
         ("PUT", "/api/v1/kb/categories/:id"),
         ("POST", "/api/v1/public/agents/:id/chat"),
