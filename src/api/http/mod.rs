@@ -100,13 +100,13 @@ use guard::{guard_audit_handler, guard_stats_handler};
 use kb::{
     create_kb_category_handler, create_knowledge_base_handler, create_knowledge_pack_handler,
     delete_kb_category_handler, delete_knowledge_base_handler, delete_knowledge_pack_handler,
-    import_graph_knowledge_base_handler, ingest_knowledge_base_handler, kb_document_raw_handler,
-    knowledge_base_stats_handler, list_kb_categories_handler, list_kb_documents_handler,
-    list_knowledge_bases_handler, list_knowledge_packs_handler, load_kb_categories,
-    load_knowledge_bases, load_knowledge_packs, materialize_rml_knowledge_base_handler,
-    reindex_knowledge_base_handler, save_knowledge_packs, search_knowledge_base_handler,
-    update_kb_category_handler, update_knowledge_base_handler, update_knowledge_pack_handler,
-    upload_knowledge_base_handler, KB_UPLOAD_MAX_BYTES,
+    get_knowledge_pack_handler, import_graph_knowledge_base_handler, ingest_knowledge_base_handler,
+    kb_document_raw_handler, knowledge_base_stats_handler, list_kb_categories_handler,
+    list_kb_documents_handler, list_knowledge_bases_handler, list_knowledge_packs_handler,
+    load_kb_categories, load_knowledge_bases, load_knowledge_packs,
+    materialize_rml_knowledge_base_handler, reindex_knowledge_base_handler, save_knowledge_packs,
+    search_knowledge_base_handler, update_kb_category_handler, update_knowledge_base_handler,
+    update_knowledge_pack_handler, upload_knowledge_base_handler, KB_UPLOAD_MAX_BYTES,
 };
 use market::{
     install_package_handler, list_packages_handler, publish_package_handler,
@@ -666,7 +666,9 @@ pub fn build_router(
         )
         .route(
             "/api/v1/knowledge-packs/:id",
-            put(update_knowledge_pack_handler).delete(delete_knowledge_pack_handler),
+            get(get_knowledge_pack_handler)
+                .put(update_knowledge_pack_handler)
+                .delete(delete_knowledge_pack_handler),
         )
         .route("/api/v1/ontology/types", get(ontology_types_handler))
         .route("/api/v1/ontology/health", get(ontology_health_handler))

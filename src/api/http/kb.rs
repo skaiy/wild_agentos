@@ -376,6 +376,33 @@ pub(crate) async fn create_knowledge_pack_handler(
     )
 }
 
+/// GET /api/v1/knowledge-packs/:id — 返回单个知识包。
+///
+/// 响应体与列表项、以及 PUT 响应里的 `knowledge_pack` 是同一对象。
+/// 知识包是平台级共享注册表：读取门禁与 `GET /api/v1/knowledge-packs` 相同
+/// （已验证 isolation claims；匿名 401），不按租户过滤。缺失 id 返回 404。
+pub(crate) async fn get_knowledge_pack_handler(
+    State(state): State<Arc<AppState>>,
+    identity: UserIdentity,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if let Err(error) = identity.require_verified_isolation_claims("knowledge packs") {
+        return error.into_response();
+    }
+    let packs = state.knowledge_packs.read().await;
+    match packs
+        .iter()
+        .find(|pack| pack.get("id").and_then(Value::as_str) == Some(id.as_str()))
+    {
+        Some(pack) => (StatusCode::OK, Json(pack.clone())).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "knowledge pack not found", "id": id })),
+        )
+            .into_response(),
+    }
+}
+
 /// PUT /api/v1/knowledge-packs/:id — 更新知识包（合并 patch，校验关联引用）。
 pub(crate) async fn update_knowledge_pack_handler(
     State(state): State<Arc<AppState>>,
@@ -3202,6 +3229,145 @@ mod isolation_contract {
             body["error"],
             "exclude shape can contain two tokens matched by configured rules; tighten its length or group bounds"
         );
+        if let Some(previous) = previous_data_dir {
+            std::env::set_var("AGENTOS_DATA_DIR", previous);
+        } else {
+            std::env::remove_var("AGENTOS_DATA_DIR");
+        }
+        if let Some(previous) = previous_platform_tenant {
+            std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, previous);
+        } else {
+            std::env::remove_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        }
+    }
+
+    /// GET /knowledge-packs/:id returns the same object as a list item and as
+    /// PUT's `knowledge_pack`. Missing ids are 404; anonymous callers are 401.
+    /// Packs stay a platform-shared registry, so another tenant's DA can read.
+    #[tokio::test]
+    async fn get_knowledge_pack_returns_body_after_create_and_put() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_data_dir = std::env::var_os("AGENTOS_DATA_DIR");
+        let previous_platform_tenant =
+            std::env::var_os(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV);
+        std::env::set_var("AGENTOS_DATA_DIR", tmp.path());
+        std::env::set_var(crate::api::http::iam::PLATFORM_ADMIN_TENANT_ENV, "tenant-a");
+        let state = test_state(tmp.path());
+        let app = Router::new()
+            .route(
+                "/api/v1/knowledge-packs",
+                get(list_knowledge_packs_handler).post(create_knowledge_pack_handler),
+            )
+            .route(
+                "/api/v1/knowledge-packs/:id",
+                get(get_knowledge_pack_handler).put(update_knowledge_pack_handler),
+            )
+            .with_state(state);
+        let admin = platform_jwt("tenant-a");
+        let other_tenant_da = jwt_for_scope("tenant-b", Some("project-b"));
+
+        let (status, anon) = response_json(
+            &app,
+            Request::builder()
+                .uri("/api/v1/knowledge-packs/missing-pack")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(anon["error"], "verified_isolation_claims_required");
+
+        let (status, created) = response_json(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/knowledge-packs")
+                .header("authorization", format!("Bearer {admin}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"name": "demo pack"}).to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap().to_string();
+        let created_pack = created["knowledge_pack"].clone();
+
+        let (status, fetched) = response_json(
+            &app,
+            Request::builder()
+                .uri(format!("/api/v1/knowledge-packs/{id}"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched, created_pack);
+
+        let (status, updated) = response_json(
+            &app,
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/knowledge-packs/{id}"))
+                .header("authorization", format!("Bearer {admin}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"name": "renamed pack", "version": "1.0.1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["knowledge_pack"]["version"], "1.0.1");
+
+        let (status, fetched) = response_json(
+            &app,
+            Request::builder()
+                .uri(format!("/api/v1/knowledge-packs/{id}"))
+                .header("authorization", format!("Bearer {other_tenant_da}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched, updated["knowledge_pack"]);
+        assert_eq!(fetched["name"], "renamed pack");
+        assert_eq!(fetched["version"], "1.0.1");
+        assert_eq!(fetched["id"], id);
+
+        let (status, listed) = response_json(
+            &app,
+            Request::builder()
+                .uri("/api/v1/knowledge-packs")
+                .header("authorization", format!("Bearer {other_tenant_da}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list_item = listed["knowledge_packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pack| pack["id"] == id)
+            .cloned()
+            .expect("created pack is listed");
+        assert_eq!(fetched, list_item);
+
+        let (status, missing) = response_json(
+            &app,
+            Request::builder()
+                .uri("/api/v1/knowledge-packs/missing-pack")
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["error"], "knowledge pack not found");
+        assert_eq!(missing["id"], "missing-pack");
+
         if let Some(previous) = previous_data_dir {
             std::env::set_var("AGENTOS_DATA_DIR", previous);
         } else {
