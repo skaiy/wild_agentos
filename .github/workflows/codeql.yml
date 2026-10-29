@@ -14,10 +14,16 @@ name: "CodeQL Advanced"
 on:
   push:
     branches: [ "main" ]
+    paths-ignore: ['**/*.md', 'docs/**', 'LICENSE*']
   pull_request:
     branches: [ "main" ]
+    paths-ignore: ['**/*.md', 'docs/**', 'LICENSE*']
   schedule:
     - cron: '35 18 * * 6'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:
@@ -28,6 +34,7 @@ jobs:
     #   - https://gh.io/using-larger-runners (GitHub.com only)
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
     runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    timeout-minutes: 60
     permissions:
       # required for all workflows
       security-events: write
