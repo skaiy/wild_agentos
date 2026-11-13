@@ -73,6 +73,8 @@ FROM ${DISTROLESS}cc-debian12:nonroot@${DISTROLESS_DIGEST} AS runtime
 COPY --from=builder --chown=10001:10001 /out/app /app
 COPY --from=builder /build/target/release/wild-agent-os-core /usr/local/bin/wild-agent-os-core
 COPY --chown=10001:10001 config.yaml /app/config.yaml
+# Third-party license inventory. COPY creates /licenses; no shell in this stage.
+COPY --chown=10001:10001 THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
 WORKDIR /app
 

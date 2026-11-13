@@ -73,6 +73,7 @@ jobs:
         test "$found" = 0
         grep -qx 'usr/local/bin/wild-agent-os-core' image-files.txt
         grep -qx 'app/config.yaml' image-files.txt
+        grep -qx 'licenses/THIRD_PARTY_NOTICES.md' image-files.txt
 
     - name: Runtime image runs as non-root
       run: |

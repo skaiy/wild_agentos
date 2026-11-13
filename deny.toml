@@ -1,0 +1,110 @@
+# Supply-chain gate for Wild AgentOS (issue #389).
+#
+# Third-party crates must be redistributable in both the AGPL-3.0-only
+# community edition and the commercial edition. Anything not listed in
+# `allow` or in a named workspace exception is rejected. That includes
+# BUSL-1.1, SSPL-1.0, Elastic-2.0, GPL-2.0-only, GPL-2.0-or-later,
+# GPL-3.0-only, GPL-3.0-or-later, LGPL-2.0-only, LGPL-2.1-only,
+# LGPL-2.1-or-later, LGPL-3.0-only, LGPL-3.0-or-later, AGPL-3.0-only, and
+# AGPL-3.0-or-later.
+#
+# AGPL-3.0-only is accepted only for this workspace's own crates, via
+# `exceptions` below. `[licenses.private] ignore` is left false: it would
+# also skip any future unpublished path crate, and these crates do not set
+# `publish = false`.
+#
+# License judgements here are engineering checks, not legal advice.
+
+[advisories]
+yanked = "warn"
+unmaintained = "all"
+unsound = "workspace"
+# An ignore that no longer matches the graph fails the check.
+unused-ignored-advisory = "deny"
+# This PR does not upgrade or replace dependencies. Each ignore is an
+# assessment of the locked tree as of 2026-11-13, with a review date.
+# They are not permission to pull a newer affected version.
+ignore = [
+    { id = "RUSTSEC-2025-0012", reason = "backoff 0.4.0 (via async-openai) is unmaintained and has no fixed release. Not a vulnerability advisory. Review 2027-02-13." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is unmaintained. Upstream calls 1.3.3 complete, not a vulnerability. Direct dependency; replacement is out of scope here. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 timing side channel via jsonwebtoken -> p256/p384. Fix is >=0.7.6, which this PR must not bump. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2024-0388", reason = "derivative 2.2.0 (via json-ld) is unmaintained and has no fixed release. Review 2027-02-13." },
+    { id = "RUSTSEC-2021-0141", reason = "dotenv 0.15.0 is unmaintained. Direct dependency used to load env files; no vulnerability in the advisory. Replacement (dotenvy) is out of scope. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 empty-DATA memory growth, reached through tonic 0.10 / hyper 0.14. Patched in 0.4.16; the 0.3 line has no fix and this PR must not upgrade tonic. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2024-0384", reason = "instant 0.1.13 (via backoff) is unmaintained and has no fixed release. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 pop() is unsound only if a key's Drop panics under catch_unwind. Fix is >=0.18.2, a breaking bump this PR must not take. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 is an unmaintained proc-macro (via locspan-derive / json-ld). No fixed release. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37.5 and 0.38.4 quadratic attribute check. Used by json-ld and rust-s3 on XML input. Fix is >=0.41.0, which this PR must not bump. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37.5 and 0.38.4 namespace-declaration allocation. Same crates and the same upgrade ban as RUSTSEC-2026-0194. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing attack via jsonwebtoken. Fix is >=0.10.0, which this PR must not bump. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.23.45 Debug impls leak session secrets only for a custom ClientSessionStore. This repo has no ClientSessionStore; the built-in cache is redacted. Still pinned below 0.23.46. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0347", reason = "rustls 0.23.45 ECH early-data leak requires EchMode::Enable. This repo does not enable ECH. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0348", reason = "rustls 0.23.45 Brotli certificate decompression requires the non-default brotli feature. No workspace manifest enables it. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.23.45 can record an unauthenticated ServerHello group and later skip hybrid key exchange. Affects outbound rustls clients (reqwest). Fix is >=0.23.46, which this PR must not bump. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.103.15 may accept distrusted emSign intermediates. Fix is >=0.103.16, which this PR must not bump. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0215", reason = "smallstr 0.3.1 (via json-syntax) is unmaintained and has no fixed release. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0386", reason = "tokio 1.53.1 AsyncFd constructors are unsound for arbitrary RawFd values. Fix is >=1.53.3, a patch this PR must not bump. No direct AsyncFd::new call in this repo. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 1.0.9 still trusts a distrusted emSign root. Fix is >=1.0.10, which this PR must not bump. Affects rustls certificate verification. Follow-up. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0414", reason = "pulldown-cmark 0.13.4 wikilink event blow-up requires ENABLE_WIKILINKS. tui-markdown 0.3.9 does not set that option. Fix is >=0.13.5, which this PR must not bump. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0433", reason = "pulldown-cmark 0.13.4 nested image-wikilink cost requires ENABLE_WIKILINKS, which tui-markdown 0.3.9 does not set. Fix is >=0.13.6, which this PR must not bump. Review 2027-02-13." },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 (via mermaid-rs-renderer) is unmaintained and has no fixed release. Review 2027-02-13." },
+    { id = "RUSTSEC-2024-0320", reason = "yaml-rust 0.4.5 (via syntect / tui-markdown) is unmaintained and has no fixed release. Review 2027-02-13." },
+]
+
+[licenses]
+# Dev-dependencies are not redistributed. cargo-deny 0.20 leaves them out
+# unless this is true. Build-dependencies stay included (the default).
+include-dev = false
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # Boost Software License 1.0. This is SPDX BSL-1.0, not the Business
+    # Source License (SPDX BUSL-1.1), which stays rejected.
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    # File-level copyleft. Every crate that actually uses it is listed in
+    # the pull request for manual review.
+    "MPL-2.0",
+    # webpki-roots 1.0.x relicensed its CA bundle from MPL-2.0 to
+    # CDLA-Permissive-2.0 (permissive data license, not CDLA-Sharing).
+    # Needs lawyer confirmation; see the pull request. CDLA-Sharing is
+    # not allowed.
+    "CDLA-Permissive-2.0",
+]
+exceptions = [
+    { allow = ["AGPL-3.0-only"], crate = "wild-agent-os-core" },
+    { allow = ["AGPL-3.0-only"], crate = "hyperspace-engine" },
+    { allow = ["AGPL-3.0-only"], crate = "ontologies" },
+    { allow = ["AGPL-3.0-only"], crate = "wild-code-cli" },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+# v0.10.0 decision (2026-10-08): the distroless image is rustls-only.
+# Do not add an allow or a wrapper to turn a hit into a pass; remove the
+# crate from the graph instead.
+deny = [
+    { crate = "openssl-sys", use-instead = "rustls", reason = "OpenSSL must not be linked into the distroless runtime (2026-10-08)." },
+    { crate = "native-tls", use-instead = "rustls", reason = "native-tls pulls the platform TLS stack (OpenSSL on Linux). Use rustls (2026-10-08)." },
+    { crate = "openssl", use-instead = "rustls", reason = "The openssl crate must not enter the graph (2026-10-08)." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,55 @@
+# Accepted set matches deny.toml. Priority order decides which text is
+# reproduced when a crate is "Apache-2.0 OR MIT" (Apache-2.0 wins).
+#
+# Dev-dependencies are omitted so this inventory matches `cargo deny check`
+# (cargo-deny 0.20 does not include dev-dependencies unless include-dev is
+# set). Build-dependencies stay in: they are part of producing the binary.
+
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # Boost Software License. Not BUSL-1.1.
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    # Same caveat as deny.toml: webpki-roots 1.0.9, lawyer confirmation.
+    "CDLA-Permissive-2.0",
+]
+
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# Built-in clarifications for crates whose packaged license files are not
+# machine-readable. Each name is a no-op when that crate is absent.
+workarounds = [
+    "ring",
+    "rustls",
+    "unicode-ident",
+    "rustix",
+    "linux-raw-sys",
+    "chrono",
+    "prost",
+    "tonic",
+]
+
+# Own workspace crates. Not third-party; listed so generation can accept the
+# graph. Their terms are LICENSE and NOTICE, not a separate grant.
+[wild-agent-os-core]
+accepted = ["AGPL-3.0-only"]
+
+[hyperspace-engine]
+accepted = ["AGPL-3.0-only"]
+
+[ontologies]
+accepted = ["AGPL-3.0-only"]
+
+[wild-code-cli]
+accepted = ["AGPL-3.0-only"]

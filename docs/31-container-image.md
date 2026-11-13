@@ -28,9 +28,10 @@ The `Dockerfile` builds the Core server (`wild-agent-os-core`) in two stages.
 
 - Base image `gcr.io/distroless/cc-debian12:nonroot`: no shell, no curl, no
   package manager. CI fails if any of them appear in the image.
-- Contents: the binary at `/usr/local/bin/wild-agent-os-core` and the default
-  `/app/config.yaml`. `/app/data` (volume) and `/app/logs` are created at build
-  time and owned by uid/gid `10001`.
+- Contents: the binary at `/usr/local/bin/wild-agent-os-core`, the default
+  `/app/config.yaml`, and `/licenses/THIRD_PARTY_NOTICES.md` (the generated
+  third-party license inventory). `/app/data` (volume) and `/app/logs` are
+  created at build time and owned by uid/gid `10001`.
 - The process runs as `10001:10001`, the same uid as earlier images, so existing
   data volumes keep working without a `chown`.
 

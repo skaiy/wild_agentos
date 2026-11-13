@@ -21,6 +21,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  supply-chain:
+    name: Supply chain (cargo-deny, cargo-about)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_ABOUT_VERSION: "0.9.3"
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - name: Set up Rust
+      uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+    - name: Cache Cargo artifacts
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Install pinned cargo-deny and cargo-about
+      run: |
+        set -euo pipefail
+        # cargo-about 0.9.3 hides the binary behind the `cli` feature.
+        cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+        cargo install cargo-about --locked --version "$CARGO_ABOUT_VERSION" --features cli
+        cargo deny --version
+        cargo about --version
+    - name: cargo deny check
+      # --workspace: the root package is a real crate, so without this flag
+      # apps/wild_code (wild-code-cli) is not a graph root.
+      # --locked: refuse to touch Cargo.lock.
+      run: cargo deny --locked --workspace check licenses bans sources advisories
+    - name: THIRD_PARTY_NOTICES.md is current
+      run: |
+        set -euo pipefail
+        ./scripts/generate_third_party_notices.sh
+        git diff --exit-code -- THIRD_PARTY_NOTICES.md
+
   ontology-ke-golden-fixture-gate:
     name: Ontology KE frozen fixture gate
     runs-on: ubuntu-latest
