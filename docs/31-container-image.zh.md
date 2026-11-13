@@ -23,7 +23,8 @@
 
 - 基础镜像 `gcr.io/distroless/cc-debian12:nonroot`：没有 shell、curl、包管理器；
   CI 发现其中任何一个就失败。
-- 内容：`/usr/local/bin/wild-agent-os-core` 二进制和默认 `/app/config.yaml`。
+- 内容：`/usr/local/bin/wild-agent-os-core` 二进制、默认 `/app/config.yaml`，
+  以及 `/licenses/THIRD_PARTY_NOTICES.md`（生成的第三方许可清单）。
   `/app/data`（数据卷）与 `/app/logs` 在构建阶段建好，属主 uid/gid `10001`。
 - 进程以 `10001:10001` 运行，与旧镜像相同，已有数据卷无需 `chown`。
 

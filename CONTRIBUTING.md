@@ -11,13 +11,14 @@ Welcome! Wild AgentOS is an open-source Agent Operating System written in Rust. 
    - [Extending the Skill Graph](#extending-the-skill-graph)
    - [Adding a New Batch Agent](#adding-a-new-batch-agent)
    - [Adding a New Tool](#adding-a-new-tool)
-5. [Coding Conventions](#coding-conventions)
-6. [Testing](#testing)
-7. [Commit Guidelines](#commit-guidelines)
-8. [Pull Request Process](#pull-request-process)
-9. [Contributor License Agreement](#contributor-license-agreement)
-10. [Documentation](#documentation)
-11. [Getting Help](#getting-help)
+5. [Adding Dependencies](#adding-dependencies)
+6. [Coding Conventions](#coding-conventions)
+7. [Testing](#testing)
+8. [Commit Guidelines](#commit-guidelines)
+9. [Pull Request Process](#pull-request-process)
+10. [Contributor License Agreement](#contributor-license-agreement)
+11. [Documentation](#documentation)
+12. [Getting Help](#getting-help)
 
 ## Code of Conduct
 
@@ -111,6 +112,19 @@ No changes to the batch framework itself are required.
 2. Register it in `ToolExecutor::register()` in `src/tools/tool_executor.rs`
 3. Define its JSON Schema and role permissions
 4. If it’s an MCP tool, add the server configuration in `src/tools/mcp_client.rs`
+
+## Adding Dependencies
+
+Wild AgentOS is dual-licensed. Third-party code cannot be relicensed, so every new crate has to be redistributable in both the community edition and the commercial edition.
+
+Before adding a dependency:
+
+1. Run `cargo deny --locked --workspace check licenses bans sources advisories`.
+2. If the crate is accepted, regenerate `THIRD_PARTY_NOTICES.md` with `scripts/generate_third_party_notices.sh` and commit the result. CI fails when that file is stale (`git diff --exit-code`).
+
+A rejected license cannot be fixed by adding it to `allow` or `exceptions` in the same change. GPL, AGPL, LGPL, BUSL-1.1 (Business Source License), SSPL, and Elastic-2.0 stay rejected. An exception needs written maintainer approval in the pull request, and it is limited to that crate. Do not add an allow entry to turn a failing check green.
+
+`openssl-sys`, `native-tls`, and `openssl` are banned. Do not exempt them. Use rustls.
 
 ## Coding Conventions
 

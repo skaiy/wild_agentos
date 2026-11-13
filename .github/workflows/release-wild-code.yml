@@ -149,13 +149,17 @@ jobs:
       - name: Package tar.gz (Linux/macOS)
         if: runner.os != 'Windows'
         working-directory: target/${{ matrix.target }}/release
-        run: tar czvf ${{ github.workspace }}/wildcode-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+        run: |
+          cp "${{ github.workspace }}/THIRD_PARTY_NOTICES.md" .
+          tar czvf ${{ github.workspace }}/wildcode-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }} THIRD_PARTY_NOTICES.md
 
       - name: Package zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         working-directory: target/${{ matrix.target }}/release
-        run: Compress-Archive -Path ${{ env.BINARY_NAME }}.exe -DestinationPath ${{ github.workspace }}/wildcode-${{ matrix.target }}.zip
+        run: |
+          Copy-Item "${{ github.workspace }}/THIRD_PARTY_NOTICES.md" -Destination .
+          Compress-Archive -Path ${{ env.BINARY_NAME }}.exe, THIRD_PARTY_NOTICES.md -DestinationPath ${{ github.workspace }}/wildcode-${{ matrix.target }}.zip
 
       # ----- 新增：手动触发时上传构建产物 (用于测试下载) -----
       - name: Upload Artifacts (for manual run testing)
