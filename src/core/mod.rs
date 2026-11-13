@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod constitution;
 pub mod context_compressor;
 pub mod core_types;
+pub mod durable;
 pub mod event_bus;
 pub mod execution_event;
 pub mod five_w2h;
